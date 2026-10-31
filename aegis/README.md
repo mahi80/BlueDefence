@@ -63,6 +63,10 @@ agents (`full`).
 
 ## Run it in five minutes
 
+> Installing on a real host? One command does the whole thing — user, venv, config, licence, systemd:
+> `curl -fsSL https://raw.githubusercontent.com/mahi80/BlueDefence/main/install.sh | sudo bash`
+> (see the root README § *Install on a bank host*). The steps below are the developer path.
+
 Everything below runs offline on a laptop: mock LLM, mock telemetry tenant, mock WAF / SOAR
 tenants, file-based approvals. No dashboard, no API keys.
 
