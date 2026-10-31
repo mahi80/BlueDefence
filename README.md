@@ -53,7 +53,7 @@ cd soc-console && AEGIS_API_ORIGIN=http://localhost:8799 \
 | `AEGIS_ENFORCEMENT_MODE` | `shadow` | `shadow` logs what it would enforce; `live` calls vendor connectors. |
 | `AEGIS_SWARM` | `1` | Swarm fan-out on triage. |
 | `AEGIS_AUTO_BLOCK` | `shadow` | Detection-time auto-block of narrow, external, reversible targets (TTL, voter-gated). |
-| `AEGIS_ENSEMBLE_VOTE` | `off` | Multi-model majority vote on the irreversible judgment (needs ≥2 voters configured). |
+| `AEGIS_ENSEMBLE_VOTE` | `off` | Multi-model majority vote on the irreversible judgment. With it on, `build_pipeline` loads the extra voters named in `AEGIS_VOTER_MODELS` (comma-separated `model` or `backend:model`, e.g. `vllm:llama-3-8b, vllm:mistral-7b`) so the panel is ≥2; pick different families. Off, or with none set, it's the single-voter path. |
 | `AEGIS_HITL_TIMEOUT` | `off` | Timeout fallback: a reversible action with a majority-concur vote auto-executes past its window; irreversible actions and split votes hold for a human. `shadow` \| `live`; `AEGIS_HITL_TIMEOUT_SEC` (120). |
 
 WAF/SOAR vendors: `AEGIS_WAF_VENDOR`, `AEGIS_SOAR_VENDOR` (+ creds) — see `aegis/README.md`.

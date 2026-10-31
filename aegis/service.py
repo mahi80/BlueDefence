@@ -47,7 +47,8 @@ from aegis.agents.response.agent import ResponseAgent
 from aegis.agents.response.connectors import registry_from_env
 from aegis.agents.response.receipts import receipt_log_from_env
 from aegis.agents.shared.audit import AuditLog
-from aegis.agents.shared.llm_client import get_client, get_voter_client
+from aegis.agents.shared.llm_client import get_client, get_voter_client, get_extra_voter_clients
+from aegis.agents.orchestrator.voting import ensemble_enabled
 from aegis.agents.threat_intel.agent import ThreatIntelAgent
 from aegis.agents.threat_intel.cve_feeds import cve_intel_from_env
 from aegis.agents.transaction.agent import TransactionAgent
@@ -155,6 +156,11 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     primary = get_client()
     # Voter on a different model family for prompt-injection resistance.
     voter = get_voter_client(avoid_family="anthropic")
+    # Extra voters for the majority-vote ensemble (AEGIS_ENSEMBLE_VOTE). Built only when the
+    # flag is on, so a single-voter deployment loads no extra models; AEGIS_VOTER_MODELS lists
+    # them. With >=2 live voters the orchestrator runs the ensemble; otherwise the single-voter
+    # path, unchanged.
+    extra_voters = get_extra_voter_clients() if ensemble_enabled() else []
     persist_sink = sink_from_env()                       # Phase 0.3 — chains/receipts → dashboard
     audit = AuditLog(audit_path, sink=persist_sink)
     receipt_log = receipt_log_from_env(audit_path.parent, sink=persist_sink)   # Phase 1.5
@@ -173,7 +179,7 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     set_sink(persist_sink if persist_sink is not None and persist_sink.enabled else None)   # discovered AI usage → /ai-registry
 
     orch: Any = SOCOrchestrator(
-        primary_llm=primary, voter_llm=voter,
+        primary_llm=primary, voter_llm=voter, extra_voters=extra_voters,
         perimeter=PerimeterAgent(llm=primary), auth=AuthAgent(llm=primary), edr=EDRAgent(llm=primary),
         api_abuse=APIAbuseAgent(llm=primary), transaction=TransactionAgent(llm=primary),
         cloud_controlplane=CloudControlPlaneAgent(llm=primary), dlp=DLPAgent(llm=primary),

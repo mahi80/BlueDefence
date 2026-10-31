@@ -1482,6 +1482,52 @@ def get_voter_client(
     return inner
 
 
+def _pii_wrap(inner: LLMClient) -> LLMClient:
+    """Wrap a voter in the PII tokenization client unless disabled — same guard the
+    primary voter uses, so every voter sees tokenized data."""
+    if os.environ.get("AEGIS_PII_TOKENIZATION", "1") != "0":
+        try:
+            from .pii_tokenizing_client import TokenizingLLMClient
+            return TokenizingLLMClient(inner)
+        except Exception as exc:  # noqa: BLE001
+            _log.error("PII tokenization wrapper unavailable (%s: %s) — voter runs WITHOUT it",
+                       type(exc).__name__, str(exc)[:160])
+    return inner
+
+
+def get_extra_voter_clients(budget: Optional[TokenBudget] = None) -> list[LLMClient]:
+    """Additional voters beyond the primary one, for the majority-vote ensemble
+    (``AEGIS_ENSEMBLE_VOTE``). Configured with ``AEGIS_VOTER_MODELS`` — a comma-separated
+    list of specs, each ``model`` or ``backend:model`` (backend defaults to
+    ``AEGIS_VOTER_BACKEND`` or the auto resolver). Each becomes its own voter client;
+    choose different model families so a prompt injection that fools one rarely fools all.
+
+    Returns ``[]`` when the env var is unset, so a single-voter deployment loads nothing
+    extra. A spec that fails to load is skipped (logged), never fatal — the ensemble just
+    runs with however many voters came up.
+    """
+    raw = os.environ.get("AEGIS_VOTER_MODELS", "").strip()
+    if not raw:
+        return []
+    default_backend = os.environ.get("AEGIS_VOTER_BACKEND", "").strip().lower() or None
+    out: list[LLMClient] = []
+    for spec in (s.strip() for s in raw.split(",")):
+        if not spec:
+            continue
+        head, sep, tail = spec.partition(":")
+        if sep and tail.strip():                      # "backend:model"
+            backend, model = (head.strip().lower() or default_backend), tail.strip()
+        else:                                          # bare "model"
+            backend, model = default_backend, spec
+        try:
+            out.append(_pii_wrap(get_client(prefer=backend, budget=budget, model=model)))
+            _log.info("[voter] extra ensemble voter loaded: backend=%s model=%s", backend or "auto", model)
+        except Exception as exc:  # noqa: BLE001 — a bad extra voter must never break the pipeline
+            _log.warning("[voter] extra voter '%s' unavailable (%s: %s); skipping",
+                         spec, type(exc).__name__, str(exc)[:160])
+    return out
+
+
 def _alt_anthropic_or_mock(budget: Optional[TokenBudget], primary_model: str) -> LLMClient:
     """Fallback for the voter when Gemma isn't available: Anthropic on
     a DIFFERENT model than the primary. Better than nothing — different
