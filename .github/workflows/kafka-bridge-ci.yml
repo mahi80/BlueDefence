@@ -31,7 +31,14 @@ jobs:
           cache: maven
 
       - name: Unit tests
-        run: mvn -q -B test
+        run: |
+          set -o pipefail
+          if ! mvn -B test 2>&1 | tee mvn.log; then
+            # surface the failure as annotations: the log blob is not always reachable from where this PR is reviewed
+            grep -E "ERROR|FAIL|expected|Tests run|\.java:\[" mvn.log | grep -v "^\[INFO\]" | head -80 | sed 's/^/::error::/'
+            exit 1
+          fi
+          grep -E "Tests run:.*Fail" mvn.log | tail -1
 
       - name: Package (shaded jar)
         run: mvn -q -B -DskipTests package
