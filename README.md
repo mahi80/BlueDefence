@@ -137,6 +137,59 @@ python -m aegis.finetune.dpo --data datasets/triage-v1 --dry-run   # validate pa
 Analyst-only by construction, and `load_dpo` refuses non-analyst pairs unless `--allow-synthetic`,
 so no one preference-tunes a bank model on scaffold data by accident.
 
+## Pilot at a bank (sandbox) — what to ask for
+
+The one ask that decides the pilot: **a read-only mirror of real production logs into the sandbox**.
+A non-prod environment has almost no attack traffic, so AEGIS would have nothing to catch and the
+pilot would prove nothing. Everything below supports that.
+
+**Must-haves** — the pilot fails without these:
+
+| # | Ask | Detail | Why |
+|---|---|---|---|
+| 1 | Two VMs in an isolated sandbox | SOC host: 4 vCPU, 16 GB, 50 GB SSD. GPU host: 1× 24 GB (L4 / A10). Ubuntu 22.04 or RHEL 9, container runtime | Runs the brain and the local model; data never leaves the bank |
+| 2 | Read-only log mirror, live, at least one feed | WAF/CDN log export, or SIEM read-only API (Sentinel / Splunk) | Something real to detect on |
+| 3 | Historical replay | 60–90 days of logs, pseudonymised if needed | Baselines, and a back-test: would AEGIS have caught your past incidents? |
+| 4 | Past incidents with outcomes | 200–500 alerts the SOC already decided (true / false positive, action taken) | Measures accuracy on the bank's data, not ours |
+| 5 | Analyst time | 1–2 SOC analysts, ~3–4 h/week, to decide approval cards | The shadow report is scored against their decisions |
+| 6 | Approvals channel | ServiceNow dev instance, or accept the file queue | Where the cards land |
+| 7 | Sponsor and signed success criteria | CISO or Head of SOC; criteria agreed before day 1 | Avoids "interesting, but…" at the end |
+
+**Should-haves** — each unlocks a class of detection:
+
+| Ask | Unlocks |
+|---|---|
+| Network sensor tap, or Zeek / Suricata logs | C2 beacons, slow exfiltration, shadow AI |
+| EDR alerts (CrowdStrike / Defender) | Endpoint compromise |
+| Privileged engineers and their machines (IdP groups, asset inventory) → `AEGIS_PRIVILEGED_USERS` / `_HOSTS` | Attacks on DevOps / DevSecOps engineers — the entry point of the Oct 2026 Binance drain |
+| Crown-jewel list (payment signer, HSM, SWIFT, treasury, vault) → `AEGIS_CROWN_JEWELS` | Crown-jewel access and control-change detection |
+| Kubernetes / cloud audit logs; HSM / payment-signer audit logs | Privileged access and signer tampering |
+| Core-banking transaction stream (or a replay) and the treasury / nostro account list → `AEGIS_TREASURY_ACCOUNTS` | Drain and outflow detection |
+| Change-ticket / CMDB feed | Tells ticketed changes from attacks — fewer false positives |
+| Web proxy logs (Zscaler, Squid) | Shadow AI and pulls of uncensored / abliterated models |
+| Sandbox tenants for the WAF / SOAR | One connector smoke test, still in shadow |
+
+**Approvals to start early** — these take the longest at a bank:
+
+| Approval | Who signs |
+|---|---|
+| Data handling: data stays on-prem, PII tokenised, nothing leaves the bank | Legal / DPO |
+| Security review of AEGIS itself | InfoSec |
+| Model-risk sign-off for a local LLM (RBI FREE-AI) | Model risk / CRO office |
+| Network change: one inbound ingest port, internal only | Network / CAB |
+
+**What the bank gets in return:**
+
+- **Shadow only** — AEGIS takes no action on any bank system during the pilot; it records what it *would* do.
+- **No data egress** — the models run on the bank's GPU, no internet calls (air-gap supported).
+- **Read-only credentials** everywhere.
+- **6–8 weeks** — install (1), wire feeds (2), shadow window (2–3), review (1).
+- **Success criteria to propose** — catch ≥ X% of the bank's past confirmed incidents in replay; false
+  positives ≤ Y/day on live traffic; a verdict in under a minute; a shadow report showing which
+  actions would have been safe to automate.
+
+Lead with must-haves 2–4: a bank that says yes to real logs and past incidents will make the rest routine.
+
 ## CI
 
 - `.github/workflows/aegis-ci.yml` — eval gates (historical + injection, investigation
