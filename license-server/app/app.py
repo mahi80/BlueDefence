@@ -247,6 +247,9 @@ def handle(event: dict, *, cfg: Config, store: Store, now: float | None = None) 
     rc = event.get("requestContext", {}).get("http", {})
     method = str(rc.get("method") or event.get("httpMethod") or "GET").upper()
     path = str(rc.get("path") or event.get("rawPath") or event.get("path") or "/").rstrip("/") or "/"
+    stage = str(event.get("requestContext", {}).get("stage") or "")
+    if stage and stage != "$default" and (path == f"/{stage}" or path.startswith(f"/{stage}/")):
+        path = path[len(stage) + 1:] or "/"                    # HTTP API includes the stage in the path; routes do not
     parts = [p for p in path.split("/") if p]
     try:
         if method == "GET" and path == "/health":

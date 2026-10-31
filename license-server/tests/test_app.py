@@ -105,3 +105,11 @@ def test_bad_bodies(cfg):
     assert r["statusCode"] == 400
     r = app.handle({"requestContext": {"http": {"method": "POST", "path": "/activate"}}, "body": "x" * (app.MAX_BODY + 1)}, cfg=cfg, store=s, now=NOW)
     assert r["statusCode"] == 400
+
+
+def test_stage_prefix_is_stripped(cfg):
+    s = app.MemoryStore()
+    ev = {"requestContext": {"stage": "prod", "http": {"method": "GET", "path": "/prod/health"}}, "rawPath": "/prod/health", "headers": {}, "body": ""}
+    assert app.handle(ev, cfg=cfg, store=s, now=NOW)["statusCode"] == 200
+    ev["requestContext"]["stage"] = "$default"; ev["requestContext"]["http"]["path"] = "/health"
+    assert app.handle(ev, cfg=cfg, store=s, now=NOW)["statusCode"] == 200
