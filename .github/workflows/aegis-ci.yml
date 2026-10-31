@@ -60,6 +60,9 @@ jobs:
       - name: Egress gate (network-sensor TLS — beacons / exfil / known-bad / shadow AI, zero containment on benign)
         run: python -m aegis.eval.egress_bench --json egress-bench.json
 
+      - name: Signer-compromise gate (Binance Oct 2026 pattern — DevOps laptop to payment-signer drain, every stage caught, drain contained)
+        run: python -m aegis.eval.signer_compromise --gate --json signer-compromise.json
+
       - name: Upload purple-team and egress results
         if: always()
         uses: actions/upload-artifact@v4
@@ -68,6 +71,7 @@ jobs:
           path: |
             purple-team.json
             egress-bench.json
+            signer-compromise.json
           if-no-files-found: ignore
 
       - name: Hypothesis property-based tests

@@ -24,6 +24,7 @@ import os
 from ..shared.evidence_chain import EvidenceChain, RecommendedAction
 from ..shared.netguard import enforcement_refused
 from .autonomy import AutonomyPolicy
+from .breaker import OutflowBreaker
 from .hitl_timeout import HitlTimeoutPolicy
 from .connectors import ConnectorRegistry, Receipt, STATUS_REFUSED, registry_from_env
 
@@ -105,7 +106,8 @@ class ResponseAgent:
                  protected_targets: Optional[list[str]] = None,
                  two_person_actions: Optional[set[str]] = None,
                  autonomy: Optional[AutonomyPolicy] = None,
-                 hitl_timeout: Optional[HitlTimeoutPolicy] = None):
+                 hitl_timeout: Optional[HitlTimeoutPolicy] = None,
+                 breaker: Optional[OutflowBreaker] = None):
         self._mtd = mtd
         self._self_healing = self_healing
         self._hitl_stream = hitl_stream
@@ -124,6 +126,9 @@ class ResponseAgent:
         # Tiered autonomy: short self-expiring blocks on narrow external targets run without
         # waiting for a human when the evidence is strong (autonomy.py). AEGIS_AUTO_BLOCK=0 → off.
         self._autonomy = autonomy if autonomy is not None else AutonomyPolicy.from_env()
+        # Outflow circuit breaker: during a drain burst a hold on the sender's further payments runs
+        # without waiting (breaker.py). Every other hold still waits. AEGIS_OUTFLOW_BREAKER, shadow by default.
+        self._breaker = breaker if breaker is not None else OutflowBreaker.from_env()
         # Timeout fallback for pending HITL approvals (hitl_timeout.py). With few analysts,
         # a reversible action nobody has decided on auto-executes once past its wait window;
         # irreversible actions and split votes hold for a human. AEGIS_HITL_TIMEOUT=off → off.
@@ -197,6 +202,20 @@ class ResponseAgent:
                 done = self._from_receipt(action, receipt, prefix="auto-block")
                 done.note = f"{done.note} ({why})"
                 return done
+        # Outflow circuit breaker: a drain in progress does not wait for an analyst to open a card.
+        if action.action_type == "hold":
+            ok, why = self._breaker.check(action, chain)
+            if ok and self._breaker.mode == "shadow":
+                self._connectors.preview(action, alert_id=chain.alert_id, approver="aegis:breaker-shadow",
+                                         ttl_sec=self._breaker.ttl_sec, note="outflow breaker shadow")
+            elif ok:
+                receipt = self._connectors.apply(action, alert_id=chain.alert_id, approver="aegis:breaker",
+                                                 ttl_sec=self._breaker.ttl_sec)
+                if receipt.active:
+                    self._breaker.take()
+                    done = self._from_receipt(action, receipt, prefix="outflow-breaker")
+                    done.note = f"{done.note} ({why})"
+                    return done
         # Always-HITL list takes precedence
         if action.action_type in _ALWAYS_HITL_ACTIONS:
             return ExecutedAction(action=action, status="queued_for_hitl",
