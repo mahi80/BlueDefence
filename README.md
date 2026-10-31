@@ -110,6 +110,28 @@ see the flags below and [`aegis/README.md`](aegis/README.md) for the full config
 
 WAF/SOAR vendors: `AEGIS_WAF_VENDOR`, `AEGIS_SOAR_VENDOR` (+ creds) — see `aegis/README.md`.
 
+## Learning loop (DPO from the approvals queue)
+
+Every analyst decision at the HITL card is supervision. `aegis.dataset export --dpo` turns the
+ones that **overruled the model** into preference pairs in `dpo/preferences.jsonl`:
+
+- `human_corrected` (analyst rejected the action *and* gave the verdict it should have been) →
+  **chosen** = the analyst's verdict, **rejected** = the model's.
+- `human_disputed` (analyst rejected an auto-run action, no verdict) → **chosen** = the same
+  verdict with that action held for a human, **rejected** = the model's auto-run.
+
+Confirmations and agreements produce no pair — there is nothing to prefer. DPO then nudges the
+judge toward the analyst's call and away from the one it overruled, so detection sharpens with
+each decision and needs fewer of them over time. Same held-out eval gate as SFT.
+
+```bash
+aegis.dataset export --dashboard --dpo --out datasets/triage-v1   # pulls chains + decisions
+python -m aegis.finetune.dpo --data datasets/triage-v1 --dry-run   # validate pairs + plan (no GPU)
+```
+
+Analyst-only by construction, and `load_dpo` refuses non-analyst pairs unless `--allow-synthetic`,
+so no one preference-tunes a bank model on scaffold data by accident.
+
 ## CI
 
 - `.github/workflows/aegis-ci.yml` — eval gates (historical + injection, investigation

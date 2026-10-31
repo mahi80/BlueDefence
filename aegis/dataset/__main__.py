@@ -47,7 +47,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     builder = DatasetBuilder(args.out, BuildOptions(
         name=args.name or Path(args.out).name, val_pct=args.val_pct, include_weak=args.include_weak,
         include_disputed=args.include_disputed, eval_split=args.eval_split, scrub_ips=scrubber.scrub_ips,
-        salted=scrubber.salted, notes=args.notes or "",
+        salted=scrubber.salted, notes=args.notes or "", dpo=args.dpo,
     ))
 
     if not args.no_eval:
@@ -273,6 +273,8 @@ def main(argv: list[str] | None = None) -> int:
     ex.add_argument("--val-pct", type=int, default=10, help="validation share of non-eval records (default 10)")
     ex.add_argument("--include-weak", action="store_true", help="put model-labelled (unchecked) rows in sft/triage.jsonl")
     ex.add_argument("--include-disputed", action="store_true", help="put human_disputed rows in sft/triage.jsonl")
+    ex.add_argument("--dpo", action="store_true",
+                    help="also emit dpo/preferences.jsonl (preference pairs from analyst-overruled decisions)")
     ex.add_argument("--scrub-ips", action="store_true", help="also pseudonymise public IPv4 addresses")
     ex.add_argument("--notes", default="", help="free text recorded in the manifest")
     ex.set_defaults(fn=cmd_export)
