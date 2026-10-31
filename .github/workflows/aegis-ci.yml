@@ -188,6 +188,12 @@ jobs:
     timeout-minutes: 8
     env:
       ACP_HOME: /tmp/acp-home   # per-machine agent registry, isolated from the runner
+      # BlueDefence consumes acp-sdk as a pinned package from the private rbi repo. The
+      # governance runtime (and its eval) activates only when this secret is set — a
+      # read-scoped PAT (Settings -> Secrets -> Actions). WITHOUT it the job stays green:
+      # aegis runs without acp-sdk (the import is optional), the unit tests self-skip the
+      # governance ones, and the governed eval is skipped. Add the secret to run the full gate.
+      GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -196,21 +202,26 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install deps + acp-sdk (pinned to mahi80/rbi@b2e9d97 — acp-sdk 0.8.3, governance runtime)
-        env:
-          # BlueDefence consumes acp-sdk as a pinned package from the private rbi repo.
-          # Add a read-scoped PAT as the repo secret GH_READ_TOKEN (Settings -> Secrets -> Actions).
-          GH_READ_TOKEN: ${{ secrets.GH_READ_TOKEN }}
+      - name: Install base deps (no SDK, no token)
         run: |
           python -m pip install --upgrade pip
           pip install -r aegis/requirements.txt pytest
+
+      - name: Install acp-sdk (governance runtime — pinned to mahi80/rbi@b2e9d97, acp-sdk 0.8.3)
+        if: ${{ env.GH_READ_TOKEN != '' }}
+        run: |
           pip install "acp-sdk @ git+https://x-access-token:${GH_READ_TOKEN}@github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk"
           python -c "import acp; print('acp-sdk', acp.__version__)"
 
-      - name: Governance unit tests
+      - name: Note — governance runtime skipped (no GH_READ_TOKEN)
+        if: ${{ env.GH_READ_TOKEN == '' }}
+        run: echo "GH_READ_TOKEN not set — acp-sdk install and the governed eval are skipped. aegis runs without it (governance is optional); governance-only tests self-skip. Add the secret to run the full governed gate."
+
+      - name: Unit tests (governance tests self-skip without acp-sdk)
         run: python -m pytest aegis/tests -q -p no:cacheprovider
 
       - name: Historical + injection eval under governance (must match the ungoverned gate)
+        if: ${{ env.GH_READ_TOKEN != '' }}
         env:
           ACP_GOVERN: "1"
         run: |
