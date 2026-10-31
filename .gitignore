@@ -32,3 +32,5 @@ npm-debug.log*
 # Eval / scratch outputs
 /tmp/
 *.log
+# ...but test fixtures that happen to use the .log extension are source, not scratch
+!aegis/ingest/fixtures/*.log
