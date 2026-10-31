@@ -249,6 +249,62 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_contrib(args: argparse.Namespace) -> int:
+    """Build (and push or write) this installation's community contribution bundle."""
+    from aegis import license as licensing
+    from .contrib import contribute
+    st = licensing.check()
+    token = ""
+    if args.push:
+        raw = os.environ.get("AEGIS_LICENSE", "").strip()
+        if raw and raw.count(".") == 2 and not Path(raw).exists():
+            token = raw
+        elif raw and Path(raw).exists():
+            token = Path(raw).read_text().strip()
+        elif Path("/etc/aegis/license.jwt").exists():
+            token = Path("/etc/aegis/license.jwt").read_text().strip()
+    res = contribute(audit_path=args.audit, installation_id=st.installation_id, license_token=token,
+                     license_id=(st.license.license_id if st.license else ""), hitl_dir=args.hitl_dir,
+                     cursor_path=args.cursor, server=args.push, out=args.out, min_records=args.min_records)
+    if res.get("reason") == "privacy gate":
+        print(f"REFUSED by the privacy gate — nothing left this host. {len(res['findings'])} finding(s):")
+        for f in res["findings"][:10]:
+            print(f"  {f['kind']:8s} at {f['path']}  ({f['sample']})")
+        return 2
+    if not res.get("records"):
+        print("nothing new since the last contribution")
+        return 0
+    c = res.get("counts", {})
+    print(f"{res['records']} record(s): {c.get('human_decided', 0)} with analyst decisions, {c.get('human_corrected', 0)} corrected; "
+          f"verdicts {c.get('by_verdict')}")
+    if res.get("file"):
+        print(f"bundle → {res['file']}  (air-gapped: e-mail this file to BlueDefence)")
+    if res.get("sent"):
+        print(f"pushed to {args.push}: {res['server']}")
+    return 0
+
+
+def cmd_import_contrib(args: argparse.Namespace) -> int:
+    """Fold a folder of community bundles into a versioned training dataset."""
+    from .contrib import records_from_bundles
+    recs, report = records_from_bundles(args.src, gate=not args.no_gate)
+    print(f"{report['bundles']} bundle(s), {len(recs)} record(s) from {len(report['by_installation'])} installation(s)")
+    for inst, n in sorted(report["by_installation"].items(), key=lambda kv: -kv[1])[:20]:
+        print(f"  {inst:28s} {n:>7,d}")
+    if report["skipped_gate"]:
+        print(f"  ⚠ {len(report['skipped_gate'])} bundle(s) skipped by the privacy gate (first: {report['skipped_gate'][0]['file']})")
+    if not recs:
+        return 1
+    b = DatasetBuilder(args.out, BuildOptions(name=args.name or Path(args.out).name, val_pct=args.val_pct, include_weak=args.include_weak,
+                                               include_disputed=False, dpo=True, scrub_ips=True, salted=True,
+                                               notes=f"community contributions from {report['bundles']} bundle(s); {args.notes}".strip("; ")))
+    b.add(recs)
+    m = b.build()
+    print(f"dataset → {args.out}: {json.dumps(m['counts'], sort_keys=True)}")
+    print(f"next: python -m aegis.finetune.train --data {args.out} --vram <GB>   |   python -m aegis.finetune.dpo --data {args.out} --vram <GB>")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     m = json.loads((Path(args.dir) / "manifest.json").read_text(encoding="utf-8"))
     print(json.dumps(m["counts"], indent=2, sort_keys=True))
@@ -307,6 +363,25 @@ def main(argv: list[str] | None = None) -> int:
     ve = sub.add_parser("verify", help="re-hash a dataset directory and check the split invariant")
     ve.add_argument("dir")
     ve.set_defaults(fn=cmd_verify)
+
+    co = sub.add_parser("contrib", help="community licence: build this installation's scrubbed contribution bundle and push or write it")
+    co.add_argument("--audit", default=os.environ.get("AEGIS_AUDIT_PATH", "aegis/_audit_log.jsonl"))
+    co.add_argument("--hitl-dir", default=os.environ.get("AEGIS_HITL_DIR", ""), help="file-transport HITL dir (cards + decisions)")
+    co.add_argument("--cursor", default=os.environ.get("AEGIS_CONTRIB_CURSOR", ".aegis-contrib.cursor"))
+    co.add_argument("--push", default=os.environ.get("AEGIS_LICENSE_SERVER", ""), help="licence service URL (POST /contrib); empty = do not push")
+    co.add_argument("--out", default="", help="also/instead write bundle.json.gz here (air-gapped hosts)")
+    co.add_argument("--min-records", type=int, default=1)
+    co.set_defaults(fn=cmd_contrib)
+
+    ic = sub.add_parser("import-contrib", help="BlueDefence side: fold downloaded community bundles into a training dataset (SFT + DPO views)")
+    ic.add_argument("src", help="folder of *.json.gz bundles (e.g. aws s3 sync s3://<contrib-bucket>/contrib ./contrib)")
+    ic.add_argument("--out", required=True)
+    ic.add_argument("--name", default="")
+    ic.add_argument("--val-pct", type=int, default=10)
+    ic.add_argument("--include-weak", action="store_true", help="also train on model-only labels (no analyst decision)")
+    ic.add_argument("--no-gate", action="store_true", help="skip the privacy gate (never for real data)")
+    ic.add_argument("--notes", default="")
+    ic.set_defaults(fn=cmd_import_contrib)
 
     st = sub.add_parser("stats", help="print the manifest counts")
     st.add_argument("dir")
