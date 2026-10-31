@@ -80,3 +80,14 @@ def test_dry_run_plan_runs_offline(tmp_path, capsys):
 def test_missing_file_errors_clearly(tmp_path):
     with pytest.raises(DataError, match="no dpo/preferences.jsonl"):
         load_dpo(tmp_path / "empty")
+
+
+def test_split_never_empties_train_and_plan_refuses_an_empty_train(tmp_path):
+    # one training row: nothing to hold out, so it stays in train
+    from aegis.finetune.dpo_data import Preference
+    only = Preference("a", "train", "human_corrected", "o", _SYS, "{}", '{"verdict":"benign"}', '{"verdict":"malicious"}')
+    train, val = split_prefs([only])
+    assert len(train) == 1 and val == []
+    # every pair in val -> the plan refuses rather than planning a run on nothing
+    ds = _write(tmp_path, [_pair("a", "val"), _pair("b", "val")])
+    assert dpo_main(["--data", str(ds), "--dry-run"]) == 2

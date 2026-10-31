@@ -77,6 +77,51 @@ def test_human_disputed_makes_an_action_contrast_pair(tmp_path):
     assert rejected_block["requires_hitl"] is False  # the overruled auto-run
 
 
+def test_disputed_pair_survives_an_identity_shaped_target(tmp_path):
+    """The analyst rejected an auto-run on a USER ID. The chain target gets pseudonymised by the
+    scrubber while the decision's target is what the analyst clicked; matching after scrubbing
+    would silently drop exactly these account-level disputes. The match is made on the raw
+    chain by index, so the pair is emitted and the chosen side holds the action."""
+    sc = Scrubber(salt="k")
+    ch = {
+        "alert_id": "A6", "verdict": "malicious", "confidence": 0.9,
+        "evidence": [{"source": "auth", "signal": "impossible travel", "weight": "high"}],
+        "recommended_actions": [{"action_type": "disable_account", "target": "u_42891", "requires_hitl": False},
+                                {"action_type": "monitor", "target": "u_42891", "requires_hitl": False}],
+        "integrity_hash": "h6",
+    }
+    rec = record_from_chain(ch, alert={"id": "A6", "source": "auth", "user_id": "u_42891"}, origin="dashboard_chain",
+                            scrubber=sc, human=[_hd("disable_account", "u_42891", "rejected")])
+    assert rec.label["source"] == "human_disputed"
+    acts = rec.chain["recommended_actions"]
+    assert acts[0]["target"] != "u_42891" and "u_42891" not in json.dumps(rec.to_dict())   # scrubbed everywhere
+    assert acts[0].get("human_rejected") is True and acts[1].get("human_rejected") is None  # flagged by index
+    _out, by_id, rows = _build([rec], tmp_path)
+    assert len(rows) == 1
+    chosen, rejected = json.loads(by_id[rec.record_id]["chosen"]), json.loads(by_id[rec.record_id]["rejected"])
+    assert chosen["recommended_actions"][0]["requires_hitl"] is True      # the overruled auto-run is held …
+    assert chosen["recommended_actions"][1]["requires_hitl"] is False     # … and only that one
+    assert rejected["recommended_actions"][0]["requires_hitl"] is False
+    assert "u_42891" not in by_id[rec.record_id]["chosen"]
+
+
+def test_corrected_pair_holds_the_rejected_action_and_keeps_confidence_neutral(tmp_path):
+    """A corrected verdict must not keep rewarding the very action the analyst rejected, and
+    the confidence — which the analyst never gave — is identical on both sides so DPO gets no
+    preference signal from it."""
+    sc = Scrubber(salt="k")
+    rec = _rec(sc, alert_id="A7", verdict="malicious",
+               actions=[{"action_type": "block", "target": "203.0.113.9", "requires_hitl": False}],
+               human=[_hd("block", "203.0.113.9", "rejected", corrected="benign")])
+    assert rec.label["source"] == "human_corrected"
+    _out, by_id, rows = _build([rec], tmp_path)
+    chosen, rejected = json.loads(by_id[rec.record_id]["chosen"]), json.loads(by_id[rec.record_id]["rejected"])
+    assert chosen["verdict"] == "benign" and rejected["verdict"] == "malicious"
+    assert chosen["recommended_actions"][0]["requires_hitl"] is True      # held, not rewarded
+    assert rejected["recommended_actions"][0]["requires_hitl"] is False
+    assert chosen["confidence"] == rejected["confidence"]                 # no invented confidence signal
+
+
 def test_confirmations_agreements_and_synthetic_make_no_pair(tmp_path):
     sc = Scrubber(salt="k")
     confirmed = _rec(sc, alert_id="A3", verdict="malicious",

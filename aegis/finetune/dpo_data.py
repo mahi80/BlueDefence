@@ -95,10 +95,11 @@ def load_dpo(path: str | Path, *, allow_synthetic: bool = False,
 
 
 def split_prefs(rows: list[Preference]) -> tuple[list[Preference], list[Preference]]:
-    """(train, val) by each row's recorded split; val falls back to a 10% tail if none is marked."""
+    """(train, val) by each row's recorded split; val falls back to a 10% tail if none is marked.
+    The carve-out never empties train: with a single training row there is nothing to hold out."""
     train = [r for r in rows if r.split == "train"]
     val = [r for r in rows if r.split == "val"]
-    if not val and train:
+    if not val and len(train) >= 2:
         cut = max(1, len(train) // 10)
         val, train = train[:cut], train[cut:]
     return train, val
