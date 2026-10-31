@@ -54,6 +54,9 @@ def read_pointer(path: Optional[str] = None) -> Optional[dict]:
         with open(ptr, encoding="utf-8") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else None
+    except FileNotFoundError:
+        logger.debug("[hot_reload] no promotion pointer at %s yet", ptr)       # normal before the first model release lands
+        return None
     except Exception as exc:  # noqa: BLE001 — a bad pointer keeps the running model, never crashes the SOC
         logger.warning("[hot_reload] pointer %s unreadable (%s)", ptr, str(exc)[:160])
         return None

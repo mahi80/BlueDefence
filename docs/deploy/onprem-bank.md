@@ -63,7 +63,7 @@ What each edition enables, and the environment it **forces** (default when unset
 | SOC brain governed under ACPGuard | — | — | ✅ |
 | ACP SDK in the bank's own agents, Q37, Q rogue detectors, Q ↔ AEGIS bridge | — | — | ✅ |
 | **Forces** (default if unset) | `ACP_GOVERN=0`, `AEGIS_PERSIST=0`, `AEGIS_RULE_FEED=0`, `AEGIS_ENFORCEMENT_MODE=shadow`, `AEGIS_RECEIPTS=1`, `AEGIS_DATASET_CAPTURE=1`, `AEGIS_HITL_TRANSPORT=file` | `ACP_GOVERN=0`, `AEGIS_PERSIST=1`, `AEGIS_RULE_FEED=1`, enforcement `shadow`, `AEGIS_HITL_TRANSPORT=dashboard` | `ACP_GOVERN=1`, `AEGIS_PERSIST=1`, `AEGIS_RULE_FEED=1`, enforcement `shadow`, `AEGIS_HITL_TRANSPORT=dashboard` |
-| **Forbids** (startup refuses) | `ACP_DASHBOARD_URL`, `ACP_GOVERN=1`, `AEGIS_MODEL_POINTER`, `acp` in `AEGIS_SOURCES`, `AEGIS_HITL_TRANSPORT=dashboard` | `ACP_GOVERN=1` (governing the brain needs `full`) | — |
+| **Forbids** (startup refuses) | `ACP_DASHBOARD_URL`, `ACP_GOVERN=1`, `acp` in `AEGIS_SOURCES`, `AEGIS_HITL_TRANSPORT=dashboard` | `ACP_GOVERN=1` (governing the brain needs `full`) | — |
 
 A `soc`/`full` deployment that sets no `ACP_DASHBOARD_URL` is **allowed but logged as degraded**
 (stdout card, no persistence, no rule feed) — if that is intended, use `external` instead. The

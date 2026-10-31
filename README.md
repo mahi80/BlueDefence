@@ -95,7 +95,30 @@ whole bundle if anything PII-shaped remains. Terms: [`license-server/TERMS-COMMU
 | `scripts/` | `soc_demo.py` (presenter-paced offline scenario the console renders), `soc_live.py` (drives the real pipeline). |
 | `docs/` | roadmaps (`plans/`), on-prem bank deployment (`deploy/onprem-bank.md`), feed-wiring runbook (`runbooks/`). |
 
-## Quick start
+## Install on a bank host — one command
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mahi80/BlueDefence/main/install.sh | sudo bash
+```
+
+`install.sh` takes a fresh Ubuntu 22.04/24.04 or RHEL 9 host to a running, licensed SOC under
+systemd: Python check, `aegis` system user, `/opt/aegis` (code + venv), `/etc/aegis/aegis.env`,
+`/var/lib/aegis` (audit log, approvals, models), the licence (Community self-serve signup, an
+activation code, a `license.jwt`, or evaluation mode), the LLM backend (none / vLLM / local / Anthropic),
+the ingest receiver with a generated bearer token, `aegis-soc.service` enabled and started, then a
+health + licence check and the exact URLs to wire the first feed to. Interactive by default; fully
+scriptable:
+
+```bash
+sudo ./install.sh --community --org "Bank X" --email ciso@bankx.in --server https://<licence service>/prod --yes
+sudo ./install.sh --code BD-XXXX-XXXX-XXXX --server https://…/prod --llm vllm --vllm-url http://gpu:8000/v1 --sources waf,netops
+sudo ./install.sh --no-license --non-interactive                 # evaluation mode, no prompts
+```
+
+Re-running it changes the answers and keeps the licence, the pseudonym salt and the audit log.
+Air-gapped and Kubernetes deployments: [`docs/deploy/onprem-bank.md`](docs/deploy/onprem-bank.md).
+
+## Quick start (developer)
 
 Prerequisites: **Python ≥ 3.11**; **Node 22** for the console; Java 21 + Maven for the Kafka bridge;
 (optional) read access to the private `mahi80/rbi` for the governance SDK.

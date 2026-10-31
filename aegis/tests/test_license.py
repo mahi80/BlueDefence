@@ -93,7 +93,8 @@ def test_expiry_grace_then_stop(tmp_path, keys):
 
 
 def test_missing_or_invalid_is_evaluation_mode_when_enforced(tmp_path, keys):
-    env = _env(tmp_path, None, AEGIS_EDITION="full", AEGIS_ENFORCEMENT_MODE="live", AEGIS_SWARM="1", AEGIS_AUTO_BLOCK="live")
+    env = _env(tmp_path, None, AEGIS_EDITION="full", AEGIS_ENFORCEMENT_MODE="live", AEGIS_SWARM="1", AEGIS_AUTO_BLOCK="live",
+               AEGIS_LICENSE=str(tmp_path / "absent" / "license.jwt"))      # explicit: the host running the tests may have /etc/aegis/license.jwt
     st = L.check(env, now=NOW, keys=keys["pub"])
     assert st.status == "missing" and st.runs and not st.licensed and st.devices_limit == 100 and st.eps_limit == 5
     L.apply(st, env)
@@ -108,7 +109,8 @@ def test_missing_or_invalid_is_evaluation_mode_when_enforced(tmp_path, keys):
 
 
 def test_unenforced_changes_nothing(tmp_path, keys):
-    env = _env(tmp_path, None, AEGIS_LICENSE_ENFORCE="0", AEGIS_EDITION="full", AEGIS_ENFORCEMENT_MODE="live", AEGIS_SWARM="1")
+    env = _env(tmp_path, None, AEGIS_LICENSE_ENFORCE="0", AEGIS_EDITION="full", AEGIS_ENFORCEMENT_MODE="live", AEGIS_SWARM="1",
+               AEGIS_LICENSE=str(tmp_path / "absent" / "license.jwt"))
     before = dict(env)
     st = L.check(env, now=NOW, keys=keys["pub"])
     L.apply(st, env)
