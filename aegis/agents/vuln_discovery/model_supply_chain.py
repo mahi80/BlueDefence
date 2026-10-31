@@ -21,7 +21,9 @@ scorers catch the post-exploitation.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, asdict
+from urllib.parse import unquote, urlsplit
 
 
 # Publishers whose repos may be loaded without a reviewed exception (official orgs).
@@ -56,6 +58,87 @@ ADVISORY_HF_LOADER_CAMPAIGN = {
     "mitigation": ("allowlisted org + pinned reviewed revision; review auto_map files before enabling "
                    "trust_remote_code; sandbox model loading — least privilege, egress-restricted, no prod secrets"),
 }
+
+
+# Dealigned ("uncensored") models: a repack of an open model with its refusal / safety
+# behaviour removed — by abliteration (the refusal direction projected out of the weights),
+# by fine-tuning on jailbreak data, or by tools like Heretic. Matched as stems against the repo
+# id with separators removed, and against the repo's tags. A publisher whose name carries a
+# stem (e.g. ``dealignai``) is caught for every repo it ships, including ones without a marker.
+_DEALIGNED_STEMS: tuple[tuple[str, str], ...] = (
+    ("abliterat", "abliterated"),
+    ("uncensor", "uncensored"),
+    ("dealign", "dealigned"),
+    ("unaligned", "unaligned"),
+    ("jailbreak", "jailbreak"),
+    ("jailbroken", "jailbroken"),
+    ("noguardrail", "no-guardrails"),
+    ("norefusal", "no-refusal"),
+    ("refusalremoved", "refusal-removed"),
+    ("heretic", "heretic"),
+)
+_SEP_RX = re.compile(r"[\s_.\-/]+")
+
+
+def dealigned_markers(model: str | None, tags: object = ()) -> list[str]:
+    """The dealignment markers a repo id (or its tags) carries — ``[]`` for an ordinary model."""
+    hay = [_SEP_RX.sub("", str(model or "").lower())]
+    if isinstance(tags, (list, tuple, set, frozenset)):
+        hay += [_SEP_RX.sub("", str(t).lower()) for t in tags]
+    return sorted({label for stem, label in _DEALIGNED_STEMS for h in hay if stem in h})
+
+
+# First path segments on huggingface.co that are not a user/org namespace.
+_HF_RESERVED = frozenset({
+    "datasets", "spaces", "docs", "blog", "settings", "login", "join", "pricing", "papers", "collections",
+    "organizations", "posts", "tasks", "learn", "chat", "models", "new", "enterprise", "search",
+    "static-proxy", "front", "avatars", "oauth", "auth", "notifications", "inference-endpoints",
+})
+_HF_HOSTS = frozenset({"huggingface.co", "hf.co"})
+_WEIGHT_EXT = (".safetensors", ".bin", ".gguf", ".pt", ".pth", ".onnx", ".ckpt", ".h5", ".msgpack")
+
+
+def model_from_hf_url(url: str | None) -> dict | None:
+    """``{"model": "org/name", "revision", "file", "kind"}`` for a Hugging Face model URL as a web
+    proxy logs it, else ``None``. ``kind`` is ``weights`` | ``code`` | ``file`` | ``page`` | ``api``.
+
+    Datasets, Spaces and site pages are not models; the LFS / Xet CDN hosts carry only content
+    hashes, so a pull is identified from the ``huggingface.co/<org>/<repo>/resolve/...`` request
+    that precedes the CDN redirect."""
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw.lstrip("/")
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in _HF_HOSTS:
+        return None
+    seg = [unquote(s) for s in parts.path.split("/") if s]
+    if not seg:
+        return None
+    if seg[0] == "api":                       # /api/models/<org>/<name>[/revision/<rev>|/tree/<rev>/...]
+        if len(seg) < 4 or seg[1] != "models":
+            return None
+        org, name, rest = seg[2], seg[3], seg[4:]
+        rev = rest[1] if len(rest) >= 2 and rest[0] in ("revision", "tree") else ""
+        return {"model": f"{org}/{name}", "revision": rev, "file": "", "kind": "api"}
+    if seg[0].lower() in _HF_RESERVED or len(seg) < 2:
+        return None
+    org, name, rest = seg[0], seg[1], seg[2:]
+    rev, file, kind = "", "", "page"
+    if len(rest) >= 2 and rest[0] in ("resolve", "blob", "raw", "tree"):
+        rev = rest[1]
+        file = "/".join(rest[2:])
+        low = file.lower()
+        kind = ("weights" if low.endswith(_WEIGHT_EXT) else "code" if low.endswith(".py")
+                else "file" if file else "page")
+    return {"model": f"{org}/{name}", "revision": rev, "file": file, "kind": kind}
 
 
 @dataclass
@@ -101,6 +184,7 @@ def evaluate_model_load(request: dict, advisory: dict = ADVISORY_HF_LOADER_CAMPA
       ``auto_map``          bool — config.json has an auto_map that maps to a module
       ``weights_bytes``     int  — size of the declared weights file(s)
       ``loader_files``      [{"name": str, "tokens": [str]}] — static features of referenced .py files
+      ``tags``              [str] — the repo's Hub tags (``uncensored``, ``abliterated`` …)
     """
     model = str(request.get("model") or "unknown")
     reviewed = bool(request.get("reviewed"))
@@ -115,6 +199,19 @@ def evaluate_model_load(request: dict, advisory: dict = ADVISORY_HF_LOADER_CAMPA
     if model.lower() in {r.lower() for r in iocs.get("repos", set())} or (loader_names & {f.lower() for f in iocs.get("files", set())}):
         out.append(ModelLoadFinding("KNOWN_MALICIOUS_REPO", "critical", model,
                                     f"Matches {advisory.get('id')} — {advisory.get('name')}. Do not load."))
+
+    # Dealigned model — safety behaviour deliberately removed. Flagged even from an allowlisted org
+    # and even when reviewed (then medium: an approved, sandboxed red-team exception is legitimate).
+    markers = dealigned_markers(model, request.get("tags") or ())
+    if markers:
+        out.append(ModelLoadFinding(
+            "DEALIGNED_MODEL", "medium" if reviewed else "high", model,
+            f"Refusal / safety behaviour removed ({', '.join(markers)}). It follows instructions it should "
+            "refuse — including ones planted in the data it reads, so it must never judge alerts or touch "
+            "customer data; its weights are modified on purpose, so they cannot be verified against the "
+            "upstream release to rule out a backdoor; and an unsanctioned dealigned model fails model-risk "
+            "governance (RBI FREE-AI). " + ("Approved exception: keep it sandboxed and off production paths."
+                                           if reviewed else "Do not load outside an approved, sandboxed red-team exception.")))
 
     # Unvetted publisher.
     if not is_allowlisted(model) and not reviewed:
@@ -161,4 +258,4 @@ def scan_models(requests: list[dict], advisory: dict = ADVISORY_HF_LOADER_CAMPAI
 
 
 __all__ = ["ModelLoadFinding", "ADVISORY_HF_LOADER_CAMPAIGN", "is_allowlisted",
-           "evaluate_model_load", "scan_models", "iocs_host"]
+           "evaluate_model_load", "scan_models", "iocs_host", "dealigned_markers", "model_from_hf_url"]
