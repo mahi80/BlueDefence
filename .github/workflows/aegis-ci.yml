@@ -218,7 +218,19 @@ jobs:
         run: echo "GH_READ_TOKEN not set — acp-sdk install and the governed eval are skipped. aegis runs without it (governance is optional); governance-only tests self-skip. Add the secret to run the full governed gate."
 
       - name: Unit tests (governance tests self-skip without acp-sdk)
-        run: python -m pytest aegis/tests -q -p no:cacheprovider
+        run: |
+          set +e
+          python -m pytest aegis/tests -p no:cacheprovider -rfE | tee /tmp/pytest.out
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            # The Actions log store is not always retrievable; surface the failing
+            # tests as annotations (readable via the check-runs API) so a red run
+            # is diagnosable without the raw log.
+            grep -aE "^(FAILED|ERROR)" /tmp/pytest.out | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit $rc
 
       - name: Historical + injection eval under governance (must match the ungoverned gate)
         if: ${{ env.GH_READ_TOKEN != '' }}
