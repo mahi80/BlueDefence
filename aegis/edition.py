@@ -47,9 +47,10 @@ _EXTERNAL = Edition(
     "external", governed_brain=False, dashboard=False, bridge=False, hitl_default="file",
     defaults={"ACP_GOVERN": "0", "AEGIS_PERSIST": "0", "AEGIS_RULE_FEED": "0",
               "AEGIS_ENFORCEMENT_MODE": "shadow", "AEGIS_RECEIPTS": "1", "AEGIS_DATASET_CAPTURE": "1"},
+    # AEGIS_MODEL_POINTER is allowed here: it is how signed model releases from the BlueDefence licence
+    # service (aegis.model_updates) take effect in an installation that has no dashboard.
     forbidden={"ACP_DASHBOARD_URL": "the external edition has no ACP dashboard — use AEGIS_EDITION=soc for the console",
-               "ACP_GOVERN": "the external edition does not run acp-sdk — the SOC brain is ungoverned by design",
-               "AEGIS_MODEL_POINTER": "model promotion through the dashboard queue is a soc/full feature; set AEGIS_MODEL directly"},
+               "ACP_GOVERN": "the external edition does not run acp-sdk — the SOC brain is ungoverned by design"},
 )
 _SOC = Edition(
     "soc", governed_brain=False, dashboard=True, bridge=False, hitl_default="dashboard",
