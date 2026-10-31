@@ -43,7 +43,7 @@ public final class Main {
         KafkaStreams streams = new KafkaStreams(topology, streamsProps(cfg));
 
         Producer<String, String> producer = new KafkaProducer<>(producerProps(cfg));
-        VerdictPoller poller = new VerdictPoller(VerdictPoller.httpSource(cfg.aegisUrl(), cfg.ingestToken()),
+        VerdictPoller poller = new VerdictPoller(VerdictPoller.httpSource(cfg.aegisUrl(), cfg.readToken()),
                 producer, cfg.topicVerdicts(), cfg.cursorFile(), cfg.verdictPoll());
         Thread pollerThread = new Thread(poller, "aegis-verdict-poller");
         pollerThread.setDaemon(true);
@@ -92,8 +92,14 @@ public final class Main {
             java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build();
             java.net.http.HttpRequest.Builder b = java.net.http.HttpRequest.newBuilder(java.net.URI.create(cfg.aegisUrl() + "/ingest/license"))
                     .timeout(java.time.Duration.ofSeconds(10)).GET();
-            if (!cfg.ingestToken().isBlank()) b.header("Authorization", "Bearer " + cfg.ingestToken());
+            if (!cfg.readToken().isBlank()) b.header("Authorization", "Bearer " + cfg.readToken());
             java.net.http.HttpResponse<String> r = client.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() == 401 || r.statusCode() == 403) {
+                log.error("AEGIS rejected the bridge's token ({}) on /ingest/license — every pushed batch would be dropped the same way. "
+                        + "Set AEGIS_INGEST_TOKEN (and AEGIS_INGEST_READ_TOKEN if AEGIS uses one) to the values in /etc/aegis/aegis.env.",
+                        r.statusCode());
+                System.exit(4);
+            }
             if (r.statusCode() != 200) {
                 log.warn("licence check skipped: AEGIS answered {} on /ingest/license", r.statusCode());
                 return;
@@ -110,8 +116,10 @@ public final class Main {
                         st.path("installation_id").asText());
                 System.exit(3);
             }
-        } catch (java.io.IOException | InterruptedException e) {
+        } catch (java.io.IOException e) {
             log.warn("licence check skipped: AEGIS not reachable yet ({}); the sink will retry", e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 

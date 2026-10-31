@@ -34,12 +34,14 @@ Globals:
   Function:
     Runtime: python3.12
     Architectures: [arm64]          # cheaper per ms; still inside the free tier either way
-    Timeout: 10
-    MemorySize: 256
+    Timeout: 60                     # a 6 MB contribution bundle through the privacy gate takes more than 10 s
+    MemorySize: 512
 
 Resources:
   LicenseTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain          # a stack delete/replace must never take the licence records with it
+    UpdateReplacePolicy: Retain
     Properties:
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
@@ -50,6 +52,7 @@ Resources:
         - { AttributeName: SK, KeyType: RANGE }
       PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
       SSESpecification: { SSEEnabled: true }
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }   # HB#/CONTRIB#/USAGE# rows expire after 400 d
 
   LicenseApi:
     Type: AWS::Serverless::HttpApi
@@ -58,8 +61,8 @@ Resources:
       # Throttle hard: a licence API sees a handful of calls a day. This also keeps a stray loop
       # from ever leaving the free tier.
       DefaultRouteSettings:
-        ThrottlingBurstLimit: 20
-        ThrottlingRateLimit: 5
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20      # shared by the whole fleet: 500 installations × (1 heartbeat + 24 contribs)/day ≈ 0.15 rps
       AccessLogSettings:
         DestinationArn: !GetAtt ApiLogs.Arn
         Format: '{"t":"$context.requestTime","ip":"$context.identity.sourceIp","m":"$context.httpMethod","p":"$context.path","s":"$context.status","id":"$context.requestId"}'
@@ -71,6 +74,8 @@ Resources:
 
   ContribBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -86,6 +91,10 @@ Resources:
           - Id: to-ia
             Status: Enabled
             Transitions: [{ StorageClass: STANDARD_IA, TransitionInDays: 90 }]
+          - Id: old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }      # versioning is for accident recovery, not an archive
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 2 }
 
   AlertTopic:
     Type: AWS::SNS::Topic
@@ -127,9 +136,6 @@ Resources:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AdminKeyParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PubkeysParam}
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${KnownFingerprintsParam}
-            - Effect: Allow
-              Action: [kms:Decrypt]
-              Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/ssm
       Events:
         Any:
           Type: HttpApi

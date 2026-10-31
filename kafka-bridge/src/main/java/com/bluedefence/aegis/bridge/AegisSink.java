@@ -42,7 +42,9 @@ public class AegisSink implements AutoCloseable {
     private final Map<String, List<String>> buffers = new LinkedHashMap<>();
     private final Object lock = new Object();
     private int buffered = 0;
-    private volatile boolean running = true;
+    private volatile boolean running = true;      // accepting new lines
+    private volatile boolean draining = false;    // close() in progress: send what is buffered, stop accepting
+    private volatile long drainDeadlineMs = Long.MAX_VALUE;
     private Thread flusher;
 
     public final AtomicLong linesSent = new AtomicLong();
@@ -98,7 +100,10 @@ public class AegisSink implements AutoCloseable {
                     return;
                 }
             }
-            if (!running) return;
+            if (!running) {
+                linesDropped.incrementAndGet();           // offered after close(): visible in the counters, not silent
+                return;
+            }
             buffers.computeIfAbsent(path, k -> new ArrayList<>()).add(line);
             buffered++;
             if (buffered >= batchLines) lock.notifyAll();
@@ -159,7 +164,9 @@ public class AegisSink implements AutoCloseable {
         byte[] body = (String.join("\n", batch) + "\n").getBytes(StandardCharsets.UTF_8);
         long backoff = 250;
         int attempt = 0;
-        while (running) {
+        // every batch is attempted at least once, including during shutdown: Kafka offsets for these lines are already
+        // committed, so a batch given up here is gone for good — count it and say so
+        while (true) {
             int status;
             try {
                 status = transport.post(path, body);
@@ -183,31 +190,49 @@ public class AegisSink implements AutoCloseable {
             if (status > 0 && attempt == 1) {
                 log.warn("POST {} got {}: AEGIS is applying backpressure, retrying", path, status);
             }
+            if (draining && System.currentTimeMillis() + backoff > drainDeadlineMs) {
+                log.error("shutdown deadline reached with AEGIS unreachable: abandoning {} line(s) for {}", batch.size(), path);
+                linesDropped.addAndGet(batch.size());
+                return;
+            }
             try {
                 Thread.sleep(backoff);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                log.error("interrupted while retrying: abandoning {} line(s) for {}", batch.size(), path);
+                linesDropped.addAndGet(batch.size());
                 return;
             }
             backoff = Math.min(backoff * 2, 30_000);
         }
     }
 
-    @Override
-    public void close() {
-        running = false;
+    /** Stop accepting lines, then deliver everything buffered (retrying up to {@code drainTimeout}). Anything
+     *  still undelivered at the deadline is counted in {@link #linesDropped} and logged — never silently lost. */
+    public void close(Duration drainTimeout) {
+        draining = true;
+        drainDeadlineMs = System.currentTimeMillis() + Math.max(1_000, drainTimeout.toMillis());
+        running = false;                                  // offer() stops accepting; flushLoop exits its wait
         synchronized (lock) {
             lock.notifyAll();
         }
         if (flusher != null) {
             try {
-                flusher.join(5_000);
+                flusher.join(Math.max(1_000, drainTimeout.toMillis()));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
-        running = true;      // let the final flush send
-        flush();
-        running = false;
+        flush();                                          // whatever the flusher left; send() attempts each batch
+        int left = buffered();
+        if (left > 0) {
+            log.error("{} line(s) still buffered after drain", left);
+            linesDropped.addAndGet(left);
+        }
+    }
+
+    @Override
+    public void close() {
+        close(Duration.ofSeconds(30));
     }
 }

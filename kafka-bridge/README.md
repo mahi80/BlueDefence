@@ -49,8 +49,12 @@ the default, which keeps dedupe/flap state in memory — it is a cache, losing i
 (`AEGIS_LICENSE_ENFORCE=1`) and `kafka_bridge` is not among the licensed features it exits with code 3 and one
 clear line. AEGIS unreachable at start is not a licence failure — the bridge starts and the sink retries.
 
-On the AEGIS side: `AEGIS_INGEST_HTTP=1`, `AEGIS_INGEST_TOKEN=<same token>`, and the receiver must run in the
-service process (it is — `GET /ingest/verdicts` reads the service's audit log).
+On the AEGIS side: `AEGIS_INGEST_HTTP=1`, `AEGIS_INGEST_TOKEN=<same token>` (and `AEGIS_INGEST_READ_TOKEN` for the verdict
+feed when set), and the receiver must run in the service process (it is — `GET /ingest/verdicts` reads the service's audit log).
+A wrong token fails fast at start (exit 4) instead of silently dropping every batch. On shutdown the sink delivers everything
+buffered (up to 30 s of retries against an unreachable AEGIS); anything it has to abandon is counted in `linesDropped` and logged.
+The verdict feed carries an audit-log `generation`; when AEGIS rotates or restores its log the bridge resets its cursor instead of
+waiting forever for `seq` to catch up.
 
 ## Environment
 
@@ -58,7 +62,8 @@ service process (it is — `GET /ingest/verdicts` reads the service's audit log)
 |---|---|---|
 | `KAFKA_BOOTSTRAP_SERVERS` | required | broker list |
 | `AEGIS_URL` | required | the AEGIS push receiver, e.g. `https://aegis:8787` |
-| `AEGIS_INGEST_TOKEN` | "" | bearer token (required unless AEGIS listens on loopback) |
+| `AEGIS_INGEST_TOKEN` | "" | push bearer token for the `/ingest/*` POSTs (required unless AEGIS listens on loopback) |
+| `AEGIS_INGEST_READ_TOKEN` | = push token | token for `GET /ingest/verdicts` and `/ingest/license` — set when AEGIS runs with a separate `AEGIS_INGEST_READ_TOKEN` so syslog relays holding the push token cannot read verdicts |
 | `AEGIS_TOPIC_SYSLOG` / `_NETFLOW` / `_TELEMETRY` / `_ALERTS` / `_VERDICTS` | `aegis.syslog` … `aegis.verdicts` | topics |
 | `BRIDGE_APPLICATION_ID` | `aegis-kafka-bridge` | Streams application id / consumer group |
 | `BRIDGE_DEDUPE_TTL_S` | 120 | dedupe window |

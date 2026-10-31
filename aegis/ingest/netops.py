@@ -80,17 +80,25 @@ def _parse_cisco_ts(raw: str | None, year_hint: int | None = None) -> float | No
         return None
 
 
+def _scale_epoch(f: float) -> float | None:
+    """Seconds, whatever unit the exporter used (gNMI/MDT send ns, Kafka ms, some tools µs); non-finite → None."""
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    while f > 1e11:                                              # ms → s, µs → s, ns → s
+        f /= 1000.0
+    return f if f >= 0 else None
+
+
 def _ts_any(v: Any) -> float | None:
-    if v is None:
+    if v is None or isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
-        f = float(v)
-        return f / 1000.0 if f > 1e11 else f                      # epoch ms → s
+        return _scale_epoch(float(v))
     s = str(v).strip()
     if not s:
         return None
     try:
-        return float(s) / (1000.0 if float(s) > 1e11 else 1.0)
+        return _scale_epoch(float(s))
     except ValueError:
         pass
     try:
@@ -152,11 +160,35 @@ def _device_from(rec: dict, fallback: str | None = None) -> str:
 
 # ------------------------------------------------------------------ syslog --
 
+# RFC 3164 relay header: <189>Oct 29 20:05:01 SW1 123: *Oct 29 …: %LINK… (host may be a name or an IP)
+_RFC3164_RX = re.compile(r"^(?:<(?P<pri>\d{1,3})>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>[A-Za-z0-9][A-Za-z0-9_.:-]*)\s+(?P<rest>.*%.*)$")
+# RFC 5424: <189>1 2026-10-29T20:05:01Z SW1 - - - %LINK…
+_RFC5424_RX = re.compile(r"^(?:<(?P<pri>\d{1,3})>)?1\s+(?P<ts>\S+)\s+(?P<host>\S+)\s+\S+\s+\S+\s+\S+\s+(?:\[[^\]]*\]\s*|-\s+)?(?P<rest>.*%.*)$")
+
+
+def _strip_relay_header(s: str) -> tuple[str, str | None, float | None]:
+    """rsyslog / syslog-ng forward the device line wrapped in their own header; peel it off and keep its host."""
+    m = _RFC5424_RX.match(s)
+    if m:
+        host = m.group("host") if m.group("host") != "-" else None
+        return "<%s>%s" % (m.group("pri") or "189", m.group("rest")), host, _ts_any(m.group("ts"))
+    m = _RFC3164_RX.match(s)
+    if m and "%" in m.group("rest") and not m.group("host").isupper() or (m and "%" in m.group("rest") and ":" not in m.group("host")):
+        rest = m.group("rest")
+        if not rest.startswith("<"):
+            rest = "<%s>%s" % (m.group("pri") or "189", rest)
+        return rest, m.group("host"), None
+    return s, None, None
+
+
 def parse_syslog_line(line: str, *, device: str | None = None, ts: float | None = None) -> dict | None:
-    """A Cisco IOS / IOS-XE / NX-OS system message → event, or ``None`` if it is not one."""
+    """A Cisco IOS / IOS-XE / NX-OS system message → event, or ``None`` if it is not one. Relay headers
+    (RFC 3164 / 5424 from rsyslog, syslog-ng, Kiwi) are stripped and their hostname used when the device
+    line itself has none."""
     s = line.strip()
     if "%" not in s:
         return None
+    s, relay_host, relay_ts = _strip_relay_header(s)
     m = _CISCO_RX.match(s) or _NXOS_RX.match(s)
     if not m:
         return None
@@ -181,8 +213,8 @@ def parse_syslog_line(line: str, *, device: str | None = None, ts: float | None 
     if facility in ("ETHPORT", "LINK", "LINEPROTO") and state is None:
         state = "down" if "DOWN" in mnemonic or "down" in msg.lower() else "up" if "UP" in mnemonic or " up" in msg.lower() else None
     return {
-        "kind": "syslog", "ts": ts or _parse_cisco_ts(d.get("ts")) or None,
-        "device": device or d.get("host") or "unknown",
+        "kind": "syslog", "ts": ts or _parse_cisco_ts(d.get("ts")) or relay_ts or None,
+        "device": device or d.get("host") or relay_host or "unknown",
         "iface": _iface(msg), "facility": facility, "mnemonic": full, "mnemonic_short": mnemonic,
         "severity": sev, "state": state, "peer": peer, "msg": msg[:400],
     }

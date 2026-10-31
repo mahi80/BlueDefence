@@ -243,6 +243,9 @@ class StreamConsumer(BaseConsumer):
         """Device syslog / traps / flows / telemetry / configs / LLDP feed the network-assurance detector;
         most records produce no alert (they build topology and counters)."""
         from .netops import normalize as netops_normalize, shared_detector
+        from aegis.license import allows
+        if not allows("netops"):
+            return CONSUMED                                   # licence without network assurance: records are dropped, counted, not processed
         line = item.line.strip()
         record: Any = line
         if line[:1] in "{[":

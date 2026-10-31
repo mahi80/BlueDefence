@@ -59,6 +59,8 @@ _DOWN_MNEMONICS = {"LINK-3-UPDOWN", "LINEPROTO-5-UPDOWN", "ETHPORT-5-IF_DOWN_LIN
 _ADJ_MNEMONICS = {"BGP-5-ADJCHANGE", "OSPF-5-ADJCHG", "OSPF-5-ADJCHANGE", "ISIS-4-ADJCHANGE", "EIGRP-5-NBRCHANGE", "DUAL-5-NBRCHANGE"}
 _RESTART_MNEMONICS = {"SYS-5-RESTART", "SYS-5-RELOAD", "PLATFORM-2-FRU_REMOVED", "ENVM-2-TEMP", "ENVM-2-FAN", "PLATFORM-2-SENSOR"}
 _CONFIG_MNEMONICS = {"SYS-5-CONFIG_I", "PARSER-5-CFGLOG_LOGGEDCMD", "VSHD-5-VSHD_SYSLOG_CONFIG_I"}
+# %SYS-5-CONFIG_I: Configured from console by rverma on vty0 (10.1.2.3)
+_CONFIG_BY_RX = re.compile(r"\bby\s+(?P<user>[A-Za-z0-9._\\@-]+)(?:\s+on\s+\S+)?(?:\s*\((?P<ip>[0-9a-fA-F.:]+)\))?")
 
 
 def _env_f(name: str, default: float) -> float:
@@ -123,6 +125,15 @@ class _Incident:
         return ts <= (self.closed if self.closed is not None else self.opened) + window
 
 
+def _note_transition(link: "_Link", ts: float, state: str) -> None:
+    """Cisco emits %LINK-3-UPDOWN and %LINEPROTO-5-UPDOWN for the same physical transition; count it once."""
+    if link.transitions:
+        pts, pstate = link.transitions[-1]
+        if pstate == state and abs(ts - pts) <= 2.0:
+            return
+    link.transitions.append((ts, state))
+
+
 class NetworkAssurance:
     def __init__(self, *, flap_n: int = 5, flap_window_s: float = 300.0, corr_window_s: float = 900.0,
                  err_per_min: float = 100.0, util_pct: float = 90.0, util_samples: int = 3, silent_s: float = 180.0,
@@ -134,7 +145,7 @@ class NetworkAssurance:
         self.inventory = {k.lower(): v for k, v in (inventory or {}).items()}
         self.clock = clock
         self._lock = threading.RLock()          # observe() holds it and calls add_link(), which takes it again
-        self._links: dict[tuple[str, str], _Link] = {}
+        self._links: dict[tuple[str, str], list[_Link]] = {}     # parallel links between the same pair are members
         self._adj: dict[str, set[str]] = defaultdict(set)
         self._roles: dict[str, str] = {}
         self._users: dict[str, int] = {}
@@ -143,6 +154,8 @@ class NetworkAssurance:
         self._incidents: list[_Incident] = []
         self._tele: dict[tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=8))   # (ts, counters)
         self._last_seen: dict[str, float] = {}
+        self._last_tele: dict[str, float] = {}                   # silence is judged only on devices that stream telemetry
+        self._last_silence_check = 0.0
         self._unreachable: set[str] = set()
         self._config_hash: dict[str, str] = {}
         self._recent_config: dict[str, dict] = {}               # device -> last change event (for bad-push correlation)
@@ -188,21 +201,36 @@ class NetworkAssurance:
     def add_link(self, a: str, a_if: str | None, b: str, b_if: str | None) -> None:
         with self._lock:
             key = (a, b) if a <= b else (b, a)
-            link = self._links.get(key)
+            members = self._links.setdefault(key, [])
+            link = None
+            for m in members:                                   # the same physical link seen from either end
+                m_a_if, m_b_if = (m.a_if, m.b_if) if a == m.a else (m.b_if, m.a_if)
+                if (a_if is None or m_a_if is None or m_a_if == a_if) and (b_if is None or m_b_if is None or m_b_if == b_if):
+                    link = m
+                    if a == m.a:
+                        m.a_if, m.b_if = m.a_if or a_if, m.b_if or b_if
+                    else:
+                        m.a_if, m.b_if = m.a_if or b_if, m.b_if or a_if
+                    break
             if link is None:
                 link = _Link(a, a_if, b, b_if)
-                self._links[key] = link
+                members.append(link)
                 self._adj[a].add(b)
                 self._adj[b].add(a)
-            else:
-                if a == link.a:
-                    link.a_if, link.b_if = link.a_if or a_if, link.b_if or b_if
-                else:
-                    link.a_if, link.b_if = link.a_if or b_if, link.b_if or a_if
+                # LLDP arriving after the first syslog (cold start mid-outage): inherit what the pseudo-link saw
+                for dev, ifc in ((a, a_if), (b, b_if)):
+                    prev = self._iface_link.get((dev, ifc)) if ifc else None
+                    if prev is not None and prev.b.endswith(":peer"):
+                        link.state, link.down_since = prev.state, prev.down_since
+                        link.transitions.extend(prev.transitions)
             if a_if:
                 self._iface_link[(a, a_if)] = link
             if b_if:
                 self._iface_link[(b, b_if)] = link
+
+    def _pair_up(self, d: str, n: str, without_link: "_Link | None") -> bool:
+        """Two neighbours are connected while ANY member link between them is up (LACP members, dual uplinks)."""
+        return any(m.state == "up" and m is not without_link for m in self._links.get((d, n) if d <= n else (n, d), ()))
 
     def _cores(self) -> set[str]:
         return {d for d in self._adj if self._role(d) == "core"} or {max(self._adj, key=lambda d: len(self._adj[d]))} if self._adj else set()
@@ -220,8 +248,7 @@ class NetworkAssurance:
                 for n in self._adj[d]:
                     if n in seen or n == without_device:
                         continue
-                    link = self._links.get((d, n) if d <= n else (n, d))
-                    if link is None or link.state != "up" or link is without_link:
+                    if not self._pair_up(d, n, without_link):
                         continue
                     seen.add(n)
                     if self._role(n) in _TRANSIT_ROLES:
@@ -253,13 +280,21 @@ class NetworkAssurance:
     # ------------------------------------------------------------- observe --
     def observe(self, ev: dict) -> list[dict]:
         kind = ev.get("kind")
-        ts = float(ev.get("ts") or self.clock())
+        now = float(self.clock())
+        try:
+            ts = float(ev.get("ts") or now)
+        except (TypeError, ValueError):
+            ts = now
+        if ts != ts or ts in (float("inf"), float("-inf")) or ts > now + 30 * 86400 or ts < now - 365 * 86400:
+            ts = now                                            # one exporter's absurd clock must not move the estate's "now"
         device = str(ev.get("device") or "unknown")
         out: list[dict] = []
         with self._lock:
             self.stats["events"] += 1
             if device != "unknown" and kind in ("syslog", "trap", "telemetry", "flow", "config"):
                 self._last_seen[device] = max(ts, self._last_seen.get(device, 0.0))
+                if kind == "telemetry":
+                    self._last_tele[device] = max(ts, self._last_tele.get(device, 0.0))
                 if device in self._unreachable:
                     self._unreachable.discard(device)
             if kind == "topology":
@@ -270,8 +305,17 @@ class NetworkAssurance:
                 out += self._telemetry(ev, ts, device)
             elif kind == "config":
                 out += self._config(ev, ts, device)
-            out += self._silence_check(ts)
+            if ts - self._last_silence_check >= 5.0 or kind == "telemetry":
+                self._last_silence_check = ts
+                out += self._silence_check(ts)
+            self._prune_incidents(ts)
         return out
+
+    def _prune_incidents(self, now: float) -> None:
+        if len(self._incidents) > 2000:
+            keep = [i for i in self._incidents if i.closed is None and i.fault == "link_down"
+                    or now - (i.closed if i.closed is not None else i.opened) <= self.corr_window_s * 2]
+            self._incidents = keep[-2000:]
 
     def _topology(self, ev: dict) -> None:
         a, b = str(ev["device"]), str(ev["neighbor"])
@@ -292,8 +336,15 @@ class NetworkAssurance:
     def _syslog(self, ev: dict, ts: float, device: str) -> list[dict]:
         mn, state, iface = str(ev.get("mnemonic") or ""), ev.get("state"), ev.get("iface")
         if mn in _CONFIG_MNEMONICS:
-            self._recent_config.setdefault(device, {"ts": ts, "change_ticket": None, "user": None, "msg": ev.get("msg")})
-            self._recent_config[device]["ts"] = ts
+            rc = self._recent_config.get(device)
+            if rc is None or ts - float(rc.get("ts") or 0) > self.bad_push_s:
+                rc = {"ts": ts, "change_ticket": None, "user": None, "source_ip": None, "msg": ev.get("msg")}   # a stale ticket does not cover a new push
+                self._recent_config[device] = rc
+            rc["ts"] = ts
+            um = _CONFIG_BY_RX.search(str(ev.get("msg") or ""))
+            if um:
+                rc["user"] = rc.get("user") or um.group("user")
+                rc["source_ip"] = rc.get("source_ip") or um.group("ip")
             return []
         if mn in _DOWN_MNEMONICS or (mn.startswith("LINK-") or mn.startswith("LINEPROTO-") or mn.startswith("ETHPORT-")):
             return self._link_event(ts, device, iface, state, ev)
@@ -307,8 +358,8 @@ class NetworkAssurance:
         return []
 
     def _link_event(self, ts: float, device: str, iface: str | None, state: str | None, ev: dict) -> list[dict]:
-        if not iface or state not in ("up", "down"):
-            return []
+        if not iface or state not in ("up", "down") or device == "unknown":
+            return []                   # a line with no hostname cannot be a per-device fault (IOS without `logging origin-id`)
         link = self._iface_link.get((device, iface))
         key = (device, iface)
         known = link is not None and link.b in self._adj and link.a in self._adj
@@ -316,19 +367,20 @@ class NetworkAssurance:
         # still counts as up; once it is marked down those devices have no path at all
         downstream = self._downstream_of_link(link) if (known and state == "down") else set()
         if link is not None:
-            link.transitions.append((ts, state))
+            _note_transition(link, ts, state)
             prev = link.state
             link.state = state
             if state == "down":
                 link.down_since = link.down_since or ts
             else:
                 link.down_since = None
-                for inc in self._incidents:          # the link is back: close its incident, the window starts now
-                    if inc.fault == "link_down" and inc.device == device and inc.iface == iface and inc.closed is None:
+                ends, ifaces = {link.a, link.b}, {link.a_if, link.b_if, iface}
+                for inc in self._incidents:          # the link is back (reported by EITHER end): close its incident
+                    if inc.fault == "link_down" and inc.closed is None and inc.device in ends and inc.iface in ifaces:
                         inc.closed = ts
         else:   # an interface the topology does not know (an edge/access port): track flaps only
             link = self._iface_link.setdefault(key, _Link(device, iface, f"{device}:{iface}:peer", None))
-            link.transitions.append((ts, state))
+            _note_transition(link, ts, state)
             link.state = state
         # flap: N transitions inside the window
         recent = [t for t, _ in link.transitions if t >= ts - self.flap_window_s]
@@ -393,7 +445,7 @@ class NetworkAssurance:
         if rc.get("change_ticket"):
             return None                                   # a ticketed change that broke something is still drift, not a bad push
         who = f" by {rc['user']}" if rc.get("user") else ""
-        return f"configuration changed on {device}{who} {int(ts - rc['ts'])} s earlier with no change ticket, then the device lost connectivity"
+        return f"configuration changed on {device}{who} {max(0, int(ts - rc['ts']))} s earlier with no change ticket, then the device lost connectivity"
 
     def _push_extra(self, device: str) -> dict:
         """Who pushed, from where, when — what the response needs to revoke the right sessions."""
@@ -474,7 +526,9 @@ class NetworkAssurance:
     # ------------------------------------------------------------ silence --
     def _silence_check(self, now: float) -> list[dict]:
         out: list[dict] = []
-        for device, seen in list(self._last_seen.items()):
+        # only devices that stream telemetry can be "silent"; a syslog-only switch is quiet for days when healthy
+        for device, tele_seen in list(self._last_tele.items()):
+            seen = max(tele_seen, self._last_seen.get(device, 0.0))      # any sign of life counts once we expect telemetry
             if device in self._unreachable or now - seen < self.silent_s or device not in self._adj:
                 continue
             if self._covered(device, now):
@@ -506,6 +560,10 @@ class NetworkAssurance:
         return False
 
     def incident_for(self, alert_id: str) -> dict | None:
+        with self._lock:
+            return self._incident_for(alert_id)
+
+    def _incident_for(self, alert_id: str) -> dict | None:
         for inc in self._incidents:
             if inc.alert_id == alert_id:
                 return {"suppressed": inc.suppressed, "symptoms": list(inc.symptoms), "downstream": sorted(inc.downstream)}
@@ -520,7 +578,7 @@ class NetworkAssurance:
 
     def _alert(self, fault: str, device: str, iface: str | None, ts: float, *, severity: str, root_cause: str,
                downstream: set[str], ev: dict | None = None, incident: _Incident | None = None, extra: dict | None = None) -> dict:
-        digest = hashlib.sha1(f"{fault}|{device}|{iface}|{int(ts)}".encode()).hexdigest()[:10]
+        digest = hashlib.sha1(f"{fault}|{device}|{iface}|{ts:.3f}|{root_cause}".encode()).hexdigest()[:10]
         aid = f"net-{fault}-{digest}"
         if incident is not None:
             incident.alert_id = aid

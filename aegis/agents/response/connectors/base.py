@@ -99,12 +99,22 @@ class Connector:
 
     def __init__(self, *, dry_run: Optional[bool] = None, default_ttl_sec: int = DEFAULT_TTL_SEC,
                  clock: Callable[[], float] = time.time):
-        self.dry_run = (enforcement_mode() == MODE_SHADOW) if dry_run is None else bool(dry_run)
+        self._dry_run_override = None if dry_run is None else bool(dry_run)
         self.default_ttl_sec = default_ttl_sec
         self._clock = clock
         self._lock = threading.Lock()
         self._active: dict[str, Receipt] = {}
         self.history: list[Receipt] = []
+
+    @property
+    def dry_run(self) -> bool:
+        """Shadow unless ``AEGIS_ENFORCEMENT_MODE=live`` — read per call, so a licence that drops to over-limit
+        or evaluation mid-run (which forces the variable back to shadow) takes effect without a restart."""
+        return (enforcement_mode() == MODE_SHADOW) if self._dry_run_override is None else self._dry_run_override
+
+    @dry_run.setter
+    def dry_run(self, value: bool) -> None:
+        self._dry_run_override = bool(value)
 
     # ---------------------------------------------------------- vendor --
 

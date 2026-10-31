@@ -32,8 +32,13 @@ public final class VerdictPoller implements Runnable, AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(VerdictPoller.class);
 
-    /** One row of the feed. */
-    public record Verdict(long seq, String prevHash, String alertId, String json) {}
+    /** One row of the feed. {@code generation} identifies the audit log the row came from (0 = feed did not say):
+     *  when AEGIS rotates or restores its audit log the generation changes and seq restarts, so the cursor must too. */
+    public record Verdict(long seq, String prevHash, String alertId, String json, long generation) {
+        public Verdict(long seq, String prevHash, String alertId, String json) {
+            this(seq, prevHash, alertId, json, 0L);
+        }
+    }
 
     /** The HTTP + JSON side, separated so tests can fake AEGIS. */
     public interface Source {
@@ -48,6 +53,7 @@ public final class VerdictPoller implements Runnable, AutoCloseable {
     private final long pollMs;
     private volatile boolean running = true;
     private long cursor;
+    private long generation;
 
     public final AtomicLong produced = new AtomicLong();
     public final AtomicLong errors = new AtomicLong();
@@ -58,7 +64,9 @@ public final class VerdictPoller implements Runnable, AutoCloseable {
         this.topic = topic;
         this.cursorFile = cursorFile;
         this.pollMs = Math.max(100, poll.toMillis());
-        this.cursor = readCursor(cursorFile);
+        long[] saved = readCursorAndGeneration(cursorFile);
+        this.cursor = saved[0];
+        this.generation = saved[1];
     }
 
     public long cursor() {
@@ -92,7 +100,16 @@ public final class VerdictPoller implements Runnable, AutoCloseable {
     public int pollOnce() throws IOException {
         List<Verdict> rows = source.fetch(cursor, 200);
         int n = 0;
+        if (!rows.isEmpty() && rows.get(0).generation() != 0 && generation != 0 && rows.get(0).generation() != generation) {
+            log.warn("AEGIS audit log generation changed ({} -> {}): the log was rotated or restored; restarting the cursor from 0",
+                    generation, rows.get(0).generation());
+            cursor = 0;
+            generation = rows.get(0).generation();
+            writeCursor(cursorFile, cursor, generation);
+            rows = source.fetch(cursor, 200);
+        }
         for (Verdict v : rows) {
+            if (v.generation() != 0) generation = v.generation();
             if (v.seq() <= cursor) continue;                       // the feed is ordered; never go backwards
             ProducerRecord<String, String> rec = new ProducerRecord<>(topic, v.alertId(), v.json());
             rec.headers().add("aegis-seq", Long.toString(v.seq()).getBytes(StandardCharsets.UTF_8));
@@ -109,7 +126,7 @@ public final class VerdictPoller implements Runnable, AutoCloseable {
             produced.incrementAndGet();
             n++;
         }
-        if (n > 0) writeCursor(cursorFile, cursor);
+        if (n > 0) writeCursor(cursorFile, cursor, generation);
         return n;
     }
 
@@ -140,22 +157,34 @@ public final class VerdictPoller implements Runnable, AutoCloseable {
     }
 
     static long readCursor(Path file) {
+        return readCursorAndGeneration(file)[0];
+    }
+
+    /** The cursor file holds {@code <seq>} (older bridges) or {@code <seq> <generation>}. */
+    static long[] readCursorAndGeneration(Path file) {
         try {
             if (file != null && Files.exists(file)) {
-                return Long.parseLong(Files.readString(file).trim());
+                String[] parts = Files.readString(file).trim().split("\\s+");
+                long seq = Long.parseLong(parts[0]);
+                long gen = parts.length > 1 ? Long.parseLong(parts[1]) : 0L;
+                return new long[] {seq, gen};
             }
         } catch (IOException | NumberFormatException e) {
             log.warn("cursor file {} unreadable ({}); starting from 0 — downstream dedupes on seq", file, e.getMessage());
         }
-        return 0L;
+        return new long[] {0L, 0L};
     }
 
     static void writeCursor(Path file, long value) throws IOException {
+        writeCursor(file, value, 0L);
+    }
+
+    static void writeCursor(Path file, long value, long generation) throws IOException {
         if (file == null) return;
         Path parent = file.toAbsolutePath().getParent();
         if (parent != null) Files.createDirectories(parent);
         Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
-        Files.writeString(tmp, Long.toString(value));
+        Files.writeString(tmp, generation != 0 ? value + " " + generation : Long.toString(value));
         Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 

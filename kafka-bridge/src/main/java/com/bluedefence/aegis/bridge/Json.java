@@ -19,13 +19,14 @@ public final class Json {
         JsonNode root = MAPPER.readTree(body);
         List<VerdictPoller.Verdict> out = new ArrayList<>();
         JsonNode rows = root.path("verdicts");
+        long generation = root.path("generation").asLong(0L);
         if (!rows.isArray()) return out;
         for (JsonNode row : rows) {
             JsonNode chain = row.path("chain");
             String alertId = chain.path("alert_id").asText("");
             if (alertId.isEmpty()) alertId = chain.path("id").asText("unknown");
             out.add(new VerdictPoller.Verdict(row.path("seq").asLong(), row.path("prev_hash").asText(""), alertId,
-                    MAPPER.writeValueAsString(chain)));
+                    MAPPER.writeValueAsString(chain), generation));
         }
         return out;
     }
