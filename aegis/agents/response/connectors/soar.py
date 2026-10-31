@@ -41,6 +41,7 @@ logger = logging.getLogger("aegis.connectors.soar")
 SEVERITY_BY_ACTION = {
     "isolate": 3, "kill_process": 3, "quarantine_file": 3, "rotate_credential": 3, "lock_account": 3,
     "revoke_sessions": 2, "force_logout": 2, "snapshot_forensic": 2, "block_export": 2, "block_egress": 2, "hold": 2,
+    "config_rollback": 3, "interface_shutdown": 2,          # network closed-loop: the SOAR drives NSO / Ansible / DNA Center
     "escalate_to_fraud_team": 2, "escalate_to_hr": 2, "escalate": 1,
 }
 

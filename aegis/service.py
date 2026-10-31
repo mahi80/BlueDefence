@@ -205,7 +205,7 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     # endpoint serves the active enforcement set to any edge enforcer
     from aegis.ingest.stream import get_stream
     from aegis.ingest.http_push import push_server_from_env
-    push_server = push_server_from_env(blocklist=lambda: connectors.active_receipts)
+    push_server = push_server_from_env(blocklist=lambda: connectors.active_receipts, audit_path=audit_path)
     eventhub = None
     if "eventhub" in [x.strip().lower() for x in os.environ.get("AEGIS_SOURCES", "").split(",")]:
         from aegis.ingest.eventhub import eventhub_from_env

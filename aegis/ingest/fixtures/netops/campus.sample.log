@@ -1,0 +1,13 @@
+# A small campus: CORE-01 — DIST-01 (Eth1/49) — ACC-01/ACC-02 (Gi1/0/49). LLDP first, then the day.
+{"device":"DIST-01","neighbor":"CORE-01","local_iface":"Ethernet1/49","neighbor_iface":"Ethernet1/2","role":"distribution","neighbor_role":"core"}
+{"device":"ACC-01","neighbor":"DIST-01","local_iface":"GigabitEthernet1/0/49","neighbor_iface":"Ethernet1/5","role":"access","neighbor_role":"distribution","users":120}
+{"device":"ACC-02","neighbor":"DIST-01","local_iface":"GigabitEthernet1/0/49","neighbor_iface":"Ethernet1/6","role":"access","neighbor_role":"distribution","users":80}
+<189>ACC-01: *Oct 29 2026 06:00:01.000 UTC: %LINK-3-UPDOWN: Interface GigabitEthernet1/0/7, changed state to down
+<189>ACC-01: *Oct 29 2026 06:00:09.000 UTC: %LINEPROTO-5-UPDOWN: Line protocol on Interface GigabitEthernet1/0/7, changed state to up
+<189>DIST-01: 2026 Oct 29 06:05:00 UTC: %ETHPORT-5-IF_DOWN_LINK_FAILURE: Interface Ethernet1/49 is down (Link failure)
+<189>CORE-01: 2026 Oct 29 06:05:00 UTC: %ETHPORT-5-IF_DOWN_LINK_FAILURE: Interface Ethernet1/2 is down (Link failure)
+<189>ACC-01: *Oct 29 2026 06:05:01.000 UTC: %LINK-3-UPDOWN: Interface GigabitEthernet1/0/49, changed state to down
+<189>ACC-02: *Oct 29 2026 06:05:01.000 UTC: %LINK-3-UPDOWN: Interface GigabitEthernet1/0/49, changed state to down
+{"trap":"IF-MIB::linkDown","host":"ACC-01","varbinds":{"ifDescr":"Gi1/0/49"},"ts":"2026-10-29T06:05:02Z"}
+<189>ACC-01: *Oct 29 2026 06:05:36.000 UTC: %OSPF-5-ADJCHG: Process 1, Nbr 10.1.0.1 on GigabitEthernet1/0/49 from FULL to DOWN, Neighbor Down: Dead timer expired
+<189>DIST-01: 2026 Oct 29 06:05:40 UTC: %OSPF-5-ADJCHG: Process 1, Nbr 10.0.0.1 on Ethernet1/49 from FULL to DOWN, Neighbor Down: Dead timer expired

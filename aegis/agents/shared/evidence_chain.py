@@ -39,6 +39,8 @@ ActionType = Literal[
     "escalate_to_hr",
     "snapshot_forensic",
     "block_egress",
+    "config_rollback",       # network: revert a device to its golden / last-known-good configuration
+    "interface_shutdown",    # network: administratively shut a flapping or error-storming port
 ]
 
 # Valid values derived from the Literals above so the defensive coercion

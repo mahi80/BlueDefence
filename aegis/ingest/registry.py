@@ -1,11 +1,13 @@
 """Build the configured alert sources from the environment.
 
-    AEGIS_SOURCES   comma list of: sample | splunk | sentinel | waf | apigw | ndr | acp | stream | eventhub   (default: sample)
+    AEGIS_SOURCES   comma list of: sample | splunk | sentinel | waf | apigw | ndr | netops | acp | stream | eventhub   (default: sample)
     AEGIS_CHECKPOINT  path of the JSON checkpoint file (default: ./.aegis-ingest.json)
     WAF_EVENT_FILE  path of the WAF syslog/JSON export to read (for source "waf")
     APIGW_EVENT_FILE  API-gateway access log export (for source "apigw"; object-walk detector)
     NDR_EVENT_FILE    network sensor logs, comma list in join order: Zeek x509 / ssl / conn JSON, Suricata EVE,
                       generic flow JSON (for source "ndr"; egress detector)
+    NETOPS_EVENT_FILE network-operations records, comma list in join order: device syslog (raw lines), SNMP
+                      traps / NetFlow / telemetry / config / LLDP JSON (for source "netops"; network assurance)
 
 ``stream`` drains what the push receiver (``http_push.py``, ``AEGIS_INGEST_HTTP=1``) and the
 Event Hub reader (``eventhub.py``, source ``eventhub``) have queued; it is added automatically
@@ -73,6 +75,15 @@ def sources_from_env() -> list[tuple[str, Iterator[dict]]]:
                     logger.warning("[ingest] ndr requested but NDR_EVENT_FILE missing; skipped (push to /ingest/ndr works without it)")
                     continue
                 out.append(("ndr", NdrConsumer(detector=ndr_detector(), checkpoint=checkpoint).iter_alerts(path=",".join(files))))
+            elif name == "netops":
+                from .netops import NetopsConsumer
+                from .netops import shared_detector as netops_detector
+                path = os.environ.get("NETOPS_EVENT_FILE", "")
+                files = [f for f in (x.strip() for x in path.split(",")) if f and Path(f).exists()]
+                if not files:
+                    logger.warning("[ingest] netops requested but NETOPS_EVENT_FILE missing; skipped (push to /ingest/netops works without it)")
+                    continue
+                out.append(("netops", NetopsConsumer(detector=netops_detector(), checkpoint=checkpoint).iter_alerts(path=",".join(files))))
             elif name in ("stream", "eventhub"):
                 pass                                         # drained once below, after the loop
             elif name == "acp":

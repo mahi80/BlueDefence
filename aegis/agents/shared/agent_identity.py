@@ -343,6 +343,27 @@ def build_manifest() -> Manifest:
             credentials=_DEFAULT_CRED,
         ),
         AgentEntry(
+            id="netops",
+            module="aegis.agents.netops.assurance",
+            description=(
+                "Network assurance specialist — deterministic, no LLM. Builds the topology from "
+                "LLDP/CDP, detects link down / flap, routing adjacency loss, interface errors, "
+                "congestion, silent devices and configuration drift from Cisco IOS / NX-OS syslog, "
+                "SNMP traps, NetFlow/IPFIX and gNMI telemetry; one alert per root cause with the "
+                "downstream alarms folded in; closed-loop remediation (config rollback, port shut) "
+                "proposed shadow-first for a human."
+            ),
+            workload_identity="spiffe://aegis.bank/agents/netops",
+            model_family="none (deterministic)",
+            permissions={
+                "read":   ["syslog.cisco", "snmp.traps", "netflow.ipfix", "gnmi.telemetry",
+                           "config.rancid_oxidized_nso", "lldp.cdp"],
+                "write":  ["evidence_chain"],
+                "invoke": ["soar.config_rollback", "soar.interface_shutdown"],
+            },
+            credentials=_DEFAULT_CRED,
+        ),
+        AgentEntry(
             id="threat_intel",
             module="aegis.agents.threat_intel.agent",
             description=(

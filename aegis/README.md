@@ -47,16 +47,17 @@ agents (`full`).
 3. [How a verdict is reached](#how-a-verdict-is-reached)
 4. [Against AI-agent attackers](#against-ai-agent-attackers) — fingerprints, retry-after-stop, auto-block
 5. [What leaves over TLS](#what-leaves-over-tls) — beacons, exfiltration, known-bad servers, shadow AI
-6. [What happens after the verdict](#what-happens-after-the-verdict)
-7. [The model: data, fine-tune, gate, retrain](#the-model-data-fine-tune-gate-retrain)
-8. [Threat intelligence](#threat-intelligence)
-9. [Connecting a bank](#connecting-a-bank) — sources, approvals, connectors, topology
-10. [ACP integration (full edition)](#acp-integration-full-edition)
-11. [Failure handling and logging](#failure-handling-and-logging)
-12. [Evaluation and CI gates](#evaluation-and-ci-gates)
-13. [Configuration reference](#configuration-reference)
-14. [Code map](#code-map)
-15. [Honest limits](#honest-limits)
+6. [What the network itself says](#what-the-network-itself-says) — root cause, alarm suppression, flaps, bad pushes, the Kafka bridge
+7. [What happens after the verdict](#what-happens-after-the-verdict)
+8. [The model: data, fine-tune, gate, retrain](#the-model-data-fine-tune-gate-retrain)
+9. [Threat intelligence](#threat-intelligence)
+10. [Connecting a bank](#connecting-a-bank) — sources, approvals, connectors, topology
+11. [ACP integration (full edition)](#acp-integration-full-edition)
+12. [Failure handling and logging](#failure-handling-and-logging)
+13. [Evaluation and CI gates](#evaluation-and-ci-gates)
+14. [Configuration reference](#configuration-reference)
+15. [Code map](#code-map)
+16. [Honest limits](#honest-limits)
 
 ---
 
@@ -97,6 +98,7 @@ bank gives you anything:
 |---|---|---|
 | Alert feed | `AEGIS_SOURCES=sentinel,waf,splunk` | `AEGIS_SOURCES=sample`, or `WAF_EVENT_FILE=aegis/ingest/fixtures/waf_events.log` (or `cloud_waf_events.jsonl`) with `waf`, or the real-shape Log Analytics fixture in `aegis/ingest/fixtures/` |
 | Network sensor | Zeek / Suricata on the egress tap, or the proxy's logs | `AEGIS_SOURCES=ndr NDR_EVENT_FILE=aegis/ingest/fixtures/ndr/zeek_tls.sample.jsonl` (or `suricata_eve.sample.jsonl`), with `AEGIS_TLS_IOC_FILE` and `AEGIS_AI_REGISTER` from the same folder |
+| Network operations | device syslog, SNMP traps, NetFlow, telemetry, RANCID/Oxidized configs, LLDP — usually already on Kafka → the [Kafka bridge](../kafka-bridge/README.md) | `AEGIS_SOURCES=netops NETOPS_EVENT_FILE=aegis/ingest/fixtures/netops/campus.sample.log` |
 | Topology for the blast radius | a `TelemetrySource` adapter over Okta / EDR / NetFlow / CBS | `MockTenant` (deterministic world; `AEGIS_MOCK_SPREAD` sets how compromised it looks) |
 | Approvals | ServiceNow / dashboard | `AEGIS_HITL_TRANSPORT=file` (append decisions by hand) |
 | WAF / SOAR | Imperva · F5 · Cloudflare · AWS WAF · Azure WAF · XSOAR · Sentinel playbooks | `AEGIS_WAF_VENDOR=mock` (Imperva), `mock-cloudflare`, `mock-aws`, `mock-azure`; `AEGIS_SOAR_VENDOR=mock` — the *real* connector classes against stateful fakes with 429 / 5xx / dropped connections, lock-token and etag races, bad signatures |
@@ -428,6 +430,74 @@ with `--write-fixtures DIR`.
 
 ---
 
+## What the network itself says
+
+Security and network operations read the same wires. A fibre cut, a flapping uplink, a config
+push that broke BGP, a WAN link at 95 % — the NOC sees those as hundreds of vendor alarms; the SOC
+needs to know whether the outage is an accident or the first move of an attack (an unticketed
+change on a distribution switch at 02:00 looks the same from the syslog either way). AEGIS
+carries one **network-assurance** detector (`agents/netops/assurance.py`, deterministic, no model)
+for both audiences.
+
+**What it reads** (`ingest/netops.py`): Cisco IOS / IOS-XE / NX-OS system messages
+(`%LINK-3-UPDOWN`, `%ETHPORT-5-IF_DOWN_*`, `%OSPF-5-ADJCHG`, `%BGP-5-ADJCHANGE`, `%SYS-5-CONFIG_I`,
+hardware and environment facilities) as raw relay lines or JSON-wrapped; SNMP traps (`linkDown`,
+`bgpBackwardTransition`, FRU and sensor traps); NetFlow / IPFIX / sFlow records; streaming telemetry
+(gNMI / MDT or SNMP-polled interface counters); configuration snapshots from RANCID / Oxidized / NSO
+(hash + change ticket + user); and LLDP / CDP neighbour tables for topology. Interface names are
+canonicalised (`Gi1/0/49` ≡ `GigabitEthernet1/0/49`, `Eth1/49` ≡ `Ethernet1/49`) so both ends of a
+link match.
+
+**What it does.** From LLDP it keeps the graph; for every link-down it asks *who loses their path
+to a core if this link goes* (a reachability diff, so a dual-homed switch losing one uplink has
+nothing downstream and is **medium / redundant**, a single-homed one is **critical** with its
+users counted). Everything that then arrives from inside that blast radius — the far end's view,
+the access switches' uplinks, their OSPF dead timers, their silence — is folded into the one
+incident as symptoms, for as long as the link stays down and a grace window after it comes back.
+Edge ports (anything the topology does not know) never alert on a single transition — users
+unplug things all day — but five transitions in five minutes on *any* interface is a **flap**, once
+per episode. Telemetry gives **interface errors** (CRC rate), **congestion** (utilisation over N
+samples) and **device unreachable** (silence). A configuration whose hash differs from the golden is
+**drift**; drift **with a change ticket** is benign; drift **without one, followed inside ten
+minutes by that device losing an adjacency or a link**, is a **bad config push** — `malicious`,
+with `config_rollback` to golden and `revoke_sessions` for whoever pushed it, both held for a human.
+
+| Fault | Verdict | Proposed (all HITL except monitor) |
+|---|---|---|
+| `link_down` with downstream | suspicious 0.90, critical | escalate, monitor the far end |
+| `link_down` redundant | suspicious 0.75, medium | escalate, monitor |
+| `link_flap` | suspicious 0.80 | `interface_shutdown` of the flapping port, escalate |
+| `adjacency_loss` | suspicious 0.80 | escalate, monitor |
+| `bad_config_push` | **malicious 0.88**, critical | `config_rollback`, `revoke_sessions` (pusher), escalate |
+| `config_drift` (ticketed / unticketed) | benign 0.70 / malicious 0.80 | monitor / `config_rollback`, escalate |
+| `interface_errors`, `congestion` | suspicious 0.70 | escalate, monitor |
+| `device_unreachable` | suspicious 0.75 | escalate |
+
+**Measured** — `python -m aegis.eval.network_fault_bench` (CI gate) runs a simulated 48-device
+campus/WAN (two cores, four distribution switches of which one is single-homed, forty access
+switches with users, two WAN edges) for three hours with per-minute telemetry, LLDP and 400
+edge-port plug/unplug events, and injects eight faults. Every one is caught at its root device and
+port; the single-homed fibre cut turns **53 vendor alarms into one alert** (10 downstream switches,
+~1,000 users, 53 symptoms folded in); the dual-homed cut is medium with nothing stranded; the
+flapping port is one alert with a port-shut proposal, not eight; the unticketed push is malicious
+with a rollback, the ticketed one never is; and across the healthy devices and the plug/unplug
+churn there are **zero alerts and zero remediations proposed**.
+
+**Feeding it.** A file (`AEGIS_SOURCES=netops NETOPS_EVENT_FILE=…`, raw syslog and JSON lines may
+be mixed; `ingest/fixtures/netops/campus.sample.log` is a small worked example), a push
+(`POST /ingest/netops?feed=syslog|snmp|netflow|telemetry|config|lldp`, NDJSON or raw lines, gzip
+accepted), or the stream receiver's content sniff (a line with `%FACILITY-SEV-MNEMONIC:` or an
+LLDP row is routed here whatever the source said). Most banks already land all of this on
+**Kafka**, which is what the **Java Kafka bridge** ([`kafka-bridge/`](../kafka-bridge/README.md),
+Kafka Streams) is for: it consumes `aegis.syslog` / `aegis.netflow` / `aegis.telemetry` /
+`aegis.alerts`, dedupes re-deliveries, folds a bouncing port's transitions, batches to
+`/ingest/netops` with backpressure (an AEGIS 503 stops consumption instead of dropping), and
+produces every finalised evidence chain from `GET /ingest/verdicts?after=<seq>` to
+`aegis.verdicts`, keyed by alert id with the hash-chain position in the headers, so SOAR, the
+SIEM and the CMDB read AEGIS decisions as a stream.
+
+---
+
 ## What happens after the verdict
 
 **Inline swarm** (`orchestrator/swarm.py`, `AEGIS_SWARM=1`, ≤ 60 s) — on a suspicious /
@@ -659,6 +729,7 @@ failure and then one summary per minute.
 | `aegis.eval.fault_injection` | 18 scenarios incl. the external edition with no dashboard and the push receiver | 18/18 |
 | `aegis.eval.purple_team` | adaptive AI-agent attackers + customers, partner, proxy staff vs the real pipeline (mock Cloudflare, live enforcement) | gated campaigns detected and contained, zero collateral |
 | `aegis.eval.egress_bench` | a simulated office's TLS metadata: implants, exfiltration, known-bad certificate, shadow AI among every-host vendor beacons | 6/6 found as expected, no `malicious` or containment on benign hosts |
+| `aegis.eval.network_fault_bench` | a 48-device campus/WAN under eight injected faults among per-minute telemetry and edge-port churn | 8/8 at the right root cause, 53 alarms → 1 alert on the fibre cut, zero alerts on healthy devices, zero wrong remediations |
 | `aegis.eval.swarm_timing` | live latency and cost per mode | verdict < 60 s |
 | `pytest aegis/tests` | unit + integration | all green |
 | Governed job | historical + injection evals under ACPGuard | no verdict drift, no blocks |
@@ -680,6 +751,7 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 | Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_PROTECTED_TARGETS`, `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH` |
 | Agentic attackers | `AEGIS_AUTO_BLOCK` (`off` · `shadow` · `live`), `AEGIS_AUTO_BLOCK_MIN_CONF`, `AEGIS_AUTO_BLOCK_TTL`, `AEGIS_AUTO_BLOCK_MAX_PER_HOUR`, `AEGIS_FP_ALLOW`, `AEGIS_ADAPTIVE_MIN_RETRIES`, `AEGIS_ADAPTIVE_MAX_RETRY_S`, `AEGIS_AUTH_BURST_MIN`, `AEGIS_AWS_WAF_RULE_GROUP`, `AEGIS_JA4_DB`, `AEGIS_TLS_SHARED_UAS`, `AEGIS_TLS_LIBRARY_IPS` |
 | Network sensor (NDR) | `NDR_EVENT_FILE`, `AEGIS_INTERNAL_NETS`, `AEGIS_TLS_IOC_FILE`, `AEGIS_AI_REGISTER`, `AEGIS_SHADOW_AI_REGISTER`, `AEGIS_AI_PROVIDERS_EXTRA`, `AEGIS_NDR_RARE_MAX_SRCS`, `AEGIS_NDR_BEACON_MIN_CONN`, `AEGIS_NDR_BEACON_MIN_SPAN_S`, `AEGIS_NDR_BEACON_MAX_JITTER`, `AEGIS_NDR_EXFIL_MIN_MB`, `AEGIS_NDR_EXFIL_WINDOW_S`, `AEGIS_NDR_EXFIL_RATIO`, `AEGIS_NDR_AI_UPLOAD_MB`, `AEGIS_NDR_ALLOW_DOMAINS`, `AEGIS_NDR_ALLOW_HOSTS` |
+| Network assurance | `NETOPS_EVENT_FILE`, `AEGIS_NET_FLAP_N`, `AEGIS_NET_FLAP_WINDOW_S`, `AEGIS_NET_CORR_WINDOW_S`, `AEGIS_NET_ERR_PER_MIN`, `AEGIS_NET_UTIL_PCT`, `AEGIS_NET_UTIL_SAMPLES`, `AEGIS_NET_SILENT_S`, `AEGIS_NET_BAD_PUSH_S`, `AEGIS_NET_GOLDEN`, `AEGIS_NET_GOLDEN_FIRST_SEEN`, `AEGIS_NET_INVENTORY` |
 | BOLA | `AEGIS_OWNERSHIP_FILE`, `AEGIS_OWNERSHIP_URL`, `AEGIS_OWNERSHIP_TOKEN`, `AEGIS_BOLA_WINDOW_S`, `AEGIS_BOLA_CROSS_MIN`, `AEGIS_BOLA_ATTEMPT_MIN`, `AEGIS_BOLA_DISTINCT_MIN`, `AEGIS_BOLA_EXEMPT_PRINCIPALS`, `AEGIS_APIGW_PRINCIPAL_FIELD`, `APIGW_EVENT_FILE`, `AEGIS_EVENTHUB_SOURCE` |
 | Intel | `AEGIS_CVE_INTEL`, `NVD_API_KEY`, `AEGIS_TI_CACHE`, `AEGIS_INTEL_MOCK`, `AEGIS_STACKS` |
 | ACP | `ACP_DASHBOARD_URL`, `ACP_API_KEY`, `ACP_GOVERN`, `ACP_AGENT_CODE`, `ACP_BU`, `ACP_RATE_LIMIT`, `AEGIS_PERSIST`, `AEGIS_RULE_FEED`, `AEGIS_ACP_MIN_SEVERITY`, `AEGIS_ACP_KINDS` |
@@ -693,8 +765,9 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 |---|---|
 | `service.py` | the long-running SOC process (`build_pipeline`, `run_cycle`, `--once`) |
 | `edition.py` | editions, defaults, contradiction checks |
-| `ingest/` | Sentinel, WAF, API-gateway, network-sensor (`ndr.py`), ACP consumers; push receiver (`http_push.py`), stream queue (`stream.py`), Event Hub reader (`eventhub.py`); checkpoint |
+| `ingest/` | Sentinel, WAF, API-gateway, network-sensor (`ndr.py`), network-operations (`netops.py`: syslog / traps / flows / telemetry / configs / LLDP), ACP consumers; push receiver (`http_push.py`, incl. the `/ingest/verdicts` feed), stream queue (`stream.py`), Event Hub reader (`eventhub.py`); checkpoint |
 | `agents/orchestrator/` | triage, specialist dispatch, voter, fast paths (control-plane, adaptive attacker, credential stuffing, BOLA, spoofed browser, egress), swarm |
+| `agents/netops/` | network assurance: topology (LLDP) → reachability-diff blast radius, root cause vs symptom, flaps, telemetry thresholds, config drift and bad pushes |
 | `agents/ndr/` | egress detector (beacons, exfiltration, certificate oddities), TLS IOC list (`tls_intel.py`), AI-service catalogue + register + discovered usage (`ai_usage.py`) |
 | `agents/orchestrator/walkers/` | campaign context, walkers, blast graph, mitigation planner, twin, containment loop, async investigator |
 | `agents/<domain>/` | perimeter, auth, edr, api_abuse (incl. `object_walk.py` BOLA detector, `ownership.py`), transaction, cloud_controlplane, dlp, email, mobile, wireless |

@@ -25,6 +25,7 @@ from .low_and_slow import is_low_and_slow, low_and_slow_chain
 from .bola import is_object_walk, object_walk_chain
 from .egress import egress_chain, is_egress_finding
 from .model_pull import is_dealigned_model_pull, model_pull_chain
+from .netops import is_network_fault, network_fault_chain
 from .privileged import is_privileged_event, privileged_chain
 from .treasury import is_treasury_outflow, treasury_outflow_chain
 from .spoofed_client import is_spoofed_client, spoofed_client_chain
@@ -157,6 +158,14 @@ class SOCOrchestrator:
                 obs.record_alert_processed("control_plane")
                 obs.record_verdict(chain.verdict, "control_plane")
                 sp.attributes["specialist"] = "control_plane"
+                sp.attributes["verdict"] = chain.verdict
+            # Fast-path: one network root cause from the assurance detector (link down with its downstream
+            # folded in, flap, adjacency loss, bad config push, drift, errors, congestion, silent device).
+            elif is_network_fault(alert):
+                chain = network_fault_chain(alert)
+                obs.record_alert_processed("netops")
+                obs.record_verdict(chain.verdict, "netops")
+                sp.attributes["specialist"] = "netops"
                 sp.attributes["verdict"] = chain.verdict
             # Fast-path: an engineer with production reach, or a crown jewel they can touch (DevOps laptop
             # compromise, interactive access to the payment signer, a signer policy change).

@@ -63,6 +63,9 @@ jobs:
       - name: Signer-compromise gate (Binance Oct 2026 pattern — DevOps laptop to payment-signer drain, every stage caught, drain contained)
         run: python -m aegis.eval.signer_compromise --gate --json signer-compromise.json
 
+      - name: Network fault bench (48-device campus/WAN — fibre cut / redundant cut / flap / bad push / ticketed change / congestion / errors / silent device: root cause right, 10x+ alarm reduction, zero false alarms)
+        run: python -m aegis.eval.network_fault_bench --gate --json network-fault-bench.json
+
       - name: Upload purple-team and egress results
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,6 +75,7 @@ jobs:
             purple-team.json
             egress-bench.json
             signer-compromise.json
+            network-fault-bench.json
           if-no-files-found: ignore
 
       - name: Hypothesis property-based tests
