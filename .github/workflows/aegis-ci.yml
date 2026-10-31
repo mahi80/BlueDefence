@@ -182,7 +182,7 @@ jobs:
           hd = HumanDecision("ap", "isolate", "app-07", "rejected", "soc_analyst", "false positive", None, "benign")
           rec = record_from_chain(ch, alert={"id": "A1", "source": "waf"}, origin="dashboard_chain",
                                   scrubber=sc, human=[hd])
-          m = DatasetBuilder("/tmp/dpo-v1", BuildOptions(name="dpo-ci", dpo=True)).add([rec]).build()
+          m = DatasetBuilder("/tmp/dpo-v1", BuildOptions(name="dpo-ci", dpo=True, val_pct=0)).add([rec]).build()
           assert m["counts"]["dpo_pairs"] == 1, m["counts"]
           ok, problems = verify_dataset("/tmp/dpo-v1")
           assert ok, problems

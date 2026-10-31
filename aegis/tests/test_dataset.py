@@ -101,6 +101,40 @@ def test_orchestrator_captures_a_scrubbed_alert_snapshot(orch, monkeypatch):
     assert "alert" not in chain2.metadata
 
 
+def test_dashboard_export_never_carries_raw_ids_from_the_chain(orch):
+    """Chains are persisted raw (the analyst needs the real id on the HITL card); only the
+    snapshot is scrubbed. At export with alert=None the scrubber knows the snapshot's
+    pseudonyms, not the raw ids the chain's signals and targets carry — so the compact chain
+    captured on the agent host (scrubbed with the scrubber that knew them) must be what is
+    exported, re-keyed consistently with the alert, while metadata written after capture
+    (swarm, vote) stays live."""
+    from aegis.agents.shared.evidence_chain import EvidenceItem
+    alert = {"id": "CAP-3", "source": "Okta", "severity": "high", "anomaly_score": 0.9, "user_id": "u_42891",
+             "email": "alice@corp.test", "prev_geo": "IN-MH", "curr_geo": "RU-MO", "minutes_since_prev_login": 12,
+             "device_fingerprint": {"ua": "x", "screen": "1x1", "tz": "UTC"}, "mfa_failures": 0,
+             "user_role": "retail", "observed": {}}
+    chain = orch.handle(alert)
+    # the identity specialist already targets the raw user id (lock_account -> u_42891); add the
+    # raw identity in free text too, then re-seal, as the swarm does after enrichment
+    chain.evidence.append(EvidenceItem(source="auth", signal="impossible travel for u_42891 (alice@corp.test)",
+                                       weight="high"))
+    orch.record(alert, chain)
+    persisted = chain.model_dump(mode="json")      # what the dashboard holds: raw
+    assert any(a["target"] == "u_42891" for a in persisted["recommended_actions"])
+    persisted["metadata"]["swarm"] = {"evidence_added": 2, "verdict_before": "suspicious",
+                                      "verdict_after": "malicious", "workers": {"a": {"ok": True}}}
+
+    rec = record_from_chain(persisted, alert=None, origin="dashboard_chain", scrubber=Scrubber(salt="export"))
+    blob = json.dumps(rec.to_dict())
+    assert "u_42891" not in blob and "alice" not in blob
+    # one identity, one pseudonym: the action target is the same token as the alert's user_id
+    lock = next(a for a in rec.chain["recommended_actions"] if a["action_type"] == "lock_account")
+    assert lock["target"] == rec.alert["user_id"]
+    assert rec.alert["user_id"] in rec.rationale or rec.alert["user_id"] in json.dumps(rec.chain["evidence"])
+    # live metadata written after capture is not lost to the snapshot
+    assert rec.chain["swarm"]["evidence_added"] == 2 and rec.chain["swarm"]["workers_ok"] == 1
+
+
 def test_capture_caps_huge_alerts():
     snap = capture_alert({"id": "BIG", "payload": "x" * 50_000, "user_id": "u_7"}, Scrubber(salt="k"), cap=4096)
     assert snap["truncated"] is True and len(json.dumps(snap["data"])) <= 4096 + 64

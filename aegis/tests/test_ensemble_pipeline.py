@@ -57,3 +57,32 @@ def test_factory_parses_specs_and_count(monkeypatch):
 def test_factory_skips_blank_entries(monkeypatch):
     monkeypatch.setenv("AEGIS_VOTER_MODELS", "mock:x, , mock:y,")
     assert len(get_extra_voter_clients()) == 2
+
+
+def test_factory_drops_bad_specs_instead_of_seating_mock_dissenters(monkeypatch):
+    """get_client never raises — it falls back to MockClient, whose vote has no ``concur`` and
+    so dissents every time. A malformed or unavailable spec must be dropped, not seated: one
+    seated mock voter means the panel can never be unanimous and every irreversible action is
+    HITL-forced forever."""
+    from aegis.agents.shared.llm_client import MockClient, _innermost
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("AEGIS_VOTER_BACKEND", raising=False)
+    # malformed (empty half), unknown backend, and a backend that silently falls back to mock here
+    # (a declared-but-unreachable vLLM is seated on purpose: it fails loudly at vote time, not silently)
+    monkeypatch.setenv("AEGIS_VOTER_MODELS", "vllm:, :model, bogus:x, anthropic:claude-x")
+    assert get_extra_voter_clients() == []
+    # bare model with no creds resolves to mock on the auto backend -> dropped too
+    monkeypatch.setenv("AEGIS_VOTER_MODELS", "some-model")
+    assert get_extra_voter_clients() == []
+    # an explicitly requested mock is honoured (tests / demos), and the good ones survive the bad
+    monkeypatch.setenv("AEGIS_VOTER_MODELS", "mock:a, bogus:x, mock:b")
+    voters = get_extra_voter_clients()
+    assert len(voters) == 2 and all(isinstance(_innermost(v), MockClient) for v in voters)
+
+
+def test_factory_does_not_double_wrap_the_pii_tokenizer(monkeypatch):
+    from aegis.agents.shared.pii_tokenizing_client import TokenizingLLMClient
+    monkeypatch.setenv("AEGIS_VOTER_MODELS", "mock:a")
+    (v,) = get_extra_voter_clients()
+    assert isinstance(v, TokenizingLLMClient)                       # get_client's own wrapper …
+    assert not isinstance(getattr(v, "_inner", None), TokenizingLLMClient)   # … applied exactly once

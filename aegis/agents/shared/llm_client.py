@@ -1482,17 +1482,16 @@ def get_voter_client(
     return inner
 
 
-def _pii_wrap(inner: LLMClient) -> LLMClient:
-    """Wrap a voter in the PII tokenization client unless disabled — same guard the
-    primary voter uses, so every voter sees tokenized data."""
-    if os.environ.get("AEGIS_PII_TOKENIZATION", "1") != "0":
-        try:
-            from .pii_tokenizing_client import TokenizingLLMClient
-            return TokenizingLLMClient(inner)
-        except Exception as exc:  # noqa: BLE001
-            _log.error("PII tokenization wrapper unavailable (%s: %s) — voter runs WITHOUT it",
-                       type(exc).__name__, str(exc)[:160])
-    return inner
+_VOTER_BACKENDS = frozenset({"mock", "gemma", "local", "vllm", "tgi", "anthropic", "auto"})
+
+
+def _innermost(client: LLMClient) -> LLMClient:
+    """Unwrap the PII-tokenizing (or any) wrapper chain to the client that actually answers."""
+    seen = 0
+    while hasattr(client, "_inner") and seen < 8:
+        client = getattr(client, "_inner")
+        seen += 1
+    return client
 
 
 def get_extra_voter_clients(budget: Optional[TokenBudget] = None) -> list[LLMClient]:
@@ -1503,8 +1502,14 @@ def get_extra_voter_clients(budget: Optional[TokenBudget] = None) -> list[LLMCli
     choose different model families so a prompt injection that fools one rarely fools all.
 
     Returns ``[]`` when the env var is unset, so a single-voter deployment loads nothing
-    extra. A spec that fails to load is skipped (logged), never fatal — the ensemble just
-    runs with however many voters came up.
+    extra. A spec that is malformed, names an unknown backend, or whose backend is not
+    actually available is **dropped with an ERROR log** rather than loaded — never fatal, the
+    ensemble runs with however many real voters came up. That drop matters: ``get_client``
+    never raises, it falls back to ``MockClient``, and a mock voter answers without a
+    ``concur`` key, i.e. it dissents on every call. Let one in and the panel can never be
+    unanimous, so every irreversible action is held for a human forever with nothing but a
+    startup warning to show why. (``mock:<name>`` is honoured when asked for explicitly.)
+    ``get_client`` already applies the PII-tokenizing wrapper, so none is added here.
     """
     raw = os.environ.get("AEGIS_VOTER_MODELS", "").strip()
     if not raw:
@@ -1515,16 +1520,30 @@ def get_extra_voter_clients(budget: Optional[TokenBudget] = None) -> list[LLMCli
         if not spec:
             continue
         head, sep, tail = spec.partition(":")
-        if sep and tail.strip():                      # "backend:model"
-            backend, model = (head.strip().lower() or default_backend), tail.strip()
+        if sep:                                        # "backend:model" — both halves required
+            backend, model = head.strip().lower(), tail.strip()
+            if not backend or not model:
+                _log.error("[voter] extra voter spec %r is malformed (want backend:model or model); dropped", spec)
+                continue
         else:                                          # bare "model"
             backend, model = default_backend, spec
+        if backend is not None and backend not in _VOTER_BACKENDS:
+            _log.error("[voter] extra voter %r names unknown backend %r (known: %s); dropped",
+                       spec, backend, ", ".join(sorted(_VOTER_BACKENDS)))
+            continue
         try:
-            out.append(_pii_wrap(get_client(prefer=backend, budget=budget, model=model)))
-            _log.info("[voter] extra ensemble voter loaded: backend=%s model=%s", backend or "auto", model)
+            client = get_client(prefer=backend, budget=budget, model=model)
         except Exception as exc:  # noqa: BLE001 — a bad extra voter must never break the pipeline
-            _log.warning("[voter] extra voter '%s' unavailable (%s: %s); skipping",
-                         spec, type(exc).__name__, str(exc)[:160])
+            _log.error("[voter] extra voter %r failed to load (%s: %s); dropped",
+                       spec, type(exc).__name__, str(exc)[:160])
+            continue
+        if backend != "mock" and isinstance(_innermost(client), MockClient):
+            _log.error("[voter] extra voter %r resolved to the MOCK client (backend %s unavailable or no creds); "
+                       "dropped — a mock voter dissents on every call and would force HITL on everything",
+                       spec, backend or "auto")
+            continue
+        out.append(client)
+        _log.info("[voter] extra ensemble voter loaded: backend=%s model=%s", backend or "auto", model)
     return out
 
 

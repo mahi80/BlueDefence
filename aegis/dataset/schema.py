@@ -118,6 +118,28 @@ def compact_chain(chain: dict) -> dict:
     }
 
 
+_CAPTURED_TEXT_KEYS = {
+    "evidence": ("signal", "raw"),
+    "reasoning": ("action", "observation", "conclusion"),
+    "recommended_actions": ("target", "reasoning"),
+}
+
+
+def _overlay_captured_text(live: dict, captured: dict) -> None:
+    """Replace the PII-bearing text of a live compact chain with the copy captured (and
+    scrubbed) on the agent host, matched by index. Everything structural — verdict,
+    confidence, weights, action types, swarm / vote / governance metadata — stays live, so
+    metadata written after capture is never lost. A list the live chain has grown past the
+    snapshot keeps its extra items; those fall to the export scrubber's best effort."""
+    for key, text_keys in _CAPTURED_TEXT_KEYS.items():
+        live_items, cap_items = live.get(key) or [], captured.get(key) or []
+        for l_item, c_item in zip(live_items, cap_items):
+            if isinstance(l_item, dict) and isinstance(c_item, dict):
+                for tk in text_keys:
+                    if tk in c_item:
+                        l_item[tk] = c_item[tk]
+
+
 def rationale_from_chain(chain: dict) -> str:
     """One analyst-readable paragraph: conclusions first, then the strongest signals."""
     parts: list[str] = []
@@ -204,7 +226,32 @@ def record_from_chain(chain: dict, *, alert: Optional[dict], origin: str, scrubb
         alert_scrubbed = None
         fp = hashlib.sha256(f"chain:{chain.get('integrity_hash') or chain.get('alert_id')}".encode()).hexdigest()
 
-    chain_scrubbed = scrubber.scrub(compact_chain(chain))
+    # Which recommended actions did an analyst reject? Decide on the RAW chain, by index,
+    # before anything is scrubbed: both the chain and the decisions carry the target as the
+    # analyst saw it, so raw-vs-raw matches on the local and the dashboard path alike. Matching
+    # after scrubbing silently fails whenever the target is an identity (user id, email) —
+    # exactly the account-level disputes the learning loop most needs.
+    def _hget(h, k):
+        return getattr(h, k, None) if isinstance(h, HumanDecision) else (h or {}).get(k)
+    rejected_keys = {(_hget(h, "action_type"), str(_hget(h, "target") or ""))
+                     for h in human if _hget(h, "decision") == "rejected"}
+    rejected_idx = {i for i, a in enumerate(chain.get("recommended_actions") or [])
+                    if isinstance(a, dict) and (a.get("action_type"), str(a.get("target", ""))) in rejected_keys}
+
+    # Dashboard chains are persisted raw (the alert snapshot is the only thing scrubbed at
+    # capture), so at export the scrubber knows the captured pseudonyms but not the raw ids the
+    # chain's signals and targets still carry. Prefer the compact chain captured alongside the
+    # alert — scrubbed on the agent host with the scrubber that knew those ids — and re-key its
+    # pseudonyms into this export's space, exactly as the alert snapshot is.
+    captured_chain = snapshot.get("chain") if isinstance(snapshot, dict) else None
+    chain_src = compact_chain(chain)
+    if alert is None and isinstance(captured_chain, dict):
+        _overlay_captured_text(chain_src, captured_chain)
+    chain_scrubbed = scrubber.scrub(chain_src)
+    for i in rejected_idx:
+        acts = chain_scrubbed.get("recommended_actions") or []
+        if i < len(acts) and isinstance(acts[i], dict):
+            acts[i]["human_rejected"] = True
     model_verdict = str(chain.get("verdict", "") or "uncertain")
     if expected_verdict:
         verdict, label_source, needs_review = expected_verdict, "ground_truth", False
@@ -233,9 +280,11 @@ def record_from_chain(chain: dict, *, alert: Optional[dict], origin: str, scrubb
         alert=alert_scrubbed,
         label=label,
         chain=chain_scrubbed,
-        rationale=scrubber.scrub_text(rationale_from_chain(chain)),
+        rationale=scrubber.scrub_text(rationale_from_chain(chain_src)),
         techniques=techniques,
-        human=[asdict(h) if isinstance(h, HumanDecision) else dict(h) for h in human],
+        # decisions are scrubbed too: a raw user id / email in a decision's target or rationale
+        # would otherwise ride into records.jsonl unpseudonymised
+        human=[scrubber.scrub(asdict(h) if isinstance(h, HumanDecision) else dict(h)) for h in human],
         source_system=str(source_system or (alert_scrubbed or {}).get("source", "") or ""),
         tags=list(tags or []),
         created_at=created_at or str(chain.get("completed_at") or chain.get("started_at")

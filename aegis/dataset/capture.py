@@ -101,13 +101,31 @@ def capture_alert(alert: dict, scrubber: Scrubber | None = None, *,
     }
 
 
+def capture_chain(chain: Any, scrubber: Scrubber | None = None) -> dict:
+    """Scrubbed compact copy of the chain's trainer-facing text (evidence signals, action
+    targets, reasoning). Taken with the scrubber that just learned the alert's identity
+    literals, so a user id that is ``u_<token>`` in the alert snapshot is the same token here —
+    the live chain stays raw for the analyst; only the dataset copy is pseudonymised."""
+    from .schema import compact_chain   # local import: schema imports scrub, not capture
+
+    sc = scrubber or _scrubber()
+    raw = dict(chain.model_dump(mode="json") if hasattr(chain, "model_dump") else chain)
+    # keep the metadata compact_chain reads (swarm, vote, model …) but never nest the snapshot in itself
+    raw["metadata"] = {k: v for k, v in (raw.get("metadata") or {}).items() if k != METADATA_KEY}
+    return sc.scrub(json.loads(json.dumps(compact_chain(raw), default=str)))
+
+
 def attach(chain: Any, alert: dict) -> None:
-    """Put the snapshot on ``chain.metadata["alert"]`` when capture is on (never raises)."""
+    """Put the snapshot on ``chain.metadata["alert"]`` when capture is on (never raises).
+    The snapshot carries the scrubbed alert and a scrubbed compact chain; the orchestrator
+    calls this again after swarm enrichment, so the chain copy is the one that was acted on."""
     if not capture_enabled():
         return
     try:
         meta = getattr(chain, "metadata", None)
         if isinstance(meta, dict):
-            meta[METADATA_KEY] = capture_alert(alert)
+            snap = capture_alert(alert)       # learns the alert's identity literals first
+            snap["chain"] = capture_chain(chain)
+            meta[METADATA_KEY] = snap
     except Exception as exc:  # noqa: BLE001 — a capture failure must never cost a verdict
         logger.warning("[dataset] alert snapshot not captured for %s (%s: %s)", getattr(chain, "alert_id", "?"), type(exc).__name__, str(exc)[:120])

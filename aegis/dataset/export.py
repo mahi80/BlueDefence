@@ -176,9 +176,9 @@ class DatasetBuilder:
         if actions is None:
             actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": a["requires_hitl"]}
                        for a in chain.get("recommended_actions", [])]
-            if r.label.get("constraint") == "no_allow":
-                actions = [a for a in actions if a["action_type"] != "allow"] or [
-                    {"action_type": "monitor", "target": r.meta.get("alert_id") or "alert", "requires_hitl": False}]
+        if r.label.get("constraint") == "no_allow":
+            actions = [a for a in actions if a["action_type"] != "allow"] or [
+                {"action_type": "monitor", "target": r.meta.get("alert_id") or "alert", "requires_hitl": False}]
         target = {
             "verdict": verdict,
             "confidence": round(float(confidence or 0.0), 2),
@@ -216,33 +216,41 @@ class DatasetBuilder:
           rejected = the model's auto-run recommendation. The pair teaches "don't auto-run
           this", not a new verdict.
 
+        In both, the action(s) the analyst rejected are held for a human in ``chosen`` — a
+        corrected verdict must not keep rewarding the very action that was overruled. The
+        confidence is identical on both sides on purpose: the analyst gave none, so it must
+        carry no preference signal (DPO is indifferent to tokens shared by both completions).
+
+        Which actions were rejected comes from the ``human_rejected`` flag ``record_from_chain``
+        sets on the raw chain by index — never by matching targets after scrubbing, which
+        silently fails for identity-shaped targets (user ids, emails).
+
         Confirmations and agreements yield no pair: there is nothing to prefer. Returns
         ``None`` when no contrast can be formed."""
         if r.kind not in ("triage", "injection") or r.alert is None or r.chain is None:
             return None
         src = r.label.get("source")
+        if src not in ("human_corrected", "human_disputed"):
+            return None
         conf = float(r.label.get("confidence") or 0.0)
         human_verdict = str(r.label.get("verdict") or "")
         model_verdict = str(r.label.get("model_verdict") or "")
 
-        if src == "human_corrected" and human_verdict and model_verdict and human_verdict != model_verdict:
-            chosen = self._triage_target(r, verdict=human_verdict, confidence=conf)
-            rejected = self._triage_target(r, verdict=model_verdict, confidence=conf)
-        elif src == "human_disputed":
-            rejected_keys = {(d.get("action_type"), d.get("target"))
-                             for d in (r.human or []) if d.get("decision") == "rejected"}
-            model_actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": a["requires_hitl"]}
-                             for a in (r.chain or {}).get("recommended_actions", [])]
-            if not rejected_keys or not any((a["action_type"], a["target"]) in rejected_keys for a in model_actions):
-                return None                                   # can't identify what was overruled
-            held = [{**a, "requires_hitl": True} if (a["action_type"], a["target"]) in rejected_keys else a
-                    for a in model_actions]
-            if held == model_actions:
-                return None                                   # already all HITL — no contrast
+        model_actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": a["requires_hitl"]}
+                         for a in (r.chain or {}).get("recommended_actions", [])]
+        held = [{**a, "requires_hitl": True} if raw.get("human_rejected") else a
+                for a, raw in zip(model_actions, (r.chain or {}).get("recommended_actions", []))]
+
+        if src == "human_corrected":
+            if not human_verdict or not model_verdict or human_verdict == model_verdict:
+                return None
             chosen = self._triage_target(r, verdict=human_verdict, confidence=conf, actions=held)
             rejected = self._triage_target(r, verdict=model_verdict, confidence=conf, actions=model_actions)
-        else:
-            return None
+        else:   # human_disputed: same verdict, the overruled auto-run is the whole contrast
+            if held == model_actions:
+                return None     # nothing identified as rejected, or it was already HITL — no contrast
+            chosen = self._triage_target(r, verdict=human_verdict, confidence=conf, actions=held)
+            rejected = self._triage_target(r, verdict=model_verdict, confidence=conf, actions=model_actions)
 
         return {
             "id": r.record_id, "split": r.split, "label_source": src, "origin": r.origin,

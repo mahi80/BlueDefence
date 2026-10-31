@@ -57,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     train, val = split_prefs(rows)
+    if not train:
+        print(f"ERROR: {len(rows)} pair(s) loaded but none in the train split — nothing to train on "
+              "(re-export with more decisions, or check --val-pct)", file=sys.stderr)
+        return 2
     syn = sum(1 for r in rows if is_non_analyst(r.label_source))
     preset = get_preset(args.preset) if args.preset else preset_for_vram(args.vram)
 
@@ -67,6 +71,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nplan:\n{_plan(args, preset, len(train), len(val))}")
     if syn:
         print(f"\n  ⚠ {syn} pair(s) are non-analyst — preference tuning should run on analyst decisions only.")
+    if not val:
+        print("\n  ⚠ no validation pairs — the run has no held-out loss to watch; the eval gate is the only check.")
     if args.dry_run:
         print("\n--dry-run: nothing trained. Install the GPU deps (+ trl) and drop --dry-run to run for real.")
         return 0
