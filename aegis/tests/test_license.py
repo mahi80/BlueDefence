@@ -206,6 +206,7 @@ def test_activate_cli_against_the_license_service(tmp_path, keys, monkeypatch):
     root = Path(__file__).resolve().parents[2]
     srv_dir = root / "license-server" / "app"
     shutil.copy(root / "aegis" / "license.py", srv_dir / "aegis_license.py")
+    shutil.copy(root / "aegis" / "dataset" / "privacy_gate.py", srv_dir / "privacy_gate.py")     # what build.sh / deploy.ps1 do
     sys.path.insert(0, str(srv_dir))
     spec = importlib.util.spec_from_file_location("bd_license_app", srv_dir / "app.py")
     app = importlib.util.module_from_spec(spec); spec.loader.exec_module(app)
