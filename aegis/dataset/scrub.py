@@ -51,6 +51,11 @@ IDENTITY_KEYS: frozenset[str] = frozenset({
     "principal", "principal_id", "actor", "actor_id", "mailbox", "subject_user", "target_user",
     "target_user_id", "accountid", "caller_id", "device_owner", "owner", "object_owner", "resource_owner",
     "victim", "victim_id", "initiator", "requester", "approver",
+    # Windows / Sentinel / Splunk / CrowdStrike identity fields
+    "targetusername", "subjectusername", "accountname", "samaccountname", "src_user", "dest_user", "src_user_name",
+    "dest_user_name", "user_sid", "targetsid", "subjectusersid", "logonaccount", "userprincipal", "callerid",
+    "workstationname", "src_host_name", "logon_user", "initiatedby", "targetresources", "identity", "identityname",
+    "mailboxowner", "onbehalfof", "senderfromaddress", "recipientemailaddress", "p1sender", "p2sender",
 })
 
 # Alert keys that change on every event and must not take part in a fingerprint.
@@ -66,7 +71,8 @@ _AADHAAR_RX = re.compile(r"(?<![\w-])[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}(?![\w-])")
 _PAN_RX = re.compile(r"(?<![A-Za-z0-9])[A-Z]{5}\d{4}[A-Z](?![A-Za-z0-9])")
 _IN_MOBILE_RX = re.compile(r"(?<![\w+])(?:\+91[ -]?|0)?[6-9]\d{4}[ -]?\d{5}(?!\w)")
 _IPV4_RX = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
-_PREFIXED_ID_RX = re.compile(r"^([A-Za-z]{1,12}[_\-])(.+)$")
+# keep a short prefix only when the rest is a number / hex id (u_42891, emp-00123); "rverma_admin" is a handle, tokenised whole
+_PREFIXED_ID_RX = re.compile(r"^([A-Za-z]{1,4}[_\-])(\d{2,}|[0-9a-f]{6,})$")
 
 _MIN_LITERAL_LEN = 3
 

@@ -34,8 +34,8 @@ public final class Syslog {
         Matcher m = HOST.matcher(line);
         if (!m.find()) return Optional.empty();
         String h = m.group("host");
-        // a bare "%FACILITY" or a month name is not a host
-        if (h.startsWith("%") || h.matches("[A-Z][a-z]{2}")) return Optional.empty();
+        // a bare "%FACILITY", a month name or a timezone token (UTC, IST, GMT…) is not a host
+        if (h.startsWith("%") || h.matches("[A-Z][a-z]{2}") || h.matches("[A-Z]{2,5}")) return Optional.empty();
         return Optional.of(h);
     }
 
@@ -48,8 +48,8 @@ public final class Syslog {
 
     /** Minimal field read for a flat JSON record: {@code "name": "value"}. Good enough for a key. */
     static Optional<String> jsonField(String json, String name) {
-        Matcher m = Pattern.compile("\"" + Pattern.quote(name) + "\"\\s*:\\s*\"(?<v>[^\"]*)\"").matcher(json);
-        return m.find() ? Optional.of(m.group("v")) : Optional.empty();
+        Matcher m = Pattern.compile("\"" + Pattern.quote(name) + "\"\\s*:\\s*\"(?<v>(?:[^\"\\\\]|\\\\.)*)\"").matcher(json);
+        return m.find() ? Optional.of(m.group("v").replace("\\\"", "\"").replace("\\\\", "\\")) : Optional.empty();
     }
 
     public static String sha1(String s) {

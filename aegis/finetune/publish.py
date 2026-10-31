@@ -26,11 +26,17 @@ from pathlib import Path
 
 
 def _tar_adapter(adapter: Path, out: Path) -> tuple[str, int]:
-    with tarfile.open(out, "w:gz") as tar:
+    # dereference: HF caches symlink weight files, and every installation's extractor refuses link members
+    with tarfile.open(out, "w:gz", dereference=True) as tar:
         for p in sorted(adapter.iterdir()):
             if p.name in ("gate.json", ".complete") or p.name.startswith("."):
                 continue
             tar.add(p, arcname=p.name)
+    # self-check: the archive must pass exactly the member test the installations apply
+    with tarfile.open(out, "r:gz") as tar:
+        for m in tar.getmembers():
+            if m.issym() or m.islnk() or m.isdev() or m.name.startswith(("/", "..")) or "/../" in m.name:
+                raise SystemExit(f"archive member {m.name!r} would be refused by installations — fix the adapter directory")
     h = hashlib.sha256()
     with out.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):

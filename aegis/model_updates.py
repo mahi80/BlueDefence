@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -83,6 +84,13 @@ def verify_manifest(token: str, keys: dict[str, tuple[int, int]] | None = None) 
         return None, f"malformed manifest ({type(exc).__name__})"
 
 
+def _vkey(v: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
+
+
 def in_rollout(installation_id: str, pct: int) -> bool:
     """Stable bucket 0..99 from the installation id; a release at rollout_pct=10 reaches the same 10 % every day."""
     if pct >= 100:
@@ -120,15 +128,19 @@ def _sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
+_VERSION_RX = re.compile(r"^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,3}$")
+MAX_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024      # an adapter is tens of MB; a manifest asking for more is wrong
+
+
 def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
+    root = dest.resolve()
     for m in tar.getmembers():
         target = (dest / m.name).resolve()
-        if not str(target).startswith(str(dest.resolve())) or m.issym() or m.islnk():
+        if not (target == root or target.is_relative_to(root)) or m.issym() or m.islnk() or m.isdev():
             raise RuntimeError(f"unsafe member in release archive: {m.name}")
-    try:
-        tar.extractall(dest, filter="data")   # py ≥ 3.12: strips absolute paths, links, device nodes, odd modes
-    except TypeError:                          # older interpreters: members were checked above
-        tar.extractall(dest)  # noqa: S202
+    if not hasattr(tarfile, "data_filter"):
+        raise RuntimeError("this Python lacks tarfile.data_filter (needs 3.11.4+/3.12) — refusing to extract a downloaded archive")
+    tar.extractall(dest, filter="data")   # strips absolute paths, links, device nodes, odd modes
 
 
 # ---------------------------------------------------------------- client --
@@ -158,6 +170,10 @@ def download_and_install(res: dict, *, dest_root: Path, keys: dict | None = None
     if rel is None:
         raise RuntimeError(f"release manifest rejected: {why}")
     version = str(rel["version"])
+    if not _VERSION_RX.match(version):
+        raise RuntimeError(f"release version {version!r} is not a valid version string")
+    if not 0 < int(rel["size"]) <= MAX_ARCHIVE_BYTES:
+        raise RuntimeError(f"manifest size {rel['size']} is out of range")
     target = dest_root / version
     if (target / ".complete").exists():
         return {**rel, "adapter": str(target), "already": True}
@@ -166,8 +182,12 @@ def download_and_install(res: dict, *, dest_root: Path, keys: dict | None = None
         tmp_path = Path(tmp.name)
         try:
             req = urllib.request.Request(res["url"], headers={"User-Agent": "aegis-model-updates/1"})
+            got_bytes = 0
             with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — URL came from the verified service response
                 for chunk in iter(lambda: r.read(1 << 20), b""):
+                    got_bytes += len(chunk)
+                    if got_bytes > int(rel["size"]):
+                        raise RuntimeError(f"download exceeds the manifest size {rel['size']}")
                     tmp.write(chunk)
         except Exception:
             tmp_path.unlink(missing_ok=True)
@@ -202,24 +222,49 @@ def write_pointer(rel: dict, *, pointer: Path, previous: str = "") -> dict:
            "base_model": rel["base_model"], "channel": rel["channel"], "promoted_at": int(time.time()), "approved_by": "bluedefence-release",
            "notes": rel.get("notes", ""), "previous": previous}
     pointer.parent.mkdir(parents=True, exist_ok=True)
-    pointer.write_text(json.dumps(ptr, indent=1))
+    tmp = pointer.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(ptr, indent=1))
+    os.replace(tmp, pointer)                   # atomic: hot_reload / current_version never see a torn pointer
     return ptr
+
+
+def _load_into_vllm(rel: dict, env: dict) -> None:
+    """On the vLLM backend the adapter has to be registered with the server before the pointer flips, or every
+    triage would 404 against a LoRA name vLLM has never heard of. Raises on failure (the pointer is then not written)."""
+    backend = (env.get("LLM_BACKEND") or env.get("AEGIS_LLM_BACKEND") or "").strip().lower()
+    if backend != "vllm":
+        return
+    from aegis.finetune.vllm_registry import VLLMAdapterRegistry
+    ok, how = VLLMAdapterRegistry().load(str(rel["version"]), str(rel["adapter"]))
+    if not ok:
+        raise RuntimeError(f"vLLM refused to load adapter {rel['version']} ({how}); keeping the current model")
+    logger.info("[model_updates] vLLM %s adapter %s", how, rel["version"])
 
 
 def update_once(*, server: str, token: str, installation_id: str, env: dict | None = None) -> dict:
     """One check → (download → verify → install → point) cycle. Never raises; returns what happened."""
     env = os.environ if env is None else env
     channel = env.get("AEGIS_MODEL_CHANNEL", "stable").strip() or "stable"
-    base = env.get("AEGIS_MODEL_BASE", "").strip() or env.get("AEGIS_MODEL", "").strip() or "any"
+    base = env.get("AEGIS_MODEL_BASE", "").strip() or env.get("AEGIS_MODEL", "").strip()
     cur = current_version(env)
+    if not base:
+        return {"updated": False, "reason": "AEGIS_MODEL_BASE (or AEGIS_MODEL) is not set — an adapter is only safe on the base it was "
+                                           "trained for, so no release is requested", "current": cur}
     try:
         res = check(server, token, channel=channel, base_model=base, current=cur)
         if res is None:
             return {"updated": False, "reason": "up to date", "current": cur}
-        rel = res.get("release") or {}
+        rel, why = verify_manifest(res["manifest_token"])
+        if rel is None:
+            return {"updated": False, "reason": f"release manifest rejected: {why}", "current": cur}
+        if str(rel.get("channel")) != channel or rel.get("base_model") not in (base, "any"):
+            return {"updated": False, "reason": f"release {rel.get('version')} is for {rel.get('channel')}/{rel.get('base_model')}, not {channel}/{base}", "current": cur}
+        if cur and _vkey(str(rel.get("version"))) <= _vkey(cur):
+            return {"updated": False, "reason": f"offered {rel.get('version')} is not newer than {cur} (downgrade refused)", "current": cur}
         if not in_rollout(installation_id, int(rel.get("rollout_pct", 100))):
             return {"updated": False, "reason": "not in this release's rollout yet", "current": cur, "offered": rel.get("version")}
         installed = download_and_install(res, dest_root=model_dir(env))
+        _load_into_vllm(installed, env)
         write_pointer(installed, pointer=pointer_path(env), previous=cur)
         logger.info("[model_updates] installed %s (%s, %s) → %s; hot-reload applies it", installed["version"], installed["channel"],
                     installed["base_model"], installed["adapter"])
@@ -237,6 +282,12 @@ def _prune(root: Path, keep: set[str], max_keep: int = 3) -> None:
     for p in done[max_keep:]:
         if p.name not in keep:
             shutil.rmtree(p, ignore_errors=True)
+    for part in root.glob("*.part"):                          # a download that died mid-way
+        try:
+            if time.time() - part.stat().st_mtime > 3600:
+                part.unlink()
+        except OSError:
+            pass
 
 
 def rollback(env: dict | None = None) -> dict:

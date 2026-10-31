@@ -331,3 +331,77 @@ def test_losing_the_last_redundant_uplink_widens_the_incident_instead_of_folding
     # and the access switches behind it are now symptoms of THAT incident
     assert d.observe(_down("ACC-01", "GigabitEthernet1/0/49", T + 41)) == []
     assert d.incident_for(second["id"])["suppressed"] == 1
+
+
+# ------------------------------------------------------------ review round 1 regressions --
+
+def test_relay_headers_and_odd_timestamps_are_handled():
+    """N2 / N3 / N4: rsyslog/syslog-ng wrappers parse (host taken from the relay header), nanosecond clocks are
+    scaled, and a line with no hostname is never a per-device fault."""
+    from aegis.ingest.netops import _ts_any
+    ev = parse_syslog_line("<189>Oct 29 20:05:01 SW1 123: *Oct 29 20:05:01.123 UTC: %LINK-3-UPDOWN: Interface Gi1/0/5, changed state to down")
+    assert ev and ev["device"] == "SW1" and ev["state"] == "down" and ev["iface"] == "GigabitEthernet1/0/5"
+    ev = parse_syslog_line("<189>1 2026-10-29T20:05:01Z SW2 - - - %LINK-3-UPDOWN: Interface Gi1/0/6, changed state to down")
+    assert ev and ev["device"] == "SW2" and ev["state"] == "down"
+    ev = parse_syslog_line("<189>Oct 29 20:05:01 10.1.2.3 123: %LINK-3-UPDOWN: Interface Gi1/0/7, changed state to down")
+    assert ev and ev["device"] == "10.1.2.3"
+    assert abs(_ts_any(1700000000000000000) - 1.7e9) < 1 and abs(_ts_any(1700000000000) - 1.7e9) < 1 and _ts_any("nan") is None
+    d = _campus()
+    anon = parse_syslog_line("<189>123: *Oct 29 20:05:01.123 UTC: %LINK-3-UPDOWN: Interface Gi1/0/5, changed state to down", ts=T + 1)
+    assert anon["device"] == "unknown"
+    for i in range(8):
+        assert d.observe({**anon, "ts": T + 1 + i}) == []
+    # a telemetry record from the year 53 million does not declare the estate dead
+    assert d.observe({"kind": "telemetry", "device": "CORE-01", "iface": "x", "ts": 1.7e15, "counters": {}}) == []
+    assert d.observe({"kind": "telemetry", "device": "DIST-01", "iface": "x", "ts": "nan", "counters": {}}) == []
+    assert d.stats["device_unreachable"] == 0
+
+
+def test_syslog_only_devices_are_never_silent_and_both_ends_close_the_incident():
+    """N1 / N6."""
+    d = _campus(silent_s=180.0)
+    d.observe(parse_syslog_line("<189>DIST-01: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (10.9.9.9)", ts=T))
+    assert d.observe(_down("ACC-01", "GigabitEthernet1/0/7", T + 400)) == []       # DIST-01 has only ever sent syslog: not "silent"
+    assert d.stats["device_unreachable"] == 0
+    # CORE-01 reports first, DIST-02 later reports the up: the incident must still close
+    (a,) = d.observe(_down("CORE-01", "Ethernet1/3", T + 500, nxos=True))
+    assert a["device"] == "CORE-01"
+    d.observe(_up("DIST-02", "Ethernet1/49", T + 600))
+    assert next(i for i in d._incidents if i.alert_id == a["id"]).closed is not None
+    (b,) = d.observe(_down("ACC-02", "GigabitEthernet1/0/49", T + 600 + 1000))
+    assert b["device"] == "ACC-02"                                                   # not suppressed under a closed incident
+
+
+def test_flap_counts_physical_transitions_once_and_parallel_links_are_redundant():
+    """N5 / N7."""
+    d = _campus(flap_n=5, flap_window_s=300)
+    # one unplug/replug + one unplug, each announced by LINK and LINEPROTO: 3 transitions, not 5
+    for ts, st in ((T + 1, "down"), (T + 1.5, "down"), (T + 20, "up"), (T + 20.5, "up"), (T + 40, "down")):
+        out = d.observe(_down("ACC-01", "GigabitEthernet1/0/7", ts) if st == "down" else _up("ACC-01", "GigabitEthernet1/0/7", ts))
+        assert out == [], out
+    assert d.stats["flaps"] == 0
+    # DIST-02 gets a second uplink to CORE-01 (LACP member): losing one of the two is redundant, nothing downstream
+    d.observe({"kind": "topology", "device": "DIST-02", "neighbor": "CORE-01", "iface": "Ethernet1/50", "neighbor_iface": "Ethernet1/4", "ts": T})
+    (a,) = d.observe(_down("DIST-02", "Ethernet1/50", T + 100, nxos=True))
+    assert a["severity"] == "medium" and a["netops"]["redundant"] is True and a["netops"]["downstream_count"] == 0
+
+
+def test_topology_learned_after_the_fault_keeps_the_root_cause():
+    """N8: LLDP arriving after the first syslog (service restarted mid-outage) inherits the pseudo-link's state."""
+    d = NetworkAssurance(clock=lambda: T)
+    d.observe(_down("DIST-01", "Ethernet1/49", T + 1, nxos=True))                   # nothing known yet: tracked as a pseudo-link
+    for a, ai, b, bi in [("DIST-01", "Ethernet1/49", "CORE-01", "Ethernet1/2"), ("ACC-01", "GigabitEthernet1/0/49", "DIST-01", "Ethernet1/5")]:
+        d.observe({"kind": "topology", "device": a, "neighbor": b, "iface": ai, "neighbor_iface": bi, "ts": T + 2})
+    link = d._iface_link[("DIST-01", "Ethernet1/49")]
+    assert link.state == "down" and link.b == "CORE-01"
+    # the access switch's alarm is a symptom of the known-down uplink, not a new fault
+    assert d.observe(_down("ACC-01", "GigabitEthernet1/0/49", T + 3)) == [] or d.stats["link_down"] <= 1
+
+
+def test_stale_ticket_does_not_shield_a_new_push():
+    """N9."""
+    d = _campus(bad_push_s=600)
+    d.observe({"kind": "config", "device": "DIST-02", "ts": T, "change_ticket": "CHG-1", "config_hash": "a1"})
+    d.observe(parse_syslog_line("<189>DIST-02: %SYS-5-CONFIG_I: Configured from console by rverma on vty0 (10.1.2.3)", ts=T + 2 * 86400))
+    (a,) = d.observe(_down("DIST-02", "Ethernet1/49", T + 2 * 86400 + 60, nxos=True))
+    assert a["netops"]["fault"] == "bad_config_push" and a["netops"]["user"] == "rverma" and a["netops"]["source_ip"] == "10.1.2.3"

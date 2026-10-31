@@ -133,7 +133,10 @@ def rsa_verify(msg: bytes, sig: bytes, n: int, e: int) -> bool:
     if len(sig) != k:
         return False
     try:
-        em = _i2b(pow(_b2i(sig), e, n), k)
+        si = _b2i(sig)
+        if si >= n:                                            # RFC 8017 §8.2.2 step 2: one encoding per signature
+            return False
+        em = _i2b(pow(si, e, n), k)
         return secrets.compare_digest(em, _emsa_pkcs1_v15(msg, k))
     except (ValueError, OverflowError):
         return False
@@ -201,8 +204,14 @@ def load_public_keys(where: str | Path | None = None) -> dict[str, tuple[int, in
     for f in files:
         try:
             k = json.loads(f.read_text())
-            out[str(k["kid"])] = (int(k["n"], 16), int(k["e"]))
-        except (OSError, ValueError, KeyError) as exc:
+            if not isinstance(k, dict):
+                raise ValueError("not a JSON object")
+            kid = str(k["kid"])
+            if kid in out:
+                logger.warning("[license] duplicate kid %s in %s ignored (first file wins)", kid, f)
+                continue
+            out[kid] = (int(k["n"], 16), int(k["e"]))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.warning("[license] public key %s unreadable: %s", f, exc)
     return out
 
@@ -222,25 +231,40 @@ def write_keypair(out_dir: Path, kid: str, bits: int = 3072) -> tuple[Path, Path
 
 # -------------------------------------------------------------- installation --
 
+def machine_hash(env: MutableMapping[str, str] | None = None) -> str:
+    """The hardware/OS-derived part of the id, before any ``AEGIS_INSTALL_ID`` pin. Sent in the heartbeat
+    so the licence service can see several machines hiding behind one pinned id."""
+    env = os.environ if env is None else env
+    parts: list[str] = []
+    for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            mid = Path(p).read_text().strip()
+            if mid:
+                parts.append(mid)
+                break
+        except OSError:
+            continue
+    if not parts:
+        # no machine-id (Windows, some containers): MAC-derived node id + hostname. uuid.getnode() returns a
+        # RANDOM value when no hardware address is readable (multicast bit set) — then the id will not survive
+        # a restart, so pin AEGIS_INSTALL_ID on such hosts.
+        node = uuid.getnode()
+        if node & (1 << 40):
+            logger.warning("[license] no machine-id and no hardware address: the installation id is not stable — set AEGIS_INSTALL_ID")
+        parts += [f"{node:x}", socket.gethostname()]
+    parts += [platform.machine(), env.get("AEGIS_INSTALL_SALT", "")]
+    return "bd-" + hashlib.sha256("|".join(parts).encode()).hexdigest()[:20]
+
+
 def installation_id(env: MutableMapping[str, str] | None = None) -> str:
-    """Stable per-installation id: ``AEGIS_INSTALL_ID`` if the operator pins one (clusters), else
-    sha256(machine-id | hostname | salt)[:20]. Printed in the banner and ``/healthz``; the order to
-    the issuer carries it; the licence is bound to it, so one file does not run five sites."""
+    """Stable per-installation id: ``AEGIS_INSTALL_ID`` if the operator pins one (clusters, containers), else
+    derived from /etc/machine-id (Linux) or the hardware address + hostname. Printed in the banner; the order
+    to the issuer carries it; the licence is bound to it, so one file does not run five sites."""
     env = os.environ if env is None else env
     pinned = env.get("AEGIS_INSTALL_ID", "").strip()
     if pinned:
         return pinned
-    parts = []
-    for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
-        try:
-            parts.append(Path(p).read_text().strip())
-            break
-        except OSError:
-            continue
-    if not parts:
-        parts.append(f"{uuid.getnode():x}")
-    parts += [socket.gethostname(), platform.machine(), env.get("AEGIS_INSTALL_SALT", "")]
-    return "bd-" + hashlib.sha256("|".join(parts).encode()).hexdigest()[:20]
+    return machine_hash(env)
 
 
 # ------------------------------------------------------------------ licence --
@@ -295,6 +319,8 @@ def decode(token: str, keys: dict[str, tuple[int, int]]) -> tuple[License | None
     try:
         h, b, s = token.strip().split(".")
         header = json.loads(_unb64u(h))
+        if not isinstance(header, dict):
+            return None, "malformed licence header"
         kid = str(header.get("kid", ""))
         if header.get("alg") != "RS256" or header.get("typ") != "AEGIS-LICENSE":
             return None, "unsupported licence format"
@@ -304,10 +330,12 @@ def decode(token: str, keys: dict[str, tuple[int, int]]) -> tuple[License | None
         if not rsa_verify(f"{h}.{b}".encode(), _unb64u(s), n, e):
             return None, "signature does not verify"
         p = json.loads(_unb64u(b))
+        if not isinstance(p, dict):
+            return None, "malformed licence payload"
         if int(p.get("v", 0)) != 1:
             return None, f"unsupported licence version {p.get('v')}"
         return License.from_payload(p, kid), ""
-    except (ValueError, TypeError, KeyError) as exc:
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
         return None, f"malformed licence ({type(exc).__name__})"
 
 
@@ -426,13 +454,17 @@ def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> L
     if state.status == "expired":
         raise LicenseError(f"[license] {state.reason}. Renew the licence (installation {state.installation_id}); "
                            f"audit/verify/export tools keep working: python -m aegis.license verify")
-    wanted = env.get("AEGIS_EDITION", "").strip().lower() or "external"
+    explicit = env.get("AEGIS_EDITION", "").strip().lower()
+    wanted = explicit or "full"                                   # aegis.edition.current() defaults to full — mirror it
     if EDITION_RANK.get(wanted, 0) > EDITION_RANK[state.effective_edition]:
-        if state.licensed:
+        if state.licensed and explicit:
             raise LicenseError(f"[license] AEGIS_EDITION={wanted} but the licence covers '{state.effective_edition}' — "
                                f"set AEGIS_EDITION={state.effective_edition} or upgrade the licence")
-        logger.warning("[license] evaluation mode: AEGIS_EDITION=%s downgraded to external", wanted)
-        env["AEGIS_EDITION"] = "external"
+        logger.warning("[license] %s: edition %s is not licensed — running as %s",
+                       "evaluation mode" if not state.licensed else "licence", wanted, state.effective_edition)
+        env["AEGIS_EDITION"] = state.effective_edition
+    elif not explicit:
+        env["AEGIS_EDITION"] = state.effective_edition
     forced: dict[str, str] = {}
     for feat, offs in FEATURE_ENV_OFF.items():
         if feat not in state.effective_features:
@@ -451,9 +483,20 @@ def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> L
     return state
 
 
+_CACHE: dict[str, Any] = {"state": None, "at": 0.0}
+
+
+def cached_state(max_age_s: float = 60.0) -> LicenseState:
+    """``check()`` is an RSA verify + file read: fine per cycle, not per record. Hot paths use this."""
+    now = time.time()
+    if _CACHE["state"] is None or now - _CACHE["at"] > max_age_s:
+        _CACHE["state"], _CACHE["at"] = check(), now
+    return _CACHE["state"]
+
+
 def allows(feature: str, state: LicenseState | None = None) -> bool:
-    """Feature gate for code paths that are not env-driven (the Kafka bridge endpoint, compliance pack)."""
-    st = state or check()
+    """Feature gate for code paths that are not env-driven (netops ingest, DPO retraining, compliance pack)."""
+    st = state or cached_state()
     return (not st.enforce) or feature in st.effective_features
 
 
@@ -545,13 +588,24 @@ def heartbeat_payload(*, installation_id: str, audit_path: Path | None, counters
     flags = {k: env.get(k, "") for k in ("AEGIS_EDITION", "AEGIS_ENFORCEMENT_MODE", "AEGIS_DATASET_CAPTURE", "AEGIS_CONTRIB",
                                          "AEGIS_LICENSE_ENFORCE", "LLM_BACKEND", "AEGIS_SWARM")}
     return {"installation_id": installation_id, "ts": int(time.time()), "chains_total": chains, "audit_tail_hash": tail,
-            "code_fingerprint": code_fingerprint(), "flags": flags, "counters": dict(counters or {}),
-            "contrib_cursor": contrib_cursor, "host": platform.node(), "python": platform.python_version()}
+            "code_fingerprint": code_fingerprint(), "machine_hash": machine_hash(env), "pinned": bool(env.get("AEGIS_INSTALL_ID", "").strip()),
+            "flags": flags, "counters": dict(counters or {}), "contrib_cursor": contrib_cursor, "host": platform.node(),
+            "python": platform.python_version()}
+
+
+def _require_https(server: str) -> None:
+    """The licence token is a credential: it travels only over TLS (loopback excepted for tests/dev)."""
+    from urllib.parse import urlsplit
+    u = urlsplit(server)
+    if u.scheme == "https" or u.hostname in ("127.0.0.1", "localhost", "::1"):
+        return
+    raise LicenseError(f"licence service URL must be https:// (got {u.scheme}://{u.hostname})")
 
 
 def _post(server: str, path: str, body: dict, token: str, *, timeout: float = 20.0) -> dict:
     import urllib.error
     import urllib.request
+    _require_https(server)
     req = urllib.request.Request(server.rstrip("/") + path, data=json.dumps(body).encode(), method="POST",
                                  headers={"Content-Type": "application/json", "User-Agent": "aegis-license/1",
                                           **({"Authorization": "Bearer " + token.strip()} if token else {})})
@@ -582,6 +636,31 @@ def renew(server: str, token: str) -> dict:
     return res
 
 
+def install_token(token: str, dest: Path, *, env: MutableMapping[str, str] | None = None, keys: dict | None = None) -> License:
+    """Write a (renewed / activated) token only after it verifies and is for this installation; atomic replace,
+    previous file kept as ``.prev``. A bad token from the service must never destroy the good one."""
+    lic, why = decode(token, keys if keys is not None else load_public_keys())
+    if lic is None:
+        raise LicenseError(f"refusing to install token: {why}")
+    inst = installation_id(env)
+    if lic.installation_id and lic.installation_id != inst:
+        raise LicenseError(f"refusing to install token: bound to {lic.installation_id}, this is {inst}")
+    if time.time() > lic.expires + lic.grace_days * 86400:
+        raise LicenseError("refusing to install token: already expired")
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp.write_text(token.strip() + "\n")
+    if dest.exists():
+        try:
+            dest.replace(dest.with_suffix(dest.suffix + ".prev"))
+        except OSError:
+            pass
+    os.replace(tmp, dest)
+    _CACHE["state"] = None
+    return lic
+
+
 def token_path(env: MutableMapping[str, str] | None = None) -> Path | None:
     """Where the licence file lives, if it is a file (so a renewed token can be written back)."""
     env = os.environ if env is None else env
@@ -599,6 +678,7 @@ def activate(server: str, code: str, inst: str) -> dict:
     Raises ``LicenseError`` with the service's message on 4xx/5xx. Only the installation id leaves the host."""
     import urllib.error
     import urllib.request
+    _require_https(server)
     req = urllib.request.Request(server.rstrip("/") + "/activate", data=json.dumps({"code": code.strip().upper(), "installation_id": inst}).encode(),
                                  headers={"Content-Type": "application/json", "User-Agent": "aegis-license/1"}, method="POST")
     try:
@@ -699,7 +779,7 @@ def main(argv: list[str] | None = None) -> int:
         if not a.server:
             ap.error("--server (or AEGIS_LICENSE_SERVER) is required")
         res = activate(a.server, a.code, installation_id())
-        Path(a.out).write_text(res["token"] + "\n")
+        install_token(res["token"], Path(a.out))
         print(f"licence {res['lic']} for {res.get('customer', '')} bound to {installation_id()} → {a.out}"
               + (" (re-issued: this installation had already redeemed the code)" if res.get("reissued") else ""))
         print(f"set AEGIS_LICENSE={Path(a.out).resolve()} and AEGIS_LICENSE_ENFORCE=1, then: python -m aegis.license verify")
@@ -719,7 +799,7 @@ def main(argv: list[str] | None = None) -> int:
         res = renew(a.server, tok)
         dest = token_path(env)
         if dest:
-            dest.write_text(res["token"] + "\n")
+            install_token(res["token"], dest, env=env)
         print(f"renewed {res.get('lic')}: token valid until {time.strftime('%Y-%m-%d', time.gmtime(float(res.get('expires', 0))))}"
               + (f" → {dest}" if dest else " (inline token: set AEGIS_LICENSE to the new value)"))
         return 0
@@ -727,11 +807,9 @@ def main(argv: list[str] | None = None) -> int:
         st = check()
         rep = usage_report(st, None, audit_path=Path(a.audit))
         if a.push:
-            import urllib.request
-            req = urllib.request.Request(a.push.rstrip("/") + "/usage", data=json.dumps({"report": rep}).encode(),
-                                         headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=20) as r_:
-                print(f"usage report pushed ({r_.status})")
+            tok, _ = _read_token(os.environ)
+            _post(a.push, "/usage", {"report": rep}, tok)
+            print("usage report pushed")
         text = json.dumps(rep, indent=1)
         if a.out:
             Path(a.out).write_text(text + "\n")
@@ -743,7 +821,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = ["License", "LicenseState", "LicenseMeter", "LicenseError", "check", "apply", "allows", "issue", "decode", "activate",
-           "renew", "heartbeat", "heartbeat_payload", "code_fingerprint", "token_path",
+           "renew", "heartbeat", "heartbeat_payload", "code_fingerprint", "token_path", "install_token", "machine_hash", "cached_state",
            "installation_id", "load_public_keys", "write_keypair", "usage_report", "rsa_keygen", "rsa_sign", "rsa_verify",
            "ALL_FEATURES", "TIERS", "TIER_DEFAULTS"]
 

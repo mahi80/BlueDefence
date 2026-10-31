@@ -43,7 +43,7 @@ from .scrub import Scrubber, scrubber_from_env
 logger = logging.getLogger("aegis.dataset.contrib")
 
 BUNDLE_SCHEMA = "aegis-contrib/1"
-MAX_RECORDS = 5000
+MAX_RECORDS = int(os.environ.get("AEGIS_CONTRIB_MAX_RECORDS", "2000") or 2000)   # ~1 MB compressed at typical chain size
 
 
 # ----------------------------------------------------------------- redact --
@@ -104,7 +104,8 @@ def _decisions(hitl_dir: Path | None) -> dict[str, list[HumanDecision]]:
             if not aid:
                 continue
             out.setdefault(aid, []).append(HumanDecision(
-                approval_id=str(d["approval_id"]), action_type=str(card.get("action") or d.get("action_type") or ""),
+                approval_id=str(d["approval_id"]),
+                action_type=str(args.get("action_type") or d.get("action_type") or str(card.get("action") or "").split(" -> ")[0]),
                 target=str(args.get("target") or d.get("target") or "")[:200],
                 decision=str(d.get("status") or d.get("decision") or "pending").lower(),
                 decided_by_role=str(d.get("decided_by_role") or d.get("role") or "analyst"),
@@ -113,6 +114,23 @@ def _decisions(hitl_dir: Path | None) -> dict[str, list[HumanDecision]]:
                 corrected_verdict=str(d.get("corrected_verdict") or d.get("verdict") or ""),
             ))
     return out
+
+
+MAX_PUSH_BYTES = 5 * 1024 * 1024
+MAX_INFLATED_BYTES = 64 * 1024 * 1024
+
+
+def _write_quarantine(cursor_path: Path | str | None, items: list[dict]) -> None:
+    """Keep a local note of what the gate held back (ids + finding kinds/paths only, never the values)."""
+    if not cursor_path:
+        return
+    try:
+        q = Path(cursor_path).with_suffix(".quarantine.jsonl")
+        with q.open("a", encoding="utf-8") as fh:
+            for it in items:
+                fh.write(json.dumps({"ts": int(time.time()), **it}, separators=(",", ":")) + "\n")
+    except OSError as e:
+        logger.warning("[contrib] could not write quarantine note: %s", e)
 
 
 def read_cursor(path: Path | None) -> int:
@@ -140,6 +158,10 @@ def build_bundle(audit_path: Path | str, *, installation_id: str, license_id: st
     order: list[str] = []
     new_cursor = cursor
     if p.exists():
+        if cursor > p.stat().st_size:
+            logger.warning("[contrib] audit log is shorter than the cursor (%d > %d) — rotated or truncated; reading from the start",
+                           cursor, p.stat().st_size)
+            cursor = new_cursor = 0
         with p.open("rb") as fh:
             fh.seek(cursor)
             while True:
@@ -169,7 +191,11 @@ def build_bundle(audit_path: Path | str, *, installation_id: str, license_id: st
                                              human=decisions.get(aid) or [], source_system=installation_id))
         except Exception as e:  # noqa: BLE001 — one odd chain must not stop the batch
             logger.warning("[contrib] chain %s skipped: %s", aid, str(e)[:120])
-    salt = os.environ.get("AEGIS_DATASET_SALT", "") or installation_id
+    salt = os.environ.get("AEGIS_DATASET_SALT", "")
+    if not salt:
+        # the installation id is in the same bundle, so a key derived from it protects nothing; mark the bundle
+        # unsalted — contribute() refuses to send it and the service refuses to store it
+        salt = "unsalted|" + installation_id
     rows = [redact_for_contrib(asdict(r), salt) for r in records]
     for r in rows:
         r["source_system"] = installation_id                 # the only identity the bundle carries: the installation's
@@ -182,7 +208,8 @@ def build_bundle(audit_path: Path | str, *, installation_id: str, license_id: st
         "by_alert_type": _count(rows, lambda r: ((r.get("alert") or {}).get("alert_type") or (r.get("alert") or {}).get("source") or "unknown")),
     }
     bundle = {"schema": BUNDLE_SCHEMA, "record_schema": SCHEMA_VERSION, "installation_id": installation_id, "license_id": license_id,
-              "generated_at": int(time.time()), "scrubbed": True, "salted": sc.salted, "counts": counts, "records": rows}
+              "generated_at": int(time.time()), "scrubbed": True, "salted": bool(sc.salted and os.environ.get("AEGIS_DATASET_SALT")),
+              "counts": counts, "records": rows}
     return bundle, new_cursor
 
 
@@ -217,8 +244,12 @@ def push_bundle(server: str, bundle: dict, license_token: str, *, timeout: float
     import urllib.error
     import urllib.request
     data = gzip.compress(json.dumps(bundle, separators=(",", ":")).encode())
+    if len(data) > MAX_PUSH_BYTES:
+        raise RuntimeError(f"bundle is {len(data) // 1024} KB compressed — over the {MAX_PUSH_BYTES // (1024 * 1024)} MB limit; "
+                           "lower AEGIS_CONTRIB_MAX_RECORDS")
+    # application/gzip: the HTTP API base64-encodes binary media types; as application/json it would be mangled as text
     req = urllib.request.Request(server.rstrip("/") + "/contrib", data=data, method="POST",
-                                 headers={"Content-Type": "application/json", "Content-Encoding": "gzip",
+                                 headers={"Content-Type": "application/gzip", "Content-Encoding": "gzip",
                                           "Authorization": "Bearer " + license_token.strip(), "User-Agent": "aegis-contrib/1"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -240,12 +271,29 @@ def contribute(*, audit_path: Path | str, installation_id: str, license_token: s
     n = bundle["counts"]["records"]
     if n < min_records:
         return {"sent": False, "records": n, "reason": "nothing new"}
-    ok, found = check_bundle(bundle)
+    if not bundle.get("salted"):
+        logger.error("[contrib] AEGIS_DATASET_SALT is not set — pseudonyms would be reversible from the bundle itself; nothing sent")
+        return {"sent": False, "records": n, "reason": "unsalted (set AEGIS_DATASET_SALT)"}
+    # gate per record: one leaky record is quarantined and reported, the rest still go, and the cursor advances
+    clean, bad = privacy_gate.gate_records(bundle["records"])
+    quarantined: list[dict] = []
+    if bad:
+        for i, found in bad.items():
+            quarantined.append({"record_id": bundle["records"][i].get("record_id"), "findings": found[:5]})
+        logger.error("[contrib] privacy gate quarantined %d of %d record(s) e.g. %s — check what the capture is storing",
+                     len(bad), n, quarantined[0]["findings"][:2])
+        bundle["records"] = [bundle["records"][i] for i in clean]
+        bundle["counts"]["records"] = len(bundle["records"])
+        bundle["counts"]["quarantined"] = len(bad)
+        _write_quarantine(cursor_path, quarantined)
+    ok, found = check_bundle(bundle)                           # the envelope itself (counts, ids) must be clean too
     if not ok:
-        logger.error("[contrib] bundle refused by the privacy gate: %d finding(s) e.g. %s — nothing left this host; "
-                     "set AEGIS_DATASET_SALT and check what the capture is storing", len(found), found[:3])
+        logger.error("[contrib] bundle envelope refused by the privacy gate: %s", found[:3])
         return {"sent": False, "records": n, "reason": "privacy gate", "findings": found[:20]}
-    result: dict[str, Any] = {"sent": False, "records": n, "counts": bundle["counts"]}
+    if not bundle["records"]:
+        write_cursor(Path(cursor_path) if cursor_path else None, new_cursor)
+        return {"sent": False, "records": 0, "quarantined": len(bad), "reason": "all records quarantined"}
+    result: dict[str, Any] = {"sent": False, "records": len(bundle["records"]), "quarantined": len(bad), "counts": bundle["counts"]}
     if out:
         result["file"] = str(write_bundle(bundle, out))
     if server:
@@ -263,7 +311,12 @@ def contribute(*, audit_path: Path | str, installation_id: str, license_token: s
 def iter_bundles(folder: Path | str) -> Iterable[tuple[Path, dict]]:
     for p in sorted(Path(folder).rglob("*")):
         if p.suffix == ".gz" and p.name.endswith(".json.gz"):
-            yield p, json.loads(gzip.decompress(p.read_bytes()))
+            with gzip.open(p, "rb") as fh:
+                data = fh.read(MAX_INFLATED_BYTES + 1)
+            if len(data) > MAX_INFLATED_BYTES:
+                logger.warning("[contrib] %s inflates past %d MB — skipped", p, MAX_INFLATED_BYTES // (1024 * 1024))
+                continue
+            yield p, json.loads(data)
         elif p.suffix == ".json":
             yield p, json.loads(p.read_text(encoding="utf-8"))
 

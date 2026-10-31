@@ -37,6 +37,10 @@ def _plan(args: argparse.Namespace, preset, n_train: int, n_val: int) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from aegis.license import allows
+    if not allows("dpo"):
+        print("DPO retraining is not included in this installation's licence (feature 'dpo'); community installations get the pooled brain as model updates instead.", file=sys.stderr)
+        return 2
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="dataset dir or dpo/preferences.jsonl")
     ap.add_argument("--out", default="runs/triage-dpo", help="adapter output dir")

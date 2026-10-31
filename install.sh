@@ -32,7 +32,7 @@ LLM="deterministic"; VLLM_URL=""; VLLM_MODEL=""; LOCAL_MODEL=""
 SOURCES="stream"; INGEST_BIND="0.0.0.0:8787"; INGEST_TOKEN=""
 HITL="file"; EDITION="external"; NONINTERACTIVE=0; YES=0
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { if [[ -f "$0" ]]; then sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; else echo "see https://github.com/mahi80/BlueDefence#install"; fi; exit "${1:-0}"; }
 say()  { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
@@ -105,7 +105,7 @@ ok "$("$PY" --version), git $(git --version | awk '{print $3}')"
 say "user and directories"
 id aegis >/dev/null 2>&1 || useradd --system --home "$VAR" --shell /usr/sbin/nologin aegis
 mkdir -p "$PREFIX" "$ETC" "$VAR"/{hitl,models,contrib}
-chmod 750 "$ETC"; chown -R aegis:aegis "$VAR"
+chown root:aegis "$ETC"; chmod 750 "$ETC"; chown -R aegis:aegis "$VAR"     # the service must traverse /etc/aegis to read its licence
 ok "aegis user, $PREFIX $ETC $VAR"
 
 # ------------------------------------------------------------------ 3. code + venv
@@ -129,7 +129,8 @@ AEGIS="$PREFIX/venv/bin/python -m"
 
 # ------------------------------------------------------------------ 4. licence
 say "licence"
-INSTALL_ID=$(cd "$PREFIX/app" && $AEGIS aegis.license install-id)
+INSTALL_ID=$( { grep -s '^AEGIS_INSTALL_ID=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1)
+[[ -n "$INSTALL_ID" ]] || INSTALL_ID=$(cd "$PREFIX/app" && $AEGIS aegis.license install-id)     # derived once, then pinned in aegis.env
 echo "   installation id: $INSTALL_ID"
 if [[ -z "$MODE" ]]; then
   if [[ -f "$LIC_FILE" ]]; then MODE=keep
@@ -154,8 +155,10 @@ case $MODE in
     echo "   Terms: Community edition is free for 2 years; the model runs on this host; scrubbed evidence chains and analyst"
     echo "   decisions (never raw logs or identities) are contributed hourly. Full text: $PREFIX/app/license-server/TERMS-COMMUNITY.md"
     if [[ $YES -ne 1 && $NONINTERACTIVE -ne 1 ]]; then a=""; ask a "accept the Community terms? (yes/no)" "yes"; [[ $a == yes ]] || die "terms not accepted"; fi
-    body=$(printf '{"org":"%s","email":"%s","installation_id":"%s","accept_terms":true}' "$ORG" "$EMAIL" "$INSTALL_ID")
-    resp=$(curl -fsS -X POST "$SERVER/signup" -H 'content-type: application/json' -d "$body") || die "signup failed: $(curl -sS -X POST "$SERVER/signup" -H 'content-type: application/json' -d "$body" || true)"
+    body=$("$PY" -c 'import json,sys; print(json.dumps({"org": sys.argv[1], "email": sys.argv[2], "installation_id": sys.argv[3], "accept_terms": True}))' "$ORG" "$EMAIL" "$INSTALL_ID")
+    resp=$(curl -sS -w '\n%{http_code}' -X POST "$SERVER/signup" -H 'content-type: application/json' -d "$body") || die "signup failed: cannot reach $SERVER"
+    code=${resp##*$'\n'}; resp=${resp%$'\n'*}
+    [[ $code == 201 ]] || die "signup failed ($code): $resp"
     "$PY" - "$resp" "$LIC_FILE" <<'PYEOF'
 import json, sys, pathlib
 r = json.loads(sys.argv[1]); pathlib.Path(sys.argv[2]).write_text(r["token"] + "\n")
@@ -190,35 +193,46 @@ case $LLM in
 esac
 ask SOURCES "poll sources (comma: stream | waf | sentinel | splunk | ndr | netops; 'sample' adds demo alerts — not for production)" "$SOURCES"
 ask INGEST_BIND "ingest receiver bind (host:port) for WAF/syslog/Kafka-bridge pushes" "$INGEST_BIND"
+[[ -n "$INGEST_TOKEN" ]] || INGEST_TOKEN=$( { grep -s '^AEGIS_INGEST_TOKEN=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1)   # re-runs keep the token the relays already use
 [[ -n "$INGEST_TOKEN" ]] || INGEST_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+READ_TOKEN=$( { grep -s '^AEGIS_INGEST_READ_TOKEN=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$READ_TOKEN" ]] || READ_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 SALT=$( { grep -s '^AEGIS_DATASET_SALT=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$SALT" ]] || SALT=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 HOST_IP=$( { hostname -I 2>/dev/null || echo 127.0.0.1; } | awk '{print $1}')
 
 {
   echo "# BlueDefence / AEGIS — written by install.sh on $(date -u +%FT%TZ); edit and 'systemctl restart aegis-soc'"
   echo "AEGIS_EDITION=$EDITION"
-  echo "AEGIS_ENFORCEMENT_MODE=shadow            # flip to live per connector once the shadow report says so"
+  echo "# NOTE: systemd reads this file literally — a comment must be on its own line, never after a value."
+  echo "# pinned installation id: survives hostname/container changes; the licence is bound to it"
+  echo "AEGIS_INSTALL_ID=$INSTALL_ID"
+  echo "# flip to live per connector once the shadow report says so"
+  echo "AEGIS_ENFORCEMENT_MODE=shadow"
   echo "AEGIS_HITL_TRANSPORT=$HITL"
   echo "AEGIS_HITL_DIR=$VAR/hitl"
   echo "AEGIS_AUDIT_PATH=$VAR/audit.jsonl"
-  echo "AEGIS_SOURCES=$SOURCES                    # stream = only what is pushed to the receiver; add waf/sentinel/splunk/netops to poll"
+  echo "# stream = only what is pushed to the receiver; add waf/sentinel/splunk/netops to poll"
+  echo "AEGIS_SOURCES=$SOURCES"
   echo "AEGIS_CHECKPOINT=$VAR/ingest-checkpoint.json"
   echo "AEGIS_INGEST_HTTP=1"
   echo "AEGIS_INGEST_BIND=$INGEST_BIND"
+  echo "# push token for relays / WAF / Kafka bridge; the read token is for the bridge's verdict feed and SOAR only"
   echo "AEGIS_INGEST_TOKEN=$INGEST_TOKEN"
-  echo "AEGIS_DATASET_SALT=$SALT                   # keys the pseudonyms; never change it after go-live"
+  echo "AEGIS_INGEST_READ_TOKEN=$READ_TOKEN"
+  echo "# keys the pseudonyms; never change it after go-live"
+  echo "AEGIS_DATASET_SALT=$SALT"
   echo "AEGIS_MODEL_DIR=$VAR/models"
   echo "AEGIS_MODEL_POINTER=$VAR/models/current.json"
   case $LLM in
     vllm)  echo "LLM_BACKEND=vllm"; echo "AEGIS_VLLM_URL=$VLLM_URL"; echo "AEGIS_VLLM_MODEL=$VLLM_MODEL"; echo "AEGIS_MODEL_BASE=$VLLM_MODEL"; echo "AEGIS_HOT_RELOAD=1";;
     local) echo "LLM_BACKEND=local"; echo "AEGIS_MODEL=$LOCAL_MODEL"; echo "AEGIS_MODEL_BASE=$LOCAL_MODEL";;
     anthropic) echo "LLM_BACKEND=anthropic"; echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY";;
-    *) echo "LLM_BACKEND=mock                       # deterministic layer only until a model backend is configured";;
+    *) echo "# deterministic layer only until a model backend is configured"; echo "LLM_BACKEND=mock";;
   esac
   if [[ -f "$LIC_FILE" ]]; then
     echo "AEGIS_LICENSE=$LIC_FILE"
     echo "AEGIS_LICENSE_ENFORCE=1"
-    [[ -n "$SERVER" ]] && echo "AEGIS_LICENSE_SERVER=$SERVER         # heartbeat, renewal, contribution, model updates"
+    # heartbeat, renewal, contribution, model updates
+    [[ -n "$SERVER" ]] && echo "AEGIS_LICENSE_SERVER=$SERVER"
   fi
 } > "$ENV_FILE"
 chmod 640 "$ENV_FILE"; chown root:aegis "$ENV_FILE"
@@ -242,14 +256,30 @@ ExecStart=$PREFIX/venv/bin/python -m aegis.service --audit $VAR/audit.jsonl
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
-ProtectSystem=full
+ProtectSystem=strict
 ReadWritePaths=$VAR
+ReadOnlyPaths=$PREFIX/app $ETC
 PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+TimeoutStopSec=40
 
 [Install]
 WantedBy=multi-user.target
 EOF
-chown -R aegis:aegis "$PREFIX/app" 2>/dev/null || true
+chown -R root:aegis "$PREFIX/app" && chmod -R g-w,o-rwx "$PREFIX/app"            # the service user runs the code but cannot modify it
 HAVE_SYSTEMD=0; [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null && HAVE_SYSTEMD=1
 if [[ $HAVE_SYSTEMD -eq 1 ]]; then
   systemctl daemon-reload
@@ -282,15 +312,16 @@ $(printf '\033[1;32m')BlueDefence AEGIS is installed.$(printf '\033[0m')
   audit log      $VAR/audit.jsonl (append-only, hash-chained)
   approvals      $VAR/hitl/cards.jsonl → append decisions to $VAR/hitl/decisions.jsonl   (HITL transport: $HITL)
   installation   $INSTALL_ID   code fingerprint $FP
-  ingest token   $INGEST_TOKEN   (Authorization: Bearer … on every push to http://$HOST_IP:$PORT/ingest/*)
+  ingest token   in $ENV_FILE (AEGIS_INGEST_TOKEN; Authorization: Bearer … on every push to http://$HOST_IP:$PORT/ingest/*)
 
 Wire a feed (any one proves the install):
   WAF / CDN       POST http://$HOST_IP:$PORT/ingest/waf          NDJSON / CEF, gzip ok
   network syslog  POST http://$HOST_IP:$PORT/ingest/netops?feed=syslog   raw lines; LLDP as JSON rows
-  Kafka           kafka-bridge/ (Java) → AEGIS_URL=http://$HOST_IP:$PORT AEGIS_INGEST_TOKEN=$INGEST_TOKEN
+  Kafka           kafka-bridge/ (Java) → AEGIS_URL=http://$HOST_IP:$PORT AEGIS_INGEST_TOKEN=<from aegis.env> AEGIS_INGEST_READ_TOKEN=<from aegis.env>
   Zeek / Suricata POST http://$HOST_IP:$PORT/ingest/ndr?sensor=zeek
   runbook         $PREFIX/app/docs/runbooks/wiring-feeds.md
 
 Smoke test now:   cd $PREFIX/app && sudo -u aegis $PREFIX/venv/bin/python -m aegis.service --once
-Re-run this installer any time to change the answers; it keeps the licence, salt and audit log.
+Re-run this installer any time to change the answers; it keeps the licence, salt, ingest tokens and audit log.
+The receiver is plain HTTP on the internal network — put it behind TLS (nginx/HAProxy) before any relay crosses a trust boundary.
 EOF

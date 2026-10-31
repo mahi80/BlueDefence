@@ -175,7 +175,8 @@ def test_pipeline_banner_and_license_endpoint(tmp_path, keys, monkeypatch):
                 body = json.loads(r.read())
             assert body["status"] == "valid" and body["tier"] == "enterprise" and "kafka_bridge" in body["features"]
             with urllib.request.urlopen(f"{srv.url}/healthz", timeout=10) as r:
-                assert json.loads(r.read())["license"]["installation_id"] == "bd-test-install"
+                hz = json.loads(r.read())["license"]
+                assert hz["status"] == "valid" and "installation_id" not in hz          # the id is only on the authenticated endpoint
         finally:
             srv.stop()
 
@@ -236,6 +237,7 @@ def test_activate_cli_against_the_license_service(tmp_path, keys, monkeypatch):
                                      headers={"x-admin-key": "adm", "Content-Type": "application/json"}, method="POST")
         code = json.loads(urllib.request.urlopen(req).read())["code"]
         monkeypatch.setenv("AEGIS_INSTALL_ID", "bd-cli-install")
+        monkeypatch.setenv("AEGIS_LICENSE_PUBKEYS", str(keys["dir"]))       # the token is verified before it is written
         out = tmp_path / "license.jwt"
         assert L.main(["activate", "--server", url, "--code", code.lower(), "--out", str(out)]) == 0
         st = L.check({"AEGIS_INSTALL_ID": "bd-cli-install", "AEGIS_LICENSE": str(out), "AEGIS_LICENSE_ENFORCE": "1"}, keys=keys["pub"])
@@ -246,3 +248,101 @@ def test_activate_cli_against_the_license_service(tmp_path, keys, monkeypatch):
             L.activate(url, "BD-NOPE-NOPE-NOPE", "bd-x")
     finally:
         httpd.shutdown()
+
+
+# ------------------------------------------------------------ review round 1 --
+
+def test_signature_malleability_rejected(keys):
+    msg = b"m"
+    sig = L.rsa_sign(msg, keys["n"], keys["d"])
+    n, e = keys["pub"]["test-kid"]
+    k = (n.bit_length() + 7) // 8
+    s_plus_n = int.from_bytes(sig, "big") + n
+    if s_plus_n < (1 << (8 * k)):
+        assert not L.rsa_verify(msg, s_plus_n.to_bytes(k, "big"), n, e)
+
+
+def test_decode_never_raises_on_non_object_json(keys):
+    for tok in (L._b64u(b"[1,2]") + ".e30.AAAA", L._b64u(b'{"alg":"RS256","typ":"AEGIS-LICENSE","kid":"test-kid"}') + "." + L._b64u(b"[1]") + ".AAAA",
+                L._b64u(b"5") + ".e30.AAAA", "a.b"):
+        lic, why = L.decode(tok, keys["pub"])
+        assert lic is None and why
+
+
+def test_load_public_keys_survives_bad_files(tmp_path):
+    (tmp_path / "a.pub.json").write_text("[]")
+    (tmp_path / "b.pub.json").write_text('{"n": 5}')
+    (tmp_path / "c.pub.json").write_text('{"kid": "ok", "n": "ff", "e": 3}')
+    (tmp_path / "d.pub.json").write_text('{"kid": "ok", "n": "aa", "e": 3}')          # duplicate kid: first wins
+    assert L.load_public_keys(tmp_path) == {"ok": (255, 3)}
+
+
+def test_unset_edition_is_capped_by_the_licence(tmp_path, keys):
+    # evaluation mode with AEGIS_EDITION unset: aegis.edition would default to FULL — the licence must pin external
+    env = _env(tmp_path, None, AEGIS_LICENSE=str(tmp_path / "absent.jwt"))
+    L.apply(L.check(env, now=NOW, keys=keys["pub"]), env)
+    assert env["AEGIS_EDITION"] == "external"
+    from aegis.edition import apply_edition
+    assert apply_edition(env).name == "external"
+    # a soc licence with the variable unset runs soc, not full
+    tok = L.issue(_lic("bd-test-install", edition="soc"), n=keys["n"], d=keys["d"], kid=keys["kid"])
+    env = _env(tmp_path, tok)
+    L.apply(L.check(env, now=NOW, keys=keys["pub"]), env)
+    assert env["AEGIS_EDITION"] == "soc"
+    # an explicit higher edition with a licence is a hard error, not a silent downgrade
+    env = _env(tmp_path, tok, AEGIS_EDITION="full")
+    with pytest.raises(L.LicenseError):
+        L.apply(L.check(env, now=NOW, keys=keys["pub"]), env)
+
+
+def test_install_token_refuses_bad_tokens_and_is_atomic(tmp_path, keys, monkeypatch):
+    monkeypatch.setenv("AEGIS_INSTALL_ID", "bd-test-install")
+    monkeypatch.setenv("AEGIS_LICENSE_PUBKEYS", str(keys["dir"]))
+    dest = tmp_path / "license.jwt"
+    good = L.issue(_lic("bd-test-install"), n=keys["n"], d=keys["d"], kid=keys["kid"])
+    L.install_token(good, dest)
+    assert dest.read_text().strip() == good
+    other = L.issue(_lic("bd-someone-else"), n=keys["n"], d=keys["d"], kid=keys["kid"])
+    with pytest.raises(L.LicenseError, match="bound to"):
+        L.install_token(other, dest)
+    with pytest.raises(L.LicenseError, match="refusing"):
+        L.install_token("garbage.token.here", dest)
+    assert dest.read_text().strip() == good                                            # the good token survived both
+    newer = L.issue(_lic("bd-test-install", expires=NOW + 400 * 86400), n=keys["n"], d=keys["d"], kid=keys["kid"])
+    L.install_token(newer, dest)
+    assert dest.read_text().strip() == newer and dest.with_suffix(".jwt.prev").read_text().strip() == good
+
+
+def test_https_required_for_the_licence_service():
+    with pytest.raises(L.LicenseError, match="https"):
+        L.activate("http://license.example.com", "BD-X", "bd-x")
+    with pytest.raises(L.LicenseError, match="unreachable|refused"):
+        L.activate("http://127.0.0.1:9", "BD-X", "bd-x")                              # loopback allowed; nothing listens
+
+
+def test_running_service_notices_expiry_and_connectors_follow_the_mode(tmp_path, keys, monkeypatch):
+    """H2/M1: a long-running service re-evaluates the licence on its heartbeat tick and a drop to over-limit or
+    expiry flips the connectors to shadow without a restart."""
+    from aegis.eval.fault_injection import _env as env_ctx
+    from aegis.eval.network_fault_bench import _env as bench_env
+    tok = L.issue(_lic("bd-test-install", expires=NOW + 5 * 86400, grace_days=1), n=keys["n"], d=keys["d"], kid=keys["kid"])
+    (tmp_path / "license.jwt").write_text(tok)
+    over = dict(bench_env(tmp_path))
+    over.update({"AEGIS_LICENSE": str(tmp_path / "license.jwt"), "AEGIS_LICENSE_PUBKEYS": str(keys["dir"]), "AEGIS_INSTALL_ID": "bd-test-install",
+                 "AEGIS_LICENSE_ENFORCE": "1", "AEGIS_EDITION": "external", "AEGIS_ENFORCEMENT_MODE": "live", "AEGIS_LICENSE_SERVER": ""})
+    with env_ctx(over):
+        from aegis.agents.response.connectors.base import enforcement_mode
+        from aegis.service import Service, build_pipeline
+        p = build_pipeline(tmp_path / "audit.jsonl", fresh=True)
+        assert p.license.status == "valid" and enforcement_mode() == "live"
+        conn = p.response._connectors._connectors[0] if getattr(p.response, "_connectors", None) and getattr(p.response._connectors, "_connectors", None) else None
+        svc = Service(p, interval=1)
+        # the clock moves past expiry + grace
+        real_time = L.time.time
+        monkeypatch.setattr(L.time, "time", lambda: real_time() + 10 * 86400)
+        svc._last_heartbeat = 0
+        svc._maybe_heartbeat_and_renew()
+        assert p.license.status == "expired"
+        assert enforcement_mode() == "shadow"                                           # forced for the running service
+        if conn is not None:
+            assert conn.dry_run is True                                                 # connectors read the mode per call

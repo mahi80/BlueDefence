@@ -159,6 +159,10 @@ public final class BridgeTopology {
                 return;
             }
             String host = rec.key() == null ? "unknown" : rec.key();
+            if ("unknown".equals(host)) {
+                ctx.forward(rec);              // no hostname: cannot be one device's flap — never fold the whole estate's Gi1/0/1 together
+                return;
+            }
             String key = host + ":" + iface.get();
             long now = rec.timestamp() > 0 ? rec.timestamp() : ctx.currentSystemTimeMs();
             Long start = state.get(key + "#w");

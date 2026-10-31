@@ -77,4 +77,35 @@ class AegisSinkTest {
         assertEquals(4, sink.linesSent.get(), "nothing was dropped while the producer waited");
         assertTrue(sink.blockedMs.get() >= 100);
     }
+
+    @Test
+    void closeDeliversEverythingBufferedBeforeReturning() throws Exception {
+        // K1: close() used to flip running=false and the flusher's send loop returned before its first attempt,
+        // so a healthy AEGIS still lost the tail of the buffer (offsets already committed). Now every batch is
+        // attempted and the buffer is empty when close() returns.
+        AtomicInteger posts = new AtomicInteger();
+        AegisSink sink = new AegisSink((path, body) -> {
+            posts.incrementAndGet();
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                throw new java.io.IOException(e);
+            }
+            return 200;
+        }, 50, Duration.ofHours(1), 10_000).start();
+        for (int i = 0; i < 2_000; i++) sink.offer("/ingest/netops?feed=syslog", "line-" + i);
+        sink.close(Duration.ofSeconds(30));
+        assertEquals(2_000, sink.linesSent.get(), "nothing buffered may be lost on shutdown");
+        assertEquals(0, sink.linesDropped.get());
+        assertEquals(0, sink.buffered());
+    }
+
+    @Test
+    void closeAgainstDeadAegisCountsWhatItAbandons() throws Exception {
+        AegisSink sink = new AegisSink((path, body) -> 503, 10, Duration.ofHours(1), 100).start();
+        for (int i = 0; i < 5; i++) sink.offer("/ingest/alerts", "{\"id\":\"" + i + "\"}");
+        sink.close(Duration.ofSeconds(1));
+        assertEquals(5, sink.linesDropped.get(), "abandoned lines are counted, never silently gone");
+        assertEquals(0, sink.linesSent.get());
+    }
 }

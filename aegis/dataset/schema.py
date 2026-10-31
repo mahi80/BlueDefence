@@ -35,6 +35,7 @@ KINDS = ("triage", "injection", "verdict_only", "proposal", "attack_profile")
 LABEL_SOURCES = ("ground_truth", "human_corrected", "human_confirmed", "human_disputed", "model")
 SPLITS = ("train", "val", "test")
 
+_RAW_STR_CAP = 240
 _EVIDENCE_RAW_CAP = 600        # chars of raw_data JSON kept per evidence item
 _RATIONALE_CAP = 1200
 _SIGNAL_CAP = 240
@@ -65,13 +66,28 @@ def fingerprint(alert: dict) -> str:
 
 
 def _cap_raw(raw: Any) -> Any:
+    """Cap raw evidence WITHOUT cutting tokens in half: long strings are shortened at a whitespace boundary
+    (an e-mail or id is either kept whole or dropped, so the scrubber that runs afterwards still sees it),
+    big lists/dicts are trimmed, and only then is the serialised size checked."""
+    def trim(o: Any, depth: int) -> Any:
+        if depth > 6:
+            return "…"
+        if isinstance(o, dict):
+            return {str(k): trim(v, depth + 1) for k, v in list(o.items())[:40]}
+        if isinstance(o, (list, tuple)):
+            return [trim(v, depth + 1) for v in list(o)[:20]]
+        if isinstance(o, str) and len(o) > _RAW_STR_CAP:
+            cut = o.rfind(" ", 0, _RAW_STR_CAP)
+            return o[: cut if cut > _RAW_STR_CAP // 2 else _RAW_STR_CAP] + " …"
+        return o
     try:
-        text = json.dumps(raw, default=str, sort_keys=True)
+        slim = trim(raw, 0)
+        text = json.dumps(slim, default=str, sort_keys=True)
     except Exception:  # noqa: BLE001
         return {}
     if len(text) <= _EVIDENCE_RAW_CAP:
-        return raw
-    return {"_truncated": True, "_head": text[:_EVIDENCE_RAW_CAP]}
+        return slim
+    return {"_truncated": True, "keys": sorted(str(k) for k in raw)[:40] if isinstance(raw, dict) else []}
 
 
 def compact_chain(chain: dict) -> dict:

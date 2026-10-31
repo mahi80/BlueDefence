@@ -274,6 +274,7 @@ env for the SOC host follows the project deploy checklist.
 | `AEGIS_INGEST_HTTP` | `1` | Start the push receiver (or just set a bind) |
 | `AEGIS_INGEST_BIND` | `0.0.0.0:8787` | Default bind; put the bank's LB/reverse proxy in front for TLS |
 | `AEGIS_INGEST_TOKEN` | `<secret>` | **Required off loopback**; bearer token on every `/ingest/*` call |
+| `AEGIS_INGEST_READ_TOKEN` | `<secret>` | Optional; when set, `GET /ingest/verdicts`, `/ingest/blocklist`, `/ingest/license` need this token instead of the push token — relays that only push cannot read verdicts. `install.sh` writes both |
 | `AEGIS_FEED_WATCHDOG` | `1` | Alert when a feed goes **silent** (a dead push feed is not "no attacks"); tune with `AEGIS_FEED_SILENCE_SECONDS` / `AEGIS_FEED_EXPECT`. Exposes `aegis_feed_silent` on `/metrics` |
 | `AEGIS_VLLM_URL` | `http://gpu-host:8000/v1` | With `LLM_BACKEND=vllm`: the served (OpenAI-compatible) endpoint. Also `AEGIS_VLLM_MODEL`, `AEGIS_VLLM_API_KEY` |
 | `AEGIS_HOT_RELOAD` | `1` | **`soc`/`full`** — apply an approved model promotion at runtime, no restart (vllm backend); reads the pointer below (§8) |

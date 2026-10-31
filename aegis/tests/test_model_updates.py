@@ -123,3 +123,41 @@ def test_publish_dry_run_builds_a_manifest(tmp_path, capsys):
     (ad / "gate.json").write_text(json.dumps({"passes": False}))
     with pytest.raises(SystemExit):
         publish.main(["--adapter", str(ad), "--version", "2026.11.1", "--dry-run"])
+
+
+# ------------------------------------------------------------ review round 1 regressions --
+
+def test_bad_version_or_size_in_manifest_is_refused_before_touching_disk(tmp_path, keys):
+    """F12: the signed version is used as a directory name; the signed size bounds the download."""
+    data = _archive("2026.11.1")
+    env = {"AEGIS_MODEL_DIR": str(tmp_path / "models")}
+    with pytest.raises(RuntimeError, match="not a valid version"):
+        mu.download_and_install({"manifest_token": _manifest(keys, "../../etc", data), "url": "http://127.0.0.1:9/x"}, dest_root=mu.model_dir(env), keys=keys["pub"])
+    with pytest.raises(RuntimeError, match="out of range"):
+        mu.download_and_install({"manifest_token": _manifest(keys, "2026.11.1", data, size=0), "url": "http://127.0.0.1:9/x"}, dest_root=mu.model_dir(env), keys=keys["pub"])
+    assert not (tmp_path / "models").exists() or not any((tmp_path / "models").iterdir())
+
+
+def test_update_once_needs_a_base_model_and_loads_into_vllm_before_pointing(tmp_path, keys, monkeypatch):
+    """F4: no base → nothing requested; on vLLM the adapter is registered first, and a refusal leaves the pointer alone."""
+    data = _archive("2026.11.3")
+    httpd, url = _serve({"/v3.tgz": data})
+    env = {"AEGIS_MODEL_DIR": str(tmp_path / "models"), "AEGIS_MODEL_POINTER": str(tmp_path / "models" / "current.json"), "LLM_BACKEND": "vllm"}
+    calls: list = []
+    try:
+        res = mu.update_once(server="http://x", token="t", installation_id="bd-1", env=env)
+        assert not res["updated"] and "AEGIS_MODEL_BASE" in res["reason"]
+        env["AEGIS_MODEL_BASE"] = "Qwen/Qwen3-8B"
+        monkeypatch.setattr(mu, "check", lambda *a, **k: {"manifest_token": _manifest(keys, "2026.11.3", data), "url": url + "/v3.tgz"})
+        monkeypatch.setattr(mu.licensing, "load_public_keys", lambda *a, **k: keys["pub"])   # trust the test key
+        from aegis.finetune import vllm_registry
+        monkeypatch.setattr(vllm_registry.VLLMAdapterRegistry, "__init__", lambda self, **k: None)
+        monkeypatch.setattr(vllm_registry.VLLMAdapterRegistry, "load", lambda self, name, path: (calls.append((name, path)), (False, "error"))[1])
+        res = mu.update_once(server="http://x", token="t", installation_id="bd-1", env=env)
+        assert not res["updated"] and "vLLM refused" in res["reason"] and calls and calls[0][0] == "2026.11.3"
+        assert mu.current_version(env) == ""                                   # pointer untouched
+        monkeypatch.setattr(vllm_registry.VLLMAdapterRegistry, "load", lambda self, name, path: (True, "loaded"))
+        res = mu.update_once(server="http://x", token="t", installation_id="bd-1", env=env)
+        assert res["updated"] and mu.current_version(env) == "2026.11.3"
+    finally:
+        httpd.shutdown()

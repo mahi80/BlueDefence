@@ -135,6 +135,7 @@ class ResponseAgent:
         # a reversible action nobody has decided on auto-executes once past its wait window;
         # irreversible actions and split votes hold for a human. AEGIS_HITL_TIMEOUT=off → off.
         self._hitl_timeout = hitl_timeout if hitl_timeout is not None else HitlTimeoutPolicy.from_env()
+        self._env_policies = (autonomy is None, breaker is None, hitl_timeout is None)
         # Per-minute rate limit for high-impact actions; bounds blast radius
         # if the agent is itself compromised. Counters reset by external scheduler in prod.
         self._high_impact_counter = 0
@@ -176,6 +177,17 @@ class ResponseAgent:
             decision.note = f"{decision.note} | dashboard approval {approval_id}"
             return
         self._print_hitl_card(action, chain)
+
+    def refresh_policies(self) -> None:
+        """Rebuild the env-derived autonomy / breaker / HITL-timeout policies after the environment changed
+        (licence drop to over-limit or evaluation forces them to shadow). Explicitly injected policies are kept."""
+        a, b, h = self._env_policies
+        if a:
+            self._autonomy = AutonomyPolicy.from_env()
+        if b:
+            self._breaker = OutflowBreaker.from_env()
+        if h:
+            self._hitl_timeout = HitlTimeoutPolicy.from_env()
 
     def sync_hitl(self, **kwargs) -> list:
         """Pull decisions from the dashboard: approved actions run through

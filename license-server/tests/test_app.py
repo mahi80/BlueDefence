@@ -94,9 +94,23 @@ def test_direct_issue_and_usage(cfg):
     code, a = _call(cfg, s, "POST", "/licenses", {"customer": "Bank Z", "installation_id": "*", "tier": "pilot", "days": 30}, admin=True)
     assert code == 201 and a["installation_id"] == ""
     assert _call(cfg, s, "POST", "/licenses", {"customer": "Bank Z", "tier": "pilot"}, admin=True)[0] == 400
-    assert _call(cfg, s, "POST", "/usage", {"report": {"installation_id": "bd-z", "usage": {"peak_eps_24h": 1.5}}})[0] == 202
-    assert _call(cfg, s, "POST", "/usage", {"report": {}})[0] == 400
-    assert len(_call(cfg, s, "GET", "/installations/bd-z", admin=True)[1]["usage"]) == 1
+    # /usage needs the licence token (F14); a floating token must name a valid, unclaimed installation (F4);
+    # a float in the report must not 500 (F2 — DynamoDB refuses float, the MemoryStore round-trips the real serializer)
+    assert _call(cfg, s, "POST", "/usage", {"report": {"installation_id": "bd-z", "usage": {"peak_eps_24h": 1.5}}})[0] == 401
+    ev = {"requestContext": {"http": {"method": "POST", "path": "/usage"}}, "headers": {"authorization": f"Bearer {a['token']}"},
+          "body": json.dumps({"report": {"installation_id": "bd-z", "usage": {"peak_eps_24h": 1.5}}})}
+    assert app.handle(ev, cfg=cfg, store=s, now=NOW)["statusCode"] == 202
+    ev["body"] = json.dumps({"report": {"installation_id": "../x", "usage": {}}})
+    assert app.handle(ev, cfg=cfg, store=s, now=NOW)["statusCode"] == 403
+    ev["body"] = json.dumps({"report": {}})
+    assert app.handle(ev, cfg=cfg, store=s, now=NOW)["statusCode"] == 403
+    got = _call(cfg, s, "GET", "/installations/bd-z", admin=True)[1]
+    assert len(got["usage"]) == 1 and got["usage"][0]["report"]["usage"]["peak_eps_24h"] == 1.5
+    # a second floating licence cannot write under bd-z
+    _, a2 = _call(cfg, s, "POST", "/licenses", {"customer": "Bank Q", "installation_id": "*", "tier": "pilot", "days": 30}, admin=True)
+    ev["headers"]["authorization"] = f"Bearer {a2['token']}"
+    ev["body"] = json.dumps({"report": {"installation_id": "bd-z", "usage": {}}})
+    assert app.handle(ev, cfg=cfg, store=s, now=NOW)["statusCode"] == 403
 
 
 def test_bad_bodies(cfg):
@@ -296,3 +310,146 @@ def test_release_publish_and_updates_feed(cfg2):
     assert _call(cfg2, s, "GET", "/releases", admin=True)[1]["releases"][0]["status"] == "withdrawn"
     # no bearer → 401
     assert app.handle({**ev, "headers": {}}, cfg=cfg2, store=s, now=NOW)["statusCode"] == 401
+
+
+# ------------------------------------------------------- review round 1 regressions --
+
+def test_decimal_and_float_round_trips_do_not_break_responses(cfg2):
+    """F1/F2/F20: DynamoDB hands back Decimal and refuses float. publish/rollout must sign plain ints,
+    responses must be JSON, and a float in a heartbeat counter must not 500."""
+    s = app.MemoryStore()
+    _, b = _call(cfg2, s, "POST", "/signup", {"org": "Bank D", "email": "x@bankd.in", "installation_id": "bd-d", "accept_terms": True})
+    assert isinstance(b["expires"], int) and isinstance(b["entitlement_until"], int)
+    sha = "cd" * 32
+    assert _call(cfg2, s, "POST", "/releases", {"version": "2026.11.2", "sha256": sha, "size": 10, "rollout_pct": 50}, admin=True)[0] == 201
+    code, pub = _call(cfg2, s, "POST", "/releases/2026.11.2/publish", {}, admin=True)
+    assert code == 200 and pub["size"] == 10 and pub["rollout_pct"] == 50 and isinstance(pub["published_at"], int)
+    assert _call(cfg2, s, "POST", "/releases/2026.11.2/rollout", {"pct": 75}, admin=True)[0] == 200
+    ev = {"requestContext": {"http": {"method": "POST", "path": "/heartbeat"}}, "headers": _bearer(b["token"]),
+          "body": json.dumps({"chains_total": 5, "counters": {"eps": 1.75, "ok": True}})}
+    assert app.handle(ev, cfg=cfg2, store=s, now=NOW)["statusCode"] == 200
+    h = _call(cfg2, s, "GET", "/installations/bd-d/health", admin=True)[1]
+    assert h["chains_total"] == 5 and isinstance(h["renewals"], int)
+    # the stored heartbeat row carries a ttl
+    assert all("ttl" in r for r in s.query("INST#bd-d", "HB#"))
+
+
+def test_standing_hardens_after_the_first_week(cfg2):
+    """F3: a licence that never heartbeats or contributes must not renew forever."""
+    s = app.MemoryStore()
+    _, b = _call(cfg2, s, "POST", "/signup", {"org": "Silent Bank", "email": "x@silentbank.in", "installation_id": "bd-s", "accept_terms": True})
+    ren = lambda t: app.handle({"requestContext": {"http": {"method": "POST", "path": "/renew"}}, "headers": _bearer(b["token"]), "body": ""},
+                               cfg=cfg2, store=s, now=t)
+    assert ren(NOW + 2 * 86400)["statusCode"] == 200          # inside the first week: warn only, renews
+    r = ren(NOW + 9 * 86400)
+    assert r["statusCode"] == 402 and "no heartbeat" in json.loads(r["body"])["error"]
+    # heartbeating but never contributing is also hard after the week
+    _hb(cfg2, s, b["token"], inst="bd-s", chains=3, now=NOW + 9 * 86400)
+    r = ren(NOW + 9 * 86400 + 1)
+    assert r["statusCode"] == 402 and "no contribution in the last 30 days" in json.loads(r["body"])["error"]
+
+
+def test_counter_reset_is_flagged_not_blinding(cfg2):
+    """F8: chains_total going backwards (audit rotation) must not make the ratio look perfect."""
+    s = app.MemoryStore()
+    _, b = _call(cfg2, s, "POST", "/signup", {"org": "Rot Bank", "email": "x@rotbank.in", "installation_id": "bd-rot", "accept_terms": True})
+    tok = b["token"]
+    _hb(cfg2, s, tok, inst="bd-rot", chains=0, now=NOW)
+    for d in range(1, 10):
+        _hb(cfg2, s, tok, inst="bd-rot", chains=1000 * d, now=NOW + d * 86400)
+        _contrib(cfg2, s, tok, inst="bd-rot", n=10, now=NOW + d * 86400)        # 1%
+    h = _call(cfg2, s, "GET", "/installations/bd-rot/health", admin=True, now=NOW + 9 * 86400)[1]
+    assert h["standing"] == "bad"
+    _hb(cfg2, s, tok, inst="bd-rot", chains=200, now=NOW + 10 * 86400)         # "rotated"
+    h = _call(cfg2, s, "GET", "/installations/bd-rot/health", admin=True, now=NOW + 10 * 86400)[1]
+    assert h["counter_reset"] and h["standing"] == "bad" and any("backwards" in i for i in h["issues"])
+
+
+def test_signup_cap_is_per_registrable_domain_and_rejects_junk(cfg2):
+    """F9: subdomains and tricks must not multiply the per-org cap."""
+    s = app.MemoryStore()
+    assert app._registrable_domain("a@soc.mumbai.sbi.co.in") == "sbi.co.in"
+    assert app._registrable_domain("a@s1.bank.com") == "bank.com"
+    for i, dom in enumerate(["bank.com", "soc.bank.com", "a.b.bank.com"]):
+        assert _call(cfg2, s, "POST", "/signup", {"org": "B", "email": f"x@{dom}", "installation_id": f"bd-n{i}", "accept_terms": True})[0] == 201
+    assert _call(cfg2, s, "POST", "/signup", {"org": "B", "email": "x@z.bank.com", "installation_id": "bd-n9", "accept_terms": True})[0] == 429
+    assert _call(cfg2, s, "POST", "/signup", {"org": "B", "email": "x@outlook.in", "installation_id": "bd-n8", "accept_terms": True})[0] == 400
+    assert _call(cfg2, s, "POST", "/signup", {"org": "B", "email": "x@bank2.com", "installation_id": "*", "accept_terms": True})[0] == 400
+    assert _call(cfg2, s, "POST", "/signup", {"org": "B", "email": "x@bank2.com", "installation_id": "../etc", "accept_terms": True})[0] == 400
+    assert _call(cfg2, s, "POST", "/signup", {"org": "B", "email": "x@bank2.com", "installation_id": "a/b", "accept_terms": True})[0] == 400
+
+
+def test_revoked_licence_is_refused_on_bearer_routes_and_renew_rejects_fixed_term(cfg2):
+    """F13 / F12."""
+    s = app.MemoryStore()
+    _, b = _call(cfg2, s, "POST", "/signup", {"org": "Rev Bank", "email": "x@revbank.in", "installation_id": "bd-rev", "accept_terms": True})
+    assert _hb(cfg2, s, b["token"], inst="bd-rev", chains=1, now=NOW)[0] == 200
+    _call(cfg2, s, "POST", f"/licenses/{b['lic']}/revoke", {"reason": "abuse"}, admin=True)
+    code, body = _hb(cfg2, s, b["token"], inst="bd-rev", chains=2, now=NOW + 1)
+    assert code == 401 and "revoked" in body["error"]
+    assert _contrib(cfg2, s, b["token"], inst="bd-rev", n=1, now=NOW + 1)[0] == 401
+    # a fixed-term (non-rolling) licence cannot be shortened by /renew
+    _, o = _call(cfg2, s, "POST", "/orders", {"customer": "Fixed Bank", "tier": "standard", "days": 365}, admin=True)
+    _, a = _call(cfg2, s, "POST", "/activate", {"code": o["code"], "installation_id": "bd-fix"})
+    r = app.handle({"requestContext": {"http": {"method": "POST", "path": "/renew"}}, "headers": _bearer(a["token"]), "body": ""}, cfg=cfg2, store=s, now=NOW)
+    assert r["statusCode"] == 400 and "not a rolling" in json.loads(r["body"])["error"]
+    assert _call(cfg2, s, "GET", f"/licenses/{a['lic']}", admin=True)[1]["expires"] == a["expires"]
+
+
+def test_contrib_body_handling(cfg2):
+    """F7 / F10 / F16: text-mode gzip gets a clear 400, a gzip bomb is refused, malformed records are 400 not 500."""
+    import gzip
+    s = app.MemoryStore()
+    _, b = _call(cfg2, s, "POST", "/signup", {"org": "Body Bank", "email": "x@bodybank.in", "installation_id": "bd-body", "accept_terms": True})
+    hdr = {**_bearer(b["token"]), "content-type": "application/json"}
+    mk = lambda body, b64: {"requestContext": {"http": {"method": "POST", "path": "/contrib"}}, "headers": hdr, "body": body, "isBase64Encoded": b64}
+    raw = gzip.compress(json.dumps({"schema": "aegis-contrib/1", "installation_id": "bd-body", "salted": True, "records": []}).encode())
+    r = app.handle(mk(raw.decode("latin-1"), False), cfg=cfg2, store=s, now=NOW)
+    assert r["statusCode"] == 400 and "application/gzip" in json.loads(r["body"])["error"]
+    bomb = gzip.compress(b"0" * (app.MAX_CONTRIB_INFLATED + 1024), compresslevel=9)
+    assert len(bomb) < app.MAX_CONTRIB_BODY
+    r = app.handle(mk(base64.b64encode(bomb).decode(), True), cfg=cfg2, store=s, now=NOW)
+    assert r["statusCode"] == 400 and "inflates" in json.loads(r["body"])["error"]
+    bad = gzip.compress(json.dumps({"schema": "aegis-contrib/1", "installation_id": "bd-body", "salted": True, "records": [{"human": "yes"}]}).encode())
+    r = app.handle(mk(base64.b64encode(bad).decode(), True), cfg=cfg2, store=s, now=NOW)
+    assert r["statusCode"] == 400 and "records[0]" in json.loads(r["body"])["error"]
+    plain = json.dumps({"schema": "aegis-contrib/1", "installation_id": "bd-body", "salted": True, "records": []})
+    assert app.handle(mk(plain, False), cfg=cfg2, store=s, now=NOW)["statusCode"] == 202      # uncompressed JSON still fine
+    unsalted = json.dumps({"schema": "aegis-contrib/1", "installation_id": "bd-body", "salted": False, "records": []})
+    assert app.handle(mk(unsalted, False), cfg=cfg2, store=s, now=NOW)["statusCode"] == 422   # F3: reversible pseudonyms refused
+
+
+def test_activation_is_atomic_and_updates_match_base(cfg2):
+    """F11 / F19."""
+    s = app.MemoryStore()
+    _, o = _call(cfg2, s, "POST", "/orders", {"customer": "Race Bank", "tier": "standard"}, admin=True)
+    assert _call(cfg2, s, "POST", "/activate", {"code": o["code"].lower(), "installation_id": "bd-r1"})[0] == 200
+    assert _call(cfg2, s, "POST", "/activate", {"code": "nope", "installation_id": "bd-r1"})[0] == 400
+    # a code stuck in "redeeming" (crash between claim and issue) is not open any more
+    s.update(f"ORDER#{o['code']}", "META", status="redeeming")
+    assert _call(cfg2, s, "POST", "/activate", {"code": o["code"], "installation_id": "bd-r2"})[0] == 410
+    # base=any only sees releases marked any
+    _, b = _call(cfg2, s, "POST", "/signup", {"org": "Race Bank", "email": "x@racebank.in", "installation_id": "bd-r3", "accept_terms": True})
+    _call(cfg2, s, "POST", "/releases", {"version": "2026.11.3", "base_model": "Qwen/Qwen3-8B", "sha256": "ef" * 32, "size": 1}, admin=True)
+    _call(cfg2, s, "POST", "/releases/2026.11.3/publish", {}, admin=True)
+    ev = {"requestContext": {"http": {"method": "GET", "path": "/updates"}}, "headers": _bearer(b["token"]),
+          "queryStringParameters": {"channel": "stable", "base": "any"}, "body": ""}
+    assert app.handle(ev, cfg=cfg2, store=s, now=NOW)["statusCode"] == 204
+    ev["queryStringParameters"]["base"] = "Qwen/Qwen3-8B"
+    assert app.handle(ev, cfg=cfg2, store=s, now=NOW)["statusCode"] == 200
+
+
+def test_admin_migrate_from_first_schema(cfg2):
+    s = app.MemoryStore()
+    s.put({"PK": "INST#bd-old", "SK": "META", "installation_id": "bd-old", "customer": "Old Bank", "tier": "community", "created": 1})
+    s.put({"PK": "INST#bd-old", "SK": "LIC#L-1", "lic": "L-1"})
+    s.put({"PK": "LIC#L-1", "SK": "META", "lic": "L-1", "status": "active", "customer": "Old Bank", "tier": "community", "features": ["data_sharing"],
+           "installation_id": "bd-old", "issued": 1, "expires": 10 ** 10, "entitlement_until": 10 ** 10})
+    s.put({"PK": "REL#2026.10.1", "SK": "META", "version": "2026.10.1", "channel": "stable", "base_model": "any", "status": "published",
+           "sha256": "ab" * 32, "size": 5, "rollout_pct": 100, "key": "releases/stable/2026.10.1/adapter.tar.gz", "manifest_token": "x.y.z"})
+    assert _call(cfg2, s, "GET", "/fleet", admin=True)[1]["installations"] == []
+    code, r = _call(cfg2, s, "POST", "/admin/migrate", {}, admin=True)
+    assert code == 200 and r == {"fleet_pointers_added": 1, "releases_moved": 1}
+    assert [x["installation_id"] for x in _call(cfg2, s, "GET", "/fleet", admin=True)[1]["installations"]] == ["bd-old"]
+    assert _call(cfg2, s, "GET", "/releases", admin=True)[1]["releases"][0]["version"] == "2026.10.1"
+    assert _call(cfg2, s, "POST", "/admin/migrate", {}, admin=True)[1] == {"fleet_pointers_added": 0, "releases_moved": 0}

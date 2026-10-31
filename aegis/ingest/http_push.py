@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import base64
 import gzip
+import hashlib
 import hmac
 import json
 import logging
@@ -96,12 +97,16 @@ class PushServer:
 
     def __init__(self, *, token: str, bind: str = DEFAULT_BIND, queue: Optional[StreamQueue] = None,
                  max_mb: int = DEFAULT_MAX_MB, blocklist: Optional[Callable[[], list[Any]]] = None,
-                 audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None):
+                 audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None, read_token: str = ""):
         host, _, port = bind.rpartition(":")
         self.host, self.port = (host or "0.0.0.0"), int(port or 8787)
         if not token and not _is_loopback(self.host):
             raise ValueError("AEGIS_INGEST_TOKEN is required unless AEGIS_INGEST_BIND is loopback")
         self.token = token
+        # the read side (/ingest/verdicts, /ingest/blocklist, /ingest/license) is for the Kafka bridge / SOAR, not for
+        # every syslog relay that holds the push token: a separate AEGIS_INGEST_READ_TOKEN gates it when set
+        self.read_token = read_token or token
+        self._verdict_cache: tuple[int, int, str, int] = (0, 0, "0" * 64, 0)   # (seq, byte offset, prev_hash, generation)
         self.queue = queue if queue is not None else get_stream()   # an empty queue is falsy
         self.max_bytes = int(max_mb) * 1024 * 1024
         self.blocklist = blocklist
@@ -137,15 +142,25 @@ class PushServer:
         return f"http://{host}:{self.port}"
 
     # -- auth
-    def authorized(self, headers: Any) -> bool:
-        if not self.token:
-            return True
+    @staticmethod
+    def _presented(headers: Any) -> str:
         presented = ""
         auth = headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
             presented = auth[7:].strip()
-        presented = presented or headers.get("X-Amz-Firehose-Access-Key", "") or headers.get("X-AEGIS-Token", "")
+        return presented or headers.get("X-Amz-Firehose-Access-Key", "") or headers.get("X-AEGIS-Token", "")
+
+    def authorized(self, headers: Any) -> bool:
+        if not self.token:
+            return True
+        presented = self._presented(headers)
         return bool(presented) and hmac.compare_digest(presented.encode(), self.token.encode())
+
+    def read_authorized(self, headers: Any) -> bool:
+        if not self.read_token:
+            return True
+        presented = self._presented(headers)
+        return bool(presented) and hmac.compare_digest(presented.encode(), self.read_token.encode())
 
     # -- the four ingest shapes; each returns (status, body_dict)
     def ingest_cloudflare(self, body: bytes) -> tuple[int, dict]:
@@ -194,6 +209,13 @@ class PushServer:
                 bad += 1
                 continue
             if isinstance(obj, dict) and obj.get("id"):
+                if obj.get("alert_type") == "network_fault" and isinstance(obj.get("netops"), dict):
+                    # a pre-correlated network fault would skip the LLM and go straight to config_rollback / revoke_sessions
+                    # proposals; faults are derived here from raw syslog/telemetry (/ingest/netops), never accepted ready-made
+                    obj.pop("netops", None)
+                    obj["alert_type"] = "network_event"
+                    obj["note"] = "pushed as network_fault; demoted — correlation happens inside AEGIS"
+                    ln = json.dumps(obj, separators=(",", ":"))
                 good.append(ln)
             else:
                 bad += 1
@@ -234,11 +256,23 @@ class PushServer:
         ``prev`` let it re-verify the chain on its side."""
         limit = max(1, min(int(limit), 1000))
         out: list[dict] = []
-        seq = 0
-        prev = "0" * 64
+        seq, offset, prev = 0, 0, "0" * 64
+        generation = self._generation()
         if self.audit_path is not None and self.audit_path.exists():
-            with self.audit_path.open("r", encoding="utf-8") as fh:
-                for line in fh:
+            c_seq, c_off, c_prev, c_gen = self._verdict_cache
+            size = self.audit_path.stat().st_size
+            if c_gen == generation and after >= c_seq and c_off <= size:
+                seq, offset, prev = c_seq, c_off, c_prev          # resume from the last served row instead of re-reading the file
+            with self.audit_path.open("rb") as fh:
+                fh.seek(offset)
+                while True:
+                    raw = fh.readline()
+                    if not raw:
+                        break
+                    if not raw.endswith(b"\n"):
+                        break                                       # a row still being written
+                    offset += len(raw)
+                    line = raw.decode("utf-8", "replace")
                     if not line.strip():
                         continue
                     seq += 1
@@ -256,7 +290,23 @@ class PushServer:
                     prev = chain.get("integrity_hash", prev)
                     if len(out) >= limit:
                         break
-        return {"after": after, "next": out[-1]["seq"] if out else after, "count": len(out), "verdicts": out}
+            if seq >= after:
+                self._verdict_cache = (seq, offset, prev, generation)
+        return {"after": after, "next": out[-1]["seq"] if out else after, "count": len(out), "verdicts": out,
+                "generation": generation}
+
+    def _generation(self) -> int:
+        """Identifies THIS audit log: inode + the first row's hash. A consumer whose stored generation differs
+        (rotation, truncation, restore) resets its cursor to 0 instead of waiting forever for seq to catch up."""
+        if self.audit_path is None or not self.audit_path.exists():
+            return 0
+        try:
+            st = self.audit_path.stat()
+            with self.audit_path.open("rb") as fh:
+                head = fh.readline()
+            return (st.st_ino & 0xFFFFFFFF) * 1000003 + (int.from_bytes(hashlib.sha1(head).digest()[:4], "big") if head else 0)
+        except OSError:
+            return 0
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -289,13 +339,13 @@ class _Handler(BaseHTTPRequestHandler):
             if self.server_ref.license is not None:
                 try:
                     st = self.server_ref.license()
-                    body["license"] = {"status": st.status, "installation_id": st.installation_id, "days_left": st.days_left}
+                    body["license"] = {"status": st.status, "days_left": st.days_left}     # the id is on the authenticated /ingest/license
                 except Exception:  # noqa: BLE001
                     pass
             self._reply(200, body)
             return
         if path == "/ingest/license":
-            if not self.server_ref.authorized(self.headers):
+            if not self.server_ref.read_authorized(self.headers):
                 self._reply(401, {"error": "unauthorized"})
                 return
             if self.server_ref.license is None:
@@ -316,13 +366,13 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
         if path == "/ingest/blocklist":
-            if not self.server_ref.authorized(self.headers):
+            if not self.server_ref.read_authorized(self.headers):
                 self._reply(401, {"error": "unauthorized"})
                 return
             self._reply(200, self.server_ref.blocklist_payload())
             return
         if path == "/ingest/verdicts":
-            if not self.server_ref.authorized(self.headers):
+            if not self.server_ref.read_authorized(self.headers):
                 self._reply(401, {"error": "unauthorized"})
                 return
             if self.server_ref.audit_path is None:
@@ -371,6 +421,10 @@ class _Handler(BaseHTTPRequestHandler):
                 sensor = (parse_qs(parts.query).get("sensor") or [""])[0].strip().lower()[:24]
                 status, out = srv.ingest_waf(body, f"ndr-{sensor}" if sensor else "ndr")
             elif path == "/ingest/netops":
+                from aegis.license import allows
+                if not allows("netops"):
+                    self._reply(402, {"error": "network assurance is not included in this installation's licence"})
+                    return
                 feed = (parse_qs(parts.query).get("feed") or [""])[0].strip().lower()[:24]   # syslog | snmp | netflow | telemetry | config | lldp
                 status, out = srv.ingest_waf(body, f"netops-{feed}" if feed else "netops")
             elif path == "/ingest/alerts":
@@ -394,7 +448,7 @@ def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
     try:
         srv = PushServer(token=os.environ.get("AEGIS_INGEST_TOKEN", "").strip(), bind=bind or DEFAULT_BIND,
                          max_mb=int(os.environ.get("AEGIS_INGEST_MAX_MB", str(DEFAULT_MAX_MB))), blocklist=blocklist,
-                         audit_path=audit_path, license=license)
+                         audit_path=audit_path, license=license, read_token=os.environ.get("AEGIS_INGEST_READ_TOKEN", "").strip())
         return srv.start()
     except Exception as e:  # noqa: BLE001 — a bad bind must not take the SOC down; polling still works
         logger.error("[ingest:http] push receiver not started: %s", str(e)[:200])

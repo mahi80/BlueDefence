@@ -42,7 +42,11 @@ if ($SigningKeyFile) {
   $ErrorActionPreference = $eap2
   if ($AdminKey -or -not $haveAdmin) {
     # generate only when there is none yet (or one was given): re-running with -SigningKeyFile must not rotate the admin key
-    if (-not $AdminKey) { $AdminKey = -join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) }
+    if (-not $AdminKey) {
+        $bytes = New-Object byte[] 32
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)   # CSPRNG, not Get-Random
+        $AdminKey = ($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
+    }
     aws ssm put-parameter --name /bluedefence/license/admin-key --type SecureString --overwrite --value $AdminKey --region $Region @p | Out-Null
     Write-Host "admin key   -> SSM /bluedefence/license/admin-key   (read it back: aws ssm get-parameter --name /bluedefence/license/admin-key --with-decryption --query Parameter.Value --output text)"
   } else {

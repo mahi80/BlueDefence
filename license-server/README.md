@@ -90,6 +90,22 @@ heartbeats) vs records contributed (from bundles) over 30 days; code fingerprint
 Re-activating with the same code **from the same installation** returns the same licence (lost-file
 recovery); from another installation it is refused with 409.
 
+Hardening notes (review round 1): bearer routes refuse a **revoked** licence at once (renew, heartbeat, contrib,
+updates); a floating `*` licence must name a valid, unclaimed `installation_id` and can never write another
+installation's rows; `/usage` needs the licence token; `/renew` is 400 for a fixed-term licence (it never shortens
+one); standing turns **hard** a week after issue when there is still no heartbeat or no contribution, and a
+`chains_total` that goes backwards is flagged (`counter_reset`) instead of making the ratio look perfect; `/contrib`
+needs `Content-Type: application/gzip` (the HTTP API base64-encodes binary types; as `application/json` the gzip is
+mangled), refuses unsalted bundles (422), bounds gzip inflation at 64 MB and validates record shapes (400, not 500).
+Every DynamoDB read converts `Decimal` → `int`/`float` and every write `float` → `Decimal`, so `/releases/{v}/publish`
+and float counters no longer 500 in production. The table has a TTL attribute (`ttl`, 400 d on HB/CONTRIB/USAGE rows);
+table and bucket carry `DeletionPolicy: Retain`.
+
+**Upgrading from the first release**: after `deploy.ps1`, run once
+`curl -X POST $API/admin/migrate -H "x-admin-key: $ADMIN"` — it adds the `FLEET` pointer rows for existing
+installations (the fleet view is a query now, not a table scan) and moves release rows under the `RELEASES` partition.
+Idempotent.
+
 ## Cost
 
 | Service | Monthly at ~1,000 calls | Free tier |
