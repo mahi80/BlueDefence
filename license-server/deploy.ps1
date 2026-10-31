@@ -30,7 +30,11 @@ if ($SigningKeyFile) {
   if (-not (Test-Path $SigningKeyFile)) { throw "signing key file not found: $SigningKeyFile" }
   $key = Get-Content $SigningKeyFile -Raw
   if ($key -notmatch '"d"') { throw "$SigningKeyFile is not a PRIVATE key (.key.json from 'python -m aegis.license keygen')" }
-  aws ssm put-parameter --name /bluedefence/license/signing-key --type SecureString --overwrite --value $key --region $Region @p | Out-Null
+  # pass the JSON via file:// - the Windows CLI strips the quotes out of an inline JSON argument
+  $abs = (Resolve-Path $SigningKeyFile).Path -replace '\\', '/'
+  aws ssm put-parameter --name /bluedefence/license/signing-key --type SecureString --overwrite --value "file://$abs" --region $Region @p | Out-Null
+  $check = aws ssm get-parameter --name /bluedefence/license/signing-key --with-decryption --query Parameter.Value --output text --region $Region @p
+  if ($check -notmatch '"kid"') { throw "signing key did not round-trip through SSM intact; stored value starts: $($check.Substring(0, [Math]::Min(40, $check.Length)))" }
   Write-Host "signing key -> SSM /bluedefence/license/signing-key"
   if (-not $AdminKey) { $AdminKey = -join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) }
   aws ssm put-parameter --name /bluedefence/license/admin-key --type SecureString --overwrite --value $AdminKey --region $Region @p | Out-Null
