@@ -167,6 +167,35 @@ jobs:
           PY
           python -m aegis.finetune.gate --self-test
 
+      - name: DPO learning-loop smoke (analyst-overruled pairs → export --dpo → load → dry-run plan)
+        run: |
+          python - <<'PY'
+          # Build a tiny dataset carrying analyst decisions (synth has none), export with --dpo,
+          # and confirm verify + the preference pairs land. Mirrors the SFT smoke above.
+          from aegis.dataset import BuildOptions, DatasetBuilder, HumanDecision, Scrubber, record_from_chain
+          from aegis.dataset.export import verify_dataset
+          sc = Scrubber(salt="ci")
+          ch = {"alert_id": "A1", "verdict": "malicious", "confidence": 0.9,
+                "evidence": [{"source": "waf", "signal": "sqli reached /x", "weight": "high"}],
+                "recommended_actions": [{"action_type": "isolate", "target": "app-07", "requires_hitl": True}],
+                "integrity_hash": "h1"}
+          hd = HumanDecision("ap", "isolate", "app-07", "rejected", "soc_analyst", "false positive", None, "benign")
+          rec = record_from_chain(ch, alert={"id": "A1", "source": "waf"}, origin="dashboard_chain",
+                                  scrubber=sc, human=[hd])
+          m = DatasetBuilder("/tmp/dpo-v1", BuildOptions(name="dpo-ci", dpo=True)).add([rec]).build()
+          assert m["counts"]["dpo_pairs"] == 1, m["counts"]
+          ok, problems = verify_dataset("/tmp/dpo-v1")
+          assert ok, problems
+          print("ok: export --dpo wrote", m["counts"]["dpo_pairs"], "analyst pair(s); verify clean")
+          PY
+          python -m aegis.finetune.dpo --data /tmp/dpo-v1 --dry-run --vram 8
+          python - <<'PY'
+          import sys
+          from aegis.finetune.dpo_data import load_dpo, DataError
+          assert load_dpo("/tmp/dpo-v1"), "analyst pairs should load"
+          print("ok: load_dpo loaded analyst preference pairs")
+          PY
+
       - name: Full end-to-end demo
         run: python -m aegis.main
 

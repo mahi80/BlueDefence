@@ -59,6 +59,7 @@ class BuildOptions:
     include_weak: bool = False          # include label.source == "model" rows in sft/triage.jsonl
     include_disputed: bool = False      # include human_disputed rows in sft/triage.jsonl
     eval_split: str = "test"            # where eval records go ("test" = held out)
+    dpo: bool = False                   # also emit dpo/preferences.jsonl from analyst-overruled records
     scrub_ips: bool = False
     salted: bool = False
     sources: list[str] = field(default_factory=list)
@@ -98,7 +99,17 @@ class DatasetBuilder:
         proposal_rows = [row for r in records if (row := self._sft_proposal_row(r)) is not None]
         files["sft/proposals.jsonl"] = _write_jsonl(self.out_dir / "sft" / "proposals.jsonl", proposal_rows)
 
+        dpo_rows: list[dict] = []
+        if self.opt.dpo:
+            (self.out_dir / "dpo").mkdir(exist_ok=True)
+            dpo_rows = [row for r in records if (row := self._dpo_pref_row(r)) is not None]
+            files["dpo/preferences.jsonl"] = _write_jsonl(self.out_dir / "dpo" / "preferences.jsonl", dpo_rows)
+            self.stats["dpo_pairs"] = len(dpo_rows)
+
         manifest = self._manifest(records, triage_rows, proposal_rows, files)
+        if self.opt.dpo:
+            manifest["counts"]["dpo_pairs"] = len(dpo_rows)
+            manifest["counts"]["dpo_pairs_by_source"] = dict(Counter(row["label_source"] for row in dpo_rows))
         (self.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n",
                                                     encoding="utf-8")
         (self.out_dir / "README.md").write_text(_readme(manifest), encoding="utf-8")
@@ -143,6 +154,43 @@ class DatasetBuilder:
                 self.stats["leak_moved_to_test"] += 1
         return records
 
+    def _triage_prompt(self, r: TriageRecord) -> list[dict]:
+        """The system+user turns a triage row trains on — the alert the model judged.
+        Shared by the SFT row and the DPO pair so both train on the same prompt distribution."""
+        return [
+            {"role": "system", "content": TRIAGE_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(r.alert, sort_keys=True, ensure_ascii=False)},
+        ]
+
+    def _triage_target(self, r: TriageRecord, *, verdict: str, confidence: float,
+                       actions: Optional[list[dict]] = None) -> dict:
+        """The assistant-side triage JSON for a record at a given verdict/confidence.
+        Shared by the SFT row (human-aligned verdict) and the DPO pair (chosen = human,
+        rejected = the model verdict/action the analyst overruled). ``actions`` overrides
+        the chain's recommended actions when a pair needs to contrast on the action."""
+        chain = r.chain or {}
+        signals = [f"{e['source']}: {e['signal']}" for e in chain.get("evidence", [])
+                   if e.get("weight") in ("high", "medium")][:6]
+        if not signals:
+            signals = [f"{e['source']}: {e['signal']}" for e in chain.get("evidence", [])][:4]
+        if actions is None:
+            actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": a["requires_hitl"]}
+                       for a in chain.get("recommended_actions", [])]
+            if r.label.get("constraint") == "no_allow":
+                actions = [a for a in actions if a["action_type"] != "allow"] or [
+                    {"action_type": "monitor", "target": r.meta.get("alert_id") or "alert", "requires_hitl": False}]
+        target = {
+            "verdict": verdict,
+            "confidence": round(float(confidence or 0.0), 2),
+            "key_signals": signals,
+            "recommended_actions": actions,
+            "techniques": [t["id"] for t in r.techniques],
+            "rationale": r.rationale or "No specialist evidence; triage decision only.",
+        }
+        if r.kind == "injection":
+            target["injection_detected"] = True
+        return target
+
     def _sft_triage_row(self, r: TriageRecord) -> Optional[dict]:
         if r.kind not in ("triage", "injection") or r.alert is None or r.chain is None:
             return None
@@ -151,33 +199,56 @@ class DatasetBuilder:
             return None
         if src == "human_disputed" and not self.opt.include_disputed:
             return None
-        chain = r.chain
-        signals = [f"{e['source']}: {e['signal']}" for e in chain.get("evidence", [])
-                   if e.get("weight") in ("high", "medium")][:6]
-        if not signals:
-            signals = [f"{e['source']}: {e['signal']}" for e in chain.get("evidence", [])][:4]
-        actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": a["requires_hitl"]}
-                   for a in chain.get("recommended_actions", [])]
-        if r.label.get("constraint") == "no_allow":
-            actions = [a for a in actions if a["action_type"] != "allow"] or [
-                {"action_type": "monitor", "target": r.meta.get("alert_id") or "alert", "requires_hitl": False}]
-        target = {
-            "verdict": r.label["verdict"],
-            "confidence": round(float(r.label.get("confidence") or 0.0), 2),
-            "key_signals": signals,
-            "recommended_actions": actions,
-            "techniques": [t["id"] for t in r.techniques],
-            "rationale": r.rationale or "No specialist evidence; triage decision only.",
-        }
-        if r.kind == "injection":
-            target["injection_detected"] = True
+        target = self._triage_target(r, verdict=r.label["verdict"], confidence=r.label.get("confidence") or 0.0)
         return {
             "id": r.record_id, "split": r.split, "label_source": src, "origin": r.origin,
-            "messages": [
-                {"role": "system", "content": TRIAGE_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(r.alert, sort_keys=True, ensure_ascii=False)},
-                {"role": "assistant", "content": json.dumps(target, ensure_ascii=False)},
-            ],
+            "messages": self._triage_prompt(r) + [{"role": "assistant", "content": json.dumps(target, ensure_ascii=False)}],
+        }
+
+    def _dpo_pref_row(self, r: TriageRecord) -> Optional[dict]:
+        """A preference pair from an analyst decision that overruled the model.
+
+        Two signals, both genuine disagreements an analyst produced at the HITL card:
+        - ``human_corrected`` — the analyst rejected the action AND gave the verdict it
+          should have been → chosen = that verdict, rejected = the model's verdict.
+        - ``human_disputed`` — the analyst rejected a recommended action without naming a
+          verdict → chosen = the same verdict with the rejected action(s) held for a human,
+          rejected = the model's auto-run recommendation. The pair teaches "don't auto-run
+          this", not a new verdict.
+
+        Confirmations and agreements yield no pair: there is nothing to prefer. Returns
+        ``None`` when no contrast can be formed."""
+        if r.kind not in ("triage", "injection") or r.alert is None or r.chain is None:
+            return None
+        src = r.label.get("source")
+        conf = float(r.label.get("confidence") or 0.0)
+        human_verdict = str(r.label.get("verdict") or "")
+        model_verdict = str(r.label.get("model_verdict") or "")
+
+        if src == "human_corrected" and human_verdict and model_verdict and human_verdict != model_verdict:
+            chosen = self._triage_target(r, verdict=human_verdict, confidence=conf)
+            rejected = self._triage_target(r, verdict=model_verdict, confidence=conf)
+        elif src == "human_disputed":
+            rejected_keys = {(d.get("action_type"), d.get("target"))
+                             for d in (r.human or []) if d.get("decision") == "rejected"}
+            model_actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": a["requires_hitl"]}
+                             for a in (r.chain or {}).get("recommended_actions", [])]
+            if not rejected_keys or not any((a["action_type"], a["target"]) in rejected_keys for a in model_actions):
+                return None                                   # can't identify what was overruled
+            held = [{**a, "requires_hitl": True} if (a["action_type"], a["target"]) in rejected_keys else a
+                    for a in model_actions]
+            if held == model_actions:
+                return None                                   # already all HITL — no contrast
+            chosen = self._triage_target(r, verdict=human_verdict, confidence=conf, actions=held)
+            rejected = self._triage_target(r, verdict=model_verdict, confidence=conf, actions=model_actions)
+        else:
+            return None
+
+        return {
+            "id": r.record_id, "split": r.split, "label_source": src, "origin": r.origin,
+            "prompt": self._triage_prompt(r),
+            "chosen": json.dumps(chosen, ensure_ascii=False),
+            "rejected": json.dumps(rejected, ensure_ascii=False),
         }
 
     def _sft_proposal_row(self, r: TriageRecord) -> Optional[dict]:
@@ -215,7 +286,8 @@ class DatasetBuilder:
             "git_sha": _git_sha(),
             "sources": self.opt.sources,
             "options": {"val_pct": self.opt.val_pct, "include_weak": self.opt.include_weak,
-                        "include_disputed": self.opt.include_disputed, "eval_split": self.opt.eval_split},
+                        "include_disputed": self.opt.include_disputed, "eval_split": self.opt.eval_split,
+                        "dpo": self.opt.dpo},
             "scrub": {"salted": self.opt.salted, "scrub_ips": self.opt.scrub_ips},
             "counts": {
                 "records": len(records),
@@ -288,6 +360,28 @@ def verify_dataset(out_dir: Path | str) -> tuple[bool, list[str]]:
                 break
             if target.get("verdict") not in ("benign", "suspicious", "malicious", "uncertain"):
                 problems.append(f"sft row {row.get('id')} has verdict {target.get('verdict')!r}")
+                break
+    dpo = d / "dpo" / "preferences.jsonl"
+    if dpo.exists():
+        for row in _read_jsonl(dpo):
+            prompt = row.get("prompt") or []
+            if len(prompt) != 2 or [m.get("role") for m in prompt] != ["system", "user"]:
+                problems.append(f"dpo row {row.get('id')} prompt is not system/user")
+                break
+            try:
+                chosen = json.loads(row["chosen"])
+                rejected = json.loads(row["rejected"])
+            except Exception:  # noqa: BLE001
+                problems.append(f"dpo row {row.get('id')} chosen/rejected is not JSON")
+                break
+            if row.get("chosen") == row.get("rejected"):
+                problems.append(f"dpo row {row.get('id')} has identical chosen and rejected (no preference)")
+                break
+            if chosen.get("verdict") not in ("benign", "suspicious", "malicious", "uncertain"):
+                problems.append(f"dpo row {row.get('id')} chosen has verdict {chosen.get('verdict')!r}")
+                break
+            if row.get("label_source") not in ("human_corrected", "human_disputed"):
+                problems.append(f"dpo row {row.get('id')} from non-analyst source {row.get('label_source')!r}")
                 break
     return not problems, problems
 

@@ -1,0 +1,103 @@
+"""DPO preference pairs are built only from analyst decisions that overruled the model."""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from aegis.dataset import BuildOptions, DatasetBuilder, HumanDecision, Scrubber, record_from_chain
+from aegis.dataset.export import verify_dataset
+
+
+@pytest.fixture(autouse=True)
+def _iso(monkeypatch):
+    monkeypatch.setenv("ACP_HOME", tempfile.mkdtemp())
+    yield
+
+
+def _rec(sc, *, alert_id, verdict, actions, human, alert_src="waf"):
+    ch = {
+        "alert_id": alert_id, "verdict": verdict, "confidence": 0.9,
+        "evidence": [{"source": alert_src, "signal": f"signal for {alert_id}", "weight": "high"}],
+        "recommended_actions": actions,
+        "integrity_hash": f"h-{alert_id}",
+    }
+    return record_from_chain(ch, alert={"id": alert_id, "source": alert_src},
+                             origin="dashboard_chain", scrubber=sc, human=human)
+
+
+def _hd(action_type, target, decision, corrected=""):
+    return HumanDecision("ap-" + target, action_type, target, decision, "soc_analyst", "rationale", None, corrected)
+
+
+def _build(records, tmp_path, **opts):
+    out = tmp_path / "ds"
+    DatasetBuilder(out, BuildOptions(name="t", dpo=True, **opts)).add(records).build()
+    rows = [json.loads(l) for l in (out / "dpo" / "preferences.jsonl").read_text().splitlines() if l.strip()]
+    return out, {r["id"]: r for r in rows}, rows
+
+
+def test_human_corrected_makes_a_verdict_contrast_pair(tmp_path):
+    sc = Scrubber(salt="k")
+    # model said malicious; analyst rejected and corrected to benign
+    rec = _rec(sc, alert_id="A1", verdict="malicious",
+               actions=[{"action_type": "isolate", "target": "app-07", "requires_hitl": True}],
+               human=[_hd("isolate", "app-07", "rejected", corrected="benign")])
+    assert rec.label["source"] == "human_corrected"
+    out, by_id, rows = _build([rec], tmp_path)
+    assert len(rows) == 1
+    pair = by_id[rec.record_id]
+    chosen, rejected = json.loads(pair["chosen"]), json.loads(pair["rejected"])
+    assert chosen["verdict"] == "benign"           # the analyst's call
+    assert rejected["verdict"] == "malicious"       # the one the model was overruled on
+    assert pair["label_source"] == "human_corrected"
+    # prompt is the same system+user shape the SFT judge trains on
+    assert [m["role"] for m in pair["prompt"]] == ["system", "user"]
+    assert json.loads(pair["prompt"][1]["content"])["id"] == "A1"
+    ok, problems = verify_dataset(out)
+    assert ok, problems
+
+
+def test_human_disputed_makes_an_action_contrast_pair(tmp_path):
+    sc = Scrubber(salt="k")
+    # analyst rejected an auto-run block but named no verdict → hold that action for a human
+    rec = _rec(sc, alert_id="A2", verdict="malicious",
+               actions=[{"action_type": "block", "target": "10.0.0.9", "requires_hitl": False}],
+               human=[_hd("block", "10.0.0.9", "rejected")])
+    assert rec.label["source"] == "human_disputed"
+    _out, by_id, rows = _build([rec], tmp_path)
+    assert len(rows) == 1
+    chosen, rejected = json.loads(by_id[rec.record_id]["chosen"]), json.loads(by_id[rec.record_id]["rejected"])
+    chosen_block = next(a for a in chosen["recommended_actions"] if a["target"] == "10.0.0.9")
+    rejected_block = next(a for a in rejected["recommended_actions"] if a["target"] == "10.0.0.9")
+    assert chosen_block["requires_hitl"] is True    # chosen holds it for a human
+    assert rejected_block["requires_hitl"] is False  # the overruled auto-run
+
+
+def test_confirmations_agreements_and_synthetic_make_no_pair(tmp_path):
+    sc = Scrubber(salt="k")
+    confirmed = _rec(sc, alert_id="A3", verdict="malicious",
+                     actions=[{"action_type": "isolate", "target": "app-09", "requires_hitl": True}],
+                     human=[_hd("isolate", "app-09", "approved")])              # human_confirmed → no contrast
+    model_only = _rec(sc, alert_id="A4", verdict="suspicious",
+                      actions=[{"action_type": "monitor", "target": "app-10", "requires_hitl": False}],
+                      human=[])                                                  # label.source == "model"
+    assert confirmed.label["source"] == "human_confirmed"
+    assert model_only.label["source"] == "model"
+    _out, _by_id, rows = _build([confirmed, model_only], tmp_path)
+    assert rows == []
+
+
+def test_no_dpo_file_without_the_flag(tmp_path):
+    sc = Scrubber(salt="k")
+    rec = _rec(sc, alert_id="A5", verdict="malicious",
+               actions=[{"action_type": "isolate", "target": "app-07", "requires_hitl": True}],
+               human=[_hd("isolate", "app-07", "rejected", corrected="benign")])
+    out = tmp_path / "ds_nodpo"
+    manifest = DatasetBuilder(out, BuildOptions(name="t")).add([rec]).build()   # dpo defaults off
+    assert not (out / "dpo").exists()
+    assert "dpo/preferences.jsonl" not in manifest["files"]
+    assert "dpo_pairs" not in manifest["counts"]
