@@ -194,3 +194,52 @@ def test_cli_roundtrip(tmp_path, capsys):
     assert L.main(["report", "--audit", str(tmp_path / "none.jsonl"), "--out", str(tmp_path / "u.json")]) == 0
     rep = json.loads((tmp_path / "u.json").read_text())
     assert rep["audit_chains"] == 0 and len(rep["digest"]) == 64
+
+
+def test_activate_cli_against_the_license_service(tmp_path, keys, monkeypatch):
+    """End to end: the AWS handler (in-memory store, no boto3) behind a local HTTP server, redeemed by the CLI."""
+    import importlib.util
+    import shutil
+    import sys
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    root = Path(__file__).resolve().parents[2]
+    srv_dir = root / "license-server" / "app"
+    shutil.copy(root / "aegis" / "license.py", srv_dir / "aegis_license.py")
+    sys.path.insert(0, str(srv_dir))
+    spec = importlib.util.spec_from_file_location("bd_license_app", srv_dir / "app.py")
+    app = importlib.util.module_from_spec(spec); spec.loader.exec_module(app)
+    priv = json.loads((keys["dir"] / "test-kid.key.json").read_text())
+    cfg = app.Config(signing_key=priv, admin_key="adm", extra_pubkeys=[])
+    store = app.MemoryStore()
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def _do(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            ev = {"requestContext": {"http": {"method": self.command, "path": self.path}}, "headers": dict(self.headers),
+                  "body": self.rfile.read(n).decode() if n else ""}
+            r = app.handle(ev, cfg=cfg, store=store)
+            raw = r["body"].encode()
+            self.send_response(r["statusCode"]); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+        do_GET = do_POST = _do
+
+    httpd = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        req = urllib.request.Request(url + "/orders", data=json.dumps({"customer": "Bank Q", "tier": "pilot", "days": 90}).encode(),
+                                     headers={"x-admin-key": "adm", "Content-Type": "application/json"}, method="POST")
+        code = json.loads(urllib.request.urlopen(req).read())["code"]
+        monkeypatch.setenv("AEGIS_INSTALL_ID", "bd-cli-install")
+        out = tmp_path / "license.jwt"
+        assert L.main(["activate", "--server", url, "--code", code.lower(), "--out", str(out)]) == 0
+        st = L.check({"AEGIS_INSTALL_ID": "bd-cli-install", "AEGIS_LICENSE": str(out), "AEGIS_LICENSE_ENFORCE": "1"}, keys=keys["pub"])
+        assert st.status == "valid" and st.license.customer == "Bank Q" and st.license.tier == "pilot"
+        with pytest.raises(L.LicenseError, match="already used on another installation"):
+            L.activate(url, code, "bd-other")
+        with pytest.raises(L.LicenseError, match="unknown activation code"):
+            L.activate(url, "BD-NOPE-NOPE-NOPE", "bd-x")
+    finally:
+        httpd.shutdown()

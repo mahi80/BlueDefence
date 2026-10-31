@@ -1,0 +1,4 @@
+app/aegis_license.py
+.aws-sam/
+samconfig.toml
+.build/

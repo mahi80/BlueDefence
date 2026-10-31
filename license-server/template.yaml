@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: BlueDefence licence service — issue / activate / verify, all inside the AWS free tier (Lambda + HTTP API + DynamoDB on-demand + SSM).
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+  SigningKeyParam:
+    Type: String
+    Default: /bluedefence/license/signing-key
+    Description: SSM SecureString holding the *.key.json from `python -m aegis.license keygen`
+  AdminKeyParam:
+    Type: String
+    Default: /bluedefence/license/admin-key
+    Description: SSM SecureString holding the admin API key (x-admin-key header)
+  PubkeysParam:
+    Type: String
+    Default: /bluedefence/license/public-keys
+    Description: optional SSM String with a JSON list of extra public keys (rotation)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]          # cheaper per ms; still inside the free tier either way
+    Timeout: 10
+    MemorySize: 256
+
+Resources:
+  LicenseTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  LicenseApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      # Throttle hard: a licence API sees a handful of calls a day. This also keeps a stray loop
+      # from ever leaving the free tier.
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 5
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiLogs.Arn
+        Format: '{"t":"$context.requestTime","ip":"$context.identity.sourceIp","m":"$context.httpMethod","p":"$context.path","s":"$context.status","id":"$context.requestId"}'
+
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 90
+
+  LicenseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: app/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          LICENSE_TABLE: !Ref LicenseTable
+          SIGNING_KEY_PARAM: !Ref SigningKeyParam
+          ADMIN_KEY_PARAM: !Ref AdminKeyParam
+          PUBKEYS_PARAM: !Ref PubkeysParam
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref LicenseTable }
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:GetParameter]
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SigningKeyParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AdminKeyParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PubkeysParam}
+            - Effect: Allow
+              Action: [kms:Decrypt]
+              Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/ssm
+      Events:
+        Any:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LicenseApi
+            Path: /{proxy+}
+            Method: ANY
+
+Outputs:
+  ApiUrl:
+    Description: Base URL — give this to `python -m aegis.license activate --server`
+    Value: !Sub https://${LicenseApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  TableName:
+    Value: !Ref LicenseTable

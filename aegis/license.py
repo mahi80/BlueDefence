@@ -9,6 +9,9 @@ home. One licence per installation; a second site is a second licence.
     python -m aegis.license issue   --key keys/license.key --customer "Bank X" --installation <id>
                                     --edition soc --tier standard --days 365 [--devices 2000 --eps 50]
                                     [--feature netops --feature kafka_bridge …] --out license.jwt
+    python -m aegis.license activate --server https://… --code BD-XXXX-XXXX-XXXX [--out /etc/aegis/license.jwt]
+                                                                      operator: redeem an activation code from the licence
+                                                                      service (sends only this installation's id)
     python -m aegis.license verify  [--license license.jwt]           operator: what the running service will conclude
     python -m aegis.license report  [--out usage.json]                operator: signed usage snapshot (counts only) for true-up
 
@@ -344,7 +347,11 @@ def _read_token(env: MutableMapping[str, str]) -> tuple[str, str]:
                 break
     if not raw:
         return "", "no licence (AEGIS_LICENSE unset, no /etc/aegis/license.jwt)"
-    if raw.count(".") == 2 and not Path(raw).exists():
+    try:
+        is_file = Path(raw).is_file()
+    except OSError:                                             # an inline token is far longer than a path may be
+        is_file = False
+    if raw.count(".") == 2 and not is_file:
         return raw, ""                                          # inline token
     try:
         return Path(raw).read_text().strip(), ""
@@ -475,6 +482,31 @@ def usage_report(state: LicenseState, meter: LicenseMeter | None, *, audit_path:
     return rep
 
 
+# ---------------------------------------------------------------- activation --
+
+def activate(server: str, code: str, inst: str) -> dict:
+    """Redeem an activation code at the licence service; returns the service's JSON (``token``, ``lic`` …).
+    Raises ``LicenseError`` with the service's message on 4xx/5xx. Only the installation id leaves the host."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(server.rstrip("/") + "/activate", data=json.dumps({"code": code.strip().upper(), "installation_id": inst}).encode(),
+                                 headers={"Content-Type": "application/json", "User-Agent": "aegis-license/1"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            res = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", "")
+        except Exception:  # noqa: BLE001
+            msg = ""
+        raise LicenseError(f"activation refused ({e.code}): {msg or e.reason}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise LicenseError(f"licence service unreachable: {e}") from None
+    if not res.get("token"):
+        raise LicenseError("licence service returned no token")
+    return res
+
+
 # ---------------------------------------------------------------------- CLI --
 
 def main(argv: list[str] | None = None) -> int:
@@ -502,7 +534,12 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--license", help="path or token (default: AEGIS_LICENSE / /etc/aegis/license.jwt)")
     v.add_argument("--pubkeys", help="directory or file of *.pub.json (default: AEGIS_LICENSE_PUBKEYS / shipped keys)")
     v.add_argument("--json", action="store_true")
+    ac = sub.add_parser("activate", help="operator: redeem an activation code from the licence service")
+    ac.add_argument("--server", default=os.environ.get("AEGIS_LICENSE_SERVER", ""), help="licence service base URL (or AEGIS_LICENSE_SERVER)")
+    ac.add_argument("--code", required=True, help="BD-XXXX-XXXX-XXXX from your BlueDefence order")
+    ac.add_argument("--out", default="license.jwt")
     r = sub.add_parser("report", help="operator: signed usage snapshot (counts only) for the true-up")
+    r.add_argument("--push", default=os.environ.get("AEGIS_LICENSE_SERVER", ""), help="also POST the report to this licence service (optional)")
     r.add_argument("--audit", default=os.environ.get("AEGIS_AUDIT_PATH", "aegis/_audit_log.jsonl"))
     r.add_argument("--out", default="")
     a = ap.parse_args(argv)
@@ -543,9 +580,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"installation {st.installation_id}")
             print(st.describe())
         return 0 if st.licensed else 1
+    if a.cmd == "activate":
+        if not a.server:
+            ap.error("--server (or AEGIS_LICENSE_SERVER) is required")
+        res = activate(a.server, a.code, installation_id())
+        Path(a.out).write_text(res["token"] + "\n")
+        print(f"licence {res['lic']} for {res.get('customer', '')} bound to {installation_id()} → {a.out}"
+              + (" (re-issued: this installation had already redeemed the code)" if res.get("reissued") else ""))
+        print(f"set AEGIS_LICENSE={Path(a.out).resolve()} and AEGIS_LICENSE_ENFORCE=1, then: python -m aegis.license verify")
+        return 0
     if a.cmd == "report":
         st = check()
         rep = usage_report(st, None, audit_path=Path(a.audit))
+        if a.push:
+            import urllib.request
+            req = urllib.request.Request(a.push.rstrip("/") + "/usage", data=json.dumps({"report": rep}).encode(),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=20) as r_:
+                print(f"usage report pushed ({r_.status})")
         text = json.dumps(rep, indent=1)
         if a.out:
             Path(a.out).write_text(text + "\n")
@@ -556,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-__all__ = ["License", "LicenseState", "LicenseMeter", "LicenseError", "check", "apply", "allows", "issue", "decode",
+__all__ = ["License", "LicenseState", "LicenseMeter", "LicenseError", "check", "apply", "allows", "issue", "decode", "activate",
            "installation_id", "load_public_keys", "write_keypair", "usage_report", "rsa_keygen", "rsa_sign", "rsa_verify",
            "ALL_FEATURES", "TIERS", "TIER_DEFAULTS"]
 
