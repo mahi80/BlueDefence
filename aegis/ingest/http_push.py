@@ -20,6 +20,9 @@
                               for an edge enforcer — Envoy ext_authz, a Cloudflare Worker, the
                               Go tier-0 filter — to apply inline without any vendor API.
     GET  /healthz             queue depth and counters (no auth).
+    GET  /metrics             Prometheus text: verdicts, actions, HITL queue, feed ages / silent
+                              feeds, audit integrity, token spend. Open unless ``AEGIS_METRICS_TOKEN``
+                              is set (then ``Authorization: Bearer``); serve it on the internal network.
 
 Auth: every ``/ingest/*`` call must carry ``AEGIS_INGEST_TOKEN`` as ``Authorization: Bearer``,
 ``X-Amz-Firehose-Access-Key`` (what Firehose sends) or ``X-AEGIS-Token``; compared in constant
@@ -238,6 +241,18 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/healthz":
             self._reply(200, {"ok": True, "queue": len(self.server_ref.queue), **self.server_ref.queue.stats.to_dict()})
+            return
+        if path == "/metrics":
+            from aegis.agents.shared.observability import METRICS, PROMETHEUS_CONTENT_TYPE, metrics_authorized
+            if not metrics_authorized(self.headers):
+                self._reply(401, {"error": "unauthorized"})
+                return
+            raw = METRICS.prometheus_text().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", PROMETHEUS_CONTENT_TYPE)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
             return
         if path == "/ingest/blocklist":
             if not self.server_ref.authorized(self.headers):
