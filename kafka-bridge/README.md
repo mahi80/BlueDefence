@@ -45,6 +45,10 @@ four ingress topics, write on the verdicts topic, and the usual Streams rights o
 `<BRIDGE_APPLICATION_ID>-*` changelog topics (or pre-create them and set `BRIDGE_PERSISTENT_STORES=0`,
 the default, which keeps dedupe/flap state in memory — it is a cache, losing it on restart costs nothing).
 
+**Licence.** At start the bridge reads `GET /ingest/license`; when AEGIS enforces its licence
+(`AEGIS_LICENSE_ENFORCE=1`) and `kafka_bridge` is not among the licensed features it exits with code 3 and one
+clear line. AEGIS unreachable at start is not a licence failure — the bridge starts and the sink retries.
+
 On the AEGIS side: `AEGIS_INGEST_HTTP=1`, `AEGIS_INGEST_TOKEN=<same token>`, and the receiver must run in the
 service process (it is — `GET /ingest/verdicts` reads the service's audit log).
 

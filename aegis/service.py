@@ -89,6 +89,8 @@ class Pipeline:
     stream: Any = None                  # the shared StreamQueue the receivers feed; the loop wakes on it
     watchdog: Any = None                # feed-liveness watchdog (AEGIS_FEED_WATCHDOG=1); a silent feed is not "no attacks"
     metrics_server: Any = None          # standalone /metrics (AEGIS_METRICS_BIND) for a deployment with no push receiver
+    license: Any = None                 # aegis.license.LicenseState — per-installation licence (AEGIS_LICENSE)
+    license_meter: Any = None           # 24 h peak eps / devices against the licence
     model_key: str = ""                 # change-key of the promotion pointer the live model reflects (hot-reload)
 
     def hot_reload_from_pointer(self) -> Any:
@@ -112,7 +114,9 @@ class Pipeline:
 
     def banner(self) -> str:
         g = self.governed
+        lic = self.license
         return (f"[{self.edition}] LLM backend: {self.primary_name} ({self.primary_model})"
+                + (f" — {lic.describe()} — installation {lic.installation_id}" if lic is not None else "")
                 + (f" — governed by ACP as {g.agent_code}" if g else " — ungoverned brain")
                 + f" — HITL {getattr(getattr(self.response, '_hitl', None), 'name', 'stdout')}"
                 + (f" — swarm on ({self.orch.max_workers} workers, {self.orch.max_seconds:.0f}s cap)"
@@ -147,6 +151,8 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     ``include_mock_intel`` seeds the IOC store with the built-in mock feed (demo default);
     the service reads ``AEGIS_INTEL_MOCK`` (default off) when it is not given.
     """
+    from aegis import license as licensing
+    lic_state = licensing.apply(licensing.check())       # per-installation licence first: it may cap the edition / force shadow
     edition = apply_edition()                            # fills edition defaults, refuses contradictory config (fail fast)
     audit_path = Path(audit_path)
     if fresh and audit_path.exists():
@@ -205,7 +211,8 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     # endpoint serves the active enforcement set to any edge enforcer
     from aegis.ingest.stream import get_stream
     from aegis.ingest.http_push import push_server_from_env
-    push_server = push_server_from_env(blocklist=lambda: connectors.active_receipts, audit_path=audit_path)
+    push_server = push_server_from_env(blocklist=lambda: connectors.active_receipts, audit_path=audit_path,
+                                       license=lambda: lic_state)
     eventhub = None
     if "eventhub" in [x.strip().lower() for x in os.environ.get("AEGIS_SOURCES", "").split(",")]:
         from aegis.ingest.eventhub import eventhub_from_env
@@ -219,7 +226,10 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
                  rules_report=rules_report, primary_name=primary.name, primary_model=primary.model,
                  investigator=investigator, containment=containment, edition=edition.name,
                  push_server=push_server, eventhub=eventhub, stream=get_stream(), watchdog=watchdog,
-                 metrics_server=metrics_server)
+                 metrics_server=metrics_server, license=lic_state,
+                 license_meter=licensing.LicenseMeter(eps_limit=lic_state.eps_limit, devices_limit=lic_state.devices_limit,
+                                                      allowance_s=float(os.environ.get("AEGIS_LICENSE_OVERLIMIT_DAYS", "7")) * 86400))
+    _license_metrics(lic_state)
     # record which promotion the live model reflects, so hot-reload fires only on a CHANGE. The
     # local backend applied the pointer at startup (via _promoted_model); the vllm backend does
     # not, so leave its key empty and let the first hot-reload cycle apply the promoted adapter.
@@ -338,7 +348,49 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
     if p.persist_sink is not None:
         p.persist_sink.flush()
     stats.seconds = time.time() - t0
+    _meter_license(p, stats)
     return stats
+
+
+def _license_metrics(state: Any) -> None:
+    from aegis.agents.shared.observability import METRICS
+    for st in ("valid", "grace", "over_limit", "expired", "missing", "invalid"):
+        METRICS.set("aegis_license_state", 1.0 if state.status == st else 0.0, status=st)
+    METRICS.set("aegis_license_days_left", float(state.days_left) if state.days_left is not None else -1.0)
+    METRICS.set("aegis_license_enforced", 1.0 if state.enforce else 0.0)
+
+
+def _meter_license(p: Pipeline, stats: CycleStats) -> None:
+    """Events this cycle (alerts handled + everything the stream drained) against the licence. Over the
+    limit for longer than the allowance → re-evaluate as over_limit, which in enforce mode forces shadow
+    for the rest of the run (connectors read the mode per call). Never a stop, never a drop."""
+    meter, state = p.license_meter, p.license
+    if meter is None or state is None:
+        return
+    from aegis import license as licensing
+    drained = int(getattr(getattr(p.stream, "stats", None), "drained", 0) or 0)
+    delta = max(0, drained - int(getattr(meter, "_last_drained", 0)))
+    meter._last_drained = drained
+    devices = None
+    try:
+        from aegis.ingest.netops import _shared as net_det   # the netops inventory is the device count when present
+        if net_det is not None:
+            devices = len(getattr(net_det, "_adj", {}) or {})
+    except Exception:  # noqa: BLE001
+        devices = None
+    over = meter.observe(stats.alerts + delta, time.time(), devices)
+    if over and state.status == "valid":
+        new = licensing.check(over_limit=True)
+        if new.status == "over_limit":
+            p.license = licensing.apply(new)
+            _license_metrics(p.license)
+            logger.warning("[license] %s", p.license.reason)
+    elif state.status in ("grace", "over_limit") and time.time() - getattr(meter, "_last_warn", 0.0) > 3600:
+        meter._last_warn = time.time()                       # hourly, not every cycle
+        logger.warning("[license] %s", state.describe())
+    from aegis.agents.shared.observability import METRICS
+    METRICS.set("aegis_license_peak_eps_24h", meter.peak_eps_24h)
+    METRICS.set("aegis_license_devices_seen", float(meter.devices_seen))
 
 
 class Service:
@@ -356,6 +408,101 @@ class Service:
     def stop(self, *_: Any) -> None:
         self._stop = True
 
+    _last_contrib: float = 0.0
+    _last_heartbeat: float = 0.0
+
+    def _maybe_heartbeat_and_renew(self) -> None:
+        """With a licence service configured: a daily heartbeat (counts + code fingerprint + effective flags, never
+        event data), and a token roll when fewer than AEGIS_LICENSE_RENEW_DAYS (7) remain. The service re-issues only
+        while the installation is in good standing — for a data-sharing licence, only while contributions arrive."""
+        server = os.environ.get("AEGIS_LICENSE_SERVER", "").strip()
+        lic = self.p.license
+        if not server or lic is None:
+            return
+        every = float(os.environ.get("AEGIS_HEARTBEAT_INTERVAL_S", "86400"))
+        if time.time() - self._last_heartbeat < every:
+            return
+        self._last_heartbeat = time.time()
+        from aegis import license as licensing
+        token, _ = licensing._read_token(os.environ)
+        if not token:
+            return
+        counters = {"cycles": self.cycles, "alerts": sum(h.alerts for h in self.history), "executed": sum(h.executed for h in self.history),
+                    "hitl_queued": sum(h.hitl_queued for h in self.history), "decisions": sum(h.decisions for h in self.history)}
+        try:
+            from aegis.dataset.contrib import read_cursor
+            cur = read_cursor(Path(os.environ.get("AEGIS_CONTRIB_CURSOR", str(self.p.audit_path.parent / ".contrib.cursor"))))
+            res = licensing.heartbeat(server, token, licensing.heartbeat_payload(
+                installation_id=lic.installation_id, audit_path=self.p.audit_path, counters=counters, contrib_cursor=cur))
+            if res.get("attestation") == "unknown":
+                logger.warning("[license] the licence service does not recognise this install's code fingerprint — "
+                               "a modified install will not be renewed")
+            if res.get("standing") and res["standing"] != "good":
+                logger.warning("[license] standing with the licence service: %s — %s", res["standing"], res.get("reason", ""))
+        except Exception as e:  # noqa: BLE001 — a heartbeat failure never affects the SOC
+            logger.warning("[license] heartbeat failed: %s", str(e)[:200])
+        # model updates — the brain ships like antivirus definitions: pull, verify the signed manifest, point, hot-reload
+        try:
+            from aegis import model_updates
+            if model_updates.enabled() and lic.licensed:
+                r = model_updates.update_once(server=server, token=token, installation_id=lic.installation_id)
+                if r.get("updated"):
+                    logger.info("[model_updates] %s → %s installed; %s", r.get("previous") or "base", r["version"],
+                                "hot-reloading" if os.environ.get("AEGIS_HOT_RELOAD", "").lower() in ("1", "true", "yes", "on")
+                                else "applies at the next restart (set AEGIS_HOT_RELOAD=1 for an in-place swap on vLLM)")
+                    from aegis.agents.shared.observability import METRICS
+                    METRICS.inc("aegis_model_updates_total")
+                    if os.environ.get("AEGIS_HOT_RELOAD", "").lower() in ("1", "true", "yes", "on"):
+                        self.p.hot_reload_from_pointer()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[model_updates] %s", str(e)[:200])
+        try:
+            if lic.license is not None and lic.days_left is not None and lic.days_left < float(os.environ.get("AEGIS_LICENSE_RENEW_DAYS", "7")):
+                res = licensing.renew(server, token)
+                dest = licensing.token_path()
+                if dest is not None:
+                    dest.write_text(res["token"] + "\n")
+                    self.p.license = licensing.apply(licensing.check())
+                    _license_metrics(self.p.license)
+                    logger.info("[license] token renewed until %s", time.strftime("%Y-%m-%d", time.gmtime(float(res.get("expires", 0)))))
+                else:
+                    logger.warning("[license] renewed token received but AEGIS_LICENSE is inline — set it to the new value: %s…", res["token"][:24])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[license] renewal failed: %s", str(e)[:200])
+
+    def _maybe_contribute(self) -> None:
+        """Community licence (``AEGIS_CONTRIB=1``): every ``AEGIS_CONTRIB_INTERVAL_S`` (3600) build the scrubbed
+        bundle of new chains + analyst decisions and push it to ``AEGIS_LICENSE_SERVER`` (or write it to
+        ``AEGIS_CONTRIB_OUT`` on an air-gapped host). A refused bundle leaves nothing; a failed push retries next time."""
+        if os.environ.get("AEGIS_CONTRIB", "0").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        every = float(os.environ.get("AEGIS_CONTRIB_INTERVAL_S", "3600"))
+        if time.time() - self._last_contrib < every:
+            return
+        self._last_contrib = time.time()
+        try:
+            from aegis.dataset.contrib import contribute
+            from aegis.license import _read_token
+            token, _ = _read_token(os.environ)
+            lic = self.p.license
+            res = contribute(audit_path=self.p.audit_path, installation_id=lic.installation_id if lic else "unknown",
+                             license_token=token, license_id=(lic.license.license_id if lic and lic.license else ""),
+                             hitl_dir=os.environ.get("AEGIS_HITL_DIR") or None,
+                             cursor_path=os.environ.get("AEGIS_CONTRIB_CURSOR", str(self.p.audit_path.parent / ".contrib.cursor")),
+                             server=os.environ.get("AEGIS_LICENSE_SERVER", "").strip(),
+                             out=(os.environ.get("AEGIS_CONTRIB_OUT", "").strip() and
+                                  str(Path(os.environ["AEGIS_CONTRIB_OUT"]) / f"contrib-{int(time.time())}.json.gz")) or None)
+            if res.get("sent") or res.get("file"):
+                logger.info("[contrib] %d record(s) (%d with analyst decisions) %s", res["records"], res["counts"]["human_decided"],
+                            "pushed" if res.get("sent") else f"written to {res['file']}")
+            elif res.get("reason") == "privacy gate":
+                logger.error("[contrib] bundle refused by the privacy gate — nothing left this host (%d finding(s))", len(res["findings"]))
+            from aegis.agents.shared.observability import METRICS
+            METRICS.inc("aegis_contrib_records_total", res.get("records", 0))
+            METRICS.set("aegis_contrib_last_ok", 1.0 if res.get("sent") or res.get("file") or res.get("reason") == "nothing new" else 0.0)
+        except Exception as e:  # noqa: BLE001 — contribution must never take the SOC down
+            logger.warning("[contrib] failed: %s", str(e)[:200])
+
     def run(self, *, once: bool = False, max_cycles: int = 0) -> int:
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -372,6 +519,8 @@ class Service:
         while not self._stop:
             stats = run_cycle(self.p, max_alerts=self.max_alerts)
             self.cycles += 1
+            self._maybe_contribute()
+            self._maybe_heartbeat_and_renew()
             self.history.append(stats)
             del self.history[:-100]
             logger.info("[service] cycle %d: %s", self.cycles, stats.line())

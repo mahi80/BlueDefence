@@ -35,3 +35,6 @@ npm-debug.log*
 # ...but test fixtures that happen to use the .log extension are source, not scratch
 !aegis/ingest/fixtures/*.log
 !aegis/ingest/fixtures/**/*.log
+
+# licence signing keys: the public half ships (aegis/keys/*.pub.json); a private key is never committed
+*.key.json

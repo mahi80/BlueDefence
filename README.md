@@ -114,6 +114,8 @@ see the flags below and [`aegis/README.md`](aegis/README.md) for the full config
 | `AEGIS_TREASURY_ACCOUNTS` | — | Treasury / nostro / settlement senders (plus ids containing TREASURY, NOSTRO, VOSTRO, SETTLEMENT, and `svc_` users). |
 | `AEGIS_PRIVILEGED_USERS`, `AEGIS_PRIVILEGED_HOSTS` | — | Engineers with production reach (DevOps / SRE / DevSecOps / platform) and their machines — export from the IdP groups and asset inventory. A compromise there is a crown-jewel incident: isolate, revoke, rotate. Role tags on alerts work too. |
 | `AEGIS_CROWN_JEWELS` | payment, signer, hsm, swift, treasury, vault, kms, core-banking | Systems where interactive access or a control change (signing policy, allowlist, limits) outside a ticketed window is malicious. |
+| `AEGIS_LICENSE_SERVER`, `AEGIS_CONTRIB`, `AEGIS_CONTRIB_INTERVAL_S`, `AEGIS_CONTRIB_OUT`, `AEGIS_HEARTBEAT_INTERVAL_S`, `AEGIS_LICENSE_RENEW_DAYS` | — / forced by `data_sharing` / 3600 / — / 86400 / 7 | Licence service URL; hourly contribution (or write bundles to a folder on an air-gapped host); daily heartbeat; token roll when fewer days remain. |
+| `AEGIS_LICENSE`, `AEGIS_LICENSE_ENFORCE` | — / `0` | Path (or inline token) of the installation licence; `1` makes the service honour it (edition cap, feature gates, shadow on over-limit, refuse start past grace). `AEGIS_INSTALL_ID` pins the installation id; `AEGIS_LICENSE_PUBKEYS` overrides the shipped issuer keys; `AEGIS_LICENSE_OVERLIMIT_DAYS` (7). See *Licensing*. |
 | `AEGIS_NET_*` | flap 5/300 s, correlation 900 s, errors 100/min, utilisation 90 % × 3, silent 180 s, bad push 600 s | Network assurance thresholds (`AEGIS_NET_FLAP_N`, `_FLAP_WINDOW_S`, `_CORR_WINDOW_S`, `_ERR_PER_MIN`, `_UTIL_PCT`, `_UTIL_SAMPLES`, `_SILENT_S`, `_BAD_PUSH_S`); `AEGIS_NET_GOLDEN` (JSON `{device: config_hash}`) or `AEGIS_NET_GOLDEN_FIRST_SEEN=1`; `AEGIS_NET_INVENTORY` for roles/sites/users. Root cause, alarm suppression, flaps, bad config pushes — see `aegis/README.md` § What the network itself says. |
 
 WAF/SOAR vendors: `AEGIS_WAF_VENDOR`, `AEGIS_SOAR_VENDOR` (+ creds) — see `aegis/README.md`.
@@ -139,6 +141,60 @@ python -m aegis.finetune.dpo --data datasets/triage-v1 --dry-run   # validate pa
 
 Analyst-only by construction, and `load_dpo` refuses non-analyst pairs unless `--allow-synthetic`,
 so no one preference-tunes a bank model on scaffold data by accident.
+
+## Licensing (per installation)
+
+A bank's AEGIS often has no egress, so the licence is an **offline signed file bound to one
+installation** — checked at startup and every cycle, never a call home. One licence per
+installation; a second site is a second licence. Verification is stdlib-only (RSA / SHA-256).
+
+| Step | Who | Command |
+|---|---|---|
+| Create the signing keypair (once; private key offline) | BlueDefence | `python -m aegis.license keygen --out keys/ --kid bd-2026-11` → ship `keys/*.pub.json` in the image (`aegis/keys/`) |
+| Read the installation id | bank operator | `python -m aegis.license install-id` (or pin `AEGIS_INSTALL_ID` on a cluster) → send it with the order |
+| Issue | BlueDefence | `python -m aegis.license issue --key keys/bd-2026-11.key.json --customer "Bank X" --installation bd-… --edition soc --tier standard --days 365 [--feature kafka_bridge] --out license.jwt` |
+| Install | bank operator | `AEGIS_LICENSE=/etc/aegis/license.jwt`, `AEGIS_LICENSE_ENFORCE=1`; `python -m aegis.license verify` shows what the service will conclude |
+| Renew / upgrade | both | drop the new file; picked up at the next start. Rotate issuer keys by adding a new `*.pub.json` (`kid`) |
+| True-up | bank operator | `python -m aegis.license report --out usage.json` — signed counts only (peak eps, devices, chains), e-mailable across an air gap |
+
+| Tier | Devices / eps | Features | Enforcement |
+|---|---|---|---|
+| **evaluation** (no licence) | 100 / 5 | — | external edition, shadow only |
+| **community** (free 2 years) | 500 / 20 | swarm, investigate, netops, ensemble, kafka_bridge, live enforcement, **data_sharing** | live allowed; model runs at the bank; scrubbed chains + analyst decisions contributed hourly |
+| **pilot** (90 d) | 100 / 5 | swarm, investigate, netops | shadow only |
+| **standard** | 2,000 / 50 | + ensemble, live enforcement, live auto-block | live allowed |
+| **enterprise** | unlimited | + kafka_bridge, dpo, compliance_pack | live allowed |
+
+**Community edition — how the free licence stays honest.** The bank keeps the model (open weights) and sends
+back *derived* telemetry: `aegis/dataset/contrib.py` builds a bundle of new evidence chains + analyst decisions,
+scrubbed (salted pseudonyms, IPs, hostnames, e-mail domains) and checked by `aegis/dataset/privacy_gate.py`
+(anything PII-shaped → the bundle is not sent), then `POST /contrib` to the licence service every hour. The
+licence token itself is **30-day rolling**: the service re-issues it only while the installation is in good
+standing — daily heartbeat (counts + code fingerprint + effective flags), contribution ratio ≥ 0.5 over 30 days,
+fingerprint on the published-release list, capture not switched off. Stop sending and the token lapses within
+≤ 44 days into evaluation mode; nothing is ever deleted. Self-serve: `POST /signup` (work e-mail, ≤ 3 per
+domain); terms in `license-server/TERMS-COMMUNITY.md`. Your side: `aws s3 sync s3://<contrib-bucket>/contrib
+./contrib && python -m aegis.dataset import-contrib ./contrib --out datasets/community-v1` → SFT + DPO views →
+`aegis.finetune` → the next brain, shipped back to every installation.
+
+**Model updates — the brain ships like antivirus definitions.** You train on the pool, gate the adapter, and
+`python -m aegis.finetune.publish --adapter … --version 2026.11.1 --channel stable --rollout-pct 10` uploads it
+and has the licence service sign a release manifest with the issuer key. Every licensed installation asks
+`GET /updates` on its daily heartbeat, verifies the manifest against `aegis/keys/`, downloads, checks sha256 +
+size against the *signed* manifest, extracts to `AEGIS_MODEL_DIR/<version>/`, writes the promotion pointer and
+hot-reloads (vLLM `set_model`) or applies at the next restart. Staged rollout by installation-id bucket; `rollout`
+widens, `withdraw` pulls; `python -m aegis.model_updates rollback` repoints to the previous release kept on disk.
+`AEGIS_MODEL_UPDATES` (on when a licence server is set), `AEGIS_MODEL_CHANNEL`, `AEGIS_MODEL_BASE`.
+
+What happens when things go wrong (`AEGIS_LICENSE_ENFORCE=1`): **grace** (expired < `grace_days`, 30) runs
+as licensed and warns hourly; **over_limit** (24 h peak above devices/eps for > `AEGIS_LICENSE_OVERLIMIT_DAYS`, 7)
+forces enforcement to shadow — never a stop; **expired** past grace refuses to *start* (audit, verify and
+export tools keep working); **missing / invalid / wrong installation** runs in evaluation mode. Nothing is ever
+deleted, HITL always works, and a licence can only cap the edition, never raise it. Dev and CI run with
+`AEGIS_LICENSE_ENFORCE=0` (default), where the licence is reported but changes nothing. The Kafka bridge
+checks `GET /ingest/license` for the `kafka_bridge` feature before it starts. State is on `/healthz`,
+`/ingest/license` and `/metrics` (`aegis_license_state{status}`, `aegis_license_days_left`,
+`aegis_license_peak_eps_24h`).
 
 ## Pilot at a bank (sandbox) — what to ask for
 

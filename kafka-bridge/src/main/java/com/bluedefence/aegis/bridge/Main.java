@@ -34,6 +34,8 @@ public final class Main {
                 cfg.bootstrapServers(), cfg.aegisUrl(), cfg.topicSyslog(), cfg.topicNetflow(), cfg.topicTelemetry(),
                 cfg.topicAlerts(), cfg.topicVerdicts());
 
+        checkLicense(cfg);
+
         AegisSink sink = new AegisSink(AegisSink.httpTransport(cfg.aegisUrl(), cfg.ingestToken()),
                 cfg.batchLines(), cfg.linger(), cfg.maxBufferedLines()).start();
 
@@ -78,6 +80,39 @@ public final class Main {
         stats.setDaemon(true);
         stats.start();
         done.await();
+    }
+
+    /**
+     * {@code GET /ingest/license}: when AEGIS enforces its licence and {@code kafka_bridge} is not among the
+     * licensed features, refuse to start — the bank sees one clear line instead of a silently rejected feed.
+     * AEGIS unreachable at start is not a licence failure: the sink retries, so the bridge starts anyway.
+     */
+    static void checkLicense(BridgeConfig cfg) {
+        try {
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(5)).build();
+            java.net.http.HttpRequest.Builder b = java.net.http.HttpRequest.newBuilder(java.net.URI.create(cfg.aegisUrl() + "/ingest/license"))
+                    .timeout(java.time.Duration.ofSeconds(10)).GET();
+            if (!cfg.ingestToken().isBlank()) b.header("Authorization", "Bearer " + cfg.ingestToken());
+            java.net.http.HttpResponse<String> r = client.send(b.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (r.statusCode() != 200) {
+                log.warn("licence check skipped: AEGIS answered {} on /ingest/license", r.statusCode());
+                return;
+            }
+            com.fasterxml.jackson.databind.JsonNode st = new com.fasterxml.jackson.databind.ObjectMapper().readTree(r.body());
+            boolean enforce = st.path("enforce").asBoolean(false);
+            boolean allowed = false;
+            for (com.fasterxml.jackson.databind.JsonNode f : st.path("features")) allowed |= "kafka_bridge".equals(f.asText());
+            log.info("AEGIS licence: status={} tier={} edition={} kafka_bridge={} enforce={}", st.path("status").asText(),
+                    st.path("tier").asText(), st.path("edition").asText(), allowed, enforce);
+            if (enforce && !allowed) {
+                log.error("the AEGIS licence for installation {} does not include the kafka_bridge feature — not starting. "
+                        + "Ask for the feature on the licence (python -m aegis.license issue … --feature kafka_bridge).",
+                        st.path("installation_id").asText());
+                System.exit(3);
+            }
+        } catch (java.io.IOException | InterruptedException e) {
+            log.warn("licence check skipped: AEGIS not reachable yet ({}); the sink will retry", e.getMessage());
+        }
     }
 
     static Properties streamsProps(BridgeConfig cfg) {

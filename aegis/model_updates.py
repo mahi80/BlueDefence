@@ -1,0 +1,306 @@
+"""Model updates — the brain ships to every installation like antivirus definitions.
+
+BlueDefence trains on the pooled Community data, gates the adapter (``aegis.finetune.gate``) and
+**publishes** it; every installation **pulls** it on its daily licence heartbeat, verifies it, and
+hot-swaps (vLLM) or applies it at the next restart (local backend). The bank never has to do
+anything; the weights come to them.
+
+    publisher (you)        python -m aegis.finetune.publish --adapter runs/…/adapter --version 2026.11.1 --channel stable
+                           → tar.gz + sha256 → POST /releases (admin) → presigned S3 PUT → POST /releases/{v}/publish
+                           → the service signs a release MANIFEST (RS256, same issuer key as the licence)
+
+    installation           GET /updates?channel=stable&base=<base model>&current=<version>   (bearer = licence)
+                           → {manifest_token, url}  → download → sha256 matches the SIGNED manifest → verify signature
+                           against aegis/keys → extract to AEGIS_MODEL_DIR/<version>/ → write the promotion pointer
+                           (current.json) → aegis.finetune.hot_reload applies it (set_model / restart_required)
+
+Two signatures stand between an attacker and a bank's brain: TLS to the licence service, and the
+manifest signed with the issuer key the image already trusts for licences. A download whose sha256
+does not match the signed manifest is deleted. Staged rollout: ``rollout_pct`` on a release gates by a
+stable hash of the installation id, so a bad adapter reaches 10 % of the fleet, not all of it.
+Rollback: the previous version stays on disk; ``python -m aegis.model_updates rollback`` repoints.
+
+Env: ``AEGIS_MODEL_UPDATES`` (default 1 when ``AEGIS_LICENSE_SERVER`` is set), ``AEGIS_MODEL_CHANNEL``
+(stable | beta), ``AEGIS_MODEL_DIR`` (/var/lib/aegis/models), ``AEGIS_MODEL_POINTER`` (the pointer file
+``hot_reload`` reads; defaults to ``<AEGIS_MODEL_DIR>/current.json``), ``AEGIS_MODEL_BASE`` (which base
+the installation runs — only releases for that base are offered).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import shutil
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+from aegis import license as licensing
+
+logger = logging.getLogger("aegis.model_updates")
+
+DEFAULT_DIR = "/var/lib/aegis/models"
+MANIFEST_TYP = "AEGIS-MODEL-RELEASE"
+
+
+# ---------------------------------------------------------------- manifest --
+
+def sign_manifest(rel: dict, *, n: int, d: int, kid: str) -> str:
+    """Server side: ``<header>.<payload>.<sig>`` with ``typ`` = AEGIS-MODEL-RELEASE (never confusable with a licence)."""
+    header = licensing._b64u(json.dumps({"alg": "RS256", "typ": MANIFEST_TYP, "kid": kid}, separators=(",", ":")).encode())
+    body = licensing._b64u(json.dumps(rel, sort_keys=True, separators=(",", ":")).encode())
+    sig = licensing.rsa_sign(f"{header}.{body}".encode(), n, d)
+    return f"{header}.{body}.{licensing._b64u(sig)}"
+
+
+def verify_manifest(token: str, keys: dict[str, tuple[int, int]] | None = None) -> tuple[dict | None, str]:
+    """Installation side: the release dict on a good signature, else ``(None, reason)``."""
+    keys = keys if keys is not None else licensing.load_public_keys()
+    try:
+        h, b, s = token.strip().split(".")
+        header = json.loads(licensing._unb64u(h))
+        if header.get("alg") != "RS256" or header.get("typ") != MANIFEST_TYP:
+            return None, "not a model-release manifest"
+        kid = str(header.get("kid", ""))
+        if kid not in keys:
+            return None, f"unknown signing key '{kid}'"
+        n, e = keys[kid]
+        if not licensing.rsa_verify(f"{h}.{b}".encode(), licensing._unb64u(s), n, e):
+            return None, "manifest signature does not verify"
+        rel = json.loads(licensing._unb64u(b))
+        for k in ("version", "channel", "base_model", "sha256", "size"):
+            if k not in rel:
+                return None, f"manifest lacks {k}"
+        return rel, ""
+    except (ValueError, TypeError, KeyError) as exc:
+        return None, f"malformed manifest ({type(exc).__name__})"
+
+
+def in_rollout(installation_id: str, pct: int) -> bool:
+    """Stable bucket 0..99 from the installation id; a release at rollout_pct=10 reaches the same 10 % every day."""
+    if pct >= 100:
+        return True
+    if pct <= 0:
+        return False
+    bucket = int(hashlib.sha256(installation_id.encode()).hexdigest()[:8], 16) % 100
+    return bucket < pct
+
+
+# ------------------------------------------------------------------- state --
+
+def model_dir(env: dict | None = None) -> Path:
+    env = os.environ if env is None else env
+    return Path(env.get("AEGIS_MODEL_DIR", DEFAULT_DIR))
+
+
+def pointer_path(env: dict | None = None) -> Path:
+    env = os.environ if env is None else env
+    return Path(env.get("AEGIS_MODEL_POINTER") or (model_dir(env) / "current.json"))
+
+
+def current_version(env: dict | None = None) -> str:
+    try:
+        return str(json.loads(pointer_path(env).read_text()).get("run", ""))
+    except (OSError, ValueError):
+        return ""
+
+
+def _sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
+    for m in tar.getmembers():
+        target = (dest / m.name).resolve()
+        if not str(target).startswith(str(dest.resolve())) or m.issym() or m.islnk():
+            raise RuntimeError(f"unsafe member in release archive: {m.name}")
+    try:
+        tar.extractall(dest, filter="data")   # py ≥ 3.12: strips absolute paths, links, device nodes, odd modes
+    except TypeError:                          # older interpreters: members were checked above
+        tar.extractall(dest)  # noqa: S202
+
+
+# ---------------------------------------------------------------- client --
+
+def check(server: str, token: str, *, channel: str, base_model: str, current: str, timeout: float = 20.0) -> dict | None:
+    """Ask the service for the latest release; ``None`` when there is nothing newer for this installation."""
+    q = f"/updates?channel={channel}&base={urllib.request.quote(base_model, safe='')}&current={urllib.request.quote(current, safe='')}"
+    req = urllib.request.Request(server.rstrip("/") + q, headers={"Authorization": "Bearer " + token.strip(), "User-Agent": "aegis-model-updates/1"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            res = json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        if e.code == 204:
+            return None
+        try:
+            msg = json.loads(e.read()).get("error", "")
+        except Exception:  # noqa: BLE001
+            msg = ""
+        raise licensing.LicenseError(f"/updates refused ({e.code}): {msg or e.reason}") from None
+    return res if res.get("manifest_token") else None
+
+
+def download_and_install(res: dict, *, dest_root: Path, keys: dict | None = None, timeout: float = 600.0) -> dict:
+    """Verify the signed manifest, fetch the archive, verify sha256 + size, extract to ``<dest_root>/<version>/``.
+    Returns the release dict with ``adapter`` (the directory). Anything failing verification is deleted."""
+    rel, why = verify_manifest(res["manifest_token"], keys)
+    if rel is None:
+        raise RuntimeError(f"release manifest rejected: {why}")
+    version = str(rel["version"])
+    target = dest_root / version
+    if (target / ".complete").exists():
+        return {**rel, "adapter": str(target), "already": True}
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=dest_root, suffix=".part", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        try:
+            req = urllib.request.Request(res["url"], headers={"User-Agent": "aegis-model-updates/1"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — URL came from the verified service response
+                for chunk in iter(lambda: r.read(1 << 20), b""):
+                    tmp.write(chunk)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    try:
+        if tmp_path.stat().st_size != int(rel["size"]):
+            raise RuntimeError(f"size mismatch: got {tmp_path.stat().st_size}, manifest says {rel['size']}")
+        got = _sha256_file(tmp_path)
+        if got != rel["sha256"]:
+            raise RuntimeError(f"sha256 mismatch: archive {got[:16]}… ≠ signed manifest {rel['sha256'][:16]}…")
+        if target.exists():
+            shutil.rmtree(target)
+        target.mkdir(parents=True)
+        with tarfile.open(tmp_path, "r:gz") as tar:
+            _safe_extract(tar, target)
+        if not (target / "adapter_config.json").exists():
+            raise RuntimeError("archive holds no adapter_config.json")
+        (target / "release.json").write_text(json.dumps(rel, indent=1))
+        (target / ".complete").write_text(str(int(time.time())))
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return {**rel, "adapter": str(target)}
+
+
+def write_pointer(rel: dict, *, pointer: Path, previous: str = "") -> dict:
+    """The promotion pointer ``aegis.finetune.hot_reload`` reads. ``served_model`` = the version, which is also the
+    name the vLLM register step uses for the LoRA."""
+    ptr = {"run": str(rel["version"]), "adapter": rel["adapter"], "sha256": rel["sha256"], "served_model": str(rel["version"]),
+           "base_model": rel["base_model"], "channel": rel["channel"], "promoted_at": int(time.time()), "approved_by": "bluedefence-release",
+           "notes": rel.get("notes", ""), "previous": previous}
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    pointer.write_text(json.dumps(ptr, indent=1))
+    return ptr
+
+
+def update_once(*, server: str, token: str, installation_id: str, env: dict | None = None) -> dict:
+    """One check → (download → verify → install → point) cycle. Never raises; returns what happened."""
+    env = os.environ if env is None else env
+    channel = env.get("AEGIS_MODEL_CHANNEL", "stable").strip() or "stable"
+    base = env.get("AEGIS_MODEL_BASE", "").strip() or env.get("AEGIS_MODEL", "").strip() or "any"
+    cur = current_version(env)
+    try:
+        res = check(server, token, channel=channel, base_model=base, current=cur)
+        if res is None:
+            return {"updated": False, "reason": "up to date", "current": cur}
+        rel = res.get("release") or {}
+        if not in_rollout(installation_id, int(rel.get("rollout_pct", 100))):
+            return {"updated": False, "reason": "not in this release's rollout yet", "current": cur, "offered": rel.get("version")}
+        installed = download_and_install(res, dest_root=model_dir(env))
+        write_pointer(installed, pointer=pointer_path(env), previous=cur)
+        logger.info("[model_updates] installed %s (%s, %s) → %s; hot-reload applies it", installed["version"], installed["channel"],
+                    installed["base_model"], installed["adapter"])
+        _prune(model_dir(env), keep={installed["version"], cur})
+        return {"updated": True, "version": installed["version"], "previous": cur, "adapter": installed["adapter"]}
+    except Exception as e:  # noqa: BLE001 — a failed update never affects the running SOC
+        logger.warning("[model_updates] update failed: %s", str(e)[:200])
+        return {"updated": False, "reason": str(e)[:200], "current": cur}
+
+
+def _prune(root: Path, keep: set[str], max_keep: int = 3) -> None:
+    """Keep the current, the previous and the newest few complete releases; delete the rest."""
+    done = sorted((p for p in root.iterdir() if p.is_dir() and (p / ".complete").exists()),
+                  key=lambda p: (p / ".complete").stat().st_mtime, reverse=True)
+    for p in done[max_keep:]:
+        if p.name not in keep:
+            shutil.rmtree(p, ignore_errors=True)
+
+
+def rollback(env: dict | None = None) -> dict:
+    env = os.environ if env is None else env
+    ptr_path = pointer_path(env)
+    try:
+        ptr = json.loads(ptr_path.read_text())
+    except (OSError, ValueError):
+        return {"ok": False, "reason": "no pointer"}
+    prev = str(ptr.get("previous") or "")
+    prev_dir = model_dir(env) / prev
+    if not prev or not (prev_dir / ".complete").exists():
+        return {"ok": False, "reason": "no previous release on disk"}
+    rel = json.loads((prev_dir / "release.json").read_text())
+    write_pointer({**rel, "adapter": str(prev_dir)}, pointer=ptr_path, previous="")
+    return {"ok": True, "version": prev, "adapter": str(prev_dir)}
+
+
+def enabled(env: dict | None = None) -> bool:
+    env = os.environ if env is None else env
+    v = env.get("AEGIS_MODEL_UPDATES", "").strip().lower()
+    if v:
+        return v in ("1", "true", "yes", "on")
+    return bool(env.get("AEGIS_LICENSE_SERVER", "").strip())
+
+
+# ------------------------------------------------------------------- CLI --
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m aegis.model_updates", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("check", "apply"):
+        c = sub.add_parser(name, help="check for a newer release" + (" and install it" if name == "apply" else ""))
+        c.add_argument("--server", default=os.environ.get("AEGIS_LICENSE_SERVER", ""))
+    sub.add_parser("status", help="current release and what is on disk")
+    sub.add_parser("rollback", help="repoint to the previous release")
+    a = ap.parse_args(argv)
+    if a.cmd == "status":
+        print(f"current: {current_version() or '(none — base model / AEGIS_MODEL)'}  pointer: {pointer_path()}")
+        root = model_dir()
+        if root.exists():
+            for p in sorted(root.iterdir()):
+                if p.is_dir():
+                    print(f"  {p.name:20s} {'complete' if (p / '.complete').exists() else 'partial'}")
+        return 0
+    if a.cmd == "rollback":
+        r = rollback()
+        print(r)
+        return 0 if r.get("ok") else 1
+    if not a.server:
+        ap.error("--server (or AEGIS_LICENSE_SERVER) is required")
+    token, why = licensing._read_token(os.environ)
+    if not token:
+        ap.error(why)
+    st = licensing.check()
+    if a.cmd == "check":
+        res = check(a.server, token, channel=os.environ.get("AEGIS_MODEL_CHANNEL", "stable"),
+                    base_model=os.environ.get("AEGIS_MODEL_BASE", "") or os.environ.get("AEGIS_MODEL", "") or "any", current=current_version())
+        print("up to date" if res is None else json.dumps(res.get("release"), indent=1))
+        return 0
+    r = update_once(server=a.server, token=token, installation_id=st.installation_id)
+    print(json.dumps(r, indent=1))
+    return 0 if r.get("updated") or r.get("reason", "").startswith(("up to date", "not in")) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
