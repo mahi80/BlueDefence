@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bluedefence"
+version = "0.1.0"
+description = "BlueDefence — AEGIS autonomous-SOC brain (Agent Q), governed by ACP"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "anthropic>=0.40.0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Governance runtime — the ACP SDK that governs SOC-AGENTQ-01. Optional: AEGIS runs
+# without it (the acp import degrades to a no-op). Pinned to mahi80/rbi @ b2e9d97.
+# Private; see requirements-governance.txt for how to authenticate the install.
+governance = [
+    "acp-sdk @ git+https://github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk",
+]
+# Test, fine-tune and RL extras live in aegis/requirements-*.txt.
+
+[tool.setuptools.packages.find]
+include = ["aegis*"]
+
+[tool.pytest.ini_options]
+testpaths = ["aegis/tests"]
+addopts = "-q"

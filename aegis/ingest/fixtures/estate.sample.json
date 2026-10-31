@@ -1,0 +1,27 @@
+{
+  "_comment": "Synthetic bank estate for InventorySource (AEGIS_TENANT=inventory). Every node is invented; no real host, user, account or asset. In production this file is generated from CMDB + EDR + IAM + CBS exports. b_type values use aegis/agents/orchestrator/walkers/graph.py::SENSITIVITY so the blast graph, min-cut planner and containment loop score it correctly.",
+  "as_of": "2026-10-01T09:00:00Z",
+  "edges": [
+    {"a": "u-alice", "relation": "holds_session", "b": "sess-9001", "b_type": "session", "ts": "2026-10-01T08:30:00Z", "confidence": 1.0, "source": "identity"},
+    {"a": "u-alice", "relation": "logged_on_from", "b": "LT-alice", "b_type": "device_managed", "ts": "2026-10-01T08:29:00Z", "confidence": 1.0, "source": "identity"},
+    {"a": "u-alice", "relation": "member_of", "b": "role-cloud-admin", "b_type": "admin_role", "ts": "2026-10-01T08:00:00Z", "confidence": 1.0, "source": "identity"},
+    {"a": "u-alice", "relation": "logged_on", "b": "host-ws-14", "b_type": "host", "ts": "2026-10-01T08:31:00Z", "confidence": 1.0, "source": "endpoint"},
+    {"a": "u-alice", "relation": "queried", "b": "tbl-kyc", "b_type": "table_pii", "ts": "2026-10-01T08:40:00Z", "confidence": 0.8, "source": "data"},
+
+    {"a": "host-ws-14", "relation": "spawned", "b": "proc-archiver", "b_type": "host", "ts": "2026-10-01T08:33:00Z", "confidence": 0.9, "source": "endpoint"},
+    {"a": "host-ws-14", "relation": "lateral_to", "b": "SRV-finance-02", "b_type": "server", "ts": "2026-10-01T08:35:00Z", "confidence": 0.9, "source": "endpoint"},
+    {"a": "host-ws-14", "relation": "connected_to", "b": "cbs-db-01", "b_type": "core_banking_db", "ts": "2026-10-01T08:36:00Z", "confidence": 0.85, "source": "network"},
+    {"a": "host-ws-14", "relation": "resolved", "b": "c2-young.example", "b_type": "domain", "ts": "2026-10-01T08:34:00Z", "confidence": 0.7, "source": "network"},
+    {"a": "host-ws-14", "relation": "wrote", "b": "share-finance", "b_type": "file_server", "ts": "2026-10-01T08:37:00Z", "confidence": 0.8, "source": "endpoint"},
+
+    {"a": "SRV-finance-02", "relation": "lateral_to", "b": "DC-01", "b_type": "domain_controller", "ts": "2026-10-01T08:42:00Z", "confidence": 0.8, "source": "endpoint"},
+    {"a": "SRV-finance-02", "relation": "connected_to", "b": "cbs-db-01", "b_type": "core_banking_db", "ts": "2026-10-01T08:43:00Z", "confidence": 0.8, "source": "network"},
+
+    {"a": "svc-deploy", "relation": "assumed", "b": "role-deploy", "b_type": "cloud_role", "ts": "2026-10-01T08:10:00Z", "confidence": 1.0, "source": "cloud"},
+    {"a": "svc-deploy", "relation": "touched", "b": "bucket-kyc", "b_type": "storage_bucket_pii", "ts": "2026-10-01T08:12:00Z", "confidence": 0.9, "source": "cloud"},
+
+    {"a": "acct-1000", "relation": "sent_to", "b": "mule-77", "b_type": "mule_account", "ts": "2026-10-01T08:50:00Z", "confidence": 0.9, "source": "transaction"},
+    {"a": "acct-1000", "relation": "received_from", "b": "acct-2001", "b_type": "bank_account", "ts": "2026-10-01T08:48:00Z", "confidence": 0.8, "source": "transaction"},
+    {"a": "acct-1000", "relation": "linked_to", "b": "acct-1001", "b_type": "bank_account", "ts": "2026-10-01T07:00:00Z", "confidence": 0.7, "source": "transaction"}
+  ]
+}

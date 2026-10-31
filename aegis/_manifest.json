@@ -1,0 +1,560 @@
+{
+  "system": "AEGIS",
+  "version": "0.1.0",
+  "generated_at": "2026-10-22T15:46:36Z",
+  "spec_url": "https://github.com/mahi80/rbi/tree/Agentic_Endpoint_AEGIS/aegis",
+  "agents": [
+    {
+      "id": "soc_orchestrator",
+      "module": "aegis.agents.orchestrator.agent",
+      "description": "Entry point for every alert. Triages and dispatches to a specialist; runs multi-agent voting on high-impact verdicts.",
+      "workload_identity": "spiffe://aegis.bank/agents/orchestrator",
+      "model_family": "claude-sonnet-4-6 (primary) + claude-sonnet-4-6 (voter on different family in prod)",
+      "permissions": {
+        "read": [
+          "siem.notable_events",
+          "audit.log",
+          "honeytokens.registry"
+        ],
+        "write": [
+          "audit.log",
+          "evidence_chain"
+        ],
+        "invoke": [
+          "perimeter",
+          "auth",
+          "edr",
+          "deception",
+          "voter_llm"
+        ]
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "perimeter",
+      "module": "aegis.agents.perimeter.agent",
+      "description": "Web/L7 specialist \u2014 payload decode, IP rep, similar-request retrieval, user baseline.",
+      "workload_identity": "spiffe://aegis.bank/agents/perimeter",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "ip_reputation.*",
+          "similar_incidents.*",
+          "user_baseline.*"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "auth",
+      "module": "aegis.agents.auth.agent",
+      "description": "Auth/IAM specialist \u2014 impossible travel, device fingerprint, MFA pattern, peer baseline.",
+      "workload_identity": "spiffe://aegis.bank/agents/auth",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "okta.events",
+          "device_fingerprints.*",
+          "peer_baselines.*"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "edr",
+      "module": "aegis.agents.edr.agent",
+      "description": "EDR/Host specialist \u2014 process tree, lateral movement, IOC match, file integrity.",
+      "workload_identity": "spiffe://aegis.bank/agents/edr",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "edr.detections",
+          "ioc.feed",
+          "file_integrity.baseline"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "deception",
+      "module": "aegis.agents.deception.honeytoken_monitor",
+      "description": "Honeytoken / decoy fast-path. Touching a decoy = high-confidence intrusion.",
+      "workload_identity": "spiffe://aegis.bank/agents/deception",
+      "model_family": "(no LLM; deterministic registry match)",
+      "permissions": {
+        "read": [
+          "honeytokens.registry"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "n/a (no external creds)",
+        "scope": "read-only registry"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "vuln_discovery",
+      "module": "aegis.agents.vuln_discovery.agent",
+      "description": "Glasswing-style internal red team. Static scans for dependency CVEs, config misconfigs, code logic flaws, supply-chain anomalies. EPSS+KEV+PoC weighted prioritization.",
+      "workload_identity": "spiffe://aegis.bank/agents/vuln_discovery",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "repo.manifests",
+          "repo.configs",
+          "repo.code",
+          "first_org.epss",
+          "cisa.kev"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "patch",
+      "module": "aegis.agents.patch.agent",
+      "description": "Finding -> dev -> canary -> HITL -> prod pipeline. HITL gate on prod always.",
+      "workload_identity": "spiffe://aegis.bank/agents/patch",
+      "model_family": "(no LLM; pipeline orchestration)",
+      "permissions": {
+        "read": [
+          "vuln_discovery.findings"
+        ],
+        "write": [
+          "build_pipeline.dev",
+          "deploy.canary"
+        ],
+        "invoke": [
+          "build",
+          "test",
+          "canary_deploy"
+        ]
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT per-deploy",
+        "scope": "scoped to deployment pipeline"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": [
+        "deploy_prod"
+      ]
+    },
+    {
+      "id": "response",
+      "module": "aegis.agents.response.agent",
+      "description": "Actuator + HITL gate. Auto-safe actions execute; high-impact actions queue for human approval. Rate-limited blast cap.",
+      "workload_identity": "spiffe://aegis.bank/agents/response",
+      "model_family": "(no LLM; deterministic policy)",
+      "permissions": {
+        "read": [
+          "evidence_chain"
+        ],
+        "write": [
+          "audit.log"
+        ],
+        "invoke": [
+          "firewall.api",
+          "iam.api",
+          "edr.isolate",
+          "self_healing"
+        ]
+      },
+      "credentials": {
+        "type": "hardware_backed_signing_key",
+        "rotation_policy": "HSM-resident; signing operations only",
+        "scope": "scoped per action_type via OPA"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": [
+        "block",
+        "block_egress",
+        "block_export",
+        "escalate_to_fraud_team",
+        "escalate_to_hr",
+        "hold",
+        "isolate",
+        "kill_process",
+        "lock_account",
+        "quarantine_file",
+        "recall_message",
+        "revoke_sessions",
+        "rotate_credential",
+        "snapshot_forensic",
+        "trigger_self_heal"
+      ]
+    },
+    {
+      "id": "api_abuse",
+      "module": "aegis.agents.api_abuse.agent",
+      "description": "API Abuse specialist \u2014 BOLA/IDOR, schema drift, volumetric anomaly, auth-boundary violations. Reasons about authorization context, which signature defenses miss.",
+      "workload_identity": "spiffe://aegis.bank/agents/api_abuse",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "api_gateway.events",
+          "rbac.policies",
+          "schema_registry.*"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "transaction",
+      "module": "aegis.agents.transaction.agent",
+      "description": "Transaction/Fraud specialist \u2014 mule patterns, beneficiary risk, velocity, payment-rail anomaly, AML structuring. Indian context (UPI/NEFT/RTGS/IMPS rails, Aadhaar/IFSC identifiers, RBI Master Direction reporting thresholds).",
+      "workload_identity": "spiffe://aegis.bank/agents/transaction",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "core_banking.txn_stream",
+          "account_graph",
+          "beneficiary_risk",
+          "rail_baselines.*"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "dlp",
+      "module": "aegis.agents.dlp.agent",
+      "description": "DLP / data-exfiltration specialist \u2014 reasons over bulk reads, sensitive-data egress, external-recipient mail with attachments, HR-context-aware insider-threat scoring. Covers BOTH compromised-admin smash-grab AND intentional insider with valid creds.",
+      "workload_identity": "spiffe://aegis.bank/agents/dlp",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "dlp.events",
+          "db.audit_stream",
+          "object_storage.access_logs",
+          "email_gateway.attachments",
+          "hr_system.risk_signals"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "email",
+      "module": "aegis.agents.email.agent",
+      "description": "Email / phishing specialist \u2014 consumes M365 Defender / Mimecast / Proofpoint detections. Reasons over header-auth fails, display-name spoof, lookalike domains, attachment risk, body lexical patterns, and reply-chain anomaly indicating compromised-sender mass-blast.",
+      "workload_identity": "spiffe://aegis.bank/agents/email",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "m365.defender",
+          "mimecast.*",
+          "proofpoint.*",
+          "exchange.message_trace"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "mobile",
+      "module": "aegis.agents.mobile.agent",
+      "description": "Mobile-app specialist \u2014 jailbreak/root, SDK integrity, SSL pinning bypass, SIM-swap correlation, mobile session anomaly. Catches the mobile-ATO chain (tampered device + recent SIM swap).",
+      "workload_identity": "spiffe://aegis.bank/agents/mobile",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "mobile_sdk.events",
+          "mno.sim_swap_signals",
+          "mobile_session.*"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "wireless",
+      "module": "aegis.agents.wireless.agent",
+      "description": "Wireless specialist \u2014 rogue AP detection, evil-twin SSIDs (esp. PoS-Wi-Fi targeting), deauth bursts, WPA-handshake / PMKID capture, KRACK indicators. Reads from Aruba ClearPass / Cisco WLC / Meraki / Mist.",
+      "workload_identity": "spiffe://aegis.bank/agents/wireless",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "aruba.clearpass",
+          "cisco.wlc",
+          "meraki.*",
+          "mist.*"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "cloud_controlplane",
+      "module": "aegis.agents.cloud_controlplane.agent",
+      "description": "Cloud control-plane specialist \u2014 reasons about admin actions in CloudTrail / Azure Activity Logs / GCP Audit / network device audit (Panorama, Checkpoint, Juniper). Posture-weakening detection: wildcard IAM, public S3, internet-open NSG, KMS disable, log-disable, ANY-ANY firewall rules.",
+      "workload_identity": "spiffe://aegis.bank/agents/cloud_controlplane",
+      "model_family": "claude-sonnet-4-6",
+      "permissions": {
+        "read": [
+          "cloudtrail.events",
+          "azure.activity_log",
+          "gcp.audit_log",
+          "panorama.audit_log",
+          "checkpoint.smartconsole_audit",
+          "juniper.space_audit"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "threat_intel",
+      "module": "aegis.agents.threat_intel.agent",
+      "description": "Pull-side IOC service + LLM advisory analyst. Maintains in-memory IOC store; pulls STIX 2.1 feeds, mock seed, and CISA KEV; distributes fresh IOCs into perimeter/edr matchers.",
+      "workload_identity": "spiffe://aegis.bank/agents/threat_intel",
+      "model_family": "claude-sonnet-4-6 (advisory analysis only; lookup is no-LLM)",
+      "permissions": {
+        "read": [
+          "external_feeds.stix",
+          "cisa.kev",
+          "fs_isac.shares"
+        ],
+        "write": [
+          "perimeter._KNOWN_BAD",
+          "edr._IOC_HASHES",
+          "edr._IOC_DOMAINS",
+          "edr._IOC_IPS"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
+      "id": "meta_agent",
+      "module": "aegis.meta_agent.main",
+      "description": "Observes eval failures, proposes heuristic / threshold / prompt fixes, validates in simulation, queues for HITL. Never auto-deploys.",
+      "workload_identity": "spiffe://aegis.bank/agents/meta_agent",
+      "model_family": "claude-sonnet-4-6 (or self-hosted Gemma-class)",
+      "permissions": {
+        "read": [
+          "audit.log",
+          "eval.cases",
+          "eval.results"
+        ],
+        "write": [
+          "meta_agent._proposals.jsonl"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT",
+        "scope": "read-only on repo, write only to proposals queue"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": [
+        "apply_proposal_to_repo"
+      ]
+    },
+    {
+      "id": "meta_agent.rl_generator",
+      "module": "aegis.meta_agent.rl_generator.main",
+      "description": "Gemma-class RL component generator. Proposes RewardSpec / PPOHyperparams adjustments based on threat patterns. Schema-bounded values only \u2014 never arbitrary code.",
+      "workload_identity": "spiffe://aegis.bank/agents/meta_agent_rl",
+      "model_family": "google/gemma-2-9b-it (self-hosted, on-prem GPU)",
+      "permissions": {
+        "read": [
+          "threat_observations",
+          "current_reward_spec",
+          "current_hyperparameters"
+        ],
+        "write": [
+          "meta_agent._proposals.jsonl"
+        ],
+        "invoke": []
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT",
+        "scope": "schema-bounded numeric proposals only"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": [
+        "apply_reward_spec_to_prod",
+        "apply_hyperparams_to_prod"
+      ]
+    }
+  ],
+  "high_impact_actions": [
+    "block",
+    "block_egress",
+    "block_export",
+    "escalate_to_fraud_team",
+    "escalate_to_hr",
+    "hold",
+    "isolate",
+    "kill_process",
+    "lock_account",
+    "quarantine_file",
+    "recall_message",
+    "revoke_sessions",
+    "rotate_credential",
+    "snapshot_forensic",
+    "trigger_self_heal"
+  ],
+  "audit": {
+    "log_format": "hash-chained JSONL (SHA-256)",
+    "log_path": "aegis/_audit_log.jsonl",
+    "tamper_evident": true,
+    "retention_years": 7,
+    "verifier": "aegis.agents.shared.audit.AuditLog.verify"
+  },
+  "privacy": {
+    "causal_inference_module": "aegis.agents.shared.causal",
+    "causal_networks": [
+      "ato (Account Takeover SCM, 5 nodes)"
+    ],
+    "observability_module": "aegis.agents.shared.observability",
+    "observability_format": "Prometheus exposition + optional OpenTelemetry SDK",
+    "pii_tokenization_enabled": true,
+    "tokenizer_module": "aegis.agents.shared.pii_tokenizer",
+    "wrapper_module": "aegis.agents.shared.pii_tokenizing_client",
+    "covered_pii_kinds": [
+      "AADHAAR",
+      "PAN_IN",
+      "IFSC",
+      "ACCOUNT",
+      "PAN_CC",
+      "EMAIL",
+      "PHONE",
+      "SSN_US"
+    ],
+    "regulations_addressed": [
+      "DPDP Act 2023",
+      "PCI-DSS scope reduction",
+      "RBI Master Direction (data residency)"
+    ],
+    "production_substitutes": [
+      "Vault Transit",
+      "Voltage SecureData",
+      "Protegrity (HSM-backed FPE)"
+    ]
+  }
+}

@@ -1,0 +1,50 @@
+---
+# ServiceAccount + RBAC for the AEGIS Self-Healing controller.
+# Scoped to the absolute minimum: it can label pods (for quarantine),
+# create Jobs (forensic snapshot), and patch Argo Rollouts (respawn).
+# Critically: NO 'delete' on Deployments, NO 'create' on Pods directly,
+# NO cluster-admin. All deletion happens via the Rollout abstraction.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.controller.serviceAccount }}
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.controllerLabels" . | indent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.controller.serviceAccount }}
+  namespace: {{ .Values.target.namespace }}
+rules:
+# Label / annotate pods to apply quarantine NetworkPolicy
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "patch"]
+# Create forensic snapshot Jobs (cannot delete other resources)
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "watch", "create"]
+# Trigger Rollout restart / abort / promote — but not delete
+- apiGroups: ["argoproj.io"]
+  resources: ["rollouts"]
+  verbs: ["get", "list", "watch", "patch"]
+# Read events for audit correlation
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.controller.serviceAccount }}
+  namespace: {{ .Values.target.namespace }}
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.controller.serviceAccount }}
+  namespace: {{ .Values.target.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.controller.serviceAccount }}

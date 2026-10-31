@@ -1,0 +1,660 @@
+[
+  {
+    "alert": {
+      "id": "EVAL-001",
+      "source": "F5 ASM",
+      "severity": "low",
+      "anomaly_score": 0.15,
+      "source_ip": "10.20.30.40",
+      "user_id": "u_42891",
+      "url": "/api/balance",
+      "payload": "GET /api/balance?account=primary HTTP/1.1"
+    },
+    "expected_verdict": "benign",
+    "label": "internal IP, baseline user, low anomaly"
+  },
+  {
+    "alert": {
+      "id": "EVAL-002",
+      "source": "F5 ASM",
+      "severity": "high",
+      "anomaly_score": 0.95,
+      "source_ip": "185.220.101.45",
+      "user_id": null,
+      "url": "/api/search",
+      "payload": "GET /api/search?q=' UNION SELECT username,password FROM users--"
+    },
+    "expected_verdict": "malicious",
+    "label": "classic SQLi from known-bad IP"
+  },
+  {
+    "alert": {
+      "id": "EVAL-003",
+      "source": "F5 ASM",
+      "severity": "medium",
+      "anomaly_score": 0.55,
+      "source_ip": "198.51.100.12",
+      "user_id": "u_77104",
+      "url": "/api/profile",
+      "payload": "GET /api/profile?id=42 OR 1=1"
+    },
+    "expected_verdict": "suspicious",
+    "label": "single SQLi primitive, unknown IP"
+  },
+  {
+    "alert": {
+      "id": "EVAL-004",
+      "source": "F5 ASM",
+      "severity": "high",
+      "anomaly_score": 0.99,
+      "source_ip": "203.0.113.66",
+      "user_id": null,
+      "url": "/admin-internal-debug",
+      "payload": "GET /admin-internal-debug HTTP/1.1"
+    },
+    "expected_verdict": "malicious",
+    "label": "honeytoken endpoint touched"
+  },
+  {
+    "alert": {
+      "id": "EVAL-005",
+      "source": "Okta",
+      "severity": "high",
+      "anomaly_score": 0.9,
+      "user_id": "u_42891",
+      "user_role": "retail_customer",
+      "prev_geo": "IN-MH",
+      "curr_geo": "RU-MO",
+      "minutes_since_prev_login": 12,
+      "device_fingerprint": {"ua": "Mozilla/5.0 (Linux) Firefox/115", "screen": "1366x768", "tz": "UTC"},
+      "mfa_failures": [],
+      "observed": {"failed_logins_24h": 1, "session_count_24h": 2, "endpoint": "/api/profile"}
+    },
+    "expected_verdict": "malicious",
+    "label": "impossible travel + new device"
+  },
+  {
+    "alert": {
+      "id": "EVAL-007",
+      "source": "F5 ASM",
+      "severity": "medium",
+      "anomaly_score": 0.7,
+      "source_ip": "198.51.100.50",
+      "user_id": null,
+      "url": "/api/info",
+      "payload": "GET /api/info?q=1 AND @@version > '5.0'"
+    },
+    "expected_verdict": "suspicious",
+    "label": "@@version probe — relies solely on the perimeter primitive list"
+  },
+  {
+    "alert": {
+      "id": "EVAL-008",
+      "source": "API Gateway",
+      "severity": "high",
+      "anomaly_score": 0.85,
+      "principal_id": "u_77104",
+      "role": "wealth_advisor",
+      "accessed_object_owner": "u_42891",
+      "endpoint": "/api/users/u_42891",
+      "http_method": "PUT",
+      "params": {"user_id": "u_42891", "extra_admin_flag": true},
+      "observed_per_min": 18.0
+    },
+    "expected_verdict": "malicious",
+    "label": "BOLA: wealth advisor mutating retail customer object + schema drift"
+  },
+  {
+    "alert": {
+      "id": "EVAL-009",
+      "source": "Core Banking (txn stream)",
+      "severity": "high",
+      "anomaly_score": 0.88,
+      "user_id": "u_42891",
+      "rail": "RTGS",
+      "amount_inr": 950000.0,
+      "beneficiary_account": "ACC-MULE-001",
+      "sender_geo": "IN",
+      "recent_24h_count": 4,
+      "recent_24h_total_inr": 200000.0,
+      "recent_amounts_inr": [950000.0, 950000.0, 950000.0]
+    },
+    "expected_verdict": "malicious",
+    "label": "RTGS structuring to mule-shape beneficiary"
+  },
+  {
+    "alert": {
+      "id": "EVAL-006",
+      "source": "CrowdStrike Falcon",
+      "severity": "high",
+      "anomaly_score": 0.92,
+      "host": "FIN-WS-0001",
+      "user_id": "u_77104",
+      "parent_process": "winword.exe",
+      "child_process": "powershell.exe",
+      "cmdline": "powershell.exe -enc SQBFAFgAIAAoAA==",
+      "src_zone": "user_workstation",
+      "dst_zone": "internet_egress",
+      "dst_port": 443,
+      "file_hash": "44d88612fea8a8f36de82e1278abb02f",
+      "dest_domain": "evil.example.com",
+      "dest_ip": null,
+      "file_path": null,
+      "file_hash_current": null
+    },
+    "expected_verdict": "malicious",
+    "label": "macro-spawned PS + IOC match"
+  },
+  {
+    "alert": {
+      "id": "EVAL-010",
+      "source": "F5 ASM",
+      "severity": "low",
+      "anomaly_score": 0.22,
+      "source_ip": "10.20.30.40",
+      "user_id": "u_42891",
+      "url": "/api/transfer",
+      "payload": "POST /api/transfer body={\"to_account\":\"ACC-NORMAL-001\",\"amount\":1000}"
+    },
+    "expected_verdict": "benign",
+    "label": "internal IP + baseline user + small known-recipient transfer"
+  },
+  {
+    "alert": {
+      "id": "EVAL-011",
+      "source": "Okta",
+      "severity": "medium",
+      "anomaly_score": 0.55,
+      "user_id": "u_42891",
+      "user_role": "retail_customer",
+      "prev_geo": "IN-MH",
+      "curr_geo": "IN-KA",
+      "minutes_since_prev_login": 240,
+      "device_fingerprint": {"ua": "Mozilla/5.0 (Windows) Chrome/130", "screen": "1920x1080", "tz": "Asia/Kolkata"},
+      "mfa_failures": [],
+      "observed": {"failed_logins_24h": 0, "session_count_24h": 1, "endpoint": "/api/profile"}
+    },
+    "expected_verdict": "benign",
+    "label": "domestic geo change with known device + matching baseline (FP trap)"
+  },
+  {
+    "alert": {
+      "id": "EVAL-012",
+      "source": "Okta",
+      "severity": "medium",
+      "anomaly_score": 0.6,
+      "user_id": "u_42891",
+      "user_role": "retail_customer",
+      "prev_geo": "IN-MH",
+      "curr_geo": "IN-MH",
+      "minutes_since_prev_login": 5,
+      "device_fingerprint": {"ua": "Mozilla/5.0 (Linux) Firefox/115", "screen": "1024x768", "tz": "UTC"},
+      "mfa_failures": [1.0, 5.0, 10.0, 20.0, 35.0],
+      "observed": {"failed_logins_24h": 5, "session_count_24h": 8, "endpoint": "/api/login"}
+    },
+    "expected_verdict": "malicious",
+    "label": "MFA-burst + new device from same geo (credential stuffing)"
+  },
+  {
+    "alert": {
+      "id": "EVAL-013",
+      "source": "F5 ASM",
+      "severity": "medium",
+      "anomaly_score": 0.6,
+      "source_ip": "198.51.100.20",
+      "user_id": null,
+      "url": "/api/login",
+      "payload": "POST body={\"username\":\"admin\",\"password\":\"admin\"}"
+    },
+    "expected_verdict": "benign",
+    "label": "guess-credential bruteforce single attempt — KNOWN GAP: requires login-rate aggregation across requests, not catchable from one alert"
+  },
+  {
+    "alert": {
+      "id": "EVAL-014",
+      "source": "F5 ASM",
+      "severity": "high",
+      "anomaly_score": 0.8,
+      "source_ip": "198.51.100.21",
+      "user_id": null,
+      "url": "/api/upload",
+      "payload": "POST /api/upload body=<?php system($_GET['c']); ?>"
+    },
+    "expected_verdict": "malicious",
+    "label": "PHP webshell upload pattern (multiple RCE primitives in payload)"
+  },
+  {
+    "alert": {
+      "id": "EVAL-015",
+      "source": "API Gateway",
+      "severity": "medium",
+      "anomaly_score": 0.55,
+      "principal_id": "u_42891",
+      "role": "retail_customer",
+      "accessed_object_owner": "u_42891",
+      "endpoint": "/api/profile",
+      "http_method": "GET",
+      "params": {"user_id": "u_42891"},
+      "observed_per_min": 8.0
+    },
+    "expected_verdict": "benign",
+    "label": "self-access on profile endpoint at baseline volume"
+  },
+  {
+    "alert": {
+      "id": "EVAL-016",
+      "source": "Core Banking (txn stream)",
+      "severity": "low",
+      "anomaly_score": 0.18,
+      "user_id": "u_42891",
+      "rail": "UPI",
+      "amount_inr": 5000.0,
+      "beneficiary_account": "ACC-NORMAL-001",
+      "sender_geo": "IN",
+      "recent_24h_count": 1,
+      "recent_24h_total_inr": 5000.0,
+      "recent_amounts_inr": [5000.0]
+    },
+    "expected_verdict": "benign",
+    "label": "small UPI to known good beneficiary, baseline velocity"
+  },
+  {
+    "alert": {
+      "id": "EVAL-017",
+      "source": "Core Banking (txn stream)",
+      "severity": "high",
+      "anomaly_score": 0.75,
+      "user_id": "u_77104",
+      "rail": "RTGS",
+      "amount_inr": 1500000.0,
+      "beneficiary_account": "ACC-FOREIGN-99",
+      "sender_geo": "IN",
+      "recent_24h_count": 2,
+      "recent_24h_total_inr": 1700000.0,
+      "recent_amounts_inr": [200000.0, 1500000.0]
+    },
+    "expected_verdict": "suspicious",
+    "label": "large cross-border RTGS to high-risk-geo (Russia) beneficiary — single strong signal warrants hold + step-up, not block"
+  },
+  {
+    "alert": {
+      "id": "EVAL-018",
+      "source": "CrowdStrike Falcon",
+      "severity": "low",
+      "anomaly_score": 0.22,
+      "host": "FIN-DEV-0099",
+      "user_id": "u_77104",
+      "parent_process": "explorer.exe",
+      "child_process": "code.exe",
+      "cmdline": "code.exe c:\\projects\\repo",
+      "src_zone": "user_workstation",
+      "dst_zone": "user_workstation",
+      "dst_port": null,
+      "file_hash": null,
+      "dest_domain": null,
+      "dest_ip": null,
+      "file_path": null,
+      "file_hash_current": null
+    },
+    "expected_verdict": "benign",
+    "label": "developer launching VS Code (FP trap: parent->child not in suspicious set)"
+  },
+  {
+    "alert": {
+      "id": "EVAL-019",
+      "source": "F5 ASM",
+      "severity": "high",
+      "anomaly_score": 0.85,
+      "source_ip": "203.0.113.66",
+      "user_id": null,
+      "url": "/api/files",
+      "payload": "GET /api/files?path=../../../../etc/passwd"
+    },
+    "expected_verdict": "malicious",
+    "label": "path traversal targeting /etc/passwd"
+  },
+  {
+    "alert": {
+      "id": "EVAL-020",
+      "source": "F5 ASM",
+      "severity": "high",
+      "anomaly_score": 0.95,
+      "source_ip": "185.220.101.45",
+      "user_id": null,
+      "url": "/api/exec",
+      "payload": "POST body={\"cmd\":\"; cat /etc/shadow\"}"
+    },
+    "expected_verdict": "malicious",
+    "label": "command injection with shell metacharacter"
+  },
+  {
+    "alert": {
+      "id": "EVAL-021",
+      "source": "API Gateway",
+      "severity": "high",
+      "anomaly_score": 0.7,
+      "principal_id": "u_42891",
+      "role": "retail_customer",
+      "accessed_object_owner": "u_42891",
+      "endpoint": "/api/orders",
+      "http_method": "GET",
+      "params": {"user_id": "u_42891"},
+      "observed_per_min": 220.0
+    },
+    "expected_verdict": "suspicious",
+    "label": "scraping pattern: 220x baseline volume on read endpoint"
+  },
+  {
+    "alert": {
+      "id": "EVAL-022",
+      "source": "F5 ASM",
+      "severity": "high",
+      "anomaly_score": 0.85,
+      "source_ip": "45.155.205.233",
+      "user_id": null,
+      "url": "/api/info",
+      "payload": "GET /api/info?q=' UNION SELECT * FROM information_schema.tables--"
+    },
+    "expected_verdict": "malicious",
+    "label": "SQLi via information_schema enumeration from known-bad IP"
+  },
+  {
+    "alert": {
+      "id": "EVAL-023",
+      "source": "AWS CloudTrail",
+      "severity": "high",
+      "anomaly_score": 0.95,
+      "principal": "arn:aws:iam::123456789012:role/EC2InstanceProfile-Web",
+      "event": {
+        "eventName": "StopLogging",
+        "userIdentity": {"type": "AssumedRole", "arn": "arn:aws:sts::123456789012:assumed-role/EC2InstanceProfile-Web/i-0abc"},
+        "requestParameters": {"name": "prod-trail"}
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "CloudTrail StopLogging from EC2 workload identity (attacker covers tracks)"
+  },
+  {
+    "alert": {
+      "id": "EVAL-024",
+      "source": "Palo Alto Panorama",
+      "severity": "high",
+      "anomaly_score": 0.9,
+      "principal": "panadmin@bank.in",
+      "event": {
+        "eventName": "panorama:add-rule",
+        "requestParameters": {
+          "rule_name": "tmp-troubleshoot",
+          "source": "any",
+          "destination": "any",
+          "service": "any",
+          "rule_action": "allow"
+        }
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "Panorama ANY-ANY-ALLOW rule (flat negation of perimeter)"
+  },
+  {
+    "alert": {
+      "id": "EVAL-025",
+      "source": "AWS CloudTrail",
+      "severity": "high",
+      "anomaly_score": 0.85,
+      "principal": "arn:aws:iam::123456789012:user/contractor",
+      "event": {
+        "eventName": "PutBucketPolicy",
+        "userIdentity": {"type": "IAMUser", "arn": "arn:aws:iam::123456789012:user/contractor"},
+        "requestParameters": {
+          "bucketName": "bank-customer-statements",
+          "bucketPolicy": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::bank-customer-statements/*\"}]}"
+        }
+      }
+    },
+    "expected_verdict": "suspicious",
+    "label": "Public-grant on customer-data bucket — single signal, hold pending verification"
+  },
+  {
+    "alert": {
+      "id": "EVAL-026",
+      "source": "Azure Activity Log",
+      "severity": "high",
+      "anomaly_score": 0.88,
+      "principal": "/subscriptions/abc/.../users/admin@bank.in",
+      "event": {
+        "operationName": "Microsoft.Network/networkSecurityGroups/securityRules/write",
+        "properties": {
+          "destinationPortRange": "3389",
+          "sourceAddressPrefix": "0.0.0.0/0",
+          "access": "Allow",
+          "direction": "Inbound",
+          "protocol": "Tcp"
+        }
+      }
+    },
+    "expected_verdict": "suspicious",
+    "label": "Azure NSG opening internet -> RDP — single signal, step-up + review"
+  },
+  {
+    "alert": {
+      "id": "EVAL-027",
+      "source": "AWS CloudTrail",
+      "severity": "low",
+      "anomaly_score": 0.2,
+      "principal": "arn:aws:iam::123456789012:user/sre.alice",
+      "event": {
+        "eventName": "DescribeInstances",
+        "userIdentity": {"type": "IAMUser", "arn": "arn:aws:iam::123456789012:user/sre.alice"},
+        "requestParameters": {}
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "Routine read-only describe — no posture change"
+  },
+  {
+    "alert": {
+      "id": "EVAL-028",
+      "source": "Okta",
+      "severity": "low",
+      "anomaly_score": 0.35,
+      "user_id": "u_admin_99",
+      "user_role": "cloud_admin",
+      "prev_geo": "IN-MH",
+      "curr_geo": "IN-MH",
+      "minutes_since_prev_login": 720,
+      "device_fingerprint": {"ua": "Mozilla/5.0 (Windows) Chrome/130", "screen": "1920x1080", "tz": "Asia/Kolkata"},
+      "mfa_failures": [],
+      "observed": {
+        "failed_logins_24h": 0,
+        "session_count_24h": 5,
+        "endpoint": "/api/admin/iam",
+        "hour_of_day": 23,
+        "source_ip": "10.50.1.42",
+        "high_impact_action": false,
+        "behavioral_drift_score": 0.1
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "Cloud admin off-hours from bastion subnet — privileged baseline says normal"
+  },
+  {
+    "alert": {
+      "id": "EVAL-029",
+      "source": "Okta",
+      "severity": "high",
+      "anomaly_score": 0.7,
+      "user_id": "u_admin_99",
+      "user_role": "cloud_admin",
+      "prev_geo": "IN-MH",
+      "curr_geo": "IN-MH",
+      "minutes_since_prev_login": 30,
+      "device_fingerprint": {"ua": "Mozilla/5.0 (Windows) Chrome/130", "screen": "1920x1080", "tz": "Asia/Kolkata"},
+      "mfa_failures": [],
+      "observed": {
+        "failed_logins_24h": 0,
+        "session_count_24h": 4,
+        "endpoint": "/api/admin/iam",
+        "hour_of_day": 14,
+        "source_ip": "10.50.1.42",
+        "high_impact_action": true,
+        "change_ticket_id": null,
+        "behavioral_drift_score": 0.2
+      }
+    },
+    "expected_verdict": "suspicious",
+    "label": "Privileged admin: high-impact IAM change with NO change ticket — verify with owner"
+  },
+  {
+    "alert": {
+      "id": "EVAL-030",
+      "source": "Okta",
+      "severity": "high",
+      "anomaly_score": 0.92,
+      "user_id": "u_admin_99",
+      "user_role": "cloud_admin",
+      "prev_geo": "IN-MH",
+      "curr_geo": "IN-MH",
+      "minutes_since_prev_login": 60,
+      "device_fingerprint": {"ua": "Mozilla/5.0 (Linux) Firefox/115", "screen": "1366x768", "tz": "UTC"},
+      "mfa_failures": [],
+      "observed": {
+        "failed_logins_24h": 0,
+        "session_count_24h": 1,
+        "endpoint": "/iam/CreateAccessKey",
+        "hour_of_day": 3,
+        "source_ip": "203.0.113.99",
+        "high_impact_action": true,
+        "change_ticket_id": null,
+        "behavioral_drift_score": 0.7
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "Privileged admin: unticketed IAM change + outside bastion subnet + behavioral drift = compromised admin"
+  },
+  {
+    "alert": {
+      "id": "EVAL-032",
+      "source": "OpenStack Neutron",
+      "severity": "high",
+      "anomaly_score": 0.85,
+      "principal": "user@core-banking.bank.in",
+      "event": {
+        "event_type": "network.security_group_rule.create.end",
+        "payload": {
+          "security_group_rule": {
+            "direction": "ingress",
+            "ethertype": "IPv4",
+            "protocol": "tcp",
+            "port_range_min": 22,
+            "port_range_max": 22,
+            "remote_ip_prefix": "0.0.0.0/0"
+          }
+        }
+      }
+    },
+    "expected_verdict": "suspicious",
+    "label": "OpenStack Neutron security-group rule opening internet -> SSH"
+  },
+  {
+    "alert": {
+      "id": "EVAL-033",
+      "source": "Microsoft Purview DLP",
+      "severity": "high",
+      "anomaly_score": 0.9,
+      "user_id": "u_resigning_alice",
+      "table": "customer_kyc",
+      "rows_returned": 12000,
+      "queries_per_session": 18,
+      "observed_mb_last_hour": 480.0
+    },
+    "expected_verdict": "malicious",
+    "label": "Insider-threat: resigning employee bulk-downloading customer KYC"
+  },
+  {
+    "alert": {
+      "id": "EVAL-034",
+      "source": "M365 Defender for Office 365",
+      "severity": "high",
+      "anomaly_score": 0.88,
+      "from_display": "CFO Office",
+      "from_address": "ceo.office@bank-secure.test",
+      "headers": {"spf": "fail", "dkim": "fail", "dmarc": "fail"},
+      "subject": "URGENT: Wire transfer Q2 RBI mandate",
+      "body": "Click here to login and verify your password. KYC update required immediately.",
+      "attachments": [{"filename": "Q2_RBI_Mandate.docm"}]
+    },
+    "expected_verdict": "malicious",
+    "label": "CFO-impersonation phish with macro attachment + auth fails + RBI bait"
+  },
+  {
+    "alert": {
+      "id": "EVAL-035",
+      "source": "Promon SHIELD SDK",
+      "severity": "high",
+      "anomaly_score": 0.94,
+      "user_id": "u_42891",
+      "device_telemetry": {"is_jailbroken": true, "frida_detected": true},
+      "sdk_telemetry": {"sdk_signature": "TAMPERED_X", "ssl_pinning_failed": true},
+      "mno_signals": {"last_sim_swap_hours_ago": 6}
+    },
+    "expected_verdict": "malicious",
+    "label": "Mobile-ATO chain: tampered device + recent SIM swap"
+  },
+  {
+    "alert": {
+      "id": "EVAL-036",
+      "source": "Cisco WLC",
+      "severity": "high",
+      "anomaly_score": 0.92,
+      "ap_record": {
+        "bssid": "AA-BB-CC-DD-EE-FF",
+        "ssid": "BankWiFi-PoS",
+        "captive_portal_detected": true,
+        "known_bssids": ["00-1A-1E-11-22-33"]
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "Evil-twin impersonating BankWiFi-PoS SSID"
+  },
+  {
+    "alert": {
+      "id": "EVAL-037",
+      "source": "Microsoft Purview DLP",
+      "severity": "low",
+      "anomaly_score": 0.2,
+      "user_id": "u_42891",
+      "table": "products",
+      "rows_returned": 50,
+      "observed_mb_last_hour": 5.0
+    },
+    "expected_verdict": "benign",
+    "label": "Routine read of low-sensitivity table within baseline volume"
+  },
+  {
+    "alert": {
+      "id": "EVAL-031",
+      "source": "Okta",
+      "severity": "medium",
+      "anomaly_score": 0.5,
+      "user_id": "u_admin_99",
+      "user_role": "cloud_admin",
+      "prev_geo": "IN-MH",
+      "curr_geo": "IN-MH",
+      "minutes_since_prev_login": 240,
+      "device_fingerprint": {"ua": "Mozilla/5.0 (Windows) Chrome/130", "screen": "1920x1080", "tz": "Asia/Kolkata"},
+      "mfa_failures": [],
+      "observed": {
+        "failed_logins_24h": 0,
+        "session_count_24h": 6,
+        "endpoint": "/api/admin/iam",
+        "hour_of_day": 11,
+        "source_ip": "10.50.1.42",
+        "high_impact_action": true,
+        "change_ticket_id": "CHG-2026-04829",
+        "behavioral_drift_score": 0.15
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "Privileged admin doing high-impact change WITH a change ticket — normal admin workflow"
+  }
+]

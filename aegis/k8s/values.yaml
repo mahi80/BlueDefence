@@ -1,0 +1,83 @@
+# AEGIS agent layer values
+
+namespace: bank-prod
+
+image:
+  repository: registry.bank.internal/aegis
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Replica count — scale horizontally; orchestrator is stateless, audit
+# log is per-pod local + flushed to S3 (audit-storage Terraform module).
+replicas: 3
+
+# IRSA — service account assumes an IAM role with bedrock:Invoke +
+# secretsmanager:GetSecretValue + s3:PutObject on the audit bucket.
+# Set `serviceAccount.roleArn` to the role ARN from the Terraform
+# output `eks.cluster_name` deployment.
+serviceAccount:
+  create: true
+  name: aegis-agent
+  roleArn: ""   # populate per-tenant after `terraform apply`
+
+# Resources tuned for agent layer's typical CPU (mostly I/O-bound) +
+# memory (LLM client buffers + audit chain). Bump for higher throughput.
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "2"
+    memory: "4Gi"
+
+# Horizontal Pod Autoscaler
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilization: 70
+
+# LLM backend selection — read by aegis.agents.shared.llm_client.get_client()
+# AWS deployments typically use bedrock for in-VPC Claude access.
+llm:
+  backend: "bedrock"   # bedrock | anthropic | gemma | mock
+  model: "anthropic.claude-sonnet-4-6"
+  voter_backend: "gemma"   # multi-provider diversity for the voter
+  voter_model: "google/gemma-2-9b-it"
+
+# PII tokenization is mandatory in production. Don't disable.
+pii_tokenization_enabled: "1"
+
+# Token budget caps per session — bounds blast radius on a runaway
+# agent + bounds Bedrock cost.
+token_budget:
+  max_input: "2000000"
+  max_output: "200000"
+  max_cost_cents: "5000"   # $50/session
+
+# Egress allowlist — agent pods can only reach the listed services.
+egress_allowlist:
+  - service: bedrock-runtime
+    cidr: ""    # populated from `aws_vpc_endpoint.bedrock_runtime` IPs
+  - service: secretsmanager
+    cidr: ""
+  - service: splunk-rest
+    cidr: ""    # bank's SIEM
+  - service: servicenow-rest
+    cidr: ""
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
+
+# Annotations to enable Prometheus scrape (paired with the OTel chart)
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"

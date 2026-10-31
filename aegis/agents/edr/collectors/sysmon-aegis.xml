@@ -1,0 +1,87 @@
+<Sysmon schemaversion="4.90">
+  <!-- AEGIS host-hunt baseline. Tuned to the endpoint/host artifact checklist.
+       Deploy:  sysmon64 -accepteula -i sysmon-aegis.xml
+       Update:  sysmon64 -c sysmon-aegis.xml
+       This is an INCLUDE-based hunting baseline: it logs high-signal events only,
+       so volume stays low enough to stream into AEGIS. Extend per host class. -->
+  <HashAlgorithms>SHA256</HashAlgorithms>
+  <DnsLookup>Enable</DnsLookup>
+  <EventFiltering>
+
+    <!-- EID 1 ProcessCreate: LOLBins + script hosts (T1059, T1218) -->
+    <RuleGroup name="lolbin-exec" groupRelation="or">
+      <ProcessCreate onmatch="include">
+        <Image condition="end with">\powershell.exe</Image>
+        <Image condition="end with">\pwsh.exe</Image>
+        <Image condition="end with">\cmd.exe</Image>
+        <Image condition="end with">\wscript.exe</Image>
+        <Image condition="end with">\cscript.exe</Image>
+        <Image condition="end with">\mshta.exe</Image>
+        <Image condition="end with">\regsvr32.exe</Image>
+        <Image condition="end with">\rundll32.exe</Image>
+        <Image condition="end with">\certutil.exe</Image>
+        <Image condition="end with">\bitsadmin.exe</Image>
+        <Image condition="end with">\installutil.exe</Image>
+        <Image condition="end with">\msbuild.exe</Image>
+        <CommandLine condition="contains any">-enc;-EncodedCommand;FromBase64String;DownloadString;IEX;Invoke-Expression;-urlcache;scrobj.dll;hidden</CommandLine>
+        <ParentImage condition="contains any">\winword.exe;\excel.exe;\outlook.exe;\mshta.exe</ParentImage>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- EID 3 NetworkConnect: egress from script hosts / unusual images (T1071) -->
+    <RuleGroup name="suspicious-egress" groupRelation="or">
+      <NetworkConnect onmatch="include">
+        <Image condition="end with">\powershell.exe</Image>
+        <Image condition="end with">\pwsh.exe</Image>
+        <Image condition="end with">\certutil.exe</Image>
+        <Image condition="end with">\rundll32.exe</Image>
+        <Image condition="end with">\mshta.exe</Image>
+        <Image condition="begin with">C:\Users\Public</Image>
+        <Image condition="begin with">C:\Windows\Temp</Image>
+        <Image condition="begin with">C:\ProgramData</Image>
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!-- EID 22 DNS: log all, scorer handles DGA/entropy + IOC match (T1071.004) -->
+    <RuleGroup name="dns" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+        <QueryName condition="end with">.microsoft.com</QueryName>
+        <QueryName condition="end with">.windowsupdate.com</QueryName>
+        <QueryName condition="end with">.in-addr.arpa</QueryName>
+      </DnsQuery>
+    </RuleGroup>
+
+    <!-- EID 11 FileCreate: persistence dirs, web roots, droppers (T1505.003, T1547) -->
+    <RuleGroup name="file-drop" groupRelation="or">
+      <FileCreate onmatch="include">
+        <TargetFilename condition="contains">\Start Menu\Programs\Startup</TargetFilename>
+        <TargetFilename condition="contains">\inetpub\wwwroot</TargetFilename>
+        <TargetFilename condition="end with">.ps1</TargetFilename>
+        <TargetFilename condition="end with">.hta</TargetFilename>
+        <TargetFilename condition="end with">.jsp</TargetFilename>
+        <TargetFilename condition="end with">.aspx</TargetFilename>
+        <TargetFilename condition="end with">.php</TargetFilename>
+        <TargetFilename condition="begin with">C:\Windows\Temp</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+
+    <!-- EID 12/13 Registry: autostart + service persistence (T1547.001, T1543.003) -->
+    <RuleGroup name="reg-persistence" groupRelation="or">
+      <RegistryEvent onmatch="include">
+        <TargetObject condition="contains">\CurrentVersion\Run</TargetObject>
+        <TargetObject condition="contains">\CurrentVersion\RunOnce</TargetObject>
+        <TargetObject condition="contains">\Services\</TargetObject>
+        <TargetObject condition="contains">\Image File Execution Options\</TargetObject>
+        <TargetObject condition="contains">\Winlogon\</TargetObject>
+      </RegistryEvent>
+    </RuleGroup>
+
+    <!-- EID 19/20/21 WMI persistence (T1546.003) + EID 8 remote thread (T1055) + EID 6 driver -->
+    <RuleGroup name="advanced-persistence" groupRelation="or">
+      <WmiEvent onmatch="include"><Operation condition="is">Created</Operation></WmiEvent>
+      <CreateRemoteThread onmatch="include"><SourceImage condition="contains">\</SourceImage></CreateRemoteThread>
+      <DriverLoad onmatch="include"><Signed condition="is">false</Signed></DriverLoad>
+    </RuleGroup>
+
+  </EventFiltering>
+</Sysmon>

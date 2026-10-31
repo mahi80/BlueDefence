@@ -1,0 +1,22 @@
+[
+  {
+    "id": "prop_01",
+    "change_type": "model_promotion",
+    "status": "pending",
+    "summary": "Promote triage-qwen3-8b-public-v5 → live brain",
+    "validation_passed": true,
+    "rationale": "Gate PASS (historical 33/37, injection 9/9, tls 11/13). Shadow: +3pt analyst agreement vs current on 48 new alerts.",
+    "created_at": "2026-10-23T05:10:00Z"
+  },
+  {
+    "id": "prop_02",
+    "change_type": "rule",
+    "status": "accepted",
+    "summary": "Raise auth-burst sensitivity for /login after 03:00 IST",
+    "validation_passed": true,
+    "rationale": "Meta-agent proposal; reduced two historical misses with zero regressions.",
+    "decided_by": "ciso",
+    "decided_at": "2026-10-22T19:20:00Z",
+    "created_at": "2026-10-22T18:55:00Z"
+  }
+]

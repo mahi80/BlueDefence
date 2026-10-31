@@ -1,0 +1,589 @@
+[
+  {
+    "alert": {
+      "id": "AGT-E01",
+      "source": "Imperva Cloud WAF",
+      "alert_type": "campaign_summary",
+      "site": "netbanking.bank.in",
+      "stack": {
+        "framework": "react",
+        "render": "spa",
+        "bundler": "webpack",
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "data-reactroot / chunk names",
+      "source_ip": "203.0.113.77",
+      "session_id": "s_7f3a9c1d02",
+      "user_agent": "Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/129",
+      "window_minutes": 15,
+      "tls_version": "1.3",
+      "http_version": "2",
+      "cdn_pop": "SIN",
+      "browser_locale": "en-US",
+      "avg_page_bytes": 12040,
+      "recon": {
+        "source_map_fetches": 11,
+        "debug_route_probes": [
+          "/static/js/main.chunk.js.map",
+          "/asset-manifest.json",
+          "/.env"
+        ],
+        "graphql_introspection": false,
+        "openapi_fetch": true,
+        "keys_in_bundle_found": true
+      },
+      "enumeration": {
+        "distinct_endpoints": 184,
+        "requests": 611,
+        "no_referer_ratio": 0.96,
+        "sequential_id_pattern": true,
+        "endpoints_never_seen_from_browsers": 61
+      },
+      "automation": {
+        "bot_verdict": "Headless browser",
+        "inter_request_stddev_ms": 21,
+        "ip_rotations_same_session": 0,
+        "webdriver_flag": true,
+        "mouse_events_per_page": 0
+      },
+      "timeline": {
+        "first_recon_at": "2026-10-03T02:11:00+00:00",
+        "first_exploit_at": "2026-10-03T02:17:00+00:00",
+        "recon_to_exploit_minutes": 6
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "AI-agent recon → enumeration → exploit in 6 min on a React SPA (headless, source maps, keys in bundle)"
+  },
+  {
+    "alert": {
+      "id": "AGT-E02",
+      "source": "Microsoft Sentinel",
+      "alert_type": "single_event",
+      "site": "loans.bank.in",
+      "stack": {
+        "framework": "django",
+        "render": "server",
+        "bundler": null,
+        "api_style": "drf"
+      },
+      "stack_fingerprint_seen": "csrftoken cookie / DRF browsable API",
+      "source_ip": "10.41.8.23",
+      "session_id": "s_11aa22bb33",
+      "user_agent": "Mozilla/5.0 (Macintosh) Chrome/129",
+      "window_minutes": 5,
+      "tls_version": "1.3",
+      "http_version": "2",
+      "cdn_pop": "BOM",
+      "browser_locale": "en-IN",
+      "avg_page_bytes": 310400,
+      "recon": {
+        "source_map_fetches": 0,
+        "debug_route_probes": [
+          "/admin/",
+          "/api/schema/"
+        ],
+        "graphql_introspection": false,
+        "openapi_fetch": true,
+        "keys_in_bundle_found": false
+      },
+      "context": {
+        "source_in_dev_range": true
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "developer on the dev VPN range opening /admin and the API schema — recon-shaped, explained by context"
+  },
+  {
+    "alert": {
+      "id": "AGT-E03",
+      "source": "F5 ASM",
+      "alert_type": "campaign_summary",
+      "site": "cards.bank.in",
+      "stack": {
+        "framework": "laravel",
+        "render": "server",
+        "bundler": "vite",
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "laravel_session cookie / X-Powered-By",
+      "source_ip": "198.51.100.9",
+      "session_id": "s_c0ffee0042",
+      "user_agent": "python-requests/2.32",
+      "window_minutes": 30,
+      "tls_version": "1.2",
+      "http_version": "1.1",
+      "cdn_pop": "FRA",
+      "browser_locale": "en-US",
+      "avg_page_bytes": 4100,
+      "waf": {
+        "blocked": 63,
+        "distinct_signatures": 14,
+        "attack_classes": [
+          "SQL Injection",
+          "Path Traversal",
+          "Command Injection"
+        ],
+        "passed_on_sensitive_endpoint_200": false,
+        "target": "/api/cards/{id}/limit"
+      },
+      "automation": {
+        "bot_verdict": "Unclassified",
+        "inter_request_stddev_ms": 140,
+        "ip_rotations_same_session": 18,
+        "webdriver_flag": false,
+        "mouse_events_per_page": 0
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "adaptive mutation after every block (14 signatures) + 18 IP rotations under one session — automated attacker even though all blocked"
+  },
+  {
+    "alert": {
+      "id": "AGT-E04",
+      "source": "API Gateway",
+      "alert_type": "campaign_summary",
+      "site": "api.bank.in",
+      "stack": {
+        "framework": "angular",
+        "render": "spa",
+        "bundler": "esbuild",
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "ng-version attribute",
+      "source_ip": "192.0.2.44",
+      "session_id": "s_dd0g0000a1",
+      "user_agent": "Datadog Synthetics",
+      "window_minutes": 15,
+      "tls_version": "1.3",
+      "http_version": "2",
+      "cdn_pop": "DEL",
+      "browser_locale": "en-US",
+      "avg_page_bytes": 220000,
+      "enumeration": {
+        "distinct_endpoints": 72,
+        "requests": 72,
+        "no_referer_ratio": 0.9,
+        "sequential_id_pattern": false,
+        "endpoints_never_seen_from_browsers": 0
+      },
+      "automation": {
+        "bot_verdict": "Good Bot",
+        "inter_request_stddev_ms": 31,
+        "ip_rotations_same_session": 0,
+        "webdriver_flag": false,
+        "mouse_events_per_page": 0
+      },
+      "context": {
+        "synthetic_monitor": {
+          "vendor": "Datadog Synthetics",
+          "allowlisted_source": true
+        }
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "allow-listed synthetic monitor: 72 endpoints at machine timing — enumeration-shaped, explained by context"
+  },
+  {
+    "alert": {
+      "id": "AGT-E05",
+      "source": "CSP Report Collector",
+      "alert_type": "campaign_summary",
+      "site": "netbanking.bank.in",
+      "stack": {
+        "framework": "vue",
+        "render": "spa",
+        "bundler": "vite",
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "data-v-* attributes",
+      "source_ip": "203.0.113.201",
+      "session_id": "s_5kimm3r001",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/130",
+      "window_minutes": 60,
+      "tls_version": "1.3",
+      "http_version": "3",
+      "cdn_pop": "BOM",
+      "browser_locale": "en-IN",
+      "avg_page_bytes": 540000,
+      "client_integrity": {
+        "csp_violations": 1840,
+        "unknown_script_src_domains": [
+          "js.example-tag.co"
+        ],
+        "sri_failures": 0,
+        "new_service_worker_registered": false,
+        "new_inline_script_hash": true,
+        "pages_affected": "/checkout"
+      },
+      "egress": {
+        "posts_to_new_domain": 46,
+        "domain_age_days": 2,
+        "post_interval_stddev_s": 0.4,
+        "payload_bytes_avg": 380,
+        "dns_txt_queries": 0
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "skimmer: unknown script on /checkout + metronomic small posts to a 2-day-old domain (Magecart shape)"
+  },
+  {
+    "alert": {
+      "id": "AGT-E06",
+      "source": "CSP Report Collector",
+      "alert_type": "campaign_summary",
+      "site": "wealth.bank.in",
+      "stack": {
+        "framework": "nextjs",
+        "render": "ssr",
+        "bundler": "turbopack",
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "__NEXT_DATA__",
+      "source_ip": "10.20.5.5",
+      "session_id": "s_ci00000777",
+      "user_agent": "Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/129",
+      "window_minutes": 30,
+      "tls_version": "1.3",
+      "http_version": "2",
+      "cdn_pop": "DEL",
+      "browser_locale": "en-US",
+      "avg_page_bytes": 800000,
+      "client_integrity": {
+        "csp_violations": 4120,
+        "unknown_script_src_domains": [],
+        "sri_failures": 22,
+        "new_service_worker_registered": false,
+        "new_inline_script_hash": true,
+        "pages_affected": "/dashboard"
+      },
+      "automation": {
+        "bot_verdict": "Headless browser",
+        "inter_request_stddev_ms": 40,
+        "ip_rotations_same_session": 0,
+        "webdriver_flag": true,
+        "mouse_events_per_page": 0
+      },
+      "context": {
+        "deploy_window": {
+          "release": "v61.3",
+          "ci_runner_source": true,
+          "started_minutes_ago": 9
+        }
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "release deploy: new inline hashes + SRI failures + headless smoke tests from the CI runner — integrity-break-shaped, explained by the deploy window"
+  },
+  {
+    "alert": {
+      "id": "AGT-E07",
+      "source": "API Gateway",
+      "alert_type": "campaign_summary",
+      "site": "api.bank.in",
+      "stack": {
+        "framework": "react",
+        "render": "spa",
+        "bundler": "webpack",
+        "api_style": "graphql"
+      },
+      "stack_fingerprint_seen": "/graphql endpoint",
+      "source_ip": "198.51.100.120",
+      "session_id": "s_gql0000019",
+      "user_agent": "Mozilla/5.0 (Linux) Firefox/115",
+      "window_minutes": 15,
+      "tls_version": "1.3",
+      "http_version": "2",
+      "cdn_pop": "SIN",
+      "browser_locale": "en-US",
+      "avg_page_bytes": 9000,
+      "recon": {
+        "source_map_fetches": 0,
+        "debug_route_probes": [],
+        "graphql_introspection": true,
+        "openapi_fetch": false,
+        "keys_in_bundle_found": false
+      },
+      "enumeration": {
+        "distinct_endpoints": 31,
+        "requests": 90,
+        "no_referer_ratio": 0.5,
+        "sequential_id_pattern": false,
+        "endpoints_never_seen_from_browsers": 4
+      }
+    },
+    "expected_verdict": "suspicious",
+    "label": "GraphQL introspection + moderate enumeration, nothing else yet — throttle and step up, do not block"
+  },
+  {
+    "alert": {
+      "id": "AGT-E08",
+      "source": "F5 ASM",
+      "alert_type": "campaign_summary",
+      "site": "api.bank.in",
+      "stack": {
+        "framework": "mobile-android-ios",
+        "render": "native",
+        "bundler": null,
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "app user agent without pinning",
+      "source_ip": "203.0.113.5",
+      "session_id": "s_pt20264829",
+      "user_agent": "okhttp/4.12",
+      "window_minutes": 60,
+      "tls_version": "1.2",
+      "http_version": "1.1",
+      "cdn_pop": "BOM",
+      "browser_locale": "en-IN",
+      "avg_page_bytes": 3000,
+      "access": {
+        "cross_owner_reads": 12,
+        "cross_owner_writes": 0,
+        "caller_role": "retail_customer"
+      },
+      "waf": {
+        "blocked": 9,
+        "distinct_signatures": 4,
+        "attack_classes": [
+          "Illegal Resource Access"
+        ],
+        "passed_on_sensitive_endpoint_200": true,
+        "target": "/api/accounts/{id}"
+      },
+      "context": {
+        "pentest_window": {
+          "ticket": "PT-4829",
+          "source_in_approved_range": true,
+          "scope_includes_site": true
+        }
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "approved pen-test (ticket, approved range, in scope): IDOR reads and a passed probe are the test itself"
+  },
+  {
+    "alert": {
+      "id": "AGT-E09",
+      "source": "Microsoft Sentinel",
+      "alert_type": "campaign_summary",
+      "site": "cards.bank.in",
+      "stack": {
+        "framework": "php",
+        "render": "server",
+        "bundler": null,
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "PHPSESSID / X-Powered-By",
+      "source_ip": "203.0.113.5",
+      "session_id": "s_pt20264830",
+      "user_agent": "python-requests/2.32",
+      "window_minutes": 60,
+      "tls_version": "1.2",
+      "http_version": "1.1",
+      "cdn_pop": "BOM",
+      "browser_locale": "en-IN",
+      "avg_page_bytes": 2000,
+      "recon": {
+        "source_map_fetches": 0,
+        "debug_route_probes": [
+          "/phpinfo.php",
+          "/.env",
+          "/.git/config"
+        ],
+        "graphql_introspection": false,
+        "openapi_fetch": false,
+        "keys_in_bundle_found": false
+      },
+      "client_integrity": {
+        "csp_violations": 12,
+        "unknown_script_src_domains": [],
+        "sri_failures": 0,
+        "new_service_worker_registered": true,
+        "new_inline_script_hash": false,
+        "pages_affected": "/login"
+      },
+      "egress": {
+        "posts_to_new_domain": 30,
+        "domain_age_days": 1,
+        "post_interval_stddev_s": 0.9,
+        "payload_bytes_avg": 210,
+        "dns_txt_queries": 0
+      },
+      "context": {
+        "pentest_window": {
+          "ticket": "PT-4830",
+          "source_in_approved_range": true,
+          "scope_includes_site": true
+        }
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "pen-test ticket does NOT explain a planted service worker + beaconing to a 1-day-old domain — persistence and exfil are never in scope"
+  },
+  {
+    "alert": {
+      "id": "AGT-E10",
+      "source": "Imperva Cloud WAF",
+      "alert_type": "single_event",
+      "site": "wealth.bank.in",
+      "stack": {
+        "framework": "symfony",
+        "render": "server",
+        "bundler": "webpack-encore",
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "sf_redirect / _profiler",
+      "source_ip": "192.0.2.199",
+      "session_id": "s_sym0000055",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/130",
+      "window_minutes": 5,
+      "tls_version": "1.3",
+      "http_version": "2",
+      "cdn_pop": "FRA",
+      "browser_locale": "ru-RU",
+      "avg_page_bytes": 15000,
+      "recon": {
+        "source_map_fetches": 0,
+        "debug_route_probes": [
+          "/_profiler/",
+          "/.env"
+        ],
+        "graphql_introspection": false,
+        "openapi_fetch": false,
+        "keys_in_bundle_found": false
+      }
+    },
+    "expected_verdict": "suspicious",
+    "label": "profiler + .env probes from an external source, nothing else in the window — one strong signal: throttle and watch"
+  },
+  {
+    "alert": {
+      "id": "AGT-E11",
+      "source": "Imperva Cloud WAF",
+      "alert_type": "campaign_summary",
+      "site": "netbanking.bank.in",
+      "stack": {
+        "framework": "angular",
+        "render": "spa",
+        "bundler": "esbuild",
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "ng-version attribute",
+      "source_ip": "198.51.100.77",
+      "session_id": "s_ja4liar001",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/130",
+      "window_minutes": 15,
+      "tls_version": "1.3",
+      "http_version": "2",
+      "cdn_pop": "SIN",
+      "browser_locale": "en-US",
+      "avg_page_bytes": 6000,
+      "tls_identity": {
+        "ja4": "t13d1012h1_d2f6b9a1c0e4_09a7c3b2d1e5",
+        "ja4_family": "python-requests",
+        "ua_claims_family": "chrome",
+        "tls_version_offered": "1.3",
+        "sni_matches_host": true,
+        "weak_ciphers_offered": false,
+        "renegotiations_per_min": 0
+      },
+      "enumeration": {
+        "distinct_endpoints": 96,
+        "requests": 310,
+        "no_referer_ratio": 0.98,
+        "sequential_id_pattern": true,
+        "endpoints_never_seen_from_browsers": 40
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "client lies about what it is (Chrome UA, python TLS stack) + enumeration with no page-load chain"
+  },
+  {
+    "alert": {
+      "id": "AGT-E12",
+      "source": "F5 ASM",
+      "alert_type": "single_event",
+      "site": "api.bank.in",
+      "stack": {
+        "framework": "react",
+        "render": "spa",
+        "bundler": "webpack",
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "data-reactroot / chunk names",
+      "source_ip": "10.20.44.9",
+      "session_id": "s_corpproxy9",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64) Chrome/130",
+      "window_minutes": 5,
+      "tls_version": "1.2",
+      "http_version": "1.1",
+      "cdn_pop": "BOM",
+      "browser_locale": "en-IN",
+      "avg_page_bytes": 410000,
+      "tls_identity": {
+        "ja4": "t12d1407h1_0a1b2c3d4e5f_f6e5d4c3b2a1",
+        "ja4_family": "inspection-proxy",
+        "ua_claims_family": "chrome",
+        "tls_version_offered": "1.2",
+        "sni_matches_host": true,
+        "weak_ciphers_offered": false,
+        "renegotiations_per_min": 0
+      },
+      "enumeration": {
+        "distinct_endpoints": 4,
+        "requests": 11,
+        "no_referer_ratio": 0.1,
+        "sequential_id_pattern": false,
+        "endpoints_never_seen_from_browsers": 0
+      },
+      "context": {
+        "known_inspection_proxy": "Zscaler ZIA egress"
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "fingerprint mismatch fully explained by the corporate TLS-inspection proxy; ordinary browsing otherwise"
+  },
+  {
+    "alert": {
+      "id": "AGT-E13",
+      "source": "API Gateway",
+      "alert_type": "single_event",
+      "site": "api.bank.in",
+      "stack": {
+        "framework": "mobile-android-ios",
+        "render": "native",
+        "bundler": null,
+        "api_style": "rest"
+      },
+      "stack_fingerprint_seen": "app user agent without pinning",
+      "source_ip": "203.0.113.88",
+      "session_id": "s_jwtforge01",
+      "user_agent": "okhttp/4.12",
+      "window_minutes": 15,
+      "tls_version": "1.3",
+      "http_version": "2",
+      "cdn_pop": "DEL",
+      "browser_locale": "en-IN",
+      "avg_page_bytes": 2000,
+      "tls_identity": {
+        "ja4": "t13d1211h2_2b2d5f1c9e3a_7c1b0d7f6a2e",
+        "ja4_family": "okhttp",
+        "ua_claims_family": "okhttp",
+        "tls_version_offered": "1.3",
+        "sni_matches_host": true,
+        "weak_ciphers_offered": false,
+        "renegotiations_per_min": 0,
+        "tokens": {
+          "signature_failures_15m": 212,
+          "alg": "none",
+          "kid": "../../etc/keys",
+          "kid_in_jwks": false,
+          "iat_in_future": false
+        }
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "forged tokens: alg=none + injected kid + 212 signature failures — fingerprint itself is honest"
+  }
+]

@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+{{ include "aegis-agent.labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+{{ include "aegis-agent.labels" . | indent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "aegis-agent.labels" . | indent 8 }}
+      annotations:
+{{ toYaml .Values.podAnnotations | indent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: true
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
+      containers:
+      - name: agent
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["python", "-m", "aegis.main"]
+        ports:
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: LLM_BACKEND
+          value: {{ .Values.llm.backend | quote }}
+        - name: AEGIS_VOTER_BACKEND
+          value: {{ .Values.llm.voter_backend | quote }}
+        - name: AEGIS_PII_TOKENIZATION
+          value: {{ .Values.pii_tokenization_enabled | quote }}
+        - name: AEGIS_TOKEN_BUDGET_INPUT
+          value: {{ .Values.token_budget.max_input | quote }}
+        - name: AEGIS_TOKEN_BUDGET_OUTPUT
+          value: {{ .Values.token_budget.max_output | quote }}
+        - name: AEGIS_TOKEN_BUDGET_COST_CENTS
+          value: {{ .Values.token_budget.max_cost_cents | quote }}
+        # Anthropic / Bedrock credentials — IRSA-bound, JIT-injected
+        # from Secrets Manager via the external-secrets operator (NOT
+        # in here as plain env vars). Below is the contract; the
+        # external-secrets ExternalSecret resource is rendered
+        # separately in templates/external-secret.yaml.
+        envFrom:
+        - secretRef:
+            name: aegis-runtime-credentials
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        # Liveness: the agent layer is stateless; if its event loop
+        # dies, Kubernetes restarts it. Readiness gates traffic until
+        # the LLM client is responsive.
+        livenessProbe:
+          httpGet: { path: /healthz, port: metrics }
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet: { path: /readyz, port: metrics }
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: audit-buffer
+          mountPath: /var/aegis/audit
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      # Audit log buffer — written locally then flushed to S3 (Object
+      # Lock COMPLIANCE bucket from aegis/deploy/aws/modules/audit-storage).
+      # PVC ensures the local hash chain survives pod restart until
+      # flushed.
+      - name: audit-buffer
+        persistentVolumeClaim:
+          claimName: aegis-audit-buffer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aegis-audit-buffer
+  namespace: {{ .Values.namespace }}
+  labels:
+{{ include "aegis-agent.labels" . | indent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+{{ include "aegis-agent.labels" . | indent 4 }}
+spec:
+  selector:
+{{ include "aegis-agent.labels" . | indent 4 }}
+  ports:
+  - name: metrics
+    port: 9090
+    targetPort: metrics

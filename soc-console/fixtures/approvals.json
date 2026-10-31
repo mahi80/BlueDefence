@@ -1,0 +1,49 @@
+[
+  {
+    "id": "appr_01",
+    "status": "pending",
+    "created_at": "2026-10-23T05:42:50Z",
+    "action_type": "isolate",
+    "target": "app-ledger-07",
+    "alert_id": "ALR-2201",
+    "integrity_hash": "f2a1c0de4b7788aa",
+    "reasoning": "Isolating app-ledger-07 severs the only path left to the core ledger DB.",
+    "agent_id": "SOC-AGENTQ-01"
+  },
+  {
+    "id": "appr_02",
+    "status": "pending",
+    "created_at": "2026-10-23T05:42:51Z",
+    "action_type": "block_egress",
+    "target": "203.0.113.77",
+    "alert_id": "ALR-2201",
+    "integrity_hash": "f2a1c0de4b7788aa",
+    "reasoning": "Block the forged-token source IP at the egress proxy and firewall.",
+    "agent_id": "SOC-AGENTQ-01"
+  },
+  {
+    "id": "appr_03",
+    "status": "pending",
+    "created_at": "2026-10-23T05:38:41Z",
+    "action_type": "block_egress",
+    "target": "203.0.113.9",
+    "alert_id": "ALR-2202",
+    "integrity_hash": "9b33aa21ce0045fd",
+    "reasoning": "Known-bad TLS certificate on the destination — block the C2 egress.",
+    "agent_id": "SOC-AGENTQ-01"
+  },
+  {
+    "id": "appr_04",
+    "status": "approved",
+    "created_at": "2026-10-23T05:43:02Z",
+    "action_type": "revoke_sessions",
+    "target": "svc-acct-pay",
+    "alert_id": "ALR-2201",
+    "integrity_hash": "f2a1c0de4b7788aa",
+    "reasoning": "Revoke the service account's active sessions used on the lateral movement.",
+    "agent_id": "SOC-AGENTQ-01",
+    "decided_by": "m.bhandari",
+    "decided_at": "2026-10-23T05:44:10Z",
+    "rationale": "Confirmed — svc-acct-pay has no business touching app-ledger-07."
+  }
+]

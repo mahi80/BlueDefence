@@ -1,0 +1,12 @@
+# Governance runtime — the ACP SDK that governs the SOC agent (SOC-AGENTQ-01).
+#
+# AEGIS runs WITHOUT this (the acp import is optional at import time and governance
+# degrades to a no-op); install it to run the SOC agent under ACPGuard.
+#
+# Pinned to mahi80/rbi (private) @ b2e9d97 — acp-sdk 0.8.3.
+# Private access needs a GitHub token. Either configure a git credential helper
+# (e.g. `gh auth setup-git`) and run `pip install -r requirements-governance.txt`,
+# or install with the token in the URL:
+#   pip install "acp-sdk @ git+https://x-access-token:$GH_READ_TOKEN@github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk"
+# To bump the pin, change the @<sha> below (and the matching line in .github/workflows/aegis-ci.yml).
+acp-sdk @ git+https://github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk

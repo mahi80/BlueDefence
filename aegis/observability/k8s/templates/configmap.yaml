@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aegis-otel-collector-config
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis-obs.labels" . | indent 4 }}
+data:
+  config.yaml: |
+    # OpenTelemetry Collector pipeline for AEGIS.
+    #
+    # Receivers:
+    #   otlp grpc + http on the collector pod (AEGIS containers push here)
+    #   prometheus scrape over local pods on port {{ .Values.prom_scrape.port }}
+    #
+    # Processors:
+    #   batch        — efficient export
+    #   memory_limiter — back-pressure if exporters fall behind
+    #   attributes/aegis-redact — drop fields that might carry PII even after
+    #                              the AEGIS PII tokenizer (defense in depth)
+    #
+    # Exporters:
+    #   otlp/tempo  — traces
+    #   prometheusremotewrite/mimir — metrics
+    #   logging     — for debugging in dev clusters
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:{{ .Values.collector.receivers.otlp_grpc_port }}
+          http:
+            endpoint: 0.0.0.0:{{ .Values.collector.receivers.otlp_http_port }}
+      prometheus:
+        config:
+          scrape_configs:
+          - job_name: aegis-pods
+            kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [{{ .Values.target.namespace }}]
+            relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_managed_by]
+              action: keep
+              regex: aegis-self-healing|aegis-observability|aegis
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              action: keep
+              regex: "true"
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+              action: replace
+              target_label: __address__
+              regex: (.+):.+
+              replacement: $1:{{ .Values.prom_scrape.port }}
+
+    processors:
+      batch:
+        send_batch_size: 1024
+        timeout: 5s
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 75
+        spike_limit_percentage: 25
+      # Defense-in-depth: drop any attribute that looks PII-shaped even
+      # after the AEGIS PII tokenizer. The tokenizer is the primary
+      # control; this is belt-and-braces.
+      attributes/aegis-redact:
+        actions:
+        - key: user.email
+          action: delete
+        - key: user.phone
+          action: delete
+        - key: account.aadhaar
+          action: delete
+        - key: account.pan
+          action: delete
+        - key: account.ifsc
+          action: delete
+      # Sample at the collector — so AEGIS itself doesn't decide.
+      probabilistic_sampler:
+        sampling_percentage: {{ mul .Values.collector.exporters.sampling_rate 100 }}
+
+    exporters:
+      otlp/tempo:
+        endpoint: {{ .Values.collector.exporters.tempo_endpoint }}
+        tls:
+          insecure: false
+      prometheusremotewrite/mimir:
+        endpoint: {{ .Values.collector.exporters.mimir_endpoint }}
+      logging:
+        verbosity: detailed
+        sampling_initial: 5
+        sampling_thereafter: 200
+
+    service:
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+          address: 0.0.0.0:8888
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, attributes/aegis-redact, probabilistic_sampler, batch]
+          exporters: [otlp/tempo]
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [memory_limiter, batch]
+          exporters: [prometheusremotewrite/mimir]

@@ -1,0 +1,60 @@
+# Self-Healing controller values. Override per environment.
+
+# The protected workload — the application AEGIS will heal on compromise.
+target:
+  name: bank-api
+  namespace: bank-prod
+  image: registry.bank.internal/bank-api:1.4.2   # immutable, signed image
+  replicas: 6
+  containerPort: 8080
+
+# Forensic snapshot destination (immutable WORM bucket / S3 Object Lock).
+forensics:
+  pvcSize: 50Gi
+  storageClass: worm-immutable
+  retentionDays: 2555  # ~7 years for regulatory retention
+
+# Argo Rollouts canary parameters for the respawn step.
+rollout:
+  steps:
+    - setWeight: 5
+    - pause: { duration: 60 }
+    - setWeight: 25
+    - pause: { duration: 120 }
+    - setWeight: 50
+    - pause: { duration: 180 }
+    - setWeight: 100
+  canaryAnalysis:
+    successThreshold: 0.99
+    metricInterval: 30s
+
+# Strict security context — respawn runs with these, ensuring clean state.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
+
+# Egress policy: respawned pods reach only approved destinations.
+egressAllowlist:
+  - service: "bank-db.bank-prod.svc.cluster.local"
+    port: 5432
+    protocol: TCP
+  - service: "bank-cache.bank-prod.svc.cluster.local"
+    port: 6379
+    protocol: TCP
+  - service: "kube-dns.kube-system.svc.cluster.local"
+    port: 53
+    protocol: UDP
+
+# Self-Healing controller workload identity (SPIFFE / IRSA / managed identity).
+controller:
+  serviceAccount: aegis-healing-controller
+  image: registry.bank.internal/aegis/healing:0.1.0
+  resources:
+    requests: { cpu: "200m", memory: "256Mi" }
+    limits:   { cpu: "1",    memory: "1Gi" }

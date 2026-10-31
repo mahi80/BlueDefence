@@ -1,0 +1,73 @@
+# BlueDefence
+
+Autonomous SOC — **AEGIS** (Agent Q), an ACP-governed detection, investigation and
+response brain, with its analyst console. Carved out of the ACP monorepo
+(`mahi80/rbi`) so the SOC product ships on its own cadence.
+
+Detection is **deterministic** (scorers, fast-paths, policy-as-code); the LLMs
+**triage and judge**; a multi-model vote guards the irreversible calls; and every
+containment action is auditable and, by default, held for a human.
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `aegis/` | The SOC brain: orchestrator → specialists → swarm fan-out → evidence chains → min-cut containment → HITL. Ingest (Sentinel/Splunk/WAF), response connectors (shadow by default), eval gates, dataset capture, meta-agent. See `aegis/README.md`. |
+| `soc-console/` | The analyst console (Next.js) — decision-first HITL queue, evidence-backed Agent Q, attack-path map. Talks to the dashboard over HTTP. |
+| `scripts/` | `soc_demo.py` (presenter-paced offline scenario the console renders) and `soc_live.py` (drives the real pipeline). |
+| `docs/plans/` | AEGIS roadmaps. |
+
+## The two seams (why this split is clean)
+
+1. **Governance → `acp-sdk`, a pinned package.** Only `aegis/governance.py` touches it,
+   imported lazily — AEGIS runs without it (governance degrades to a no-op). Pinned to
+   `mahi80/rbi@b2e9d97` (acp-sdk 0.8.3) in `requirements-governance.txt` / `pyproject.toml`.
+2. **Persistence/HITL → the ACP dashboard, over HTTP.** No dashboard code is imported;
+   AEGIS posts to `ACP_DASHBOARD_URL` (`/api/soc/*`, `/api/approvals`). That API is the
+   frozen contract between the two repos.
+
+## Run it
+
+```bash
+# SOC brain + eval gates (no governance needed)
+pip install -r aegis/requirements.txt pytest
+python -m pytest aegis/tests -q
+python -m aegis.eval.fault_injection          # end-to-end over synthetic campaigns
+
+# With governance (SOC-AGENTQ-01 under ACPGuard) — needs access to the private SDK:
+pip install "acp-sdk @ git+https://x-access-token:$GH_READ_TOKEN@github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk"
+
+# The console (renders the demo scenario)
+python scripts/soc_demo.py --port 8799
+cd soc-console && AEGIS_API_ORIGIN=http://localhost:8799 \
+  AEGIS_AUTH_MODE=demo AEGIS_CONSOLE_SECRET=demo AEGIS_DEMO_USER=soc AEGIS_DEMO_PASSWORD=demo \
+  npm install && npm run dev
+```
+
+## Key env flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `ACP_DASHBOARD_URL`, `ACP_API_KEY` | — | Persistence + HITL transport to the dashboard. |
+| `AEGIS_EDITION` | `external` | `external` \| `soc` \| `full`. |
+| `AEGIS_ENFORCEMENT_MODE` | `shadow` | `shadow` logs what it would enforce; `live` calls vendor connectors. |
+| `AEGIS_SWARM` | `1` | Swarm fan-out on triage. |
+| `AEGIS_AUTO_BLOCK` | `shadow` | Detection-time auto-block of narrow, external, reversible targets (TTL, voter-gated). |
+| `AEGIS_ENSEMBLE_VOTE` | `off` | Multi-model majority vote on the irreversible judgment (needs ≥2 voters configured). |
+| `AEGIS_HITL_TIMEOUT` | `off` | Timeout fallback: a reversible action with a majority-concur vote auto-executes past its window; irreversible actions and split votes hold for a human. `shadow` \| `live`; `AEGIS_HITL_TIMEOUT_SEC` (120). |
+
+WAF/SOAR vendors: `AEGIS_WAF_VENDOR`, `AEGIS_SOAR_VENDOR` (+ creds) — see `aegis/README.md`.
+
+## CI
+
+- `.github/workflows/aegis-ci.yml` — eval gates (historical + injection, investigation
+  quality, fault injection, property tests), plus `pytest aegis/tests` under governance.
+  The governed job installs `acp-sdk` from the pinned URL and needs the repo secret
+  **`GH_READ_TOKEN`** (a read-scoped PAT for `mahi80/rbi`).
+- `.github/workflows/soc-console-ci.yml` — `npm ci` + typecheck + build.
+
+## Provenance
+
+Clean import from `mahi80/rbi` (the ACP monorepo) at `b2e9d97`. The dashboard, the
+license server and `acp-sdk` itself stay in `rbi`; BlueDefence consumes the SDK as a
+pinned package and the dashboard over HTTP.

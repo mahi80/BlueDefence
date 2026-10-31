@@ -1,0 +1,76 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-agent-egress
+  namespace: {{ .Values.namespace }}
+  labels:
+{{ include "aegis-agent.labels" . | indent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "aegis-agent.labels" . | indent 6 }}
+  policyTypes:
+  - Egress
+  egress:
+  # DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  # OTel collector (observability namespace)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.namespace }}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: aegis-otel-collector
+    ports:
+    - port: 4317
+      protocol: TCP
+    - port: 4318
+      protocol: TCP
+  # Bedrock VPC endpoint — DNS-resolved within VPC; egress to the
+  # endpoint's CIDR block. In production, replace 10.0.0.0/8 with the
+  # actual subnet CIDRs of the Bedrock endpoint ENIs.
+  - to:
+    - ipBlock:
+        cidr: 10.0.0.0/8
+    ports:
+    - port: 443
+      protocol: TCP
+  # Splunk + ServiceNow + Slack — bank's SIEM/SOAR. Tighten CIDRs in prod.
+  - to:
+    - ipBlock:
+        cidr: 10.0.0.0/8
+    ports:
+    - port: 8089   # splunk REST
+      protocol: TCP
+    - port: 443
+      protocol: TCP
+---
+# No ingress allowed except Prometheus scrape from the OTel collector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-agent-ingress
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "aegis-agent.labels" . | indent 6 }}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: aegis-otel-collector
+    ports:
+    - port: 9090
+      protocol: TCP

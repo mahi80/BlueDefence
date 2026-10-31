@@ -1,0 +1,47 @@
+# AEGIS observability stack values
+
+# Where AEGIS workloads run
+target:
+  namespace: bank-prod
+  app_label: aegis
+
+# OTel collector (DaemonSet — every node has one for low-latency span ingest)
+collector:
+  image: otel/opentelemetry-collector-contrib:0.114.0
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits:   { cpu: "1",    memory: "1Gi" }
+  serviceAccount: aegis-otel-collector
+  # Receive ports
+  receivers:
+    otlp_grpc_port: 4317
+    otlp_http_port: 4318
+  # Where to forward traces / metrics. Production fills with the bank's
+  # internal Tempo + Mimir endpoints (or vendor: Honeycomb / Datadog).
+  exporters:
+    tempo_endpoint: "tempo.observability.svc.cluster.local:4317"
+    mimir_endpoint: "http://mimir.observability.svc.cluster.local/api/v1/push"
+    sampling_rate: 1.0    # 1.0 = 100% (drop to 0.1 in steady-state prod)
+  # Bank-data residency: NEVER forward AEGIS spans to external SaaS.
+  external_export_blocked: true
+
+# Prometheus scrape annotations to apply to AEGIS pods
+prom_scrape:
+  enabled: true
+  port: 9090
+  path: /metrics
+
+# AlertManager rules — declarative alerts the SRE team should care about.
+# These translate AEGIS' security-relevant signals into pageable alerts.
+alertmanager_rules:
+  enabled: true
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault

@@ -1,0 +1,4 @@
+# SAMPLE DATA: a simulated office network from aegis/eval/egress_bench.py; every value is invented
+{"kind": "cert_sha1", "value": "81bf2a526c6f183839b09cfabf3d6bf26ca37dcf", "name": "sample C2 certificate (invented)", "confidence": 0.95, "source": "sample"}
+{"kind": "ja3", "value": "00000000000000000000000000000bad", "name": "sample client fingerprint (invented)", "confidence": 0.6, "source": "sample"}
+{"kind": "domain", "value": "phish-kit.example", "name": "sample phishing kit domain (invented)", "source": "sample"}

@@ -1,0 +1,48 @@
+{
+  "tables": [
+    {
+      "name": "PrimaryResult",
+      "columns": [
+        {"name": "TimeGenerated", "type": "datetime"}, {"name": "SystemAlertId", "type": "string"},
+        {"name": "AlertName", "type": "string"}, {"name": "AlertSeverity", "type": "string"},
+        {"name": "Description", "type": "string"}, {"name": "ProductName", "type": "string"},
+        {"name": "ProviderName", "type": "string"}, {"name": "Tactics", "type": "string"},
+        {"name": "Techniques", "type": "string"}, {"name": "Entities", "type": "string"},
+        {"name": "ExtendedProperties", "type": "string"}, {"name": "CompromisedEntity", "type": "string"},
+        {"name": "Status", "type": "string"}, {"name": "AlertType", "type": "string"}
+      ],
+      "rows": [
+        [
+          "2026-10-21T06:12:04.511Z", "0e4d7c1a-5b7a-4c22-9f3e-1a2b3c4d5e6f",
+          "Atypical travel", "Medium",
+          "Sign-in from Moscow 12 minutes after a sign-in from Mumbai for the same account.",
+          "Azure Active Directory Identity Protection", "IPC", "InitialAccess", "T1078",
+          "[{\"$id\":\"3\",\"Name\":\"u_42891\",\"UPNSuffix\":\"bank.in\",\"AadUserId\":\"a1b2\",\"Type\":\"account\"},{\"$id\":\"4\",\"Address\":\"185.220.101.7\",\"Type\":\"ip\"},{\"$id\":\"5\",\"Address\":\"103.21.244.9\",\"Type\":\"ip\"}]",
+          "{\"Previous Location\":\"IN-MH\",\"Current Location\":\"RU-MO\"}",
+          "u_42891@bank.in", "New", "UnfamiliarLocation"
+        ],
+        [
+          "2026-10-21T06:09:40.002Z", "7d1e2f3a-9c8b-4a7d-8e6f-5a4b3c2d1e0f",
+          "Suspicious PowerShell command line", "High",
+          "A PowerShell process was launched by winword.exe with an encoded command.",
+          "Microsoft Defender for Endpoint", "MDATP", "Execution,DefenseEvasion", "T1059.001,T1027",
+          "[{\"$id\":\"3\",\"HostName\":\"FIN-WS-0421\",\"OSFamily\":\"Windows\",\"Type\":\"host\"},{\"$id\":\"4\",\"Name\":\"u_77104\",\"Type\":\"account\"},{\"$id\":\"5\",\"CommandLine\":\"powershell.exe -nop -w hidden -enc SQBFAFgA\",\"ImageFile\":{\"Name\":\"powershell.exe\",\"Directory\":\"C:\\\\Windows\\\\System32\"},\"ParentProcess\":{\"ImageFile\":{\"Name\":\"winword.exe\"}},\"Type\":\"process\"},{\"$id\":\"6\",\"Name\":\"invoice.docm\",\"Directory\":\"C:\\\\Users\\\\u_77104\\\\Downloads\",\"FileHashes\":[{\"Algorithm\":\"SHA256\",\"Value\":\"9f2c0d7e1a4b3c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5\"}],\"Type\":\"file\"}]",
+          "{\"ProcessCommandLine\":\"powershell.exe -nop -w hidden -enc SQBFAFgA\"}",
+          "FIN-WS-0421", "New", "SuspiciousPowerShell"
+        ],
+        [
+          "2026-10-21T05:58:11.900Z", "c0ffee00-1111-2222-3333-444455556666",
+          "SQL injection attempt on web application", "High",
+          "Repeated requests containing UNION SELECT patterns against /api/accounts from a single source.",
+          "Azure Web Application Firewall", "Azure WAF", "InitialAccess", "T1190",
+          "[{\"$id\":\"3\",\"Address\":\"203.0.113.77\",\"Type\":\"ip\"},{\"$id\":\"4\",\"Url\":\"https://portal.bank.in/api/accounts?id=1%20UNION%20SELECT%20username,password%20FROM%20users\",\"Type\":\"url\"}]",
+          "{\"Request\":\"GET /api/accounts?id=1 UNION SELECT username,password FROM users\"}",
+          "portal.bank.in", "New", "WAFSQLi"
+        ],
+        [
+          "2026-10-21T05:50:00.000Z", "", "Row without id must be skipped", "Low", "", "x", "x", "", "", "[]", "{}", "", "New", "x"
+        ]
+      ]
+    }
+  ]
+}

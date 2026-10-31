@@ -1,0 +1,240 @@
+{
+  "_description": "Curated AI-specific threat intelligence — OWASP LLM Top 10, MCP supply chain, public model-poisoning incidents. Refreshed by hand or by re-running seed_ai_threat_intel() from app.py at startup. Supplements vuln_db.json (which targets traditional Python/NPM dependency CVEs).",
+  "_source_of_record": "Updated when a major AI-specific disclosure is reported.",
+  "categories": {
+    "owasp_llm_top10": "OWASP LLM Top 10 reference incidents — pattern-level guidance, not single-CVE",
+    "mcp_supply_chain": "MCP ecosystem advisories — bad servers, registry poisoning, fingerprint drift",
+    "model_supply_chain": "Hugging Face / vendor model-side compromises and poisoning",
+    "framework_advisory": "LangChain / LangGraph / CrewAI / Autogen advisory feed",
+    "agent_tooling": "AI agent tool ecosystem (Lakera, Protect AI, HiddenLayer published research)"
+  },
+  "advisories": [
+    {
+      "id": "OWASP-LLM-01",
+      "category": "owasp_llm_top10",
+      "title": "LLM01: Prompt Injection",
+      "severity": "HIGH",
+      "summary": "Adversarial prompts that override system instructions or manipulate tool calls. Direct (user input) and indirect (tool result, retrieved doc, database field) variants. Mitigation: input scanning + output validation + tool permission scoping. ACP coverage: Q4 InjectionFirewall.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q4_InjectionFirewall",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OWASP-LLM-02",
+      "category": "owasp_llm_top10",
+      "title": "LLM02: Insecure Output Handling",
+      "severity": "HIGH",
+      "summary": "Downstream systems treating LLM output as trusted (XSS, SQL injection, RCE). Mitigation: encode output, parameterise queries, sandbox tool execution. ACP coverage: Q5 ContentScanner + Q11 ToolPermissions.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q5_ContentScanner",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OWASP-LLM-03",
+      "category": "owasp_llm_top10",
+      "title": "LLM03: Training Data Poisoning",
+      "severity": "MEDIUM",
+      "summary": "Malicious training / fine-tuning data inserts backdoors or biases. Mitigation: dataset provenance, eval-pack canaries, drift detection. ACP coverage: Q14 DriftDetector.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q14_DriftDetector",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OWASP-LLM-04",
+      "category": "owasp_llm_top10",
+      "title": "LLM04: Model Denial of Service",
+      "severity": "MEDIUM",
+      "summary": "Resource-exhaustion via large prompts, recursive tool calls, or token bombing. Mitigation: rate limits, iteration caps, cost budgets. ACP coverage: Q1 LoopGuard + Q7 CostGate.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q1_LoopGuard",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OWASP-LLM-05",
+      "category": "owasp_llm_top10",
+      "title": "LLM05: Supply Chain Vulnerabilities",
+      "severity": "HIGH",
+      "summary": "Compromised models, libraries, or MCP servers. Includes typosquatting and registry poisoning. Mitigation: pin versions, verify hashes, allowlist registries. ACP coverage: Q36 MCPServerTrust + VulnOps.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q36_MCPServerTrust",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": [
+        "litellm",
+        "gpt-researcher"
+      ]
+    },
+    {
+      "id": "OWASP-LLM-06",
+      "category": "owasp_llm_top10",
+      "title": "LLM06: Sensitive Information Disclosure",
+      "severity": "CRITICAL",
+      "summary": "PII or proprietary data leaks via LLM responses, tool outputs, or memory. Mitigation: output PII scanning + redaction, memory hygiene, role-scoped retrieval. ACP coverage: Q3 PIIScanner + Q5 ContentScanner.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q3_PIIScanner",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OWASP-LLM-07",
+      "category": "owasp_llm_top10",
+      "title": "LLM07: Insecure Plugin Design",
+      "severity": "HIGH",
+      "summary": "Plugins / tools that accept free-form input without validation, or grant excessive scopes. Mitigation: typed parameters, least-privilege tool grants. ACP coverage: Q11 ToolPermissions + Q12 ApprovalGate.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q11_ToolPermissions",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OWASP-LLM-08",
+      "category": "owasp_llm_top10",
+      "title": "LLM08: Excessive Agency",
+      "severity": "HIGH",
+      "summary": "Agent granted tools or privileges beyond what its task requires. Mitigation: tier-scoped autonomy, HITL for high-blast actions. ACP coverage: Q8 AutonomyTier + Q12 ApprovalGate.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q8_AutonomyTier",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OWASP-LLM-09",
+      "category": "owasp_llm_top10",
+      "title": "LLM09: Overreliance",
+      "severity": "MEDIUM",
+      "summary": "Treating LLM output as ground truth in safety-critical decisions. Mitigation: human review on high-risk outputs, hallucination detection, citation grounding. ACP coverage: Q9 HallucinationGuard.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "Q9_HallucinationGuard",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OWASP-LLM-10",
+      "category": "owasp_llm_top10",
+      "title": "LLM10: Model Theft",
+      "severity": "MEDIUM",
+      "summary": "Unauthorised extraction of model weights or query-based reconstruction. Mitigation: rate limits, watermarking, query monitoring. ACP coverage: rate-limit envelopes via gateway.",
+      "source": "OWASP LLM Top 10 (2025 edition)",
+      "url": "https://owasp.org/www-project-top-10-for-large-language-model-applications/",
+      "acp_control": "rate_limit",
+      "published": "2025-08-14",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "OX-2026-MCP-01",
+      "category": "mcp_supply_chain",
+      "title": "GPT-Researcher MCP-STDIO unauthenticated UI injection",
+      "severity": "CRITICAL",
+      "summary": "MCP server allows arbitrary command execution via crafted tool-call JSON. RCE on any host running the GPT-Researcher stack. Part of the 'Mother of All Supply Chains' architectural flaw.",
+      "source": "OX Security Advisory",
+      "url": "https://www.ox.security/blog/mcp-supply-chain-research/",
+      "cve": "CVE-2025-65720",
+      "acp_control": "Q36_MCPServerTrust",
+      "published": "2026-04-15",
+      "affects_frameworks": [],
+      "affects_mcp_servers": [
+        "gpt-researcher",
+        "gpt_researcher"
+      ]
+    },
+    {
+      "id": "OX-2026-MCP-02",
+      "category": "mcp_supply_chain",
+      "title": "LiteLLM MCP registry poisoning + RCE",
+      "severity": "CRITICAL",
+      "summary": "Attacker can inject a malicious MCP server through the registry layer and achieve RCE. Vendor initially declined as 'by design'; reclassified after public disclosure.",
+      "source": "OX Security Advisory",
+      "url": "https://www.ox.security/blog/mcp-supply-chain-research/",
+      "cve": "CVE-2026-30623",
+      "acp_control": "Q36_MCPServerTrust",
+      "published": "2026-04-15",
+      "affects_frameworks": [],
+      "affects_mcp_servers": [
+        "litellm"
+      ]
+    },
+    {
+      "id": "PROTECTAI-HF-01",
+      "category": "model_supply_chain",
+      "title": "Hugging Face: malicious pickle payloads in shared model cards",
+      "severity": "HIGH",
+      "summary": "Models distributed via .pkl / pickle.load() execute arbitrary code on download. Protect AI's scanner has flagged thousands of such uploads since 2024. Mitigation: load via safetensors, scan with Protect AI Guardian / huggingface-pickle-scan.",
+      "source": "Protect AI Research",
+      "url": "https://protectai.com/insights",
+      "acp_control": "Q5_ContentScanner",
+      "published": "2025-09-12",
+      "affects_frameworks": [
+        "transformers",
+        "huggingface"
+      ],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "LAKERA-INJ-01",
+      "category": "agent_tooling",
+      "title": "Indirect prompt injection via PDF metadata + retrieval",
+      "severity": "HIGH",
+      "summary": "Lakera's red-team research demonstrates RAG pipelines pulling PDFs with adversarial metadata that hijack downstream agent behaviour. Mitigation: scan retrieved docs for injection patterns BEFORE concatenation into the prompt.",
+      "source": "Lakera Research",
+      "url": "https://www.lakera.ai/blog",
+      "acp_control": "Q4_InjectionFirewall",
+      "published": "2025-11-08",
+      "affects_frameworks": [],
+      "affects_mcp_servers": []
+    },
+    {
+      "id": "HIDDENLAYER-MCP-01",
+      "category": "mcp_supply_chain",
+      "title": "Trojan MCP servers in unverified registries",
+      "severity": "HIGH",
+      "summary": "HiddenLayer flagged multiple MCP servers in npm + PyPI that masquerade as legitimate but call out to attacker-controlled endpoints during tool execution. Mitigation: pin MCP servers via ACP MCPServerTrust + sandbox new MCPs before production attach.",
+      "source": "HiddenLayer Research",
+      "url": "https://hiddenlayer.com/research",
+      "acp_control": "Q36_MCPServerTrust",
+      "published": "2026-01-22",
+      "affects_frameworks": [],
+      "affects_mcp_servers": [
+        "mcp-registry",
+        "unverified"
+      ]
+    },
+    {
+      "id": "LANGCHAIN-2024-EXEC",
+      "category": "framework_advisory",
+      "title": "LangChain Python REPL tool RCE",
+      "severity": "CRITICAL",
+      "summary": "Default LangChain Python REPL tool (PythonREPLTool) accepts arbitrary code execution from agent reasoning. Multi-CVE class — patched in chains since v0.0.300 but legacy code paths still ship in many in-house wrappers.",
+      "source": "GitHub Advisory + LangChain blog",
+      "url": "https://github.com/advisories/GHSA-prgp-w7m9-9wqj",
+      "cve": "CVE-2023-39659",
+      "acp_control": "Q11_ToolPermissions",
+      "published": "2024-02-14",
+      "affects_frameworks": [
+        "langchain"
+      ],
+      "affects_mcp_servers": []
+    }
+  ]
+}

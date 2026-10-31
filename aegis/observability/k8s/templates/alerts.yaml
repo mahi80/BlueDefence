@@ -1,0 +1,88 @@
+{{- if .Values.alertmanager_rules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aegis-security-alerts
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis-obs.labels" . | indent 4 }}
+spec:
+  groups:
+  - name: aegis-security-alerts
+    interval: 30s
+    rules:
+
+    - alert: AEGISAuditChainBroken
+      expr: aegis_audit_integrity{} == 0
+      for: 1m
+      labels:
+        severity: critical
+        team: soc
+      annotations:
+        summary: "AEGIS audit-log integrity FAILED"
+        description: |
+          The hash-chained audit log produced an integrity FAIL during
+          verification. This indicates either tampering of historical
+          entries or a bug in the chain-write path. Treat as a P1
+          security incident: the agentic decision history can no longer
+          be trusted until investigated.
+
+    - alert: AEGISHITLBacklogStuck
+      expr: rate(aegis_actions_hitl_queued_total[15m]) > 0 and rate(aegis_actions_executed_total{action_type=~"block|isolate|lock_account|revoke_sessions"}[1h]) == 0
+      for: 30m
+      labels:
+        severity: warning
+        team: soc
+      annotations:
+        summary: "AEGIS high-impact HITL queue not draining"
+        description: |
+          AEGIS is queueing high-impact actions for HITL review but no
+          such actions have executed in the last hour. SOC analysts may
+          be unaware or unable to approve. Check the approval surface
+          (Slack / ServiceNow) and analyst staffing.
+
+    - alert: AEGISFalsePositiveSpike
+      expr: |
+        rate(aegis_verdicts_total{verdict="malicious"}[15m])
+          / rate(aegis_alerts_processed_total[15m]) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        team: soc
+      annotations:
+        summary: "AEGIS malicious-verdict rate above 50% over 15m"
+        description: |
+          More than half of recent alerts produced a 'malicious' verdict.
+          Either the bank is under attack OR the defender is over-firing.
+          Cross-reference with WAF/EDR signals and consider invoking
+          the meta-agent to inspect for FP regressions.
+
+    - alert: AEGISTokenBudgetSpike
+      expr: rate(aegis_token_budget_consumed_cost_cents[1h]) > 1000
+      for: 15m
+      labels:
+        severity: warning
+        team: platform
+      annotations:
+        summary: "AEGIS LLM cost rate above $10/hr sustained"
+        description: |
+          Token-budget cost rate for the AEGIS reasoning tier is
+          elevated. Could indicate a campaign driving extra deep
+          investigation, OR a runaway loop in an agent. Review
+          orchestrator span volume and recent code/prompt changes.
+
+    - alert: AEGISSpecialistMissing
+      expr: |
+        absent(rate(aegis_alerts_processed_total{specialist="orchestrator"}[15m]))
+        or absent(rate(aegis_alerts_processed_total{specialist="response"}[15m]))
+      for: 5m
+      labels:
+        severity: critical
+        team: soc
+      annotations:
+        summary: "AEGIS orchestrator or response agent not processing alerts"
+        description: |
+          No metric activity from a critical agent in 15 minutes.
+          Either no traffic is flowing OR the agent is wedged.
+          Check agent pod status + the upstream SIEM consumer.
+{{- end }}

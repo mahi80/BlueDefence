@@ -1,0 +1,87 @@
+{
+  "platform": "all",
+  "version": "0.1.0",
+  "description": "AEGIS host-hunt pack. Cross-platform collectors for the endpoint/host artifact checklist. Install: place in /etc/osquery/packs/ and reference from osquery.conf, or run `osqueryi --pack aegis-host.pack.json`. Snapshot queries feed the host scorers; _events queries need the matching eventing tables enabled (evented config).",
+  "queries": {
+    "persistence_launchd": {
+      "query": "SELECT path, name, program, program_arguments, run_at_load, keep_alive FROM launchd;",
+      "interval": 600, "platform": "darwin", "snapshot": true,
+      "description": "macOS Launch Agents/Daemons. ATT&CK T1543.001/.004. Diff vs baseline -> persistence_new."
+    },
+    "persistence_crontab": {
+      "query": "SELECT event, minute, hour, command, path FROM crontab;",
+      "interval": 600, "platform": "posix", "snapshot": true,
+      "description": "cron persistence. ATT&CK T1053.003. Watch web-service users (www-data) especially."
+    },
+    "persistence_startup_items": {
+      "query": "SELECT name, path, source, status, username FROM startup_items;",
+      "interval": 600, "snapshot": true,
+      "description": "Cross-platform autostart (Run keys, login items, systemd user). ATT&CK T1547."
+    },
+    "persistence_services_win": {
+      "query": "SELECT name, path, start_type, status, user_account FROM services WHERE start_type IN ('AUTO_START','SYSTEM_START');",
+      "interval": 600, "platform": "windows", "snapshot": true,
+      "description": "Windows auto-start services. ATT&CK T1543.003."
+    },
+    "persistence_scheduled_tasks_win": {
+      "query": "SELECT name, action, path, enabled, hidden FROM scheduled_tasks WHERE enabled=1;",
+      "interval": 600, "platform": "windows", "snapshot": true,
+      "description": "Scheduled Tasks. ATT&CK T1053.005."
+    },
+    "persistence_systemd": {
+      "query": "SELECT id, description, fragment_path, user FROM systemd_units WHERE sub_state='running';",
+      "interval": 600, "platform": "linux", "snapshot": true,
+      "description": "systemd units/timers. ATT&CK T1543.002/T1053.006. (needs systemd_units table build)"
+    },
+    "persistence_authorized_keys": {
+      "query": "SELECT uid, key_file, algorithm, key FROM authorized_keys;",
+      "interval": 900, "platform": "posix", "snapshot": true,
+      "description": "SSH authorized_keys. ATT&CK T1098.004. New key = lateral/persistence lead."
+    },
+    "exec_lolbin_events": {
+      "query": "SELECT pid, path, cmdline, parent, uid, time FROM process_events WHERE path LIKE '%powershell%' OR path LIKE '%certutil%' OR path LIKE '%mshta%' OR path LIKE '%rundll32%' OR cmdline LIKE '%-enc%' OR cmdline LIKE '%FromBase64String%' OR cmdline LIKE '%curl %' OR cmdline LIKE '%wget %';",
+      "interval": 60, "snapshot": false,
+      "description": "LOLBin / encoded-command execution. ATT&CK T1059/T1218. Needs process auditing (audit_allow_process)."
+    },
+    "net_egress_events": {
+      "query": "SELECT pid, path, remote_address, remote_port, time FROM socket_events WHERE action='connect' AND remote_port NOT IN (53,80,443,123);",
+      "interval": 60, "snapshot": false,
+      "description": "Outbound connects on odd ports. ATT&CK T1071/T1571. Feed c2_beacon scorer for periodicity."
+    },
+    "net_dns_resolvers": {
+      "query": "SELECT address, type FROM dns_resolvers;",
+      "interval": 900, "snapshot": true,
+      "description": "Resolver tampering. ATT&CK T1584/T1565."
+    },
+    "net_etc_hosts": {
+      "query": "SELECT address, hostnames FROM etc_hosts WHERE address NOT IN ('127.0.0.1','::1','255.255.255.255');",
+      "interval": 900, "snapshot": true,
+      "description": "hosts-file redirection. ATT&CK T1565.001."
+    },
+    "webshell_webroot_scripts": {
+      "query": "SELECT f.path, f.size, f.mtime, h.sha256 FROM file f JOIN hash h ON f.path=h.path WHERE (f.path LIKE '/var/www/%' OR f.path LIKE '%/inetpub/wwwroot/%') AND (f.filename LIKE '%.php' OR f.filename LIKE '%.jsp' OR f.filename LIKE '%.aspx') AND f.mtime > 0;",
+      "interval": 300, "snapshot": true,
+      "description": "Script files in web roots -> webshell_drop scorer. ATT&CK T1505.003. Bridges to the perimeter SOC."
+    },
+    "defense_ld_preload": {
+      "query": "SELECT key, value FROM augeas WHERE path='/etc/ld.so.preload' UNION SELECT 'LD_PRELOAD' AS key, variable_value AS value FROM process_envs WHERE variable_name='LD_PRELOAD';",
+      "interval": 600, "platform": "linux", "snapshot": true,
+      "description": "Shared-object injection. ATT&CK T1574.006."
+    },
+    "defense_kernel_modules": {
+      "query": "SELECT name, size, used_by, status FROM kernel_modules;",
+      "interval": 900, "platform": "linux", "snapshot": true,
+      "description": "Loaded modules (rootkit surface). ATT&CK T1547.006/T1014."
+    },
+    "macos_tcc_grants": {
+      "query": "SELECT service, client, allowed, prompt_count FROM access_policies WHERE service IN ('kTCCServiceCamera','kTCCServiceMicrophone','kTCCServiceSystemPolicyAllFiles','kTCCServiceAccessibility') AND allowed=1;",
+      "interval": 600, "platform": "darwin", "snapshot": true,
+      "description": "Sensitive TCC grants (spyware tell). ATT&CK T1123/T1113. Non-allowlisted client=1 -> tcc_grant scorer."
+    },
+    "browser_extensions": {
+      "query": "SELECT name, identifier, version, path FROM chrome_extensions;",
+      "interval": 1800, "snapshot": true,
+      "description": "Unknown browser extensions. ATT&CK T1176."
+    }
+  }
+}

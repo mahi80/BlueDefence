@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.collector.serviceAccount }}
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis-obs.labels" . | indent 4 }}
+---
+# Read-only RBAC needed for the prometheus receiver to enumerate pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aegis-otel-collector
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes/metrics", "nodes/proxy"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aegis-otel-collector
+subjects:
+- kind: ServiceAccount
+  name: {{ .Values.collector.serviceAccount }}
+  namespace: {{ .Values.target.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aegis-otel-collector
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aegis-otel-collector
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis-obs.labels" . | indent 4 }}
+spec:
+  selector:
+    matchLabels:
+{{ include "aegis-obs.labels" . | indent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "aegis-obs.labels" . | indent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8888"
+    spec:
+      serviceAccountName: {{ .Values.collector.serviceAccount }}
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
+      containers:
+      - name: otel-collector
+        image: {{ .Values.collector.image }}
+        args: ["--config=/etc/otel-collector/config.yaml"]
+        ports:
+        - name: otlp-grpc
+          containerPort: {{ .Values.collector.receivers.otlp_grpc_port }}
+          protocol: TCP
+        - name: otlp-http
+          containerPort: {{ .Values.collector.receivers.otlp_http_port }}
+          protocol: TCP
+        - name: metrics
+          containerPort: 8888
+          protocol: TCP
+        resources:
+{{ toYaml .Values.collector.resources | indent 10 }}
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otel-collector
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: aegis-otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-otel-collector
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis-obs.labels" . | indent 4 }}
+spec:
+  selector:
+{{ include "aegis-obs.labels" . | indent 4 }}
+  ports:
+  - name: otlp-grpc
+    port: {{ .Values.collector.receivers.otlp_grpc_port }}
+    targetPort: otlp-grpc
+  - name: otlp-http
+    port: {{ .Values.collector.receivers.otlp_http_port }}
+    targetPort: otlp-http
+  - name: metrics
+    port: 8888
+    targetPort: metrics
+---
+# Block egress from the collector to anything outside the bank's
+# observability namespace. This bounds blast radius: a compromised
+# collector cannot exfiltrate spans to external SaaS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-otel-collector-egress
+  namespace: {{ .Values.target.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "aegis-obs.labels" . | indent 6 }}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: observability
+    ports:
+    - port: 4317   # tempo
+    - port: 9009   # mimir push
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 443
+      protocol: TCP   # K8s API for prom scrape SD

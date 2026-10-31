@@ -1,0 +1,75 @@
+---
+# Forensic snapshot pre-respawn. The AEGIS controller creates one of
+# these as a Kubernetes Job before deleting the suspect pod, copying
+# memory + disk + recent NetFlow into the WORM PVC for later analysis.
+#
+# This template is rendered by the controller dynamically with the
+# specific pod name; the rendered manifest is recorded in the audit log.
+# The template here is the canonical contract.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: aegis-forensic-
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.labels" . | indent 4 }}
+    aegis.bank/role: forensic-snapshot
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+{{ include "aegis.labels" . | indent 8 }}
+        aegis.bank/role: forensic-snapshot
+    spec:
+      serviceAccountName: aegis-healing-controller
+      restartPolicy: Never
+      automountServiceAccountToken: true
+      hostPID: true     # required to read process state of suspect pod
+      containers:
+      - name: snapshot
+        image: registry.bank.internal/aegis/forensic-tools:0.1.0
+        securityContext:
+          privileged: false
+          capabilities:
+            add: [SYS_PTRACE, SYS_ADMIN]
+            drop: [ALL]
+        # The controller passes TARGET_POD + ARTIFACT_ID via env at
+        # render time. The image runs LiME (memory) + criu (process
+        # state) + tcpdump-on-replay against captured NetFlow.
+        env:
+        - name: TARGET_POD
+          value: ""    # filled by controller
+        - name: ARTIFACT_ID
+          value: ""    # filled by controller (matches HealEvent.forensic_artifact_id)
+        - name: AUDIT_LOG_BUCKET
+          value: s3://bank-aegis-audit-worm/
+        volumeMounts:
+        - name: forensic-store
+          mountPath: /forensic
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+          readOnly: true
+      volumes:
+      - name: forensic-store
+        persistentVolumeClaim:
+          claimName: aegis-forensic-pvc
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aegis-forensic-pvc
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.labels" . | indent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.forensics.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.forensics.pvcSize }}

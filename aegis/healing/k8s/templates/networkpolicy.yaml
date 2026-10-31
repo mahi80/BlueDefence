@@ -1,0 +1,49 @@
+---
+# Default-deny + explicit egress allowlist. Used by:
+#  - All protected workload pods (steady state)
+#  - Quarantined pods (still labeled aegis.bank/quarantined=true)
+#    — the egress is replaced with deny-all for those.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.target.name }}-egress
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.labels" . | indent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Values.target.name }}
+  policyTypes:
+  - Egress
+  egress:
+  {{- range .Values.egressAllowlist }}
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: {{ regexFind "^[^.]+" .service }}
+    ports:
+    - port: {{ .port }}
+      protocol: {{ .protocol }}
+  {{- end }}
+---
+# Severance policy: any pod the AEGIS controller flags with
+# aegis.bank/quarantined=true gets a hard deny-all (no ingress, no egress).
+# This is what the orchestrator's `_sever()` step writes to apply.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.target.name }}-quarantine
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.labels" . | indent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Values.target.name }}
+      aegis.bank/quarantined: "true"
+  policyTypes:
+  - Ingress
+  - Egress
+  # No ingress / egress entries -> deny-all

@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+_audit_log.jsonl
+.pytest_cache/
+_receipts.jsonl

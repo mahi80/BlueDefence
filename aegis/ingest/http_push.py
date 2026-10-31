@@ -1,0 +1,307 @@
+"""HTTP push receiver — vendors POST events to AEGIS (stdlib only, no new dependency).
+
+    POST /ingest/cloudflare   Cloudflare Logpush HTTP destination: gzip NDJSON of
+                              firewall_events / http_requests; Logpush's job-validation
+                              probe ({"content":"test"}) is answered 200 and ignored.
+    POST /ingest/firehose     AWS Kinesis Data Firehose "HTTP endpoint" delivery: JSON
+                              {requestId, timestamp, records:[{data: <base64>}]}; the reply
+                              must echo requestId. WAF logs arrive one JSON object per record.
+    POST /ingest/waf          any forwarder: NDJSON / CEF / F5 key=value lines, plain or gzip
+                              (Imperva, F5, Azure via a Logstash / Fluent Bit / syslog relay).
+    POST /ingest/apigw        API-gateway access logs (Azure APIM, AWS API Gateway, Kong, generic JSON),
+                              NDJSON plain or gzip — fed to the object-walk (BOLA) detector; only its
+                              alerts reach the orchestrator. ``?gateway=apim`` tags the source.
+    POST /ingest/ndr          network sensor logs (Zeek ssl / conn / x509 JSON, Suricata EVE tls / flow,
+                              generic flow JSON), NDJSON plain or gzip — fed to the egress detector
+                              (beacons, exfiltration, known-bad TLS, shadow AI). ``?sensor=zeek`` tags it.
+    POST /ingest/alerts       already-normalised AEGIS alerts, one JSON object per line
+                              (custom forwarders, the purple-team harness).
+    GET  /ingest/blocklist    the active enforcement set (IPs, CIDRs, client fingerprints)
+                              for an edge enforcer — Envoy ext_authz, a Cloudflare Worker, the
+                              Go tier-0 filter — to apply inline without any vendor API.
+    GET  /healthz             queue depth and counters (no auth).
+
+Auth: every ``/ingest/*`` call must carry ``AEGIS_INGEST_TOKEN`` as ``Authorization: Bearer``,
+``X-Amz-Firehose-Access-Key`` (what Firehose sends) or ``X-AEGIS-Token``; compared in constant
+time. The server refuses to start without a token unless bound to loopback. TLS terminates at
+the bank's load balancer / reverse proxy in front of this port (document in the runbook).
+
+Replies: 200 accepted · 401 bad token · 413 body over ``AEGIS_INGEST_MAX_MB`` (64) · 415 wrong
+shape · 503 queue full (vendors retry; nothing is silently dropped).
+"""
+
+from __future__ import annotations
+
+import base64
+import gzip
+import hmac
+import json
+import logging
+import os
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, urlsplit
+
+from .stream import StreamQueue, get_stream, lines_from_body
+
+logger = logging.getLogger("aegis.ingest.http")
+
+DEFAULT_BIND = "0.0.0.0:8787"
+DEFAULT_MAX_MB = 64
+_LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
+def _is_loopback(host: str) -> bool:
+    return host in _LOOPBACK
+
+
+class _AuthFailLimiter:
+    """Log at most one auth failure per client IP per minute — a scanner must not fill the log."""
+
+    def __init__(self):
+        self._seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def should_log(self, ip: str, now: Optional[float] = None) -> bool:
+        now = now or time.time()
+        with self._lock:
+            last = self._seen.get(ip, 0.0)
+            if now - last < 60:
+                return False
+            self._seen[ip] = now
+            if len(self._seen) > 10_000:
+                self._seen.clear()
+            return True
+
+
+class PushServer:
+    """Threaded HTTP server feeding the shared ``StreamQueue``; ``start()`` returns at once."""
+
+    def __init__(self, *, token: str, bind: str = DEFAULT_BIND, queue: Optional[StreamQueue] = None,
+                 max_mb: int = DEFAULT_MAX_MB, blocklist: Optional[Callable[[], list[Any]]] = None):
+        host, _, port = bind.rpartition(":")
+        self.host, self.port = (host or "0.0.0.0"), int(port or 8787)
+        if not token and not _is_loopback(self.host):
+            raise ValueError("AEGIS_INGEST_TOKEN is required unless AEGIS_INGEST_BIND is loopback")
+        self.token = token
+        self.queue = queue if queue is not None else get_stream()   # an empty queue is falsy
+        self.max_bytes = int(max_mb) * 1024 * 1024
+        self.blocklist = blocklist
+        self.limiter = _AuthFailLimiter()
+        self._httpd: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    # -- lifecycle
+    def start(self) -> "PushServer":
+        server = self
+        handler = type("AegisPushHandler", (_Handler,), {"server_ref": server})
+        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd.daemon_threads = True
+        self.port = self._httpd.server_address[1]
+        self.queue.enabled = True
+        self._thread = threading.Thread(target=self._httpd.serve_forever, name="AegisPushServer", daemon=True)
+        self._thread.start()
+        logger.info("[ingest:http] push receiver listening on %s:%d (%s)", self.host, self.port,
+                    "token required" if self.token else "loopback, no token")
+        return self
+
+    def stop(self) -> None:
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
+
+    @property
+    def url(self) -> str:
+        host = "127.0.0.1" if self.host in ("0.0.0.0", "") else self.host
+        return f"http://{host}:{self.port}"
+
+    # -- auth
+    def authorized(self, headers: Any) -> bool:
+        if not self.token:
+            return True
+        presented = ""
+        auth = headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            presented = auth[7:].strip()
+        presented = presented or headers.get("X-Amz-Firehose-Access-Key", "") or headers.get("X-AEGIS-Token", "")
+        return bool(presented) and hmac.compare_digest(presented.encode(), self.token.encode())
+
+    # -- the four ingest shapes; each returns (status, body_dict)
+    def ingest_cloudflare(self, body: bytes) -> tuple[int, dict]:
+        lines = lines_from_body(body)
+        if len(lines) == 1 and lines[0].strip() in ('{"content":"test"}', '{"content": "test"}'):
+            return 200, {"ok": True, "note": "logpush validation"}
+        if not self.queue.put_many("cloudflare", lines):
+            return 503, {"error": "queue full, retry"}
+        return 200, {"ok": True, "accepted": len(lines)}
+
+    def ingest_firehose(self, body: bytes, headers: Any) -> tuple[int, dict]:
+        req_id = headers.get("X-Amz-Firehose-Request-Id", "")
+        now_ms = int(time.time() * 1000)
+        try:
+            if body[:2] == b"\x1f\x8b":
+                body = gzip.decompress(body)
+            payload = json.loads(body.decode("utf-8"))
+            req_id = req_id or str(payload.get("requestId", ""))
+            records = payload["records"]
+            lines: list[str] = []
+            for rec in records:
+                data = base64.b64decode(rec["data"])
+                if data[:2] == b"\x1f\x8b":
+                    data = gzip.decompress(data)
+                lines.extend(lines_from_body(data))
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError) as e:
+            return 400, {"requestId": req_id, "timestamp": now_ms, "errorMessage": f"malformed Firehose request: {str(e)[:120]}"}
+        if not self.queue.put_many("firehose", lines):
+            return 503, {"requestId": req_id, "timestamp": now_ms, "errorMessage": "queue full, retry"}
+        return 200, {"requestId": req_id, "timestamp": now_ms}
+
+    def ingest_waf(self, body: bytes, source: str) -> tuple[int, dict]:
+        lines = lines_from_body(body)
+        if not self.queue.put_many(source or "waf", lines):
+            return 503, {"error": "queue full, retry"}
+        return 200, {"ok": True, "accepted": len(lines)}
+
+    def ingest_alerts(self, body: bytes) -> tuple[int, dict]:
+        lines = lines_from_body(body)
+        bad = 0
+        good: list[str] = []
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+            except ValueError:
+                bad += 1
+                continue
+            if isinstance(obj, dict) and obj.get("id"):
+                good.append(ln)
+            else:
+                bad += 1
+        if lines and not good:
+            return 415, {"error": "expected one AEGIS alert JSON object (with id) per line", "rejected": bad}
+        if not self.queue.put_many("alerts", good, passthrough=True):
+            return 503, {"error": "queue full, retry"}
+        return 200, {"ok": True, "accepted": len(good), "rejected": bad}
+
+    def blocklist_payload(self) -> dict:
+        from ..agents.shared.fingerprint import is_fingerprint_target, parse_target
+        ips: list[dict] = []
+        fps: list[dict] = []
+        if self.blocklist is not None:
+            try:
+                receipts = self.blocklist()
+            except Exception as e:  # noqa: BLE001 — a broken registry must not take the receiver down
+                logger.warning("[ingest:http] blocklist source failed: %s", str(e)[:120])
+                receipts = []
+            for r in receipts:
+                if getattr(r, "dry_run", False) or getattr(r, "action_type", "") not in ("block", "challenge", "throttle"):
+                    continue
+                row = {"action": r.action_type, "expires_at": r.expires_at, "receipt": r.receipt_id}
+                t = str(r.target)
+                if is_fingerprint_target(t):
+                    try:
+                        kind, value, ua = parse_target(t)
+                    except ValueError:
+                        continue
+                    fps.append({**row, "kind": kind, "value": value, "user_agent": ua or None})
+                else:
+                    ips.append({**row, "target": t})
+        return {"generated_at": time.time(), "ips": ips, "fingerprints": fps}
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_ref: PushServer
+    timeout = 30
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:     # stdlib logs to stderr; route to our logger at DEBUG
+        logger.debug("[ingest:http] " + fmt, *args)
+
+    def _reply(self, status: int, body: dict) -> None:
+        raw = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _body(self) -> Optional[bytes]:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > self.server_ref.max_bytes:
+            self._reply(413, {"error": f"body over {self.server_ref.max_bytes} bytes"})
+            return None
+        return self.rfile.read(n) if n else b""
+
+    def do_GET(self) -> None:  # noqa: N802 — stdlib naming
+        path = urlsplit(self.path).path
+        if path == "/healthz":
+            self._reply(200, {"ok": True, "queue": len(self.server_ref.queue), **self.server_ref.queue.stats.to_dict()})
+            return
+        if path == "/ingest/blocklist":
+            if not self.server_ref.authorized(self.headers):
+                self._reply(401, {"error": "unauthorized"})
+                return
+            self._reply(200, self.server_ref.blocklist_payload())
+            return
+        self._reply(404, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        srv = self.server_ref
+        parts = urlsplit(self.path)
+        path = parts.path
+        if not path.startswith("/ingest/"):
+            self._reply(404, {"error": "not found"})
+            return
+        if not srv.authorized(self.headers):
+            ip = self.client_address[0] if self.client_address else "?"
+            if srv.limiter.should_log(ip):
+                logger.warning("[ingest:http] unauthorized push to %s from %s", path, ip)
+            self._reply(401, {"error": "unauthorized", "requestId": self.headers.get("X-Amz-Firehose-Request-Id", ""),
+                              "timestamp": int(time.time() * 1000), "errorMessage": "unauthorized"})
+            return
+        body = self._body()
+        if body is None:
+            return
+        try:
+            if path == "/ingest/cloudflare":
+                status, out = srv.ingest_cloudflare(body)
+            elif path == "/ingest/firehose":
+                status, out = srv.ingest_firehose(body, self.headers)
+            elif path == "/ingest/waf":
+                source = (parse_qs(parts.query).get("source") or [self.headers.get("X-AEGIS-Source", "")])[0]
+                status, out = srv.ingest_waf(body, (source or "waf").strip().lower()[:32])
+            elif path == "/ingest/apigw":
+                gw = (parse_qs(parts.query).get("gateway") or [""])[0].strip().lower()[:24]
+                status, out = srv.ingest_waf(body, f"apigw-{gw}" if gw else "apigw")
+            elif path == "/ingest/ndr":
+                sensor = (parse_qs(parts.query).get("sensor") or [""])[0].strip().lower()[:24]
+                status, out = srv.ingest_waf(body, f"ndr-{sensor}" if sensor else "ndr")
+            elif path == "/ingest/alerts":
+                status, out = srv.ingest_alerts(body)
+            else:
+                status, out = 404, {"error": "not found"}
+        except Exception as e:  # noqa: BLE001 — one bad batch must not kill the receiver thread
+            logger.error("[ingest:http] %s failed: %s", path, str(e)[:200], exc_info=True)
+            status, out = 500, {"error": "internal"}
+        self._reply(status, out)
+
+
+def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None) -> Optional[PushServer]:
+    """``AEGIS_INGEST_HTTP=1`` (or any ``AEGIS_INGEST_BIND``) starts the receiver; ``AEGIS_INGEST_TOKEN``
+    is required off loopback. Returns the running server or ``None``."""
+    on = os.environ.get("AEGIS_INGEST_HTTP", "").strip().lower() in ("1", "true", "yes", "on")
+    bind = os.environ.get("AEGIS_INGEST_BIND", "").strip()
+    if not (on or bind):
+        return None
+    try:
+        srv = PushServer(token=os.environ.get("AEGIS_INGEST_TOKEN", "").strip(), bind=bind or DEFAULT_BIND,
+                         max_mb=int(os.environ.get("AEGIS_INGEST_MAX_MB", str(DEFAULT_MAX_MB))), blocklist=blocklist)
+        return srv.start()
+    except Exception as e:  # noqa: BLE001 — a bad bind must not take the SOC down; polling still works
+        logger.error("[ingest:http] push receiver not started: %s", str(e)[:200])
+        return None
+
+
+__all__ = ["PushServer", "push_server_from_env", "DEFAULT_BIND"]

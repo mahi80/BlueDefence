@@ -1,0 +1,13 @@
+apiVersion: v2
+name: aegis-agent
+description: AEGIS agent-layer workload — orchestrator + specialists + meta-agent
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - security
+  - aegis
+  - agentic
+maintainers:
+  - name: AEGIS team
+home: https://github.com/mahi80/rbi

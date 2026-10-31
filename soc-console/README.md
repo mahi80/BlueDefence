@@ -1,0 +1,71 @@
+# AEGIS SOC Console (Next.js + D3)
+
+A standalone command view for the AEGIS autonomous SOC. It renders the swarm's
+**blast-radius map** (impacted endpoints, the agent fan-out, and the min-cut
+**isolate plan**), the **human-in-the-loop** action queue (approve / reject with
+rationale), and the **model-evolution** strip (retrain / promotion proposals).
+
+It is a thin client over the existing ACP dashboard backend — it reads/writes the
+same Postgres via the FastAPI endpoints already on `main`:
+
+- `GET /api/soc/chains`, `GET /api/soc/chains/{id}` — evidence chains + blast radius
+- `GET /api/approvals`, `POST /api/approvals/{id}/approve|reject` — HITL decisions
+- `GET /api/soc/proposals`, `POST /api/soc/proposals/{id}/decide` — model/rule promotion
+
+## Run
+
+```bash
+npm install
+npm run dev          # http://localhost:3000 — uses bundled fixtures, no backend needed
+```
+
+Point it at a real backend:
+
+```bash
+AEGIS_API_ORIGIN=https://dashboard.acpgovernance.com npm run dev
+```
+
+| Env | Meaning |
+|---|---|
+| `AEGIS_API_ORIGIN` | Origin of the ACP dashboard FastAPI backend. Empty → bundled fixtures. |
+| `NEXT_PUBLIC_AEGIS_USE_FIXTURES` | Force fixtures even when an origin is set (`1`). |
+| `AEGIS_API_KEY` | Optional bearer for server-side reads of api-key-gated routes. |
+| `AEGIS_ASK_URL` | Optional LLM-backed **Agent Q** endpoint. Empty → Q answers deterministically from the chain. |
+
+Same-origin `/api/*` calls are proxied to `AEGIS_API_ORIGIN` (see `next.config.mjs`),
+so the browser needs no CORS and no key in client code.
+
+## Auth
+
+The console sits behind a login. Two modes:
+
+| `AEGIS_AUTH_MODE` | Sign-in | For |
+|---|---|---|
+| `demo` (default) | local id + password (`AEGIS_DEMO_USER` / `_PASSWORD` / `_ROLE`) | demos, local dev — not production |
+| `oidc` | single sign-on to the bank IdP (Entra ID / SAML), IdP-group → role via `AEGIS_OIDC_ROLE_MAP` | production |
+
+The session is a signed, httpOnly cookie (`AEGIS_CONSOLE_SECRET` — set a strong value in prod). Roles: `admin` / `cio` / `ciso` / `bu_head` / `analyst`; only the first four may approve a containment action or promote a model. The **backend enforces** every high-impact action and audits who + role + rationale; the console reflects permissions. The OIDC callback's verified `id_token` handling is completed at deployment against the bank's IdP (the route refuses an unverified token path by default).
+
+## Ask Agent Q
+
+A floating **Agent Q** mascot lets an analyst interrogate the selected detection ("why flagged?",
+"what's at risk?", "what should I do?"). It answers **from the evidence chain itself** — verdict,
+blast radius (reached assets, crown jewels, choke point), recommended actions, who investigated — so
+it never invents facts and works with zero backend. Set `AEGIS_ASK_URL` to forward free-text
+questions to the bank's LLM-backed Q (with the detection as context); it falls back to the
+deterministic answer if that endpoint is down. See the deploy guide §4g.
+
+## Checks
+
+```bash
+npm run typecheck    # tsc --noEmit (the CI gate)
+npm run build        # next build
+npm run lint         # next lint (dev convenience)
+```
+
+## Design
+
+Deep-navy command center; color is the verdict taxonomy (malicious / suspicious /
+benign / uncertain) plus the swarm cyan and crown-jewel gold — not decoration.
+IBM Plex Sans for UI, IBM Plex Mono for telemetry values. One orchestrated motion:
+the swarm fan-out + blast reveal on select. `prefers-reduced-motion` respected.

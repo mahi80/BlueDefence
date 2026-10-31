@@ -1,0 +1,5 @@
+# SAMPLE DATA: a simulated office network from aegis/eval/egress_bench.py; every value is invented
+host,system,endpoints
+,AcmeBank enterprise Azure OpenAI tenant,acmebank-prod.openai.azure.com
+10.30.0.5,SOC-AGENTQ-01,acmebank-prod.openai.azure.com
+10.30.0.6,LEN-LOA-01,acmebank-prod.openai.azure.com

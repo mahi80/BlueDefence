@@ -1,0 +1,70 @@
+// AEGIS multi-region IOC sync — protobuf schema.
+//
+// Compile with:
+//   pip install grpcio-tools
+//   python -m grpc_tools.protoc -I aegis/agents/threat_intel \
+//       --python_out=aegis/agents/threat_intel \
+//       --grpc_python_out=aegis/agents/threat_intel \
+//       aegis/agents/threat_intel/sync.proto
+//
+// Production transport: mTLS over the bank's internal mesh (Istio /
+// Linkerd). The sync_grpc.py module sets up mTLS via the cluster's
+// CA, with each region presenting its workload identity cert.
+
+syntax = "proto3";
+
+package aegis.threat_intel;
+
+// One IOC indicator. Matches aegis/agents/threat_intel/store.IOC.
+message Indicator {
+  string kind = 1;          // "ip" | "domain" | "url" | "hash_md5" | "hash_sha256" | "email" | "asn" | "cve"
+  string value = 2;
+  double confidence = 3;    // 0-1
+  string source = 4;        // feed identifier
+  double first_seen = 5;    // epoch seconds
+  double last_seen = 6;
+  repeated string tags = 7;
+  int64 ttl_seconds = 8;
+}
+
+// Bundle exported by one region for a peer to consume.
+message SyncBundle {
+  string format = 1;         // "aegis-ioc-sync/2"  (gRPC version)
+  string source_region = 2;  // e.g., "ap-south-1-mumbai"
+  double exported_at = 3;
+  repeated Indicator iocs = 4;
+}
+
+message ExportRequest {
+  // Optional filter: only emit IOCs added since this timestamp.
+  double since = 1;
+}
+
+message ImportAck {
+  int32 received = 1;
+  int32 merged = 2;
+  int32 store_before = 3;
+  int32 store_after = 4;
+  int32 new_iocs = 5;
+}
+
+// Bidirectional streaming sync — for production setups where regions
+// continuously push deltas to each other instead of polling.
+message Delta {
+  oneof payload {
+    Indicator added = 1;
+    Indicator updated = 2;
+    string removed_key = 3;   // "kind:value"
+  }
+}
+
+service IOCSync {
+  // Pull semantics — one-shot bundle export.
+  rpc Export(ExportRequest) returns (SyncBundle);
+
+  // Push semantics — peer pushes a bundle for ingest.
+  rpc Import(SyncBundle) returns (ImportAck);
+
+  // Bidirectional streaming — for continuous replication.
+  rpc Replicate(stream Delta) returns (stream Delta);
+}

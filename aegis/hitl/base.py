@@ -1,0 +1,332 @@
+"""The HITL transport contract — what the ResponseAgent needs from *any* approval channel.
+
+    request(action, chain) -> approval_id | None     file the card (None → the stdout card fallback)
+    sync(response_agent)   -> [Decision]              poll decisions; approved ones execute via response_agent.approve()
+    attach_investigation(alert_id, card) -> int       async tier updates the card in place (optional)
+    enabled, pending, decisions
+
+``BaseHITL`` holds the bookkeeping (idempotency per (alert, action, target), pending queue,
+settle, and a **restart-safe journal** of pending approvals); a transport implements ``_file(card) -> external id``, ``_poll(pending) -> (status,
+decided_by, reason) | None`` and optionally ``_annotate(pending, card)``. Editions pick the
+transport with ``AEGIS_HITL_TRANSPORT=dashboard|servicenow|file|stdout`` (``aegis.edition``).
+
+Journal: every filed approval and every settlement is appended to a small JSONL file
+(``AEGIS_HITL_STATE``; default ``<AEGIS_HITL_DIR or ./.aegis-hitl>/pending.jsonl``;
+``off`` disables it). On start the journal is replayed, so an approval filed before a restart
+is still polled, approved and executed after it — before this, a restart mid-incident silently
+dropped every pending decision. The journal is compacted to the live set on load. Entries
+written by a different transport are ignored.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger("aegis.hitl")
+
+_ARGS_TEXT_CAP = 2000
+
+
+@dataclass
+class PendingApproval:
+    approval_id: str
+    alert_id: str
+    action: Any
+    chain: Any
+    requested_at: float = field(default_factory=time.time)
+    external_id: str = ""              # ticket sys_id / row id on the other side
+
+
+@dataclass
+class Decision:
+    approval_id: str
+    alert_id: str
+    action_type: str
+    target: str
+    status: str                 # approved | rejected | expired
+    decided_by: str = ""
+    reason: str = ""
+    executed: Optional[Any] = None   # ExecutedAction when approved
+
+
+def _slug(s: str) -> str:
+    return "".join(ch if ch.isalnum() else "-" for ch in s)[:32].strip("-") or "x"
+
+
+def card_args(action: Any, chain: Any) -> dict:
+    """What the approver sees: enough to decide, no raw payload. Shared by every transport."""
+    return {
+        "source": "aegis",
+        "alert_id": str(getattr(chain, "alert_id", "")),
+        "action_type": str(action.action_type),
+        "target": str(action.target)[:256],
+        "action_confidence": round(float(getattr(action, "confidence", 0.0) or 0.0), 2),
+        "reasoning": str(getattr(action, "reasoning", ""))[:_ARGS_TEXT_CAP],
+        "verdict": str(getattr(chain, "verdict", "")),
+        "chain_confidence": round(float(getattr(chain, "confidence", 0.0) or 0.0), 2),
+        "investigated_by": str(getattr(chain, "investigated_by", "")),
+        "specialists": list(getattr(chain, "specialist_invocations", []) or [])[:10],
+        "evidence_count": len(getattr(chain, "evidence", []) or []),
+        "integrity_hash": str(getattr(chain, "integrity_hash", "") or ""),
+        "governance_block": (getattr(chain, "metadata", {}) or {}).get("governance_block"),
+    }
+
+
+def _state_path(explicit: Optional[str | Path], transport_dir: Optional[Path]) -> Optional[Path]:
+    raw = str(explicit) if explicit is not None else os.environ.get("AEGIS_HITL_STATE", "").strip()
+    if raw.lower() in ("off", "0", "none", "false"):
+        return None
+    if raw:
+        return Path(raw)
+    base = transport_dir or Path(os.environ.get("AEGIS_HITL_DIR") or (Path.cwd() / ".aegis-hitl"))
+    return Path(base) / "pending.jsonl"
+
+
+def _action_dict(action: Any) -> dict:
+    if hasattr(action, "model_dump"):
+        return action.model_dump()
+    return {k: getattr(action, k, None) for k in ("action_type", "target", "reasoning", "requires_hitl", "confidence")}
+
+
+class BaseHITL:
+    name = "base"
+
+    def __init__(self, *, state_path: Optional[str | Path] = None) -> None:
+        self._pending: dict[str, PendingApproval] = {}
+        self._by_key: dict[tuple[str, str, str], str] = {}
+        self.decisions: list[Decision] = []
+        self._state_arg = state_path
+        self._journal: Optional[Path] = None
+        self._loaded = False
+        self._jlock = threading.Lock()
+        self.restored = 0
+        self._timeout_noted: set[str] = set()   # approvals already shadow-logged / escalated by the timeout policy
+
+    # ---- journal
+    def _journal_dir(self) -> Optional[Path]:
+        """Transports with their own directory keep the journal there (``FileHITL``)."""
+        return None
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        self._journal = _state_path(self._state_arg, self._journal_dir())
+        if self._journal is None or not self._journal.exists():
+            return
+        live: dict[str, dict] = {}
+        bad = 0
+        try:
+            for line in self._journal.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    bad += 1; continue
+                if row.get("transport") not in (None, self.name):
+                    continue
+                if row.get("op") == "filed" and row.get("approval_id"):
+                    live[str(row["approval_id"])] = row
+                elif row.get("op") == "settled":
+                    live.pop(str(row.get("approval_id")), None)
+        except OSError as e:
+            logger.warning("[hitl:%s] approvals journal %s unreadable (%s); starting with none pending", self.name, self._journal, e)
+            return
+        for aid, row in live.items():
+            try:
+                pa = self._restore(row)
+            except Exception as e:  # noqa: BLE001 — one corrupt row must not lose the others
+                bad += 1
+                logger.warning("[hitl:%s] journal row %s not restorable: %s", self.name, aid, str(e)[:120]); continue
+            self._pending[aid] = pa
+            self._by_key[(pa.alert_id, str(pa.action.action_type), str(pa.action.target))] = aid
+        self.restored = len(self._pending)
+        if bad:
+            logger.warning("[hitl:%s] approvals journal: %d unreadable row(s) skipped", self.name, bad)
+        if self.restored:
+            logger.info("[hitl:%s] restored %d pending approval(s) from %s", self.name, self.restored, self._journal)
+        self._compact()
+
+    def _restore(self, row: dict) -> PendingApproval:
+        from ..agents.shared.evidence_chain import EvidenceChain, RecommendedAction
+        action = RecommendedAction(**row["action"])
+        c = row.get("chain") or {}
+        chain = EvidenceChain(alert_id=str(c.get("alert_id") or row.get("alert_id") or ""),
+                              investigated_by=str(c.get("investigated_by") or "restored"),
+                              verdict=c.get("verdict") or "uncertain", confidence=float(c.get("confidence") or 0.0))
+        chain.metadata["restored_from_journal"] = True
+        return PendingApproval(approval_id=str(row["approval_id"]), alert_id=str(row.get("alert_id") or chain.alert_id),
+                               action=action, chain=chain, requested_at=float(row.get("requested_at") or time.time()),
+                               external_id=str(row.get("external_id") or ""))
+
+    def _journal_append(self, row: dict) -> None:
+        if self._journal is None:
+            return
+        try:
+            with self._jlock:
+                self._journal.parent.mkdir(parents=True, exist_ok=True)
+                with self._journal.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"transport": self.name, "ts": time.time(), **row}, ensure_ascii=False, default=str) + "\n")
+        except OSError as e:
+            # the approval is still filed and pending in memory; only restart-safety is lost — say so
+            logger.warning("[hitl:%s] approvals journal write failed (%s): pending decisions will not survive a restart",
+                           self.name, e)
+
+    def _compact(self) -> None:
+        if self._journal is None:
+            return
+        try:
+            with self._jlock:
+                tmp = self._journal.with_suffix(self._journal.suffix + ".tmp")
+                with tmp.open("w", encoding="utf-8") as f:
+                    for p in self._pending.values():
+                        f.write(json.dumps(self._filed_row(p), ensure_ascii=False, default=str) + "\n")
+                tmp.replace(self._journal)
+        except OSError as e:
+            logger.warning("[hitl:%s] approvals journal compaction failed: %s", self.name, e)
+
+    def _filed_row(self, p: PendingApproval) -> dict:
+        return {"transport": self.name, "op": "filed", "approval_id": p.approval_id, "alert_id": p.alert_id,
+                "external_id": p.external_id, "requested_at": p.requested_at, "action": _action_dict(p.action),
+                "chain": {"alert_id": str(getattr(p.chain, "alert_id", p.alert_id)), "verdict": str(getattr(p.chain, "verdict", "")),
+                          "confidence": float(getattr(p.chain, "confidence", 0.0) or 0.0),
+                          "investigated_by": str(getattr(p.chain, "investigated_by", ""))}}
+
+    # ---- contract
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    @property
+    def pending(self) -> list[PendingApproval]:
+        self._ensure_loaded()
+        return list(self._pending.values())
+
+    def request(self, action: Any, chain: Any) -> Optional[str]:
+        if not self.enabled:
+            return None
+        self._ensure_loaded()
+        key = (str(getattr(chain, "alert_id", "")), str(action.action_type), str(action.target))
+        if key in self._by_key and self._by_key[key] in self._pending:
+            return self._by_key[key]
+        approval_id = f"aegis_{_slug(key[0])}_{_slug(key[1])}_{uuid.uuid4().hex[:6]}"
+        card = {"id": approval_id, "action": f"{action.action_type} -> {action.target}", "args": card_args(action, chain),
+                "severity": str(getattr(chain, "verdict", "")), "alert_id": key[0]}
+        try:
+            external_id = self._file(card)
+        except Exception as e:  # noqa: BLE001 — channel down is a runtime condition; the stdout card is the fallback
+            logger.warning("[hitl:%s] could not file approval for %s (%s: %s); falling back to the stdout card",
+                           self.name, key[0], type(e).__name__, str(e)[:160])
+            return None
+        if external_id is None:
+            return None
+        pa = PendingApproval(approval_id=approval_id, alert_id=key[0], action=action, chain=chain, external_id=str(external_id))
+        self._pending[approval_id] = pa
+        self._by_key[key] = approval_id
+        row = self._filed_row(pa)
+        row.pop("transport", None)
+        self._journal_append(row)
+        logger.info("[hitl:%s] approval %s filed for %s on alert %s", self.name, approval_id, key[1], key[0])
+        return approval_id
+
+    def sync(self, response_agent: Any, *, max_age_sec: Optional[float] = None,
+             timeout_policy: Any = None) -> list[Decision]:
+        """Pull decisions and act on them.
+
+        A human decision always wins. ``timeout_policy`` (opt-in; default off) is the
+        few-analyst fallback for an approval nobody has decided: an eligible reversible
+        action past its wait window auto-executes, everything else is held (and escalated
+        on hard expiry). With no ``timeout_policy`` the behaviour is byte-identical to
+        before — ``max_age_sec`` still expires an old approval outright.
+        """
+        self._ensure_loaded()
+        made: list[Decision] = []
+        now = time.time()
+        for approval_id, p in list(self._pending.items()):
+            age = now - p.requested_at
+            expired = max_age_sec is not None and age > max_age_sec
+            # Preserve the original path exactly when the timeout policy is not in use.
+            if expired and timeout_policy is None:
+                made.append(self._settle(p, "expired", "", f"no decision within {int(max_age_sec)} s")); continue
+            # 1) a human decision always wins
+            try:
+                res = self._poll(p)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[hitl:%s] poll failed for %s: %s", self.name, approval_id, str(e)[:120])
+                res = None
+            if res:
+                status, decided_by, reason = res
+                if status == "approved":
+                    executed = response_agent.approve(p.action, approver=decided_by or self.name, source_alert_id=p.alert_id)
+                    made.append(self._settle(p, "approved", decided_by or self.name, "", executed=executed)); continue
+                if status == "rejected":
+                    made.append(self._settle(p, "rejected", decided_by or self.name, reason)); continue
+            # 2) no human decision — timeout auto-execute policy (opt-in)
+            if timeout_policy is not None:
+                decision, why = timeout_policy.evaluate(p.action, p.chain, age_sec=age)
+                if decision == "execute":
+                    executed = response_agent.approve(p.action, approver="aegis:hitl-timeout", source_alert_id=p.alert_id)
+                    logger.warning("[hitl:%s] timeout auto-execute: %s on alert %s — %s",
+                                   self.name, p.action.action_type, p.alert_id, why)
+                    made.append(self._settle(p, "approved", "aegis:hitl-timeout", why, executed=executed)); continue
+                if decision == "shadow" and approval_id not in self._timeout_noted:
+                    self._timeout_noted.add(approval_id)
+                    logger.info("[hitl:%s] timeout-shadow: would auto-execute %s on alert %s — %s",
+                                self.name, p.action.action_type, p.alert_id, why)
+                if expired:
+                    if approval_id not in self._timeout_noted:
+                        self._timeout_noted.add(approval_id)
+                        logger.warning("[hitl:%s] timeout-hold: %s on alert %s expired with no human decision — %s",
+                                       self.name, p.action.action_type, p.alert_id, why)
+                    made.append(self._settle(p, "expired", "", f"no decision within {int(max_age_sec)} s")); continue
+        return made
+
+    def attach_investigation(self, alert_id: str, card: Optional[dict]) -> int:
+        if not self.enabled or not card:
+            return 0
+        self._ensure_loaded()
+        n = 0
+        for p in [p for p in self._pending.values() if p.alert_id == str(alert_id)]:
+            try:
+                if self._annotate(p, card):
+                    n += 1
+            except Exception as e:  # noqa: BLE001 — the card keeps its verdict-time content
+                logger.warning("[hitl:%s] could not update card %s: %s", self.name, p.approval_id, str(e)[:160])
+        if n:
+            logger.info("[hitl:%s] investigation attached to %d card(s) for alert %s", self.name, n, alert_id)
+        return n
+
+    # ---- transport hooks
+    def _file(self, card: dict) -> Optional[str]:
+        raise NotImplementedError
+
+    def _poll(self, p: PendingApproval) -> Optional[tuple[str, str, str]]:
+        raise NotImplementedError
+
+    def _annotate(self, p: PendingApproval, card: dict) -> bool:
+        return False
+
+    # ---- helpers
+    def _settle(self, p: PendingApproval, status: str, decided_by: str, reason: str, executed: Any = None) -> Decision:
+        self._pending.pop(p.approval_id, None)
+        self._by_key.pop((p.alert_id, str(p.action.action_type), str(p.action.target)), None)
+        self._timeout_noted.discard(p.approval_id)
+        self._journal_append({"op": "settled", "approval_id": p.approval_id, "status": status})
+        d = Decision(approval_id=p.approval_id, alert_id=p.alert_id, action_type=str(p.action.action_type), target=str(p.action.target),
+                     status=status, decided_by=decided_by, reason=reason, executed=executed)
+        self.decisions.append(d)
+        logger.info("[hitl:%s] %s %s on alert %s by %s%s", self.name, status, d.action_type, d.alert_id, decided_by or "-",
+                    f" ({reason})" if reason else "")
+        return d
+
+
+__all__ = ["BaseHITL", "Decision", "PendingApproval", "card_args"]

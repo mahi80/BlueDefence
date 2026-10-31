@@ -1,0 +1,226 @@
+"""Tools for the API Abuse specialist."""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+
+@dataclass
+class ToolResult:
+    name: str
+    data: dict
+    weight: str
+
+
+# ---- BOLA / IDOR pattern check ----------------------------------------
+
+def bola_pattern_check(principal_id: str | None, accessed_object_owner: str | None,
+                       endpoint: str | None, http_method: str | None) -> ToolResult:
+    """Compares the authenticated principal against the object's owner.
+
+    Production: pulls owner from the data model's authorization layer
+    (Spring Security ACL, Casbin, custom). Walking-skeleton: caller
+    provides accessed_object_owner if known.
+    """
+    if not principal_id or not accessed_object_owner:
+        return ToolResult(name="bola_pattern", data={
+            "principal": principal_id, "owner": accessed_object_owner,
+            "verdict": "insufficient_data",
+        }, weight="low")
+
+    is_self_access = principal_id == accessed_object_owner
+    # Match the URL path style: /api/users/{id}/something
+    is_id_in_path = bool(re.search(r"/(users?|accounts?|customers?)/[\w\-]+", endpoint or ""))
+    is_modifying = http_method in ("POST", "PUT", "PATCH", "DELETE")
+
+    if not is_self_access and is_id_in_path:
+        weight = "high" if is_modifying else "medium"
+        return ToolResult(name="bola_pattern", data={
+            "principal": principal_id, "owner": accessed_object_owner,
+            "endpoint": endpoint, "method": http_method,
+            "is_self_access": False, "is_modifying": is_modifying,
+            "is_bola_pattern": True,
+        }, weight=weight)
+    return ToolResult(name="bola_pattern", data={
+        "is_self_access": is_self_access, "is_bola_pattern": False,
+    }, weight="low")
+
+
+# ---- Schema drift -----------------------------------------------------
+
+# Mock schema registry. Production: pulled from OpenAPI / GraphQL
+# introspection / schema registry (Confluent Schema Registry).
+_KNOWN_SCHEMAS = {
+    "/api/transfer": {
+        "required": {"from_account", "to_account", "amount"},
+        "allowed":  {"from_account", "to_account", "amount", "currency", "memo", "idempotency_key"},
+    },
+    "/api/profile": {
+        "required": {"user_id"},
+        "allowed":  {"user_id"},
+    },
+    "/api/login": {
+        "required": {"username", "password"},
+        "allowed":  {"username", "password", "mfa_token", "device_id"},
+    },
+}
+
+
+def schema_drift_check(endpoint: str | None, params: dict | None) -> ToolResult:
+    if not endpoint or endpoint not in _KNOWN_SCHEMAS:
+        return ToolResult(name="schema_drift", data={
+            "endpoint": endpoint, "tracked": False,
+        }, weight="low")
+    schema = _KNOWN_SCHEMAS[endpoint]
+    seen = set((params or {}).keys())
+    missing = schema["required"] - seen
+    extra = seen - schema["allowed"]
+    weight = "high" if extra else "medium" if missing else "low"
+    return ToolResult(name="schema_drift", data={
+        "endpoint": endpoint, "tracked": True,
+        "missing_required": sorted(missing),
+        "extra_unexpected": sorted(extra),
+        "drift": bool(missing or extra),
+    }, weight=weight)
+
+
+# ---- Volumetric anomaly ----------------------------------------------
+
+# Mock per-endpoint volume baselines (calls per minute, p99).
+_VOLUMETRIC_BASELINES = {
+    "/api/login":       {"p99_per_min": 30,  "kind": "auth"},
+    "/api/transfer":    {"p99_per_min": 5,   "kind": "txn"},
+    "/api/profile":     {"p99_per_min": 60,  "kind": "read"},
+    "/api/statements":  {"p99_per_min": 20,  "kind": "read"},
+}
+
+
+def volumetric_anomaly_check(endpoint: str | None,
+                             observed_per_min: float | None) -> ToolResult:
+    if not endpoint or observed_per_min is None or endpoint not in _VOLUMETRIC_BASELINES:
+        return ToolResult(name="volumetric", data={
+            "endpoint": endpoint, "observed": observed_per_min,
+            "verdict": "insufficient_data",
+        }, weight="low")
+    baseline = _VOLUMETRIC_BASELINES[endpoint]["p99_per_min"]
+    ratio = observed_per_min / baseline if baseline > 0 else 0.0
+    # >5x p99 = scraping / brute-force / DoS
+    if ratio >= 5.0:
+        weight = "high"
+    elif ratio >= 2.0:
+        weight = "medium"
+    else:
+        weight = "low"
+    return ToolResult(name="volumetric", data={
+        "endpoint": endpoint, "observed_per_min": observed_per_min,
+        "p99_baseline": baseline, "ratio": round(ratio, 2),
+        "anomaly": ratio >= 2.0,
+    }, weight=weight)
+
+
+# ---- Auth boundary check (privilege levels) -------------------------
+
+# Mock role -> allowed-endpoint map. Production: pulled from IAM/RBAC.
+_ROLE_PERMISSIONS = {
+    "retail_customer": {"/api/balance", "/api/transfer", "/api/profile",
+                        "/api/statements", "/api/login"},
+    "wealth_advisor":  {"/api/portfolio", "/api/orders", "/api/clients",
+                        "/api/profile", "/api/login"},
+    "admin":           {"/api/admin/*", "/api/audit/*"},
+}
+
+
+def auth_boundary_check(role: str | None, endpoint: str | None) -> ToolResult:
+    if not role or not endpoint:
+        return ToolResult(name="auth_boundary", data={
+            "role": role, "endpoint": endpoint, "verdict": "insufficient_data",
+        }, weight="low")
+    allowed = _ROLE_PERMISSIONS.get(role, set())
+    # Wildcard match (e.g. /api/admin/* covers /api/admin/users)
+    in_allowed = endpoint in allowed
+    if not in_allowed:
+        for entry in allowed:
+            if entry.endswith("/*") and endpoint.startswith(entry[:-2]):
+                in_allowed = True
+                break
+    return ToolResult(name="auth_boundary", data={
+        "role": role, "endpoint": endpoint, "allowed": in_allowed,
+        "violation": not in_allowed,
+    }, weight="high" if not in_allowed else "low")
+
+
+# ---- DB-direct query check ------------------------------------------
+
+# Database queries that bypass the API layer (DBA tooling, ad-hoc
+# psql / mysql / SSMS connections to prod). Different signal class
+# from API abuse — these are AUTHENTICATED via DB creds, not the
+# application's auth layer.
+
+_RISKY_QUERY_PATTERNS = [
+    re.compile(r"\bselect\s+\*\s+from\s+(?:customers?|customer_kyc|loan_applications)\b", re.I),
+    re.compile(r"\binto\s+outfile\b", re.I),
+    re.compile(r"\bdumpfile\b", re.I),
+    re.compile(r"\bcopy\s+\(.*\)\s+to\b", re.I),         # postgres COPY
+    re.compile(r"\bbcp\b", re.I),                          # MSSQL bulk copy
+    re.compile(r"\bdrop\s+table\b", re.I),
+    re.compile(r"\btruncate\s+table\b", re.I),
+    re.compile(r"\bgrant\s+all\s+privileges\b", re.I),
+]
+
+
+def db_direct_query_check(client_app: str | None,
+                          query: str | None,
+                          rows_returned: int | None,
+                          source_ip: str | None) -> ToolResult:
+    """Detects ad-hoc DB queries from non-application clients (psql,
+    mysql CLI, DBeaver, SSMS, pgAdmin) — DBAs/data-scientists going
+    direct without the application's audit + authorization layer.
+    """
+    if not query:
+        return ToolResult(name="db_direct_query", data={"verdict": "no_query"}, weight="low")
+    is_app_client = bool(client_app and client_app.startswith(("app:", "service:")))
+    is_dba_client = bool(client_app and any(
+        c in (client_app or "").lower()
+        for c in ("psql", "mysql cli", "dbeaver", "ssms", "pgadmin", "mongo shell")
+    ))
+    risky_pattern_hits = [str(rx.pattern) for rx in _RISKY_QUERY_PATTERNS if rx.search(query)]
+    bulk = bool(rows_returned and rows_returned >= 5000)
+    if is_dba_client and (risky_pattern_hits or bulk):
+        weight = "high"
+    elif risky_pattern_hits:
+        weight = "high" if not is_app_client else "medium"
+    elif is_dba_client and bulk:
+        weight = "medium"
+    elif is_dba_client:
+        weight = "low"
+    else:
+        weight = "low"
+    return ToolResult(name="db_direct_query", data={
+        "client_app": client_app,
+        "is_app_client": is_app_client,
+        "is_dba_client": is_dba_client,
+        "risky_patterns": risky_pattern_hits,
+        "rows_returned": rows_returned,
+        "bulk": bulk,
+        "source_ip": source_ip,
+    }, weight=weight)
+
+
+def run_all_tools(alert: dict) -> list[ToolResult]:
+    return [
+        bola_pattern_check(
+            alert.get("principal_id"),
+            alert.get("accessed_object_owner"),
+            alert.get("endpoint"),
+            alert.get("http_method"),
+        ),
+        schema_drift_check(alert.get("endpoint"), alert.get("params")),
+        volumetric_anomaly_check(alert.get("endpoint"), alert.get("observed_per_min")),
+        auth_boundary_check(alert.get("role"), alert.get("endpoint")),
+        db_direct_query_check(
+            alert.get("client_app"),
+            alert.get("query"),
+            alert.get("rows_returned"),
+            alert.get("source_ip"),
+        ),
+    ]

@@ -1,0 +1,4 @@
+################################################################
+# SAMPLE DATA: a simulated office network from aegis/eval/egress_bench.py; every value is invented (abuse.ch SSLBL export format)
+# Listingdate,SHA1,Listingreason
+2026-10-20 08:00:00,81bf2a526c6f183839b09cfabf3d6bf26ca37dcf,Sample C2 (invented)

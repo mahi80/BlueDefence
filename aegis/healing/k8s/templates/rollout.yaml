@@ -1,0 +1,83 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ .Values.target.name }}
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.labels" . | indent 4 }}
+spec:
+  replicas: {{ .Values.target.replicas }}
+  strategy:
+    canary:
+      maxSurge: 25%
+      maxUnavailable: 0
+      steps:
+{{ toYaml .Values.rollout.steps | indent 8 }}
+      analysis:
+        templates:
+        - templateName: {{ .Values.target.name }}-success
+        startingStep: 1
+        args:
+        - name: service-name
+          value: {{ .Values.target.name }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Values.target.name }}
+  template:
+    metadata:
+      labels:
+{{ include "aegis.labels" . | indent 8 }}
+      annotations:
+        # Bumped by the AEGIS controller on each respawn. Forces a fresh
+        # workload identity even when the image hash is unchanged.
+        aegis.bank/respawn-generation: "0"
+    spec:
+      serviceAccountName: {{ .Values.target.name }}
+      automountServiceAccountToken: true
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
+      containers:
+      - name: app
+        image: {{ .Values.target.image }}
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: {{ .Values.target.containerPort }}
+        livenessProbe:
+          httpGet: { path: /healthz, port: http }
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet: { path: /readyz, port: http }
+          initialDelaySeconds: 2
+          periodSeconds: 5
+        resources:
+          requests: { cpu: "100m", memory: "128Mi" }
+          limits:   { cpu: "1",    memory: "512Mi" }
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ .Values.target.name }}-success
+  namespace: {{ .Values.target.namespace }}
+spec:
+  args:
+  - name: service-name
+  metrics:
+  - name: success-rate
+    interval: {{ .Values.rollout.canaryAnalysis.metricInterval }}
+    successCondition: result[0] >= {{ .Values.rollout.canaryAnalysis.successThreshold }}
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: http://prometheus.observability.svc:9090
+        query: |
+          sum(rate(http_requests_total{service="{{ "{{args.service-name}}" }}",status!~"5.."}[2m]))
+          /
+          sum(rate(http_requests_total{service="{{ "{{args.service-name}}" }}"}[2m]))

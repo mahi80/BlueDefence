@@ -1,0 +1,6 @@
+# Optional RL dependencies (~2GB install due to torch).
+# Install only if you intend to run aegis/rl/train.py.
+gymnasium>=0.29
+stable-baselines3>=2.3
+scikit-learn>=1.4
+numpy>=1.26

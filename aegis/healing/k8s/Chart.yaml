@@ -1,0 +1,14 @@
+apiVersion: v2
+name: aegis-self-healing
+description: AEGIS Self-Healing Networks - snapshot, sever, respawn, re-onboard
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - security
+  - self-healing
+  - aegis
+  - banking
+maintainers:
+  - name: AEGIS team
+home: https://github.com/mahi80/rbi

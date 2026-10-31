@@ -1,0 +1,48 @@
+{
+  "_default": {
+    "autostart": [],
+    "tcc_allow": ["com.apple.", "/System/"],
+    "ssh_keys": []
+  },
+  "windows-workstation": {
+    "autostart": [
+      ["OneDrive", "C:\\Users\\*\\AppData\\Local\\Microsoft\\OneDrive\\OneDrive.exe"],
+      ["SecurityHealth", "C:\\Windows\\System32\\SecurityHealthSystray.exe"],
+      ["MicrosoftEdgeAutoLaunch", "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"],
+      ["Teams", "C:\\Users\\*\\AppData\\Local\\Microsoft\\Teams\\Update.exe"]
+    ]
+  },
+  "windows-server": {
+    "autostart": [
+      ["SecurityHealth", "C:\\Windows\\System32\\SecurityHealthSystray.exe"],
+      ["VMwareTools", "C:\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe"]
+    ]
+  },
+  "linux-web": {
+    "autostart": [
+      ["nginx.service", "/lib/systemd/system/nginx.service"],
+      ["php8.1-fpm.service", "/lib/systemd/system/php8.1-fpm.service"],
+      ["ssh.service", "/lib/systemd/system/ssh.service"],
+      ["cron.service", "/lib/systemd/system/cron.service"]
+    ],
+    "ssh_keys": ["SHA256:deploykeyplaceholder0000000000000000000000"]
+  },
+  "linux-generic": {
+    "autostart": [
+      ["ssh.service", "/lib/systemd/system/ssh.service"],
+      ["cron.service", "/lib/systemd/system/cron.service"],
+      ["systemd-journald.service", "/lib/systemd/system/systemd-journald.service"]
+    ]
+  },
+  "macos-workstation": {
+    "autostart": [
+      ["com.apple.keylayout", "/Library/LaunchAgents/com.apple.keylayout.plist"]
+    ],
+    "tcc_allow": [
+      "/Applications/zoom.us.app",
+      "/Applications/Microsoft Teams.app",
+      "/Applications/Google Chrome.app",
+      "/Applications/Slack.app"
+    ]
+  }
+}

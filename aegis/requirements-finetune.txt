@@ -1,0 +1,19 @@
+# QLoRA triage fine-tune (roadmap 3.3). Install on the GPU box (WSL2 + CUDA 12.x) only —
+# multi-GB, needs an NVIDIA GPU. CPU/CI uses aegis.finetune --dry-run instead.
+#
+#   python -m venv ~/.venvs/aegis-ft && source ~/.venvs/aegis-ft/bin/activate
+#   pip install -r aegis/requirements-finetune.txt
+#
+# Unsloth pulls a matching torch/bitsandbytes for your CUDA; if its wheel resolves on your box
+# it is the fast path. If it won't install, comment it out and the transformers+peft fallback
+# below is used automatically.
+unsloth>=2026.1 ; platform_system == "Linux"
+transformers>=4.46
+peft>=0.13
+trl>=0.11
+datasets>=3.0
+bitsandbytes>=0.44 ; platform_system == "Linux"
+accelerate>=1.0
+# Pin the hub: the standalone `hf` CLI pulls huggingface-hub 2.x, but transformers (<5.x deps)
+# and unsloth require <2.0 — an out-of-range hub makes `import transformers` fail at load.
+huggingface-hub>=1.5.0,<2.0

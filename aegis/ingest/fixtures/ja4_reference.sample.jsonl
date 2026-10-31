@@ -1,0 +1,8 @@
+# SAMPLE DATA: invented JA4 values for tests and demos, not real fingerprints. Build yours from your own traffic or a licensed database.
+{"ja4": "t13d1516h2_000000000001_000000000a01", "label": "browser", "family": "chromium", "name": "Chromium desktop (sample)"}
+{"ja4": "t13d1715h2_000000000002_000000000a02", "label": "browser", "family": "firefox", "name": "Firefox desktop (sample)"}
+{"ja4": "t13d2014h2_000000000003_000000000a03", "label": "browser", "family": "webkit", "name": "Safari (sample)"}
+{"ja4": "t13d1312h2_e8f1e7e78f70_0aaa1111bbbb", "label": "library", "name": "Python HTTP client, HTTP/2 enabled (sample)"}
+{"ja4": "t13d1810h1_5c2a8e7d1f3b_9e4b6a0c2d71", "label": "library", "name": "scripting HTTP client, http/1.1 first (sample)"}
+{"ja4": "t12i3006h1_000000000004_000000000a04", "label": "library", "name": "legacy scanner (sample)"}
+{"ja4": "t13d2214h1_7d3f0b9a6e21_1a8c4e2f9b05", "label": "middlebox", "name": "corporate TLS-inspection proxy (sample)"}

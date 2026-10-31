@@ -1,0 +1,14 @@
+apiVersion: v2
+name: aegis-observability
+description: AEGIS observability — OTel collector + scraping wiring for Tempo/Mimir
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - observability
+  - opentelemetry
+  - aegis
+  - banking
+maintainers:
+  - name: AEGIS team
+home: https://github.com/mahi80/rbi

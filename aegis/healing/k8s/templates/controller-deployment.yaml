@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aegis-healing-controller
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.controllerLabels" . | indent 4 }}
+spec:
+  replicas: 2   # leader-elected for HA
+  selector:
+    matchLabels:
+{{ include "aegis.controllerLabels" . | indent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "aegis.controllerLabels" . | indent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.controller.serviceAccount }}
+      securityContext:
+{{ toYaml .Values.securityContext | indent 8 }}
+      containers:
+      - name: healing
+        image: {{ .Values.controller.image }}
+        env:
+        - name: AEGIS_TARGET_NAMESPACE
+          value: {{ .Values.target.namespace }}
+        - name: AEGIS_TARGET_NAME
+          value: {{ .Values.target.name }}
+        - name: AEGIS_AUDIT_LOG
+          value: s3://bank-aegis-audit-worm/healing/
+        - name: AEGIS_LEADER_ELECTION
+          value: "true"
+        ports:
+        - name: metrics
+          containerPort: 9090
+        livenessProbe:
+          httpGet: { path: /healthz, port: metrics }
+        readinessProbe:
+          httpGet: { path: /readyz, port: metrics }
+        resources:
+{{ toYaml .Values.controller.resources | indent 10 }}
+---
+# Block the controller's egress to anything but the audit bucket and
+# the K8s API. Compromised controller blast-radius bounded.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-healing-controller-egress
+  namespace: {{ .Values.target.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "aegis.controllerLabels" . | indent 6 }}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-apiserver
+    ports:
+    - port: 6443
+      protocol: TCP
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 53
+      protocol: UDP

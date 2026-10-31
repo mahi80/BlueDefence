@@ -1,0 +1,179 @@
+[
+  {
+    "alert": {
+      "id": "EPT-E01",
+      "source": "CrowdStrike Falcon",
+      "event": "tamper_protection_disabled",
+      "host": "LT-4411",
+      "user": "u_51002",
+      "initiated_by": "local_admin",
+      "sensor_offline_minutes": 0,
+      "host_last_seen_minutes_ago": 1,
+      "asset_in_inventory": true,
+      "host_role": "laptop",
+      "prior_event_30m": "credential_store_access",
+      "os_patch_age_days": 41,
+      "disk_encrypted": true
+    },
+    "expected_verdict": "malicious",
+    "label": "tamper protection off by a local admin right after a credential-store read — the attacker's first two moves"
+  },
+  {
+    "alert": {
+      "id": "EPT-E02",
+      "source": "Sophos Central",
+      "event": "sensor_service_stopped",
+      "host": "SRV-2201",
+      "user": "svc_sccm",
+      "initiated_by": "sccm_service",
+      "sensor_offline_minutes": 0,
+      "host_last_seen_minutes_ago": 0,
+      "asset_in_inventory": true,
+      "host_role": "server",
+      "prior_event_30m": null,
+      "os_patch_age_days": 3,
+      "disk_encrypted": true,
+      "context": {
+        "maintenance_window": {
+          "ticket": "CHG-440021",
+          "covers_host": true
+        }
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "sensor stopped by the management service inside a ticketed maintenance window"
+  },
+  {
+    "alert": {
+      "id": "EPT-E03",
+      "source": "Microsoft Defender for Endpoint",
+      "event": "file_activity_burst",
+      "host": "FS-0032",
+      "user": "u_77190",
+      "files_renamed_per_min": 4200,
+      "avg_write_entropy": 7.91,
+      "extension_changed_ratio": 0.97,
+      "canary_file_modified": true,
+      "smb_hosts_written_10m": 14,
+      "backup_job_failures_1h": 2,
+      "shadow_copies_deleted": false,
+      "process_signed": false,
+      "host_role": "file-server"
+    },
+    "expected_verdict": "malicious",
+    "label": "mass encryption rate + canary file + SMB spread — isolate within the minute"
+  },
+  {
+    "alert": {
+      "id": "EPT-E04",
+      "source": "CrowdStrike Falcon",
+      "event": "file_activity_burst",
+      "host": "FS-0040",
+      "user": "svc_backup",
+      "files_renamed_per_min": 900,
+      "avg_write_entropy": 7.7,
+      "extension_changed_ratio": 0.02,
+      "canary_file_modified": false,
+      "smb_hosts_written_10m": 9,
+      "backup_job_failures_1h": 0,
+      "shadow_copies_deleted": false,
+      "process_signed": true,
+      "host_role": "file-server",
+      "context": {
+        "scheduled_backup_job": {
+          "agent": "Veeam",
+          "window_active": true
+        }
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "backup agent writing compressed (high-entropy) archives to many shares inside its window"
+  },
+  {
+    "alert": {
+      "id": "EPT-E05",
+      "source": "Microsoft Defender for Endpoint",
+      "event": "credential_store_read",
+      "host": "LT-9020",
+      "user": "u_33415",
+      "store_read": "browser_cookie_db",
+      "reader_process_signed": false,
+      "reader_reputation": "unknown",
+      "archive_created_then_uploaded": true,
+      "identity": {
+        "session_token_reused_from_new_device": true,
+        "reuse_minutes_after_read": 7,
+        "reuse_geo": "BR",
+        "mfa_prompt_on_reuse": false
+      }
+    },
+    "expected_verdict": "malicious",
+    "label": "infostealer chain: cookie DB read by unsigned process → archive uploaded → same session replayed from Brazil 7 min later"
+  },
+  {
+    "alert": {
+      "id": "EPT-E06",
+      "source": "Microsoft Intune",
+      "device_id": "MOB-55120",
+      "user": "u_20981",
+      "platform": "Android 13",
+      "rooted_or_jailbroken": false,
+      "banking_app": {
+        "install_source": "Play Store",
+        "cert_pinning_active": true,
+        "overlay_detected_on_login": true
+      },
+      "accessibility_service_granted_to_unknown_app": true,
+      "sms_read_permission_unknown_app": true,
+      "unknown_app_installed_days_ago": 2,
+      "screen_recording_active": false,
+      "device_compliance": "compliant"
+    },
+    "expected_verdict": "malicious",
+    "label": "banking-trojan posture: overlay on login + accessibility service + SMS read by a 2-day-old unknown app"
+  },
+  {
+    "alert": {
+      "id": "EPT-E07",
+      "source": "ATM Monitoring",
+      "device": "ATM-412",
+      "device_class": "atm",
+      "branch": "BR-207",
+      "whitelisting_violations_1h": 6,
+      "kiosk_shell_escape_detected": false,
+      "xfs_command_anomaly": false,
+      "service_logon_outside_window": true,
+      "local_hour": 3,
+      "usb_mass_storage_connected": true,
+      "cash_dispense_without_transaction": false,
+      "context": {
+        "scheduled_servicing": {
+          "ticket": "SVC-77120",
+          "vendor_engineer": true,
+          "window_active": true
+        }
+      }
+    },
+    "expected_verdict": "benign",
+    "label": "vendor engineer servicing the ATM under ticket: whitelisting violations, USB and off-hours logon are the service"
+  },
+  {
+    "alert": {
+      "id": "EPT-E08",
+      "source": "Sophos Central",
+      "event": "peripheral_connected",
+      "host": "TELLER-0911",
+      "user": "u_60422",
+      "device_class": "usb_hid",
+      "vendor": "Unknown",
+      "device_serial_known": false,
+      "bytes_written_to_device": 0,
+      "classification_of_files_copied": "none",
+      "hid_chars_per_second": 2400,
+      "host_role": "teller-pc",
+      "dlp_block_applied": false
+    },
+    "expected_verdict": "malicious",
+    "label": "BadUSB: unknown HID device typing at 2,400 chars/s on a teller PC"
+  }
+]

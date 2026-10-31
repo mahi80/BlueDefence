@@ -1,0 +1,181 @@
+[
+  {
+    "chain_id": "chn_2201",
+    "alert_id": "ALR-2201",
+    "source": "Imperva Cloud WAF",
+    "verdict": "malicious",
+    "confidence": 0.94,
+    "specialists": ["perimeter"],
+    "action_types": ["isolate", "block_egress", "revoke_sessions"],
+    "evidence_count": 9,
+    "governance_blocked": false,
+    "started_at": "2026-10-23T05:42:11Z",
+    "completed_at": "2026-10-23T05:42:49Z",
+    "note": "A go-http client posing as Chrome reached /api/transfer unblocked; lateral path opening toward the core ledger DB.",
+    "integrity_hash": "f2a1c0de4b7788aa",
+    "evidence": [
+      { "source": "perimeter", "signal": "User-Agent claims Chrome 128 but the JA3 TLS fingerprint is Go net/http — the client lied about what it is", "weight": "high" },
+      { "source": "perimeter", "signal": "Unauthenticated POST /api/transfer returned 200 — that endpoint must require a bearer token", "weight": "high" },
+      { "source": "ioc_extract", "signal": "Bearer token presented is not signed by the org IdP (unknown key id) — forged", "weight": "high" },
+      { "source": "intel_enrich", "signal": "Source 203.0.113.77 on 2 threat-intel feeds as a forged-token C2, first seen 6h ago", "weight": "high" },
+      { "source": "blast_radius", "signal": "Lateral path traced edge-waf -> api-gw-01 -> app-ledger-07, one hop from db-core (ledger)", "weight": "high" },
+      { "source": "log_hunt", "signal": "svc-acct-pay authenticated from app-ledger-07 at 05:41Z — that identity has never logged in from that host", "weight": "medium" },
+      { "source": "perimeter", "signal": "Request rate from the source is ~40x the per-client baseline for /api/*", "weight": "medium" },
+      { "source": "intel_enrich", "signal": "Correlated to campaign camp_17 — 2 sibling alerts in 20 min from the same ASN", "weight": "medium" },
+      { "source": "deception_check", "signal": "No honeytoken touched yet — this is exposure-stage; the ledger DB is not confirmed reached", "weight": "low" }
+    ],
+    "investigation": {
+      "swarm": ["ioc_extract", "intel_enrich", "blast_radius", "log_hunt", "deception_check"],
+      "campaign": { "id": "camp_17", "related_alerts": 3 },
+      "blast_radius": {
+        "nodes": [
+          { "id": "edge-waf", "label": "edge-waf", "kind": "service", "verdict": "malicious", "reached": true },
+          { "id": "api-gw-01", "label": "api-gw-01", "kind": "service", "verdict": "malicious", "reached": true },
+          { "id": "app-ledger-07", "label": "app-ledger-07", "kind": "host", "verdict": "suspicious", "reached": true },
+          { "id": "svc-acct-pay", "label": "svc-acct-pay", "kind": "identity", "verdict": "suspicious", "reached": true },
+          { "id": "db-core", "label": "db-core (ledger)", "kind": "data", "verdict": "uncertain", "critical": true, "reached": false }
+        ],
+        "edges": [
+          { "source": "edge-waf", "target": "api-gw-01", "kind": "attack" },
+          { "source": "api-gw-01", "target": "app-ledger-07", "kind": "lateral" },
+          { "source": "svc-acct-pay", "target": "app-ledger-07", "kind": "lateral" },
+          { "source": "app-ledger-07", "target": "db-core", "kind": "lateral" }
+        ],
+        "critical": ["db-core"],
+        "choke_edges": [["app-ledger-07", "db-core"]]
+      },
+      "plan": {
+        "steps": [
+          { "order": 1, "action_type": "isolate", "target": "app-ledger-07", "rationale": "Only remaining path to the ledger DB runs through this host — cutting it contains the campaign.", "cuts_edges": [["app-ledger-07", "db-core"]] },
+          { "order": 2, "action_type": "block_egress", "target": "203.0.113.77", "rationale": "The forged-token source; block at the egress proxy." },
+          { "order": 3, "action_type": "revoke_sessions", "target": "svc-acct-pay", "rationale": "Service identity used on the lateral hop — revoke its live sessions." }
+        ]
+      }
+    },
+    "recommended_actions": [
+      { "action_type": "isolate", "target": "app-ledger-07", "requires_hitl": true, "confidence": 0.94, "reasoning": "Isolating app-ledger-07 severs the only path the attacker has left to the core ledger DB." },
+      { "action_type": "block_egress", "target": "203.0.113.77", "requires_hitl": true, "confidence": 0.93, "reasoning": "Block the forged-token source IP at the egress proxy and firewall." },
+      { "action_type": "revoke_sessions", "target": "svc-acct-pay", "requires_hitl": true, "confidence": 0.9, "reasoning": "Revoke the service account's active sessions used on the lateral movement." }
+    ]
+  },
+  {
+    "chain_id": "chn_2202",
+    "alert_id": "ALR-2202",
+    "source": "NDR (Zeek)",
+    "verdict": "malicious",
+    "confidence": 0.9,
+    "specialists": ["perimeter"],
+    "action_types": ["block_egress", "isolate", "escalate"],
+    "evidence_count": 7,
+    "governance_blocked": false,
+    "started_at": "2026-10-23T05:38:02Z",
+    "completed_at": "2026-10-23T05:38:40Z",
+    "note": "Regular beacon with matching JA3 to a known-bad TLS cert; periodic exfil-sized uploads.",
+    "integrity_hash": "9b33aa21ce0045fd",
+    "evidence": [
+      { "source": "perimeter", "signal": "Outbound TLS to 203.0.113.9 every 60s +/-3s — beacon-regular, not human traffic", "weight": "high" },
+      { "source": "intel_enrich", "signal": "Destination JA3 hash matches a known Cobalt-Strike-family TLS cert on 3 feeds", "weight": "high" },
+      { "source": "ioc_extract", "signal": "Destination cert is self-signed, issued 9 days ago, matches the known-bad fingerprint", "weight": "high" },
+      { "source": "log_hunt", "signal": "4-6 MB uploads every ~15 min from wks-fin-212, outside business hours — exfil-sized", "weight": "medium" },
+      { "source": "blast_radius", "signal": "wks-fin-212 holds an SMB mount to fileshare-fin (finance crown-jewel), not yet accessed", "weight": "medium" },
+      { "source": "perimeter", "signal": "No matching inbound connection — host-initiated, consistent with an implant beacon", "weight": "medium" },
+      { "source": "intel_enrich", "signal": "Destination ASN previously flagged for bulletproof hosting", "weight": "low" }
+    ],
+    "investigation": {
+      "swarm": ["ioc_extract", "intel_enrich", "blast_radius", "log_hunt"],
+      "blast_radius": {
+        "nodes": [
+          { "id": "wks-fin-212", "label": "wks-fin-212", "kind": "host", "verdict": "malicious", "reached": true },
+          { "id": "c2-203-0-113-9", "label": "203.0.113.9", "kind": "service", "verdict": "malicious", "reached": true },
+          { "id": "fileshare-fin", "label": "fileshare-fin", "kind": "data", "verdict": "suspicious", "critical": true, "reached": false }
+        ],
+        "edges": [
+          { "source": "wks-fin-212", "target": "c2-203-0-113-9", "kind": "exfil" },
+          { "source": "fileshare-fin", "target": "wks-fin-212", "kind": "lateral" }
+        ],
+        "critical": ["fileshare-fin"],
+        "choke_edges": [["wks-fin-212", "c2-203-0-113-9"]]
+      },
+      "plan": {
+        "steps": [
+          { "order": 1, "action_type": "block_egress", "target": "203.0.113.9", "rationale": "Cut the C2 channel the beacon is calling out to.", "cuts_edges": [["wks-fin-212", "c2-203-0-113-9"]] },
+          { "order": 2, "action_type": "isolate", "target": "wks-fin-212", "rationale": "Contain the beaconing host before the finance fileshare is touched." }
+        ]
+      }
+    },
+    "recommended_actions": [
+      { "action_type": "block_egress", "target": "203.0.113.9", "requires_hitl": true, "confidence": 0.9, "reasoning": "Known-bad TLS certificate on the destination — block the C2 egress." },
+      { "action_type": "isolate", "target": "wks-fin-212", "requires_hitl": true, "confidence": 0.88, "reasoning": "Beaconing finance workstation; isolate before lateral movement to the fileshare." },
+      { "action_type": "escalate", "target": "ALR-2202", "requires_hitl": true, "confidence": 0.9, "reasoning": "Hunt for other hosts calling the same destination." }
+    ]
+  },
+  {
+    "chain_id": "chn_2203",
+    "alert_id": "ALR-2203",
+    "source": "F5 ASM",
+    "verdict": "suspicious",
+    "confidence": 0.66,
+    "specialists": ["auth"],
+    "action_types": ["throttle", "challenge", "monitor"],
+    "evidence_count": 4,
+    "governance_blocked": false,
+    "started_at": "2026-10-23T05:30:55Z",
+    "completed_at": "2026-10-23T05:31:20Z",
+    "note": "Many usernames from one source at a moderate rate, blocked — a probe, not yet a compromise.",
+    "integrity_hash": "41d7e0b9a1227c6e",
+    "evidence": [
+      { "source": "auth", "signal": "142 distinct usernames tried from 198.51.100.88 in 5 min — credential-stuffing pattern", "weight": "high" },
+      { "source": "auth", "signal": "Every attempt was blocked by the F5 ASM rate rule — 0 successful authentications", "weight": "medium" },
+      { "source": "perimeter", "signal": "Rate is moderate (~0.5/s), below the aggressive-bot threshold — reads as a slow probe", "weight": "low" },
+      { "source": "intel_enrich", "signal": "Source IP is on no threat-intel feed; residential ASN", "weight": "low" }
+    ],
+    "investigation": {
+      "swarm": ["ioc_extract", "intel_enrich"],
+      "blast_radius": {
+        "nodes": [
+          { "id": "login-edge", "label": "login-edge", "kind": "service", "verdict": "suspicious", "reached": true },
+          { "id": "src-198-51-100-88", "label": "198.51.100.88", "kind": "service", "verdict": "suspicious", "reached": true }
+        ],
+        "edges": [{ "source": "src-198-51-100-88", "target": "login-edge", "kind": "attack" }],
+        "critical": [],
+        "choke_edges": []
+      }
+    },
+    "recommended_actions": [
+      { "action_type": "throttle", "target": "198.51.100.88", "requires_hitl": false, "confidence": 0.66, "reasoning": "Slow the source while an analyst reviews; it is blocked but persistent." },
+      { "action_type": "monitor", "target": "login-edge", "requires_hitl": false, "confidence": 0.66, "reasoning": "Watch the login endpoint for a successful auth from this source." }
+    ]
+  },
+  {
+    "chain_id": "chn_2204",
+    "alert_id": "ALR-2204",
+    "source": "Imperva Cloud WAF",
+    "verdict": "benign",
+    "confidence": 0.86,
+    "specialists": ["perimeter"],
+    "action_types": ["allow", "monitor"],
+    "evidence_count": 3,
+    "governance_blocked": false,
+    "started_at": "2026-10-23T05:21:08Z",
+    "completed_at": "2026-10-23T05:21:26Z",
+    "note": "Odd TLS stack explained by the corporate Zscaler inspection proxy; blocked scanner noise.",
+    "integrity_hash": "d0c0ffee11223344",
+    "evidence": [
+      { "source": "perimeter", "signal": "The unusual TLS stack resolves to the corporate Zscaler inspection proxy egress range (10.20.4.0/24)", "weight": "high" },
+      { "source": "ioc_extract", "signal": "The blocked request was a generic /.env scanner probe — 404, no data returned", "weight": "medium" },
+      { "source": "intel_enrich", "signal": "Source is internal and matches a known proxy egress; no external IOC", "weight": "low" }
+    ],
+    "investigation": {
+      "swarm": ["ioc_extract"],
+      "blast_radius": {
+        "nodes": [{ "id": "proxy-egress", "label": "zscaler-egress", "kind": "service", "verdict": "benign", "reached": false }],
+        "edges": [],
+        "critical": [],
+        "choke_edges": []
+      }
+    },
+    "recommended_actions": [
+      { "action_type": "allow", "target": "10.20.4.51", "requires_hitl": false, "confidence": 0.86, "reasoning": "Traffic is the corporate inspection proxy; blocked scanner probe is noise." }
+    ]
+  }
+]
