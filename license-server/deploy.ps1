@@ -40,8 +40,11 @@ if ($SigningKeyFile) {
 # --- package --------------------------------------------------------------------------------
 Copy-Item ..\aegis\license.py app\aegis_license.py -Force
 $bucket = "bluedefence-license-artifacts-$account-$Region"
-$exists = aws s3api head-bucket --bucket $bucket --region $Region @p 2>&1
-if ($LASTEXITCODE -ne 0) {
+$eap = $ErrorActionPreference; $ErrorActionPreference = "SilentlyContinue"      # head-bucket writes to stderr when the bucket is missing; that is not an error
+aws s3api head-bucket --bucket $bucket --region $Region @p 2>$null | Out-Null
+$missing = ($LASTEXITCODE -ne 0)
+$ErrorActionPreference = $eap
+if ($missing) {
   Write-Host "creating artifact bucket $bucket"
   if ($Region -eq "us-east-1") { aws s3api create-bucket --bucket $bucket --region $Region @p | Out-Null }
   else { aws s3api create-bucket --bucket $bucket --region $Region --create-bucket-configuration LocationConstraint=$Region @p | Out-Null }
