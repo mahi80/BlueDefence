@@ -80,6 +80,9 @@ def role_of(device: str, hint: str | None = None) -> str:
     return "unknown"
 
 
+_TRANSIT_ROLES = {"core", "distribution", "unknown"}     # leaves (access, wan-edge) never forward between others
+
+
 @dataclass
 class _Link:
     a: str
@@ -221,7 +224,9 @@ class NetworkAssurance:
                     if link is None or link.state != "up" or link is without_link:
                         continue
                     seen.add(n)
-                    nxt.append(n)
+                    if self._role(n) in _TRANSIT_ROLES:
+                        nxt.append(n)           # leaves (access, WAN edge) are reached, never transited:
+                                                # a dual-homed access switch is not a backup path between distributions
             frontier = nxt
         return seen
 
@@ -345,11 +350,12 @@ class NetworkAssurance:
                     inc.suppressed += 1
                     self.stats["suppressed"] += 1
                     return []
-        # down: root cause or symptom?
-        if self._covered(device, ts):
+        # down: root cause or symptom? (a second uplink going on a device already in an incident widens it)
+        if self._covered(device, ts, downstream):
             return []
         peer = (link.b if device == link.a else link.a) if known else None
         redundant = not downstream and self._redundant(link)
+        last_path = downstream and any(i.fault == "link_down" and i.device == device and i.closed is None for i in self._incidents)
         inc = _Incident("link_down", device, iface, ts, downstream)
         self._incidents.append(inc)
         self.stats["link_down"] += 1
@@ -359,8 +365,9 @@ class NetworkAssurance:
                                 ev=ev, incident=inc, extra={"peer": peer, **self._push_extra(device)})]
         return [self._alert("link_down", device, iface, ts, severity="critical" if downstream else "high" if not redundant else "medium",
                             root_cause=f"{iface} on {device} is down" + (f" (link to {peer})" if peer else "")
-                                       + (" — a redundant path is carrying the traffic" if redundant else ""),
-                            downstream=downstream, ev=ev, incident=inc, extra={"peer": peer, "redundant": redundant})]
+                                       + (" — a redundant path is carrying the traffic" if redundant else "")
+                                       + (" — the LAST path: the redundant uplink was already down" if last_path else ""),
+                            downstream=downstream, ev=ev, incident=inc, extra={"peer": peer, "redundant": redundant, "last_path": bool(last_path)})]
 
     def _adjacency(self, ts: float, device: str, iface: str | None, state: str | None, ev: dict) -> list[dict]:
         if state != "down":
@@ -484,10 +491,13 @@ class NetworkAssurance:
         return out
 
     # --------------------------------------------------------- correlate --
-    def _covered(self, device: str, ts: float) -> bool:
-        """Is this device inside an open incident's blast radius? Then its alarm is a symptom."""
+    def _covered(self, device: str, ts: float, downstream: set[str] | None = None) -> bool:
+        """Is this device inside an open incident's blast radius? Then its alarm is a symptom — unless it
+        strands devices that incident did not (the LAST redundant path going): that is a new, wider fault."""
         for inc in reversed(self._incidents):
             if inc.covers(device, ts, self.corr_window_s):
+                if downstream and not downstream <= inc.downstream:
+                    return False
                 inc.suppressed += 1
                 if len(inc.symptoms) < 8:
                     inc.symptoms.append(device)

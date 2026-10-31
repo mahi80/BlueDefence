@@ -292,3 +292,42 @@ def test_registry_netops_file_source(monkeypatch, tmp_path):
     (name, it), *_ = sources_from_env()
     got = list(it)
     assert name == "netops" and [a["netops"]["fault"] for a in got] == ["link_down"]
+
+
+# ------------------------------------------------------------- blast radius edge cases --
+
+def _campus_with_cross_homed_access() -> NetworkAssurance:
+    """Like _campus, plus ACC-04 dual-homed to BOTH DIST-01 and DIST-02 (150 users)."""
+    d = _campus()
+    d.observe({"kind": "topology", "device": "ACC-04", "neighbor": "DIST-02", "iface": "GigabitEthernet1/0/49",
+               "neighbor_iface": "Ethernet1/6", "ts": T, "users": 150, "role": "access"})
+    d.observe({"kind": "topology", "device": "ACC-04", "neighbor": "DIST-01", "iface": "GigabitEthernet1/0/50",
+               "neighbor_iface": "Ethernet1/7", "ts": T, "users": 150, "role": "access"})
+    return d
+
+
+def test_an_access_switch_is_never_a_transit_path():
+    """ACC-04 hangs off both distributions. Graph-wise that makes DIST-02 'reachable' via ACC-04 → DIST-01 after
+    its own uplink is cut — but an access switch does not forward between distributions, so DIST-02's single-homed
+    children are stranded and the cut is critical, not redundant."""
+    d = _campus_with_cross_homed_access()
+    (a,) = d.observe(_down("DIST-02", "Ethernet1/49", T + 10, nxos=True))
+    assert a["severity"] == "critical" and a["netops"]["redundant"] is False
+    assert a["netops"]["downstream"] == ["ACC-02"] and a["netops"]["users_affected"] == 80       # ACC-04 still has DIST-01
+    # ACC-04 losing its DIST-02 leg is a redundant loss for ACC-04
+    d2 = _campus_with_cross_homed_access()
+    (b,) = d2.observe(_down("ACC-04", "GigabitEthernet1/0/49", T + 10))
+    assert b["severity"] == "medium" and b["netops"]["redundant"] is True
+
+
+def test_losing_the_last_redundant_uplink_widens_the_incident_instead_of_folding():
+    d = _campus_with_cross_homed_access()
+    (first,) = d.observe(_down("DIST-01", "Ethernet1/49", T + 10, nxos=True))
+    assert first["severity"] == "medium" and first["netops"]["redundant"] is True
+    (second,) = d.observe(_down("DIST-01", "Ethernet1/50", T + 40, nxos=True))
+    n = second["netops"]
+    assert second["severity"] == "critical" and n["last_path"] is True
+    assert n["downstream"] == ["ACC-01"] and n["users_affected"] == 120           # ACC-04 still has its DIST-02 leg
+    # and the access switches behind it are now symptoms of THAT incident
+    assert d.observe(_down("ACC-01", "GigabitEthernet1/0/49", T + 41)) == []
+    assert d.incident_for(second["id"])["suppressed"] == 1
