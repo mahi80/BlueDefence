@@ -89,6 +89,8 @@ class Pipeline:
     stream: Any = None                  # the shared StreamQueue the receivers feed; the loop wakes on it
     watchdog: Any = None                # feed-liveness watchdog (AEGIS_FEED_WATCHDOG=1); a silent feed is not "no attacks"
     metrics_server: Any = None          # standalone /metrics (AEGIS_METRICS_BIND) for a deployment with no push receiver
+    license: Any = None                 # aegis.license.LicenseState — per-installation licence (AEGIS_LICENSE)
+    license_meter: Any = None           # 24 h peak eps / devices against the licence
     model_key: str = ""                 # change-key of the promotion pointer the live model reflects (hot-reload)
 
     def hot_reload_from_pointer(self) -> Any:
@@ -112,7 +114,9 @@ class Pipeline:
 
     def banner(self) -> str:
         g = self.governed
+        lic = self.license
         return (f"[{self.edition}] LLM backend: {self.primary_name} ({self.primary_model})"
+                + (f" — {lic.describe()} — installation {lic.installation_id}" if lic is not None else "")
                 + (f" — governed by ACP as {g.agent_code}" if g else " — ungoverned brain")
                 + f" — HITL {getattr(getattr(self.response, '_hitl', None), 'name', 'stdout')}"
                 + (f" — swarm on ({self.orch.max_workers} workers, {self.orch.max_seconds:.0f}s cap)"
@@ -147,6 +151,8 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     ``include_mock_intel`` seeds the IOC store with the built-in mock feed (demo default);
     the service reads ``AEGIS_INTEL_MOCK`` (default off) when it is not given.
     """
+    from aegis import license as licensing
+    lic_state = licensing.apply(licensing.check())       # per-installation licence first: it may cap the edition / force shadow
     edition = apply_edition()                            # fills edition defaults, refuses contradictory config (fail fast)
     audit_path = Path(audit_path)
     if fresh and audit_path.exists():
@@ -205,7 +211,8 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     # endpoint serves the active enforcement set to any edge enforcer
     from aegis.ingest.stream import get_stream
     from aegis.ingest.http_push import push_server_from_env
-    push_server = push_server_from_env(blocklist=lambda: connectors.active_receipts, audit_path=audit_path)
+    push_server = push_server_from_env(blocklist=lambda: connectors.active_receipts, audit_path=audit_path,
+                                       license=lambda: lic_state)
     eventhub = None
     if "eventhub" in [x.strip().lower() for x in os.environ.get("AEGIS_SOURCES", "").split(",")]:
         from aegis.ingest.eventhub import eventhub_from_env
@@ -219,7 +226,10 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
                  rules_report=rules_report, primary_name=primary.name, primary_model=primary.model,
                  investigator=investigator, containment=containment, edition=edition.name,
                  push_server=push_server, eventhub=eventhub, stream=get_stream(), watchdog=watchdog,
-                 metrics_server=metrics_server)
+                 metrics_server=metrics_server, license=lic_state,
+                 license_meter=licensing.LicenseMeter(eps_limit=lic_state.eps_limit, devices_limit=lic_state.devices_limit,
+                                                      allowance_s=float(os.environ.get("AEGIS_LICENSE_OVERLIMIT_DAYS", "7")) * 86400))
+    _license_metrics(lic_state)
     # record which promotion the live model reflects, so hot-reload fires only on a CHANGE. The
     # local backend applied the pointer at startup (via _promoted_model); the vllm backend does
     # not, so leave its key empty and let the first hot-reload cycle apply the promoted adapter.
@@ -338,7 +348,49 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
     if p.persist_sink is not None:
         p.persist_sink.flush()
     stats.seconds = time.time() - t0
+    _meter_license(p, stats)
     return stats
+
+
+def _license_metrics(state: Any) -> None:
+    from aegis.agents.shared.observability import METRICS
+    for st in ("valid", "grace", "over_limit", "expired", "missing", "invalid"):
+        METRICS.set("aegis_license_state", 1.0 if state.status == st else 0.0, status=st)
+    METRICS.set("aegis_license_days_left", float(state.days_left) if state.days_left is not None else -1.0)
+    METRICS.set("aegis_license_enforced", 1.0 if state.enforce else 0.0)
+
+
+def _meter_license(p: Pipeline, stats: CycleStats) -> None:
+    """Events this cycle (alerts handled + everything the stream drained) against the licence. Over the
+    limit for longer than the allowance → re-evaluate as over_limit, which in enforce mode forces shadow
+    for the rest of the run (connectors read the mode per call). Never a stop, never a drop."""
+    meter, state = p.license_meter, p.license
+    if meter is None or state is None:
+        return
+    from aegis import license as licensing
+    drained = int(getattr(getattr(p.stream, "stats", None), "drained", 0) or 0)
+    delta = max(0, drained - int(getattr(meter, "_last_drained", 0)))
+    meter._last_drained = drained
+    devices = None
+    try:
+        from aegis.ingest.netops import _shared as net_det   # the netops inventory is the device count when present
+        if net_det is not None:
+            devices = len(getattr(net_det, "_adj", {}) or {})
+    except Exception:  # noqa: BLE001
+        devices = None
+    over = meter.observe(stats.alerts + delta, time.time(), devices)
+    if over and state.status == "valid":
+        new = licensing.check(over_limit=True)
+        if new.status == "over_limit":
+            p.license = licensing.apply(new)
+            _license_metrics(p.license)
+            logger.warning("[license] %s", p.license.reason)
+    elif state.status in ("grace", "over_limit") and time.time() - getattr(meter, "_last_warn", 0.0) > 3600:
+        meter._last_warn = time.time()                       # hourly, not every cycle
+        logger.warning("[license] %s", state.describe())
+    from aegis.agents.shared.observability import METRICS
+    METRICS.set("aegis_license_peak_eps_24h", meter.peak_eps_24h)
+    METRICS.set("aegis_license_devices_seen", float(meter.devices_seen))
 
 
 class Service:

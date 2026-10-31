@@ -22,6 +22,8 @@
     POST /ingest/alerts       already-normalised AEGIS alerts, one JSON object per line
                               (custom forwarders, the purple-team harness).
     GET  /ingest/blocklist    the active enforcement set (IPs, CIDRs, client fingerprints)
+    GET  /ingest/license      the installation's licence state (status, edition, tier, features, limits) — the
+                              Kafka bridge checks the ``kafka_bridge`` feature here before it starts
     GET  /ingest/verdicts     cursor feed of finalised evidence chains for a message bus (the Kafka
                               bridge): ``?after=<seq>&limit=<n>`` returns chains with seq > after, in
                               order, with ``next`` to pass back; seq is the chain's 1-based position in
@@ -94,7 +96,7 @@ class PushServer:
 
     def __init__(self, *, token: str, bind: str = DEFAULT_BIND, queue: Optional[StreamQueue] = None,
                  max_mb: int = DEFAULT_MAX_MB, blocklist: Optional[Callable[[], list[Any]]] = None,
-                 audit_path: Optional[Path] = None):
+                 audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None):
         host, _, port = bind.rpartition(":")
         self.host, self.port = (host or "0.0.0.0"), int(port or 8787)
         if not token and not _is_loopback(self.host):
@@ -104,6 +106,7 @@ class PushServer:
         self.max_bytes = int(max_mb) * 1024 * 1024
         self.blocklist = blocklist
         self.audit_path = Path(audit_path) if audit_path else None
+        self.license = license
         self.limiter = _AuthFailLimiter()
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -282,7 +285,23 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 — stdlib naming
         path = urlsplit(self.path).path
         if path == "/healthz":
-            self._reply(200, {"ok": True, "queue": len(self.server_ref.queue), **self.server_ref.queue.stats.to_dict()})
+            body = {"ok": True, "queue": len(self.server_ref.queue), **self.server_ref.queue.stats.to_dict()}
+            if self.server_ref.license is not None:
+                try:
+                    st = self.server_ref.license()
+                    body["license"] = {"status": st.status, "installation_id": st.installation_id, "days_left": st.days_left}
+                except Exception:  # noqa: BLE001
+                    pass
+            self._reply(200, body)
+            return
+        if path == "/ingest/license":
+            if not self.server_ref.authorized(self.headers):
+                self._reply(401, {"error": "unauthorized"})
+                return
+            if self.server_ref.license is None:
+                self._reply(503, {"error": "no licence state attached to this receiver"})
+                return
+            self._reply(200, self.server_ref.license().to_dict())
             return
         if path == "/metrics":
             from aegis.agents.shared.observability import METRICS, PROMETHEUS_CONTENT_TYPE, metrics_authorized
@@ -365,7 +384,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
-                         audit_path: Optional[Path] = None) -> Optional[PushServer]:
+                         audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None) -> Optional[PushServer]:
     """``AEGIS_INGEST_HTTP=1`` (or any ``AEGIS_INGEST_BIND``) starts the receiver; ``AEGIS_INGEST_TOKEN``
     is required off loopback. Returns the running server or ``None``."""
     on = os.environ.get("AEGIS_INGEST_HTTP", "").strip().lower() in ("1", "true", "yes", "on")
@@ -375,7 +394,7 @@ def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
     try:
         srv = PushServer(token=os.environ.get("AEGIS_INGEST_TOKEN", "").strip(), bind=bind or DEFAULT_BIND,
                          max_mb=int(os.environ.get("AEGIS_INGEST_MAX_MB", str(DEFAULT_MAX_MB))), blocklist=blocklist,
-                         audit_path=audit_path)
+                         audit_path=audit_path, license=license)
         return srv.start()
     except Exception as e:  # noqa: BLE001 — a bad bind must not take the SOC down; polling still works
         logger.error("[ingest:http] push receiver not started: %s", str(e)[:200])

@@ -751,6 +751,7 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 | Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_PROTECTED_TARGETS`, `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH` |
 | Agentic attackers | `AEGIS_AUTO_BLOCK` (`off` · `shadow` · `live`), `AEGIS_AUTO_BLOCK_MIN_CONF`, `AEGIS_AUTO_BLOCK_TTL`, `AEGIS_AUTO_BLOCK_MAX_PER_HOUR`, `AEGIS_FP_ALLOW`, `AEGIS_ADAPTIVE_MIN_RETRIES`, `AEGIS_ADAPTIVE_MAX_RETRY_S`, `AEGIS_AUTH_BURST_MIN`, `AEGIS_AWS_WAF_RULE_GROUP`, `AEGIS_JA4_DB`, `AEGIS_TLS_SHARED_UAS`, `AEGIS_TLS_LIBRARY_IPS` |
 | Network sensor (NDR) | `NDR_EVENT_FILE`, `AEGIS_INTERNAL_NETS`, `AEGIS_TLS_IOC_FILE`, `AEGIS_AI_REGISTER`, `AEGIS_SHADOW_AI_REGISTER`, `AEGIS_AI_PROVIDERS_EXTRA`, `AEGIS_NDR_RARE_MAX_SRCS`, `AEGIS_NDR_BEACON_MIN_CONN`, `AEGIS_NDR_BEACON_MIN_SPAN_S`, `AEGIS_NDR_BEACON_MAX_JITTER`, `AEGIS_NDR_EXFIL_MIN_MB`, `AEGIS_NDR_EXFIL_WINDOW_S`, `AEGIS_NDR_EXFIL_RATIO`, `AEGIS_NDR_AI_UPLOAD_MB`, `AEGIS_NDR_ALLOW_DOMAINS`, `AEGIS_NDR_ALLOW_HOSTS` |
+| Licence | `AEGIS_LICENSE`, `AEGIS_LICENSE_ENFORCE`, `AEGIS_INSTALL_ID`, `AEGIS_INSTALL_SALT`, `AEGIS_LICENSE_PUBKEYS`, `AEGIS_LICENSE_OVERLIMIT_DAYS` — see the root README § Licensing |
 | Network assurance | `NETOPS_EVENT_FILE`, `AEGIS_NET_FLAP_N`, `AEGIS_NET_FLAP_WINDOW_S`, `AEGIS_NET_CORR_WINDOW_S`, `AEGIS_NET_ERR_PER_MIN`, `AEGIS_NET_UTIL_PCT`, `AEGIS_NET_UTIL_SAMPLES`, `AEGIS_NET_SILENT_S`, `AEGIS_NET_BAD_PUSH_S`, `AEGIS_NET_GOLDEN`, `AEGIS_NET_GOLDEN_FIRST_SEEN`, `AEGIS_NET_INVENTORY` |
 | BOLA | `AEGIS_OWNERSHIP_FILE`, `AEGIS_OWNERSHIP_URL`, `AEGIS_OWNERSHIP_TOKEN`, `AEGIS_BOLA_WINDOW_S`, `AEGIS_BOLA_CROSS_MIN`, `AEGIS_BOLA_ATTEMPT_MIN`, `AEGIS_BOLA_DISTINCT_MIN`, `AEGIS_BOLA_EXEMPT_PRINCIPALS`, `AEGIS_APIGW_PRINCIPAL_FIELD`, `APIGW_EVENT_FILE`, `AEGIS_EVENTHUB_SOURCE` |
 | Intel | `AEGIS_CVE_INTEL`, `NVD_API_KEY`, `AEGIS_TI_CACHE`, `AEGIS_INTEL_MOCK`, `AEGIS_STACKS` |
@@ -765,6 +766,7 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 |---|---|
 | `service.py` | the long-running SOC process (`build_pipeline`, `run_cycle`, `--once`) |
 | `edition.py` | editions, defaults, contradiction checks |
+| `license.py` | per-installation licence: stdlib RSA verify, issue/keygen/verify/report CLI, evaluation mode, feature gates, 24 h meter; public keys in `keys/` |
 | `ingest/` | Sentinel, WAF, API-gateway, network-sensor (`ndr.py`), network-operations (`netops.py`: syslog / traps / flows / telemetry / configs / LLDP), ACP consumers; push receiver (`http_push.py`, incl. the `/ingest/verdicts` feed), stream queue (`stream.py`), Event Hub reader (`eventhub.py`); checkpoint |
 | `agents/orchestrator/` | triage, specialist dispatch, voter, fast paths (control-plane, adaptive attacker, credential stuffing, BOLA, spoofed browser, egress), swarm |
 | `agents/netops/` | network assurance: topology (LLDP) → reachability-diff blast radius, root cause vs symptom, flaps, telemetry thresholds, config drift and bad pushes |
