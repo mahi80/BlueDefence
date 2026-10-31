@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -75,26 +76,116 @@ class _MetricRegistry:
             }
 
     def prometheus_text(self) -> str:
-        """Render in Prometheus exposition format for scraping."""
+        """Render in Prometheus exposition format (text 0.0.4) for scraping. Samples are grouped
+        per metric under one ``# TYPE`` line, and label values are escaped — an unescaped quote,
+        backslash or newline in any one label (a feed or source name) makes Prometheus reject
+        the WHOLE scrape, which would blind every dashboard and alert at once."""
+        def esc(v: Any) -> str:
+            return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+        def render(kind: str, items: dict) -> None:
+            seen: set[str] = set()
+            for (name, lbls), val in sorted(items.items(), key=lambda kv: (kv[0][0], sorted((str(k), str(v)) for k, v in kv[0][1]))):
+                if name not in seen:
+                    lines.append(f"# TYPE {name} {kind}")
+                    seen.add(name)
+                lbl_str = ",".join(f'{k}="{esc(v)}"' for k, v in sorted(dict(lbls).items()))
+                lines.append(f"{name}{{{lbl_str}}} {val}" if lbl_str else f"{name} {val}")
+
         lines: list[str] = []
-        seen_help: set[str] = set()
         with self._lock:
-            for (name, lbls), val in sorted(self.counters.items()):
-                if name not in seen_help:
-                    lines.append(f"# TYPE {name} counter")
-                    seen_help.add(name)
-                lbl_str = ",".join(f'{k}="{v}"' for k, v in sorted(dict(lbls).items()))
-                lines.append(f'{name}{{{lbl_str}}} {val}' if lbl_str else f"{name} {val}")
-            for (name, lbls), val in sorted(self.gauges.items()):
-                if name not in seen_help:
-                    lines.append(f"# TYPE {name} gauge")
-                    seen_help.add(name)
-                lbl_str = ",".join(f'{k}="{v}"' for k, v in sorted(dict(lbls).items()))
-                lines.append(f'{name}{{{lbl_str}}} {val}' if lbl_str else f"{name} {val}")
+            render("counter", dict(self.counters))
+            render("gauge", dict(self.gauges))
         return "\n".join(lines) + "\n"
 
 
 METRICS = _MetricRegistry()
+
+PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+def metrics_authorized(headers: Any, token: str | None = None) -> bool:
+    """``AEGIS_METRICS_TOKEN`` set → the scrape must present it as ``Authorization: Bearer`` (Prometheus
+    ``authorization: {credentials: …}``). Unset → open, like ``/healthz``: serve it on the internal network."""
+    import hmac
+    want = (token if token is not None else os.environ.get("AEGIS_METRICS_TOKEN", "")).strip()
+    if not want:
+        return True
+    auth = str(headers.get("Authorization", "") or "")
+    presented = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    return bool(presented) and hmac.compare_digest(presented.encode(), want.encode())
+
+
+class MetricsServer:
+    """A metrics-only endpoint (``GET /metrics``, ``GET /healthz``) for a deployment that runs no push
+    receiver — a SOC that only polls its SIEM still has to be scrapeable. Stdlib, its own daemon thread."""
+
+    def __init__(self, bind: str, *, token: str | None = None):
+        host, _, port = bind.rpartition(":")
+        self.host, self.port = (host or "0.0.0.0"), int(port or 9464)
+        self.token = token
+        self._httpd = None
+
+    def start(self) -> "MetricsServer":
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import urlsplit
+        server = self
+
+        class _H(BaseHTTPRequestHandler):
+            def log_message(self, *a: Any) -> None:  # quiet: scrapes every 15 s would flood the log
+                return
+
+            def _send(self, code: int, body: bytes, ctype: str) -> None:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                path = urlsplit(self.path).path
+                if path == "/healthz":
+                    self._send(200, b'{"ok": true}', "application/json")
+                elif path == "/metrics":
+                    if not metrics_authorized(self.headers, server.token):
+                        self._send(401, b'{"error": "unauthorized"}', "application/json")
+                    else:
+                        self._send(200, METRICS.prometheus_text().encode(), PROMETHEUS_CONTENT_TYPE)
+                else:
+                    self._send(404, b'{"error": "not found"}', "application/json")
+
+        self._httpd = ThreadingHTTPServer((self.host, self.port), _H)
+        self._httpd.daemon_threads = True
+        self.port = self._httpd.server_address[1]
+        threading.Thread(target=self._httpd.serve_forever, name="AegisMetricsServer", daemon=True).start()
+        _log.info("[metrics] serving /metrics on %s:%d (%s)", self.host, self.port,
+                  "no token" if metrics_authorized({}, self.token) else "token required")
+        return self
+
+    def stop(self) -> None:
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
+
+    @property
+    def url(self) -> str:
+        host = "127.0.0.1" if self.host in ("0.0.0.0", "") else self.host
+        return f"http://{host}:{self.port}"
+
+
+def metrics_server_from_env() -> "MetricsServer | None":
+    """``AEGIS_METRICS_BIND`` (e.g. ``0.0.0.0:9464``) starts the standalone metrics endpoint. The push
+    receiver also serves ``/metrics`` on its own port, so this is for deployments without it.
+    A bad bind is logged, never fatal: metrics must not take the SOC down."""
+    bind = os.environ.get("AEGIS_METRICS_BIND", "").strip()
+    if not bind:
+        return None
+    try:
+        return MetricsServer(bind).start()
+    except Exception as e:  # noqa: BLE001
+        _log.error("[metrics] metrics endpoint not started on %s: %s", bind, str(e)[:200])
+        return None
 
 
 # ---- Span wrapper (OTel if available, else internal) ---------------

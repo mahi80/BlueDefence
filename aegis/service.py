@@ -88,6 +88,7 @@ class Pipeline:
     eventhub: Any = None                # Azure Event Hub reader (AEGIS_SOURCES includes eventhub)
     stream: Any = None                  # the shared StreamQueue the receivers feed; the loop wakes on it
     watchdog: Any = None                # feed-liveness watchdog (AEGIS_FEED_WATCHDOG=1); a silent feed is not "no attacks"
+    metrics_server: Any = None          # standalone /metrics (AEGIS_METRICS_BIND) for a deployment with no push receiver
     model_key: str = ""                 # change-key of the promotion pointer the live model reflects (hot-reload)
 
     def hot_reload_from_pointer(self) -> Any:
@@ -119,7 +120,8 @@ class Pipeline:
                 + (" — campaign context on" if getattr(self.orch, "_events", None) is not None else "")
                 + f" — connectors {self.connectors.mode}"
                 + f" — auto-block {getattr(getattr(self.response, '_autonomy', None), 'mode', 'off')}"
-                + (f" — push receiver {self.push_server.url}" if self.push_server is not None else "")
+                + (f" — push receiver {self.push_server.url} (+/metrics)" if self.push_server is not None else "")
+                + (f" — metrics {self.metrics_server.url}/metrics" if self.metrics_server is not None else "")
                 + (" — event hub reader on" if self.eventhub is not None else "")
                 + (" — feed watchdog on" if self.watchdog is not None else ""))
 
@@ -129,7 +131,7 @@ class Pipeline:
             flush()                                      # the discovered-AI-usage register, if NDR ran
         except Exception as e:  # noqa: BLE001
             logger.warning("[service] AI usage register flush failed: %s", e)
-        for r in (self.push_server, self.eventhub):
+        for r in (self.push_server, self.eventhub, self.metrics_server):
             if r is not None:
                 try:
                     r.stop()
@@ -210,11 +212,14 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
         eventhub = eventhub_from_env()
     from aegis.ingest.watchdog import feed_watchdog_from_env
     watchdog = feed_watchdog_from_env()              # a dead feed must page someone, not hide as silence
+    from aegis.agents.shared.observability import metrics_server_from_env
+    metrics_server = metrics_server_from_env()       # the push receiver serves /metrics too; this is for poll-only SOCs
     p = Pipeline(orch=orch, response=response, audit=audit, audit_path=audit_path, threat_intel=threat_intel,
                  connectors=connectors, receipt_log=receipt_log, persist_sink=persist_sink, governed=governed,
                  rules_report=rules_report, primary_name=primary.name, primary_model=primary.model,
                  investigator=investigator, containment=containment, edition=edition.name,
-                 push_server=push_server, eventhub=eventhub, stream=get_stream(), watchdog=watchdog)
+                 push_server=push_server, eventhub=eventhub, stream=get_stream(), watchdog=watchdog,
+                 metrics_server=metrics_server)
     # record which promotion the live model reflects, so hot-reload fires only on a CHANGE. The
     # local backend applied the pointer at startup (via _promoted_model); the vllm backend does
     # not, so leave its key empty and let the first hot-reload cycle apply the promoted adapter.
