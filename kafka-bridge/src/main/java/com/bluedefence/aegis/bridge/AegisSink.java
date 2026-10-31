@@ -26,7 +26,7 @@ import org.slf4j.LoggerFactory;
  * is dropped on the floor. A 4xx other than 429 means the batch itself is bad (wrong token, body
  * too large); it is logged and dropped, because retrying it would never succeed.
  */
-public final class AegisSink implements AutoCloseable {
+public class AegisSink implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(AegisSink.class);
 
