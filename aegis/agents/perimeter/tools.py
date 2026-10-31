@@ -7,9 +7,12 @@ historical query, etc.) keeping the same signature.
 from __future__ import annotations
 
 import base64
+import collections
 import ipaddress
 import os
 import re
+import threading
+import time
 import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
@@ -28,6 +31,13 @@ _SQLI_PRIMITIVES = (
     "union select", "' or 1=1", "' or '1'='1", " or 1=1", " or '1'='1",
     "/*!50000", "sleep(", "benchmark(", "load_file(", "@@version",
     "information_schema", " or true--", "'--", "\";--",
+    # boolean-blind (AND true/false probes), ORDER BY / LIKE / nested sub-select, paren-close
+    # breaks, and #/-- comment terminators — the signatureless SQLi variants the UNION-only set
+    # slipped past in the 2026-10-27 purple-team run. decode_payload's whitespace-collapse layer
+    # also makes these catch the newline-evaded body form (SQLI_BODY_NEWLINE).
+    "' and 1=1", "' and 1=2", " and 1=1", " and 1=2", "' and '1'='1", "' and 'x'='x",
+    "order by ", "' like '", " like '%", "(select ", "=(select ",
+    "') or ", "') and ", ") or 1=1", "'#", '"#', "')#", "')-- ",
 )
 _XSS_PRIMITIVES = ("<script", "javascript:", "onerror=", "onload=", "<svg")
 _RCE_PRIMITIVES = ("$(", "`whoami`", "; cat ", "&& cat ", "|nc ", "wget ", "curl ", "; id;",
@@ -344,6 +354,185 @@ def host_header_anomaly(alert: dict) -> ToolResult:
     return ToolResult(name="host_header_anomaly", data={"host": host[:200]}, weight="low")
 
 
+# ---- Tool: header / cookie injection -----------------------------------
+
+#: headers an app commonly trusts, logs or reflects unsanitized — a payload here reaches the
+#: backend without ever touching the query string the simpler scanners watch.
+_INJECTABLE_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-real-ip", "true-client-ip",
+                       "referer", "referrer", "forwarded", "x-original-url", "x-rewrite-url",
+                       "x-api-version", "x-request-id", "cookie")
+_CRLF_MARKERS = ("\r", "\n", "%0d", "%0a", "\\r", "\\n")
+
+
+def header_injection(alert: dict) -> ToolResult:
+    """Injection carried in request headers (incl. Cookie): CRLF / response-splitting in any
+    header value, or SQLi / XSS / traversal / RCE primitives in a header the app tends to trust
+    (XFF, Referer, Cookie, …). Covers the header- and cookie-borne classes the query-only scan
+    misses — e.g. SQLi read from a session cookie the app concatenates into a lookup."""
+    req = alert.get("request_headers") if isinstance(alert.get("request_headers"), dict) else {}
+    if not req:
+        return ToolResult(name="header_injection", data={"applicable": False}, weight="low")
+    hits: list[dict] = []
+    cookie_injection = False
+    for name, value in req.items():
+        lname = str(name).lower()
+        val = str(value)
+        if any(m in val for m in _CRLF_MARKERS):
+            hits.append({"header": lname, "kind": "crlf"})
+        if lname in _INJECTABLE_HEADERS:
+            low = urllib.parse.unquote_plus(val).lower()
+            prim = ([p for p in _SQLI_PRIMITIVES if p in low]
+                    + [p for p in _XSS_PRIMITIVES if p in low]
+                    + [p for p in _TRAVERSAL_PRIMITIVES if p in low]
+                    + [p for p in _RCE_PRIMITIVES if p in low])
+            if prim:
+                hits.append({"header": lname, "kind": "payload", "primitives": prim[:5]})
+                if lname == "cookie":
+                    cookie_injection = True
+    if not hits:
+        return ToolResult(name="header_injection", data={"headers_checked": len(req)}, weight="low")
+    weight = "high" if (cookie_injection or any(h["kind"] == "crlf" for h in hits) or len(hits) >= 2) else "medium"
+    return ToolResult(name="header_injection",
+                      data={"hits": hits, "cookie_injection": cookie_injection}, weight=weight)
+
+
+# ---- Tool: automated-scanner signature ---------------------------------
+
+#: known offensive tools and bare HTTP libraries used as a sole UA. The high set are scanners
+#: with no benign use against a bank; the rest are tells, not proof.
+_SCANNER_UAS_HIGH = ("sqlmap", "nikto", "nuclei", "acunetix", "nessus", "wpscan", "arachni",
+                     "metasploit", "havij")
+_SCANNER_UAS_MED = ("nmap", "masscan", "dirbuster", "gobuster", "feroxbuster", "ffuf", "zgrab",
+                    "httpx", "python-requests", "go-http-client", "libwww-perl", "curl/", "wget/")
+
+
+def scanner_signature(alert: dict) -> ToolResult:
+    """Automated-tool tells: an empty / missing User-Agent (EMPTY_UA), or a known scanner /
+    bare-HTTP-library UA. A tell, not a verdict — it raises suspicion, the brain decides."""
+    req = alert.get("request_headers") if isinstance(alert.get("request_headers"), dict) else {}
+    ua = str(alert.get("user_agent") or req.get("User-Agent") or req.get("user-agent") or "").strip()
+    if not ua:
+        return ToolResult(name="scanner_signature",
+                          data={"user_agent": "", "reason": "empty/missing user-agent"}, weight="medium")
+    low = ua.lower()
+    for sig in _SCANNER_UAS_HIGH:
+        if sig in low:
+            return ToolResult(name="scanner_signature",
+                              data={"user_agent": ua[:200], "scanner": sig}, weight="high")
+    for sig in _SCANNER_UAS_MED:
+        if sig in low:
+            return ToolResult(name="scanner_signature",
+                              data={"user_agent": ua[:200], "tool": sig}, weight="medium")
+    return ToolResult(name="scanner_signature", data={"user_agent": ua[:120]}, weight="low")
+
+
+# ---- Tool: reconnaissance sweep (per-source, stateful) -----------------
+
+_RECON_WINDOW_SEC = int(os.environ.get("AEGIS_RECON_WINDOW_SEC", "60"))
+_RECON_PATHS_HIGH = int(os.environ.get("AEGIS_RECON_PATHS_HIGH", "20"))
+_RECON_PATHS_MED = int(os.environ.get("AEGIS_RECON_PATHS_MED", "10"))
+_RECON_MAX_IPS = int(os.environ.get("AEGIS_RECON_MAX_IPS", "20000"))
+_recon_lock = threading.Lock()
+_recon_seen: "dict[str, collections.deque]" = collections.defaultdict(collections.deque)
+
+
+def recon_sweep(source_ip: str, alert: dict, *, now: Optional[float] = None) -> ToolResult:
+    """Directory / endpoint sweep: one source touching many distinct paths in a short window —
+    the shape of a scanner enumerating the app (RECON_SWEEP). Stateful per source IP, in a
+    sliding window; thresholds via AEGIS_RECON_PATHS_HIGH / _MED / _WINDOW_SEC."""
+    ip = str(source_ip or "").strip()
+    if not ip:
+        return ToolResult(name="recon_sweep", data={"applicable": False}, weight="low")
+    url = str(alert.get("url") or "")
+    path = urllib.parse.urlsplit(url).path or url
+    ts = now if now is not None else time.time()
+    cutoff = ts - _RECON_WINDOW_SEC
+    with _recon_lock:
+        dq = _recon_seen[ip]
+        dq.append((ts, path))
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+        n = len({p for _t, p in dq})
+        # bound memory: drop sources that have gone quiet, then the whole map if still too large
+        if len(_recon_seen) > _RECON_MAX_IPS:
+            for k in [k for k, v in _recon_seen.items() if not v or v[-1][0] < cutoff]:
+                _recon_seen.pop(k, None)
+    if n >= _RECON_PATHS_HIGH:
+        return ToolResult(name="recon_sweep",
+                          data={"distinct_paths": n, "window_sec": _RECON_WINDOW_SEC}, weight="high")
+    if n >= _RECON_PATHS_MED:
+        return ToolResult(name="recon_sweep",
+                          data={"distinct_paths": n, "window_sec": _RECON_WINDOW_SEC}, weight="medium")
+    return ToolResult(name="recon_sweep", data={"distinct_paths": n}, weight="low")
+
+
+# ---- Tool: object-id enumeration (IDOR probing, per-actor) -------------
+
+#: parameter names that typically carry a direct object reference. Walking many distinct values
+#: of one of these on a single endpoint is the shape of IDOR exploitation / enumeration.
+_ID_PARAMS = {"id", "user_id", "userid", "uid", "account", "account_id", "accountid", "acct",
+              "customer_id", "customerid", "cust_id", "order_id", "orderid", "invoice_id",
+              "doc_id", "file_id", "record_id", "txn_id", "transaction_id", "ref", "pid",
+              "object_id", "obj_id", "profile_id", "msg_id", "message_id", "card_id", "stmt_id"}
+_IDENUM_WINDOW_SEC = int(os.environ.get("AEGIS_IDENUM_WINDOW_SEC", "120"))
+_IDENUM_HIGH = int(os.environ.get("AEGIS_IDENUM_HIGH", "15"))
+_IDENUM_MED = int(os.environ.get("AEGIS_IDENUM_MED", "6"))
+_idenum_lock = threading.Lock()
+_idenum_seen: "dict[tuple, collections.deque]" = collections.defaultdict(collections.deque)
+
+
+def _id_params_from(alert: dict, raw_payload: str) -> "list[tuple[str, str]]":
+    pairs: list = []
+    q = urllib.parse.urlsplit(str(alert.get("url") or "")).query
+    if q:
+        pairs += urllib.parse.parse_qsl(q, keep_blank_values=False)
+    bp = alert.get("body_params")
+    if isinstance(bp, dict):
+        pairs += [(k, v) for k, v in bp.items()]
+    if not pairs and raw_payload:
+        try:
+            pairs += urllib.parse.parse_qsl(raw_payload, keep_blank_values=False)
+        except Exception:  # noqa: BLE001, S110 — not form-encoded; nothing to enumerate
+            pass
+    return [(str(k).lower(), str(v).strip()) for k, v in pairs
+            if str(k).lower() in _ID_PARAMS and str(v).strip()]
+
+
+def id_enumeration(source_ip: str, alert: dict, raw_payload: str = "", *,
+                   now: Optional[float] = None) -> ToolResult:
+    """Object-id enumeration / IDOR probing: one actor requesting many DISTINCT values of an
+    object-id parameter on one endpoint in a window — walking ``/account?id=1,2,3…``. Keyed by
+    the shim-supplied ``principal`` when present (so authenticated sessions are told apart even
+    behind one IP / a loopback lab), else the source IP. Stateful, windowed, thread-safe."""
+    actor = str(alert.get("principal") or source_ip or "").strip()
+    ids = _id_params_from(alert, raw_payload)
+    if not actor or not ids:
+        return ToolResult(name="id_enumeration", data={"applicable": False}, weight="low")
+    path = urllib.parse.urlsplit(str(alert.get("url") or "")).path or "/"
+    ts = now if now is not None else time.time()
+    cutoff = ts - _IDENUM_WINDOW_SEC
+    best, best_param = 0, ""
+    with _idenum_lock:
+        for key, value in ids:
+            dq = _idenum_seen[(actor, path, key)]
+            dq.append((ts, value))
+            while dq and dq[0][0] < cutoff:
+                dq.popleft()
+            n = len({v for _t, v in dq})
+            if n > best:
+                best, best_param = n, key
+        if len(_idenum_seen) > _RECON_MAX_IPS:
+            for k in [k for k, v in _idenum_seen.items() if not v or v[-1][0] < cutoff]:
+                _idenum_seen.pop(k, None)
+    data = {"actor": actor[:40], "path": path, "param": best_param,
+            "distinct_ids": best, "window_sec": _IDENUM_WINDOW_SEC}
+    if best >= _IDENUM_HIGH:
+        return ToolResult(name="id_enumeration", data=data, weight="high")
+    if best >= _IDENUM_MED:
+        return ToolResult(name="id_enumeration", data=data, weight="medium")
+    return ToolResult(name="id_enumeration", data=data, weight="low")
+
+
 # ---- Helpers -----------------------------------------------------------
 
 def run_all_tools(raw_payload: str, source_ip: str, user_id: Optional[str],
@@ -358,4 +547,8 @@ def run_all_tools(raw_payload: str, source_ip: str, user_id: Optional[str],
         cors_reflection(alert),
         mass_assignment(alert, raw_payload),
         host_header_anomaly(alert),
+        header_injection(alert),
+        scanner_signature(alert),
+        recon_sweep(source_ip, alert),
+        id_enumeration(source_ip, alert, raw_payload),
     ]

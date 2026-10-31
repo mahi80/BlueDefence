@@ -212,4 +212,12 @@ def _summarize_result(r: tools.ToolResult) -> str:
         return f"extra_params={r.data.get('extra_params', r.data.get('sensitive_params_posted', []))}"
     if r.name == "host_header_anomaly":
         return f"host_anomaly={r.data.get('reasons', r.data.get('reason', 'ok'))}"
+    if r.name == "header_injection":
+        return f"header_injection={[h.get('header') for h in r.data.get('hits', [])]}, cookie={r.data.get('cookie_injection', False)}"
+    if r.name == "scanner_signature":
+        return f"scanner={r.data.get('scanner') or r.data.get('tool') or r.data.get('reason', 'none')}"
+    if r.name == "recon_sweep":
+        return f"distinct_paths={r.data.get('distinct_paths', 0)} in {r.data.get('window_sec', 0)}s"
+    if r.name == "id_enumeration":
+        return f"distinct_ids={r.data.get('distinct_ids', 0)} on {r.data.get('param', '-')}@{r.data.get('path', '-')}"
     return "tool_result"

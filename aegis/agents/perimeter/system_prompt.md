@@ -14,7 +14,14 @@ For each dispatched alert:
    `ssrf_probe` (a request URL aimed at an internal / metadata / link-local
    host), `cors_reflection` (ACAO echoing the Origin with credentials),
    `mass_assignment` (posted params beyond the rendered form, e.g.
-   `role` / `credit_score` / `kyc_status`), and `host_header_anomaly`.
+   `role` / `credit_score` / `kyc_status`), `host_header_anomaly`,
+   `header_injection` (CRLF or an injection payload in a trusted request
+   header, incl. a SQLi/XSS payload carried in the Cookie),
+   `scanner_signature` (an empty User-Agent or a known scanner/HTTP-library
+   UA), `recon_sweep` (one source touching many distinct paths in a
+   short window — directory / endpoint enumeration), and `id_enumeration`
+   (one caller — by hashed `principal` when known, else source IP — walking
+   many distinct object-ids on one endpoint, the shape of IDOR probing).
    A `high`-weight hit from any of these is a strong malicious signal even
    when no classic injection primitive is present — these are the
    "valid-looking request" attacks that signature rules miss.

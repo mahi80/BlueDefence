@@ -45,6 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
+import hashlib
 import hmac
 import urllib.error
 import urllib.request
@@ -78,6 +79,34 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 #: Shared opener that relays redirects instead of following them (see _NoRedirect). A non-followed
 #: 3xx surfaces as urllib.error.HTTPError and is relayed by _forward_upstream's existing handler.
 _OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+# ---- caller identity (for IDOR / id-enumeration correlation) -----------
+
+_SESSION_COOKIE_NAMES = ("session", "sessionid", "session_id", "phpsessid", "sid", "jsessionid",
+                         "connect.sid", "auth", "authtoken", "auth_token", "token", "sess", "_session",
+                         "laravel_session", "ci_session")
+_PRINCIPAL_SALT = (os.environ.get("AEGIS_PRINCIPAL_SALT")
+                   or os.environ.get("AEGIS_DATASET_SALT") or "aegis-edge").encode("utf-8")
+
+
+def _principal(hl: dict) -> str:
+    """A stable, privacy-preserving fingerprint of the caller — an HMAC of the session cookie
+    value or the Authorization bearer, never the raw credential. Lets the SOC attribute requests
+    to one identity (IDOR / id-enumeration) without the shim storing secrets. '' = anonymous."""
+    secret = b""
+    auth = str(hl.get("authorization", ""))
+    if auth[:7].lower() == "bearer ":
+        secret = auth[7:].strip().encode("utf-8", "replace")
+    if not secret:
+        for part in str(hl.get("cookie", "")).split(";"):
+            k, _, v = part.strip().partition("=")
+            if k.strip().lower() in _SESSION_COOKIE_NAMES and v.strip():
+                secret = v.strip().encode("utf-8", "replace")
+                break
+    if not secret:
+        return ""
+    return "p:" + hmac.new(_PRINCIPAL_SALT, secret, hashlib.sha256).hexdigest()[:16]
 
 
 def _blocklist_url(aegis_url: str) -> str:
@@ -355,6 +384,9 @@ class Handler(BaseHTTPRequestHandler):
             "request_headers": dict(hl),
             "host": hl.get("host", ""),
         }
+        principal = _principal(hl)
+        if principal:
+            fields["principal"] = principal   # hashed caller identity for IDOR / id-enumeration
         if body_text and "application/x-www-form-urlencoded" in hl.get("content-type", ""):
             try:
                 fields["body_params"] = {k: (v[0] if v else "")
