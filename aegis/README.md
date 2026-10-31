@@ -251,6 +251,16 @@ against their decisions before anyone turns it `live`. This is separate from
 `AEGIS_ENFORCEMENT_MODE`, so flipping challenge / throttle live never makes blocks autonomous.
 Containment (isolate, revoke, lock, rotate) is always a human.
 
+**Never-block guardrail** (`agents/shared/netguard.py`). No connectivity-severing action
+(`block`, `isolate`, `throttle`, `quarantine`, `block_egress`) reaches a connector when the target
+is loopback, link-local, unspecified or multicast / reserved space, or an operator-listed address
+(`AEGIS_NEVER_BLOCK` CIDRs, `AEGIS_NEVER_BLOCK_HOSTS`) — auto, auto-approved and human-approved
+alike, at the single `ConnectorRegistry.apply()` choke point and at `ResponseAgent.approve()`. So
+an approval cannot blind the SOC by blocking its own ingest, the shim's alert sink, or — in a
+loopback lab where every source IP is `127.0.0.1` — every agent at once. Deliberately narrower
+than the auto-block guard above: RFC1918 stays blockable, so a compromised *internal* host can
+still be isolated.
+
 **Measured, not claimed** — `python -m aegis.eval.purple_team` (`eval/purple_team/`) runs
 scripted adaptive attackers through the real pipeline with the mock Cloudflare tenant in live
 enforcement. Each run starts with five minutes of ordinary traffic and keeps customers
@@ -278,9 +288,14 @@ minutes later). The gated rows fail CI:
 | low-and-slow: one client mutating against one endpoint, paced under every burst / retry signal | detected step 3, contained step 4 — caught by accumulation (attack-shaped WAF stops per source IP on one endpoint), not cadence | same |
 | customers, partner and proxy staff only | nothing enforced, nothing malicious | — |
 
-Reported but not gated: **BOLA seen only through WAF logs** stays invisible — no principal,
-no ownership. That is the case for connecting the API gateway. (Low-and-slow — one request
-every 2.5 min — is now caught by accumulation rather than cadence; see the row above.)
+Reported but not gated: **ownership-confirmed BOLA still needs the API gateway** — proving a
+caller read an object it does not own needs the principal *and* an ownership source, which only
+the gateway path carries. The edge now closes part of the gap: the shim derives a hashed
+`principal` from the session cookie / bearer (`scripts/aegis_edge.py`, salt
+`AEGIS_PRINCIPAL_SALT`), and the perimeter's `id_enumeration` scorer flags one caller walking many
+distinct object-ids on one endpoint (`AEGIS_IDENUM_HIGH` / `_MED` / `_WINDOW_SEC`) — the
+*behavioural* tell, without ownership. (Low-and-slow — one request every 2.5 min — is now caught
+by accumulation rather than cadence; see the row above.)
 
 **BOLA / object walking** (`agents/api_abuse/object_walk.py`, `orchestrator/bola.py`) needs
 what only an API gateway logs: the authenticated principal next to the object id. Gateway
@@ -718,9 +733,12 @@ Roadmap and decision log: `docs/plans/aegis-production-roadmap.md`.
   seconds, Firehose buffers 60 s by default — set its buffer interval to the minimum).
 - **Low-and-slow campaigns are undetected** (the purple-team report shows it): one request every
   few minutes is below every cadence signal by design.
-- **BOLA detection needs API-gateway logs with the principal, and an ownership source** from the
-  bank; with WAF logs only it is invisible, without ownership it only reaches *suspicious*.
-  Containing an authenticated walker is a token revoke (human); IP blocks lag one rotation.
+- **Ownership-confirmed BOLA needs API-gateway logs with the principal, and an ownership source**
+  from the bank. The WAF / edge path is no longer blind — the shim derives a hashed principal and
+  the perimeter's `id_enumeration` flags object-id walking (the *behavioural* tell) — but
+  *confirming* a caller read an object it does not own still needs the gateway + ownership, and
+  without ownership it only reaches *suspicious*. Containing an authenticated walker is a token
+  revoke (human); IP blocks lag one rotation.
 - **Benign-sharing of a fingerprint is judged from what reaches AEGIS** (security events, not
   all traffic); `AEGIS_FP_ALLOW` and the shadow window are the safety net until then. The TLS
   model learns from the same feed, so send Cloudflare's `http_requests` dataset (or a sample of
