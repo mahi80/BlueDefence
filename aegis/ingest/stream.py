@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import collections
 import json
+import re
 import logging
 import threading
 import time
@@ -177,6 +178,8 @@ class StreamConsumer(BaseConsumer):
             return self._apigw(item)
         if _is_ndr(item):
             return self._ndr(item)
+        if _is_netops(item):
+            return self._netops(item)
         if item.passthrough:
             obj = json.loads(item.line)
             if not isinstance(obj, dict) or not obj.get("id"):
@@ -234,6 +237,41 @@ class StreamConsumer(BaseConsumer):
             if ts is not None:
                 alert["ingest_lag_ms"] = max(0, int((item.received_at - ts) * 1000))
         return alerts or CONSUMED
+
+
+    def _netops(self, item: StreamItem) -> Any:
+        """Device syslog / traps / flows / telemetry / configs / LLDP feed the network-assurance detector;
+        most records produce no alert (they build topology and counters)."""
+        from .netops import normalize as netops_normalize, shared_detector
+        line = item.line.strip()
+        record: Any = line
+        if line[:1] in "{[":
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+        ev = netops_normalize(record)
+        if ev is None:
+            return CONSUMED
+        alerts = shared_detector().observe(ev)
+        for alert in alerts:
+            alert["received_at"] = item.received_at
+            alert["ingest_source"] = item.source
+            ts = _vendor_ts(alert)
+            if ts is not None:
+                alert["ingest_lag_ms"] = max(0, int((item.received_at - ts) * 1000))
+        return alerts or CONSUMED
+
+
+def _is_netops(item: StreamItem) -> bool:
+    if item.passthrough:
+        return False
+    if item.source.startswith(("netops", "syslog", "snmp", "netflow", "telemetry")):
+        return True
+    head = item.line[:300]
+    # a Cisco system message (%FACILITY-SEV-MNEMONIC:), an SNMP trap, or an LLDP/CDP neighbour row
+    return bool(re.search(r"%[A-Z0-9_]+-[0-7]-[A-Z0-9_]+:", head)) or '"snmpTrapOID"' in head or '"trapName"' in head \
+        or ('"neighbor"' in head and '"local_iface"' in head)
 
 
 def _is_ndr(item: StreamItem) -> bool:

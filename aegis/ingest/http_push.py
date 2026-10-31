@@ -14,9 +14,18 @@
     POST /ingest/ndr          network sensor logs (Zeek ssl / conn / x509 JSON, Suricata EVE tls / flow,
                               generic flow JSON), NDJSON plain or gzip — fed to the egress detector
                               (beacons, exfiltration, known-bad TLS, shadow AI). ``?sensor=zeek`` tags it.
+    POST /ingest/netops       network operations: Cisco IOS / NX-OS syslog (raw lines or JSON-wrapped), SNMP
+                              traps as JSON, NetFlow / IPFIX summaries, gNMI / MDT interface telemetry, config
+                              snapshots / change records, LLDP / CDP neighbour rows — NDJSON or raw syslog, plain
+                              or gzip — fed to the network-assurance detector (one root cause per outage, downstream
+                              alarms folded in, flaps, drift, bad pushes). ``?feed=syslog`` tags the source.
     POST /ingest/alerts       already-normalised AEGIS alerts, one JSON object per line
                               (custom forwarders, the purple-team harness).
     GET  /ingest/blocklist    the active enforcement set (IPs, CIDRs, client fingerprints)
+    GET  /ingest/verdicts     cursor feed of finalised evidence chains for a message bus (the Kafka
+                              bridge): ``?after=<seq>&limit=<n>`` returns chains with seq > after, in
+                              order, with ``next`` to pass back; seq is the chain's 1-based position in
+                              the audit log, so the cursor survives restarts and the hash chain verifies
                               for an edge enforcer — Envoy ext_authz, a Cloudflare Worker, the
                               Go tier-0 filter — to apply inline without any vendor API.
     GET  /healthz             queue depth and counters (no auth).
@@ -44,6 +53,7 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
@@ -83,7 +93,8 @@ class PushServer:
     """Threaded HTTP server feeding the shared ``StreamQueue``; ``start()`` returns at once."""
 
     def __init__(self, *, token: str, bind: str = DEFAULT_BIND, queue: Optional[StreamQueue] = None,
-                 max_mb: int = DEFAULT_MAX_MB, blocklist: Optional[Callable[[], list[Any]]] = None):
+                 max_mb: int = DEFAULT_MAX_MB, blocklist: Optional[Callable[[], list[Any]]] = None,
+                 audit_path: Optional[Path] = None):
         host, _, port = bind.rpartition(":")
         self.host, self.port = (host or "0.0.0.0"), int(port or 8787)
         if not token and not _is_loopback(self.host):
@@ -92,6 +103,7 @@ class PushServer:
         self.queue = queue if queue is not None else get_stream()   # an empty queue is falsy
         self.max_bytes = int(max_mb) * 1024 * 1024
         self.blocklist = blocklist
+        self.audit_path = Path(audit_path) if audit_path else None
         self.limiter = _AuthFailLimiter()
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -213,6 +225,36 @@ class PushServer:
                     ips.append({**row, "target": t})
         return {"generated_at": time.time(), "ips": ips, "fingerprints": fps}
 
+    def verdicts_payload(self, after: int, limit: int) -> dict:
+        """Chains with seq > ``after`` from the audit log. ``seq`` is the 1-based line number: append-only,
+        so a consumer that stores ``next`` resumes exactly where it stopped, and ``integrity_hash`` /
+        ``prev`` let it re-verify the chain on its side."""
+        limit = max(1, min(int(limit), 1000))
+        out: list[dict] = []
+        seq = 0
+        prev = "0" * 64
+        if self.audit_path is not None and self.audit_path.exists():
+            with self.audit_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    seq += 1
+                    if seq <= after:
+                        try:
+                            prev = json.loads(line).get("integrity_hash", prev)
+                        except json.JSONDecodeError:
+                            pass
+                        continue
+                    try:
+                        chain = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    out.append({"seq": seq, "prev_hash": prev, "chain": chain})
+                    prev = chain.get("integrity_hash", prev)
+                    if len(out) >= limit:
+                        break
+        return {"after": after, "next": out[-1]["seq"] if out else after, "count": len(out), "verdicts": out}
+
 
 class _Handler(BaseHTTPRequestHandler):
     server_ref: PushServer
@@ -260,6 +302,22 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._reply(200, self.server_ref.blocklist_payload())
             return
+        if path == "/ingest/verdicts":
+            if not self.server_ref.authorized(self.headers):
+                self._reply(401, {"error": "unauthorized"})
+                return
+            if self.server_ref.audit_path is None:
+                self._reply(503, {"error": "no audit log attached to this receiver"})
+                return
+            q = parse_qs(urlsplit(self.path).query)
+            try:
+                after = int((q.get("after") or ["0"])[0])
+                limit = int((q.get("limit") or ["200"])[0])
+            except ValueError:
+                self._reply(400, {"error": "after and limit must be integers"})
+                return
+            self._reply(200, self.server_ref.verdicts_payload(max(0, after), limit))
+            return
         self._reply(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -293,6 +351,9 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/ingest/ndr":
                 sensor = (parse_qs(parts.query).get("sensor") or [""])[0].strip().lower()[:24]
                 status, out = srv.ingest_waf(body, f"ndr-{sensor}" if sensor else "ndr")
+            elif path == "/ingest/netops":
+                feed = (parse_qs(parts.query).get("feed") or [""])[0].strip().lower()[:24]   # syslog | snmp | netflow | telemetry | config | lldp
+                status, out = srv.ingest_waf(body, f"netops-{feed}" if feed else "netops")
             elif path == "/ingest/alerts":
                 status, out = srv.ingest_alerts(body)
             else:
@@ -303,7 +364,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(status, out)
 
 
-def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None) -> Optional[PushServer]:
+def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
+                         audit_path: Optional[Path] = None) -> Optional[PushServer]:
     """``AEGIS_INGEST_HTTP=1`` (or any ``AEGIS_INGEST_BIND``) starts the receiver; ``AEGIS_INGEST_TOKEN``
     is required off loopback. Returns the running server or ``None``."""
     on = os.environ.get("AEGIS_INGEST_HTTP", "").strip().lower() in ("1", "true", "yes", "on")
@@ -312,7 +374,8 @@ def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None) ->
         return None
     try:
         srv = PushServer(token=os.environ.get("AEGIS_INGEST_TOKEN", "").strip(), bind=bind or DEFAULT_BIND,
-                         max_mb=int(os.environ.get("AEGIS_INGEST_MAX_MB", str(DEFAULT_MAX_MB))), blocklist=blocklist)
+                         max_mb=int(os.environ.get("AEGIS_INGEST_MAX_MB", str(DEFAULT_MAX_MB))), blocklist=blocklist,
+                         audit_path=audit_path)
         return srv.start()
     except Exception as e:  # noqa: BLE001 — a bad bind must not take the SOC down; polling still works
         logger.error("[ingest:http] push receiver not started: %s", str(e)[:200])

@@ -15,6 +15,7 @@ flowchart LR
   subgraph IN[Ingest]
     SIEM[Sentinel / Splunk]
     WAF[WAF: Imperva / F5 / Cloudflare]
+    NET["Network: syslog · SNMP · NetFlow · telemetry · LLDP<br/>(Kafka bridge)"]
     GOVE[ACP governance events]
   end
   IN --> ORCH[Orchestrator]
@@ -46,6 +47,7 @@ pinned package. Full detail: [`aegis/README.md`](aegis/README.md).
 |---|---|
 | `aegis/` | The SOC brain: orchestrator → specialists → swarm fan-out → evidence chains → min-cut containment → HITL. Ingest (Sentinel/Splunk/WAF), response connectors (shadow by default), eval gates, dataset capture, meta-agent. See `aegis/README.md`. |
 | `soc-console/` | The analyst console (Next.js) — decision-first HITL queue, evidence-backed Agent Q, attack-path map. Talks to the dashboard over HTTP. |
+| `kafka-bridge/` | Java 21 / Kafka Streams bridge: device syslog, NetFlow, telemetry and alert topics → AEGIS (`/ingest/netops`, `/ingest/alerts`) with dedupe, flap folding and backpressure; AEGIS verdicts → `aegis.verdicts`. `TopologyTestDriver` tests, no broker needed. See `kafka-bridge/README.md`. |
 | `scripts/` | `soc_demo.py` (presenter-paced offline scenario the console renders) and `soc_live.py` (drives the real pipeline). |
 | `docs/plans/` | AEGIS roadmaps. |
 
@@ -112,6 +114,7 @@ see the flags below and [`aegis/README.md`](aegis/README.md) for the full config
 | `AEGIS_TREASURY_ACCOUNTS` | — | Treasury / nostro / settlement senders (plus ids containing TREASURY, NOSTRO, VOSTRO, SETTLEMENT, and `svc_` users). |
 | `AEGIS_PRIVILEGED_USERS`, `AEGIS_PRIVILEGED_HOSTS` | — | Engineers with production reach (DevOps / SRE / DevSecOps / platform) and their machines — export from the IdP groups and asset inventory. A compromise there is a crown-jewel incident: isolate, revoke, rotate. Role tags on alerts work too. |
 | `AEGIS_CROWN_JEWELS` | payment, signer, hsm, swift, treasury, vault, kms, core-banking | Systems where interactive access or a control change (signing policy, allowlist, limits) outside a ticketed window is malicious. |
+| `AEGIS_NET_*` | flap 5/300 s, correlation 900 s, errors 100/min, utilisation 90 % × 3, silent 180 s, bad push 600 s | Network assurance thresholds (`AEGIS_NET_FLAP_N`, `_FLAP_WINDOW_S`, `_CORR_WINDOW_S`, `_ERR_PER_MIN`, `_UTIL_PCT`, `_UTIL_SAMPLES`, `_SILENT_S`, `_BAD_PUSH_S`); `AEGIS_NET_GOLDEN` (JSON `{device: config_hash}`) or `AEGIS_NET_GOLDEN_FIRST_SEEN=1`; `AEGIS_NET_INVENTORY` for roles/sites/users. Root cause, alarm suppression, flaps, bad config pushes — see `aegis/README.md` § What the network itself says. |
 
 WAF/SOAR vendors: `AEGIS_WAF_VENDOR`, `AEGIS_SOAR_VENDOR` (+ creds) — see `aegis/README.md`.
 
@@ -199,6 +202,7 @@ Lead with must-haves 2–4: a bank that says yes to real logs and past incidents
   secret it stays green — governance-only tests self-skip — and the full governed gate turns
   on automatically the day a token is added. No token is required to keep CI green.
 - `.github/workflows/soc-console-ci.yml` — `npm ci` + typecheck + build.
+- `.github/workflows/kafka-bridge-ci.yml` — Java 21 `mvn test` (Kafka Streams `TopologyTestDriver`, fake AEGIS; no broker) + shaded jar.
 
 ## Provenance
 

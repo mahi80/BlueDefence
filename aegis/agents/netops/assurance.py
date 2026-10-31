@@ -1,0 +1,531 @@
+"""Network assurance — faults, topology-aware root cause, alarm suppression, drift. No LLM.
+
+A network outage is one fault and a storm of alarms. A fibre cut on a distribution uplink takes
+every access switch behind it off the air: each one reports its uplink down, its neighbours
+report adjacency loss, monitoring reports them unreachable — forty alarms for one cause. The
+operator needs the one, with the forty folded into it as impact, and the remediation that fixes
+the one. That is what this detector does, on the records ``aegis.ingest.netops`` normalises:
+
+  topology    LLDP/CDP rows build the graph; ``role`` (core / distribution / access / wan-edge) comes
+              from the row, the inventory, or the hostname (``CORE-``, ``DIST-``, ``ACC-``, ``WAN-``).
+              A device's *uplink path* is its shortest path to any core.
+  link down   LINK/LINEPROTO/ETHPORT down, or a linkDown trap, on a link the topology knows →
+              every device whose uplink path crosses that link is **downstream**. The first alarm is
+              the root cause (``link_down``); alarms from downstream devices inside the correlation
+              window are **suppressed** into it (counted, sampled), not raised on their own.
+  flap        ≥ AEGIS_NET_FLAP_N (5) up/down transitions on one interface inside
+              AEGIS_NET_FLAP_WINDOW_S (300) → ``link_flap``, once per episode.
+  adjacency   BGP-5-ADJCHANGE / OSPF-5-ADJCHG down (or the traps) → ``adjacency_loss``, unless it is a
+              symptom of a link already down or a device already unreachable.
+  errors      telemetry: CRC / input-error rate above AEGIS_NET_ERR_PER_MIN (100) over two samples →
+              ``interface_errors`` (a dirty optic or bad cable: fix before it flaps).
+  congestion  telemetry utilisation ≥ AEGIS_NET_UTIL_PCT (90) on AEGIS_NET_UTIL_SAMPLES (3) consecutive
+              samples, or output discards rising with it → ``congestion``.
+  unreachable a device whose telemetry stops for AEGIS_NET_SILENT_S (180) → ``device_unreachable``;
+              its downstream devices are suppressed the same way. (The service's feed watchdog
+              covers "the whole feed went quiet"; this is one device going quiet inside a live feed.)
+  drift       a config whose hash differs from the golden (``AEGIS_NET_GOLDEN`` JSON {device: hash},
+              or the first config seen when AEGIS_NET_GOLDEN_FIRST_SEEN=1) → ``config_drift``, with
+              the change ticket if the record carried one. A change with **no ticket** followed inside
+              AEGIS_NET_BAD_PUSH_S (600) by adjacency loss or a link down on the same device →
+              ``bad_config_push``: the change is the root cause, the loss is its symptom.
+
+Every alert carries ``netops`` = {fault, device, iface, root_cause, downstream[], suppressed,
+symptoms[], users_affected, golden_hash, change_ticket …} for the orchestrator's fast path
+(``aegis.agents.orchestrator.netops``), which turns it into a chain with closed-loop remediation
+proposals — shadow first, a human approves.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import threading
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Any
+
+_ROLE_RX = (
+    ("core", re.compile(r"\b(core|cr|spine)\b|^core-|^cr\d|-core\d*$", re.I)),
+    ("distribution", re.compile(r"\b(dist|distribution|agg|aggregation|leaf)\b|^dist-|^dsw|-dist\d*$", re.I)),
+    ("wan-edge", re.compile(r"\b(wan|edge|border|pe|ce|br)\b|^wan-|^edge-|-wan\d*$", re.I)),
+    ("access", re.compile(r"\b(acc|access|asw|sw|tor)\b|^acc-|^asw|^sw\d", re.I)),
+)
+_DOWN_MNEMONICS = {"LINK-3-UPDOWN", "LINEPROTO-5-UPDOWN", "ETHPORT-5-IF_DOWN_LINK_FAILURE", "ETHPORT-5-IF_DOWN_ADMIN_DOWN",
+                   "ETHPORT-5-IF_DOWN_ERROR_DISABLED", "PM-4-ERR_DISABLE", "ETHPORT-3-IF_DOWN"}
+_ADJ_MNEMONICS = {"BGP-5-ADJCHANGE", "OSPF-5-ADJCHG", "OSPF-5-ADJCHANGE", "ISIS-4-ADJCHANGE", "EIGRP-5-NBRCHANGE", "DUAL-5-NBRCHANGE"}
+_RESTART_MNEMONICS = {"SYS-5-RESTART", "SYS-5-RELOAD", "PLATFORM-2-FRU_REMOVED", "ENVM-2-TEMP", "ENVM-2-FAN", "PLATFORM-2-SENSOR"}
+_CONFIG_MNEMONICS = {"SYS-5-CONFIG_I", "PARSER-5-CFGLOG_LOGGEDCMD", "VSHD-5-VSHD_SYSLOG_CONFIG_I"}
+
+
+def _env_f(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def role_of(device: str, hint: str | None = None) -> str:
+    if hint:
+        h = str(hint).lower()
+        for role, _ in _ROLE_RX:
+            if role.split("-")[0] in h:
+                return role
+    for role, rx in _ROLE_RX:
+        if rx.search(device or ""):
+            return role
+    return "unknown"
+
+
+@dataclass
+class _Link:
+    a: str
+    a_if: str | None
+    b: str
+    b_if: str | None
+    state: str = "up"
+    down_since: float | None = None
+    transitions: deque = field(default_factory=lambda: deque(maxlen=64))   # (ts, state)
+    flap_open_until: float = 0.0
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.a, self.b) if self.a <= self.b else (self.b, self.a)
+
+    def iface_on(self, device: str) -> str | None:
+        return self.a_if if device == self.a else self.b_if if device == self.b else None
+
+
+@dataclass
+class _Incident:
+    """One root cause and the symptoms folded into it."""
+    fault: str
+    device: str
+    iface: str | None
+    opened: float
+    downstream: set[str]
+    suppressed: int = 0
+    symptoms: list[str] = field(default_factory=list)
+    alert_id: str = ""
+    closed: float | None = None          # a link_down incident stays open until its link comes back
+
+    def covers(self, device: str, ts: float, window: float) -> bool:
+        if device != self.device and device not in self.downstream:
+            return False
+        if self.fault == "link_down" and self.closed is None:
+            return True                  # the link is still down: everything behind it is still a symptom
+        return ts <= (self.closed if self.closed is not None else self.opened) + window
+
+
+class NetworkAssurance:
+    def __init__(self, *, flap_n: int = 5, flap_window_s: float = 300.0, corr_window_s: float = 900.0,
+                 err_per_min: float = 100.0, util_pct: float = 90.0, util_samples: int = 3, silent_s: float = 180.0,
+                 bad_push_s: float = 600.0, golden: dict[str, str] | None = None, golden_first_seen: bool = False,
+                 inventory: dict[str, dict] | None = None, clock: Any = time.time):
+        self.flap_n, self.flap_window_s, self.corr_window_s = flap_n, flap_window_s, corr_window_s
+        self.err_per_min, self.util_pct, self.util_samples, self.silent_s = err_per_min, util_pct, util_samples, silent_s
+        self.bad_push_s, self.golden, self.golden_first_seen = bad_push_s, dict(golden or {}), golden_first_seen
+        self.inventory = {k.lower(): v for k, v in (inventory or {}).items()}
+        self.clock = clock
+        self._lock = threading.RLock()          # observe() holds it and calls add_link(), which takes it again
+        self._links: dict[tuple[str, str], _Link] = {}
+        self._adj: dict[str, set[str]] = defaultdict(set)
+        self._roles: dict[str, str] = {}
+        self._users: dict[str, int] = {}
+        self._sites: dict[str, str] = {}
+        self._iface_link: dict[tuple[str, str], _Link] = {}
+        self._incidents: list[_Incident] = []
+        self._tele: dict[tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=8))   # (ts, counters)
+        self._last_seen: dict[str, float] = {}
+        self._unreachable: set[str] = set()
+        self._config_hash: dict[str, str] = {}
+        self._recent_config: dict[str, dict] = {}               # device -> last change event (for bad-push correlation)
+        self._err_open: set[tuple[str, str]] = set()
+        self._cong_open: set[tuple[str, str]] = set()
+        self.stats: dict[str, int] = defaultdict(int)
+
+    # ---------------------------------------------------------------- env --
+    @classmethod
+    def from_env(cls) -> "NetworkAssurance":
+        golden: dict[str, str] = {}
+        raw = os.environ.get("AEGIS_NET_GOLDEN", "").strip()
+        if raw:
+            try:
+                golden = json.loads(open(raw).read()) if os.path.exists(raw) else json.loads(raw)
+            except (OSError, ValueError):
+                golden = {}
+        inv: dict[str, dict] = {}
+        inv_raw = os.environ.get("AEGIS_NET_INVENTORY", "").strip()
+        if inv_raw and os.path.exists(inv_raw):
+            try:
+                rows = json.loads(open(inv_raw).read())
+                inv = {str(r.get("device") or r.get("hostname")): r for r in (rows if isinstance(rows, list) else rows.get("devices", []))}
+            except (OSError, ValueError):
+                inv = {}
+        return cls(flap_n=int(_env_f("AEGIS_NET_FLAP_N", 5)), flap_window_s=_env_f("AEGIS_NET_FLAP_WINDOW_S", 300),
+                   corr_window_s=_env_f("AEGIS_NET_CORR_WINDOW_S", 900), err_per_min=_env_f("AEGIS_NET_ERR_PER_MIN", 100),
+                   util_pct=_env_f("AEGIS_NET_UTIL_PCT", 90), util_samples=int(_env_f("AEGIS_NET_UTIL_SAMPLES", 3)),
+                   silent_s=_env_f("AEGIS_NET_SILENT_S", 180), bad_push_s=_env_f("AEGIS_NET_BAD_PUSH_S", 600),
+                   golden=golden, golden_first_seen=os.environ.get("AEGIS_NET_GOLDEN_FIRST_SEEN", "").lower() in ("1", "true", "yes"),
+                   inventory=inv)
+
+    # ----------------------------------------------------------- topology --
+    def _role(self, device: str, hint: str | None = None) -> str:
+        r = self._roles.get(device)
+        if r and r != "unknown":
+            return r
+        inv = self.inventory.get(device.lower(), {})
+        r = role_of(device, hint or inv.get("role"))
+        self._roles[device] = r
+        return r
+
+    def add_link(self, a: str, a_if: str | None, b: str, b_if: str | None) -> None:
+        with self._lock:
+            key = (a, b) if a <= b else (b, a)
+            link = self._links.get(key)
+            if link is None:
+                link = _Link(a, a_if, b, b_if)
+                self._links[key] = link
+                self._adj[a].add(b)
+                self._adj[b].add(a)
+            else:
+                if a == link.a:
+                    link.a_if, link.b_if = link.a_if or a_if, link.b_if or b_if
+                else:
+                    link.a_if, link.b_if = link.a_if or b_if, link.b_if or a_if
+            if a_if:
+                self._iface_link[(a, a_if)] = link
+            if b_if:
+                self._iface_link[(b, b_if)] = link
+
+    def _cores(self) -> set[str]:
+        return {d for d in self._adj if self._role(d) == "core"} or {max(self._adj, key=lambda d: len(self._adj[d]))} if self._adj else set()
+
+    def _reachable(self, *, without_link: _Link | None = None, without_device: str | None = None) -> set[str]:
+        """Devices with a path to some core over links that are up, optionally with one link or one
+        device removed. Reachability, not shortest path: a dual-homed switch that loses one uplink
+        still reaches the core over the other, and must not be reported as stranded."""
+        cores = self._cores() - ({without_device} if without_device else set())
+        seen = set(cores)
+        frontier = list(cores)
+        while frontier:
+            nxt: list[str] = []
+            for d in frontier:
+                for n in self._adj[d]:
+                    if n in seen or n == without_device:
+                        continue
+                    link = self._links.get((d, n) if d <= n else (n, d))
+                    if link is None or link.state != "up" or link is without_link:
+                        continue
+                    seen.add(n)
+                    nxt.append(n)
+            frontier = nxt
+        return seen
+
+    def _downstream_of_link(self, link: _Link) -> set[str]:
+        """Devices that lose their LAST path to a core when this link goes (computed with the link up).
+        Empty when a redundant path carries them — that is impact contained, not a quiet failure."""
+        before = self._reachable()
+        after = self._reachable(without_link=link)
+        return (before - after) - {link.a, link.b} if {link.a, link.b} & before else set()
+
+    def _downstream_of_device(self, device: str) -> set[str]:
+        before = self._reachable()
+        after = self._reachable(without_device=device)
+        return (before - after) - {device}
+
+    def _redundant(self, link: _Link) -> bool:
+        """Does the far side of this link still reach a core without it?"""
+        after = self._reachable(without_link=link)
+        return link.a in after and link.b in after
+
+    def _users_behind(self, devices: set[str]) -> int:
+        return sum(self._users.get(d, self.inventory.get(d.lower(), {}).get("users", 0) or 0) for d in devices)
+
+    # ------------------------------------------------------------- observe --
+    def observe(self, ev: dict) -> list[dict]:
+        kind = ev.get("kind")
+        ts = float(ev.get("ts") or self.clock())
+        device = str(ev.get("device") or "unknown")
+        out: list[dict] = []
+        with self._lock:
+            self.stats["events"] += 1
+            if device != "unknown" and kind in ("syslog", "trap", "telemetry", "flow", "config"):
+                self._last_seen[device] = max(ts, self._last_seen.get(device, 0.0))
+                if device in self._unreachable:
+                    self._unreachable.discard(device)
+            if kind == "topology":
+                self._topology(ev)
+            elif kind in ("syslog", "trap"):
+                out += self._syslog(ev, ts, device)
+            elif kind == "telemetry":
+                out += self._telemetry(ev, ts, device)
+            elif kind == "config":
+                out += self._config(ev, ts, device)
+            out += self._silence_check(ts)
+        return out
+
+    def _topology(self, ev: dict) -> None:
+        a, b = str(ev["device"]), str(ev["neighbor"])
+        if ev.get("role"):
+            self._roles[a] = role_of(a, ev["role"])
+        if ev.get("neighbor_role"):
+            self._roles[b] = role_of(b, ev["neighbor_role"])
+        if ev.get("site"):
+            self._sites[a] = str(ev["site"])
+        if ev.get("users") is not None:
+            try:
+                self._users[a] = int(ev["users"])
+            except (TypeError, ValueError):
+                pass
+        self.add_link(a, ev.get("iface"), b, ev.get("neighbor_iface"))
+
+    # ------------------------------------------------------------- syslog --
+    def _syslog(self, ev: dict, ts: float, device: str) -> list[dict]:
+        mn, state, iface = str(ev.get("mnemonic") or ""), ev.get("state"), ev.get("iface")
+        if mn in _CONFIG_MNEMONICS:
+            self._recent_config.setdefault(device, {"ts": ts, "change_ticket": None, "user": None, "msg": ev.get("msg")})
+            self._recent_config[device]["ts"] = ts
+            return []
+        if mn in _DOWN_MNEMONICS or (mn.startswith("LINK-") or mn.startswith("LINEPROTO-") or mn.startswith("ETHPORT-")):
+            return self._link_event(ts, device, iface, state, ev)
+        if mn in _ADJ_MNEMONICS:
+            return self._adjacency(ts, device, iface, state, ev)
+        if mn in _RESTART_MNEMONICS or mn.split("-")[0] in ("SYS", "PLATFORM", "ENVM") and int(ev.get("severity") or 5) <= 2:
+            if self._covered(device, ts):
+                return []
+            return [self._alert("hardware_fault" if mn.startswith(("PLATFORM", "ENVM")) else "device_restart", device, iface, ts,
+                                severity="high", root_cause=f"{mn}: {ev.get('msg', '')[:120]}", downstream=set(), ev=ev)]
+        return []
+
+    def _link_event(self, ts: float, device: str, iface: str | None, state: str | None, ev: dict) -> list[dict]:
+        if not iface or state not in ("up", "down"):
+            return []
+        link = self._iface_link.get((device, iface))
+        key = (device, iface)
+        known = link is not None and link.b in self._adj and link.a in self._adj
+        # downstream is "who loses their path to the core if THIS link goes" — computed while the link
+        # still counts as up; once it is marked down those devices have no path at all
+        downstream = self._downstream_of_link(link) if (known and state == "down") else set()
+        if link is not None:
+            link.transitions.append((ts, state))
+            prev = link.state
+            link.state = state
+            if state == "down":
+                link.down_since = link.down_since or ts
+            else:
+                link.down_since = None
+                for inc in self._incidents:          # the link is back: close its incident, the window starts now
+                    if inc.fault == "link_down" and inc.device == device and inc.iface == iface and inc.closed is None:
+                        inc.closed = ts
+        else:   # an interface the topology does not know (an edge/access port): track flaps only
+            link = self._iface_link.setdefault(key, _Link(device, iface, f"{device}:{iface}:peer", None))
+            link.transitions.append((ts, state))
+            link.state = state
+        # flap: N transitions inside the window
+        recent = [t for t, _ in link.transitions if t >= ts - self.flap_window_s]
+        if len(recent) >= self.flap_n and ts >= link.flap_open_until:
+            link.flap_open_until = ts + self.flap_window_s
+            self.stats["flaps"] += 1
+            peer_ = (link.b if device == link.a else link.a) if known else None
+            return [self._alert("link_flap", device, iface, ts, severity="high",
+                                root_cause=f"{len(recent)} up/down transitions on {iface} in {int(self.flap_window_s)} s",
+                                downstream=downstream, ev=ev, extra={"transitions": len(recent), "peer": peer_})]
+        if state != "down":
+            return []
+        if not known:
+            return []       # an edge / access port the topology does not know: users unplug things all day — flaps only
+        # the far end reporting a link that is already down is the same fault seen twice, not a second one
+        if prev == "down":
+            for inc in reversed(self._incidents):
+                if inc.fault == "link_down" and inc.closed is None and {inc.device} <= {link.a, link.b} and inc.device != device:
+                    inc.suppressed += 1
+                    self.stats["suppressed"] += 1
+                    return []
+        # down: root cause or symptom?
+        if self._covered(device, ts):
+            return []
+        peer = (link.b if device == link.a else link.a) if known else None
+        redundant = not downstream and self._redundant(link)
+        inc = _Incident("link_down", device, iface, ts, downstream)
+        self._incidents.append(inc)
+        self.stats["link_down"] += 1
+        bad_push = self._bad_push_for(device, ts)
+        if bad_push is not None:
+            return [self._alert("bad_config_push", device, iface, ts, severity="critical", root_cause=bad_push, downstream=downstream,
+                                ev=ev, incident=inc, extra={"peer": peer, **self._push_extra(device)})]
+        return [self._alert("link_down", device, iface, ts, severity="critical" if downstream else "high" if not redundant else "medium",
+                            root_cause=f"{iface} on {device} is down" + (f" (link to {peer})" if peer else "")
+                                       + (" — a redundant path is carrying the traffic" if redundant else ""),
+                            downstream=downstream, ev=ev, incident=inc, extra={"peer": peer, "redundant": redundant})]
+
+    def _adjacency(self, ts: float, device: str, iface: str | None, state: str | None, ev: dict) -> list[dict]:
+        if state != "down":
+            return []
+        if self._covered(device, ts):
+            return []
+        peer = ev.get("peer")
+        bad_push = self._bad_push_for(device, ts)
+        inc = _Incident("adjacency_loss", device, iface, ts, set())
+        self._incidents.append(inc)
+        self.stats["adjacency_loss"] += 1
+        if bad_push is not None:
+            return [self._alert("bad_config_push", device, iface, ts, severity="critical", root_cause=bad_push, downstream=set(), ev=ev,
+                                incident=inc, extra={"peer": peer, "protocol": str(ev.get("facility") or ""), **self._push_extra(device)})]
+        return [self._alert("adjacency_loss", device, iface, ts, severity="high",
+                            root_cause=f"{ev.get('facility', 'routing')} adjacency with {peer or 'neighbour'} lost on {device}",
+                            downstream=set(), ev=ev, incident=inc, extra={"peer": peer, "protocol": str(ev.get("facility") or "")})]
+
+    def _bad_push_for(self, device: str, ts: float) -> str | None:
+        rc = self._recent_config.get(device)
+        if not rc or ts - float(rc.get("ts") or 0) > self.bad_push_s:
+            return None
+        if rc.get("change_ticket"):
+            return None                                   # a ticketed change that broke something is still drift, not a bad push
+        who = f" by {rc['user']}" if rc.get("user") else ""
+        return f"configuration changed on {device}{who} {int(ts - rc['ts'])} s earlier with no change ticket, then the device lost connectivity"
+
+    def _push_extra(self, device: str) -> dict:
+        """Who pushed, from where, when — what the response needs to revoke the right sessions."""
+        rc = self._recent_config.get(device) or {}
+        return {"user": rc.get("user"), "source_ip": rc.get("source_ip"), "changed_at": rc.get("ts"), "change_ticket": None}
+
+    # ---------------------------------------------------------- telemetry --
+    def _telemetry(self, ev: dict, ts: float, device: str) -> list[dict]:
+        iface = str(ev.get("iface") or "")
+        c = dict(ev.get("counters") or {})
+        if not iface or not c:
+            return []
+        key = (device, iface)
+        hist = self._tele[key]
+        out: list[dict] = []
+        if hist:
+            pts, pc = hist[-1]
+            dt = max(1.0, ts - pts)
+            # error rate per minute over the delta
+            err = sum(max(0.0, c.get(k, 0.0) - pc.get(k, 0.0)) for k in ("in_errors", "crc") if k in c and k in pc)
+            err_pm = err / dt * 60.0
+            if err_pm >= self.err_per_min and len(hist) >= 2:
+                if key not in self._err_open and not self._covered(device, ts):
+                    self._err_open.add(key)
+                    self.stats["interface_errors"] += 1
+                    out.append(self._alert("interface_errors", device, iface, ts, severity="medium",
+                                           root_cause=f"{err_pm:,.0f} input/CRC errors per minute on {iface}", downstream=set(), ev=ev,
+                                           extra={"errors_per_min": round(err_pm, 1)}))
+            elif err_pm < self.err_per_min / 4:
+                self._err_open.discard(key)
+        hist.append((ts, c))
+        # utilisation: explicit pct, or derived from octet deltas against speed
+        util = c.get("util_pct")
+        if util is None and len(hist) >= 2 and c.get("speed_bps"):
+            pts, pc = hist[-2]
+            dt = max(1.0, ts - pts)
+            octets = max(0.0, c.get("in_octets", 0.0) - pc.get("in_octets", 0.0)) + max(0.0, c.get("out_octets", 0.0) - pc.get("out_octets", 0.0))
+            util = octets * 8.0 / dt / c["speed_bps"] * 100.0
+        if util is not None:
+            hist[-1] = (ts, {**c, "_util": util})
+            recent = [h[1].get("_util") for h in list(hist)[-self.util_samples:]]
+            if len(recent) >= self.util_samples and all(u is not None and u >= self.util_pct for u in recent):
+                if key not in self._cong_open:
+                    self._cong_open.add(key)
+                    self.stats["congestion"] += 1
+                    disc = c.get("out_discards")
+                    out.append(self._alert("congestion", device, iface, ts, severity="medium",
+                                           root_cause=f"{iface} at {min(100.0, max(recent)):.0f}% for {self.util_samples} samples"
+                                                      + (f", {disc:,.0f} output discards" if disc else ""),
+                                           downstream=set(), ev=ev, extra={"util_pct": round(max(recent), 1)}))
+            elif recent and recent[-1] is not None and recent[-1] < self.util_pct * 0.8:
+                self._cong_open.discard(key)
+        return out
+
+    # ------------------------------------------------------------- config --
+    def _config(self, ev: dict, ts: float, device: str) -> list[dict]:
+        h = ev.get("config_hash")
+        ticket = ev.get("change_ticket")
+        self._recent_config[device] = {"ts": ts, "change_ticket": ticket, "user": ev.get("user"), "source_ip": ev.get("source_ip"), "msg": ev.get("msg")}
+        if not h:
+            return []
+        prev = self._config_hash.get(device)
+        self._config_hash[device] = str(h)
+        golden = self.golden.get(device)
+        if golden is None and self.golden_first_seen and prev is None:
+            self.golden[device] = str(h)
+            return []
+        baseline = golden if golden is not None else prev
+        if baseline is None or str(h) == str(baseline):
+            return []
+        self.stats["config_drift"] += 1
+        return [self._alert("config_drift", device, None, ts, severity="medium" if ticket else "high",
+                            root_cause=(f"running config on {device} differs from the golden" if golden is not None
+                                        else f"running config on {device} changed") + (f" (ticket {ticket})" if ticket else " with no change ticket"),
+                            downstream=set(), ev=ev, extra={"golden_hash": str(baseline)[:16], "config_hash": str(h)[:16],
+                                                            "change_ticket": ticket, "user": ev.get("user"), "source_ip": ev.get("source_ip")})]
+
+    # ------------------------------------------------------------ silence --
+    def _silence_check(self, now: float) -> list[dict]:
+        out: list[dict] = []
+        for device, seen in list(self._last_seen.items()):
+            if device in self._unreachable or now - seen < self.silent_s or device not in self._adj:
+                continue
+            if self._covered(device, now):
+                self._unreachable.add(device)
+                continue
+            self._unreachable.add(device)
+            downstream = self._downstream_of_device(device)
+            inc = _Incident("device_unreachable", device, None, now, downstream)
+            self._incidents.append(inc)
+            self.stats["device_unreachable"] += 1
+            out.append(self._alert("device_unreachable", device, None, now, severity="critical" if downstream else "high",
+                                   root_cause=f"{device} has sent nothing for {int(now - seen)} s", downstream=downstream,
+                                   extra={"silent_s": int(now - seen)}, incident=inc))
+        return out
+
+    # --------------------------------------------------------- correlate --
+    def _covered(self, device: str, ts: float) -> bool:
+        """Is this device inside an open incident's blast radius? Then its alarm is a symptom."""
+        for inc in reversed(self._incidents):
+            if inc.covers(device, ts, self.corr_window_s):
+                inc.suppressed += 1
+                if len(inc.symptoms) < 8:
+                    inc.symptoms.append(device)
+                self.stats["suppressed"] += 1
+                return True
+        return False
+
+    def incident_for(self, alert_id: str) -> dict | None:
+        for inc in self._incidents:
+            if inc.alert_id == alert_id:
+                return {"suppressed": inc.suppressed, "symptoms": list(inc.symptoms), "downstream": sorted(inc.downstream)}
+        return None
+
+    def incidents(self) -> list[dict]:
+        """Open and past incidents with the symptoms folded into each — what the console shows as one row."""
+        with self._lock:
+            return [{"alert_id": i.alert_id, "fault": i.fault, "device": i.device, "iface": i.iface, "opened": i.opened,
+                     "downstream": sorted(i.downstream), "suppressed": i.suppressed, "symptoms": list(i.symptoms)}
+                    for i in self._incidents]
+
+    def _alert(self, fault: str, device: str, iface: str | None, ts: float, *, severity: str, root_cause: str,
+               downstream: set[str], ev: dict | None = None, incident: _Incident | None = None, extra: dict | None = None) -> dict:
+        digest = hashlib.sha1(f"{fault}|{device}|{iface}|{int(ts)}".encode()).hexdigest()[:10]
+        aid = f"net-{fault}-{digest}"
+        if incident is not None:
+            incident.alert_id = aid
+        users = self._users_behind(downstream | {device}) if downstream else self._users.get(device, 0)
+        return {
+            "id": aid, "source": "Network Assurance", "alert_type": "network_fault", "severity": severity,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)), "device": device, "iface": iface,
+            "site": self._sites.get(device), "role": self._role(device),
+            "netops": {"fault": fault, "device": device, "iface": iface, "role": self._role(device), "root_cause": root_cause,
+                       "downstream": sorted(downstream)[:64], "downstream_count": len(downstream),
+                       "users_affected": users, "suppressed": incident.suppressed if incident else 0,
+                       "symptoms": list(incident.symptoms) if incident else [], "mnemonic": (ev or {}).get("mnemonic"),
+                       "msg": (ev or {}).get("msg"), **(extra or {})},
+            "note": f"{fault.replace('_', ' ')}: {root_cause}",
+        }
+
+
+__all__ = ["NetworkAssurance", "role_of"]

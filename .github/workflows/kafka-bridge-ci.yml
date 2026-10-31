@@ -1,0 +1,60 @@
+name: Kafka bridge CI
+
+on:
+  pull_request:
+    paths:
+      - 'kafka-bridge/**'
+      - '.github/workflows/kafka-bridge-ci.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'kafka-bridge/**'
+      - '.github/workflows/kafka-bridge-ci.yml'
+
+jobs:
+  test:
+    name: mvn test (Java 21, TopologyTestDriver — no broker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: kafka-bridge
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          if ! mvn -B test 2>&1 | tee mvn.log; then
+            # surface the failure as annotations: the log blob is not always reachable from where this PR is reviewed
+            grep -E "ERROR|FAIL|expected|Tests run|\.java:\[" mvn.log | grep -v "^\[INFO\]" | head -80 | sed 's/^/::error::/'
+            exit 1
+          fi
+          grep -E "Tests run:.*Fail" mvn.log | tail -1
+
+      - name: Package (shaded jar)
+        run: mvn -q -B -DskipTests package
+
+      - name: Jar starts and fails fast on missing config
+        run: |
+          set +e
+          out=$(java -jar target/aegis-kafka-bridge.jar 2>&1)
+          rc=$?
+          set -e
+          echo "$out" | tail -3
+          echo "$out" | grep -q "KAFKA_BOOTSTRAP_SERVERS is required" || { echo "::error::bridge did not fail fast on missing config (rc=$rc)"; exit 1; }
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-kafka-bridge
+          path: kafka-bridge/target/aegis-kafka-bridge.jar
+          retention-days: 14

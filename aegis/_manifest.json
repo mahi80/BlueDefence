@@ -1,7 +1,7 @@
 {
   "system": "AEGIS",
   "version": "0.1.0",
-  "generated_at": "2026-10-22T15:46:36Z",
+  "generated_at": "2026-10-31T14:13:10Z",
   "spec_url": "https://github.com/mahi80/rbi/tree/Agentic_Endpoint_AEGIS/aegis",
   "agents": [
     {
@@ -221,9 +221,11 @@
         "block",
         "block_egress",
         "block_export",
+        "config_rollback",
         "escalate_to_fraud_team",
         "escalate_to_hr",
         "hold",
+        "interface_shutdown",
         "isolate",
         "kill_process",
         "lock_account",
@@ -419,6 +421,37 @@
       "always_hitl_actions": []
     },
     {
+      "id": "netops",
+      "module": "aegis.agents.netops.assurance",
+      "description": "Network assurance specialist \u2014 deterministic, no LLM. Builds the topology from LLDP/CDP, detects link down / flap, routing adjacency loss, interface errors, congestion, silent devices and configuration drift from Cisco IOS / NX-OS syslog, SNMP traps, NetFlow/IPFIX and gNMI telemetry; one alert per root cause with the downstream alarms folded in; closed-loop remediation (config rollback, port shut) proposed shadow-first for a human.",
+      "workload_identity": "spiffe://aegis.bank/agents/netops",
+      "model_family": "none (deterministic)",
+      "permissions": {
+        "read": [
+          "syslog.cisco",
+          "snmp.traps",
+          "netflow.ipfix",
+          "gnmi.telemetry",
+          "config.rancid_oxidized_nso",
+          "lldp.cdp"
+        ],
+        "write": [
+          "evidence_chain"
+        ],
+        "invoke": [
+          "soar.config_rollback",
+          "soar.interface_shutdown"
+        ]
+      },
+      "credentials": {
+        "type": "workload_identity",
+        "rotation_policy": "JIT 5-minute TTL via Vault/HSM (per project plan)",
+        "scope": "scoped per-action via OPA gates"
+      },
+      "hitl_gated_actions": [],
+      "always_hitl_actions": []
+    },
+    {
       "id": "threat_intel",
       "module": "aegis.agents.threat_intel.agent",
       "description": "Pull-side IOC service + LLM advisory analyst. Maintains in-memory IOC store; pulls STIX 2.1 feeds, mock seed, and CISA KEV; distributes fresh IOCs into perimeter/edr matchers.",
@@ -506,9 +539,11 @@
     "block",
     "block_egress",
     "block_export",
+    "config_rollback",
     "escalate_to_fraud_team",
     "escalate_to_hr",
     "hold",
+    "interface_shutdown",
     "isolate",
     "kill_process",
     "lock_account",

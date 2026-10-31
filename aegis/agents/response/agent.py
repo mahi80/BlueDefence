@@ -45,6 +45,8 @@ _ALWAYS_HITL_ACTIONS = {
     "rotate_credential",
     "escalate_to_hr",        # DLP/insider: HR + legal involvement
     "snapshot_forensic",     # Self-healing forensic snapshot — auditable
+    "config_rollback",       # Network: a config push to a device — the network team approves, shadow first
+    "interface_shutdown",    # Network: shutting a port takes users off the air; a human confirms
 }
 
 
