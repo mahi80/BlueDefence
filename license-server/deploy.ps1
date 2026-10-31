@@ -11,6 +11,7 @@
 #>
 param(
   [string]$Stack = "bluedefence-license",
+  [string]$AlertEmail = "",
   [string]$Region = $(aws configure get region),
   [string]$SigningKeyFile = "",
   [string]$AdminKey = "",
@@ -51,6 +52,7 @@ if ($SigningKeyFile) {
 
 # --- package --------------------------------------------------------------------------------
 Copy-Item ..\aegis\license.py app\aegis_license.py -Force
+Copy-Item ..\aegis\dataset\privacy_gate.py app\privacy_gate.py -Force
 $bucket = "bluedefence-license-artifacts-$account-$Region"
 $eap = $ErrorActionPreference; $ErrorActionPreference = "SilentlyContinue"      # head-bucket writes to stderr when the bucket is missing; that is not an error
 aws s3api head-bucket --bucket $bucket --region $Region @p 2>$null | Out-Null
@@ -65,7 +67,7 @@ if ($missing) {
 New-Item -ItemType Directory -Force .build | Out-Null
 $zip = ".build\app.zip"
 if (Test-Path $zip) { Remove-Item $zip }
-Compress-Archive -Path app\app.py, app\aegis_license.py -DestinationPath $zip
+Compress-Archive -Path app\app.py, app\aegis_license.py, app\privacy_gate.py -DestinationPath $zip
 # the template's CodeUri points at app/ (for SAM); point it at the zip for plain CloudFormation
 # CodeUri is resolved relative to the template's own folder (.build/), so the zip is referenced by bare name
 (Get-Content template.yaml -Raw) -replace 'CodeUri: app/', "CodeUri: app.zip" | Set-Content .build\template.src.yaml
@@ -73,11 +75,15 @@ aws cloudformation package --template-file .build\template.src.yaml --s3-bucket 
 if ($LASTEXITCODE -ne 0) { throw "cloudformation package failed" }
 
 # --- deploy ---------------------------------------------------------------------------------
-aws cloudformation deploy --template-file .build\template.packaged.yaml --stack-name $Stack --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND --region $Region --no-fail-on-empty-changeset @p
+$overrides = @()
+if ($AlertEmail) { $overrides = @("--parameter-overrides", "AlertEmail=$AlertEmail") }
+aws cloudformation deploy --template-file .build\template.packaged.yaml --stack-name $Stack --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND --region $Region --no-fail-on-empty-changeset @overrides @p
 if ($LASTEXITCODE -ne 0) { throw "cloudformation deploy failed - see the events: aws cloudformation describe-stack-events --stack-name $Stack --region $Region --max-items 10" }
 $api = aws cloudformation describe-stacks --stack-name $Stack --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text --region $Region @p
 Write-Host ""
+$bucket2 = aws cloudformation describe-stacks --stack-name $Stack --query "Stacks[0].Outputs[?OutputKey=='ContribBucket'].OutputValue" --output text --region $Region @p
 Write-Host "deployed. API: $api"
+Write-Host "contrib bucket: $bucket2   (aws s3 sync s3://$bucket2/contrib .\contrib ; python -m aegis.dataset import-contrib .\contrib --out datasets\community-v1)"
 Write-Host "  health : curl $api/health"
 Write-Host ('  order  : curl -X POST ' + $api + '/orders -H "x-admin-key: ADMINKEY" -H "content-type: application/json" -d "{\"customer\":\"Bank X\",\"edition\":\"soc\",\"tier\":\"pilot\",\"days\":90}"')
 Write-Host ('  bank   : python -m aegis.license activate --server ' + $api + ' --code BD-XXXX-XXXX-XXXX')

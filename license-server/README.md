@@ -44,6 +44,29 @@ cd license-server && ./build.sh --deploy          # accept defaults; note the Ap
 CloudShell has `sam`, `aws` and Python preinstalled; clone the repo there with a read-only PAT
 (`git clone https://<PAT>@github.com/mahi80/BlueDefence.git`). Redeploy after changes: `./build.sh && sam deploy`.
 
+## Community edition (free 2 years, data sharing) and fleet monitoring
+
+| Call | Who | What |
+|---|---|---|
+| `POST /signup {org, email, installation_id, accept_terms:true}` | bank operator (self-serve) | 30-day rolling token, 730-day entitlement, tier `community`; work e-mail only, ≤ 3 installations per domain |
+| `POST /renew` (bearer = current token) | AEGIS service, automatically 7 days before expiry | fresh 30-day token **only in good standing**; 402 with the reasons otherwise |
+| `POST /heartbeat` (bearer) | AEGIS service, daily | `chains_total`, audit tail hash, code fingerprint, effective flags, counters — never event data |
+| `POST /contrib` (bearer, gzip bundle) | AEGIS service, hourly | privacy gate → `s3://<ContribBucket>/contrib/<inst>/<y>/<m>/<d>/<ts>-<n>.json.gz`; counts recorded |
+| `GET /installations/{id}/health` | you | standing, contribution ratio, heartbeat age, attestation, flags |
+| `GET /fleet` | you | every installation's standing in one table |
+| daily scan (EventBridge 08:00 IST) | automatic | anomalies → SNS → `-AlertEmail` |
+
+**Standing** is computed from what the installation itself reports, cross-checked: chains written (from
+heartbeats) vs records contributed (from bundles) over 30 days; code fingerprint vs the published list in SSM
+`/bluedefence/license/known-fingerprints` (`python -m aegis.license fingerprint` on each release, JSON list);
+`AEGIS_DATASET_CAPTURE` / `AEGIS_CONTRIB` not switched off. `bad` standing refuses renewal → the token lapses
+→ evaluation mode. An on-prem install can always be modified; this makes it visible within days and self-penalising.
+
+**Training on the pool:** `aws s3 sync s3://<ContribBucket>/contrib ./contrib` then
+`python -m aegis.dataset import-contrib ./contrib --out datasets/community-v1` (re-runs the privacy gate, builds
+`records.jsonl`, `sft/triage.jsonl`, `dpo/preferences.jsonl`), then `python -m aegis.finetune.train --data …` /
+`python -m aegis.finetune.dpo --data …`. Terms: `TERMS-COMMUNITY.md`.
+
 ## Operate
 
 | You want | Call |

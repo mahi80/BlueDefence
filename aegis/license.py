@@ -19,6 +19,9 @@ The verifier is **stdlib only** (RSASSA-PKCS1-v1_5 / SHA-256 is modular exponent
 byte comparison), so the service gains no dependency; ``keygen`` uses ``cryptography`` when it
 is installed and pure-Python Miller–Rabin otherwise.
 
+Tiers: evaluation (no licence) · **community** (free for 2 years, model runs at the bank, ``data_sharing`` required:
+scrubbed chains + analyst decisions ship back hourly — see ``aegis/dataset/contrib.py``) · pilot · standard · enterprise.
+
 Enforcement (``AEGIS_LICENSE_ENFORCE=1`` — off in dev/CI so tests and evals run unlicensed):
 
     valid        features/limits applied: unlicensed features are switched off in the environment
@@ -56,10 +59,15 @@ logger = logging.getLogger("aegis.license")
 
 KEYS_DIR = Path(__file__).resolve().parent / "keys"
 EDITION_RANK = {"external": 0, "soc": 1, "full": 2}
-TIERS = ("evaluation", "pilot", "standard", "enterprise")
-ALL_FEATURES = ("swarm", "ensemble", "investigate", "netops", "kafka_bridge", "dpo", "auto_block_live", "live_enforcement", "compliance_pack")
+TIERS = ("evaluation", "community", "pilot", "standard", "enterprise")
+ALL_FEATURES = ("swarm", "ensemble", "investigate", "netops", "kafka_bridge", "dpo", "auto_block_live", "live_enforcement", "compliance_pack",
+                "data_sharing")
 TIER_DEFAULTS: dict[str, dict] = {
     "evaluation": {"devices": 100, "eps": 5, "features": []},
+    # free for 2 years; the model runs at the bank (Qwen / Mistral / Llama); the installation sends scrubbed
+    # chains + analyst decisions back (data_sharing) — that pooled data is what trains the next BlueDefence brain
+    "community":  {"devices": 500, "eps": 20, "days": 730, "features": ["swarm", "investigate", "netops", "ensemble", "live_enforcement", "auto_block_live",
+                                                            "kafka_bridge", "data_sharing"]},
     "pilot":      {"devices": 100, "eps": 5, "features": ["swarm", "investigate", "netops"]},
     "standard":   {"devices": 2000, "eps": 50, "features": ["swarm", "investigate", "netops", "ensemble", "live_enforcement", "auto_block_live"]},
     "enterprise": {"devices": 0, "eps": 0, "features": list(ALL_FEATURES)},        # 0 = unlimited
@@ -76,6 +84,10 @@ FEATURE_ENV_OFF: dict[str, dict[str, str]] = {
     "live_enforcement": {"AEGIS_ENFORCEMENT_MODE": "shadow", "AEGIS_OUTFLOW_BREAKER": "shadow", "AEGIS_HITL_TIMEOUT": "shadow"},
 }
 SHADOW_ENV = FEATURE_ENV_OFF["live_enforcement"] | FEATURE_ENV_OFF["auto_block_live"]
+# the one feature that forces things ON: a data-sharing licence captures every chain and ships contributions
+FEATURE_ENV_ON: dict[str, dict[str, str]] = {
+    "data_sharing": {"AEGIS_DATASET_CAPTURE": "1", "AEGIS_CONTRIB": "1"},
+}
 
 
 class LicenseError(RuntimeError):
@@ -248,12 +260,14 @@ class License:
     kid: str = ""
     license_id: str = ""
     notes: str = ""
+    entitlement_until: float = 0.0     # commercial term; the signed token itself may be shorter and rolled by /renew
 
     def payload(self) -> dict:
         return {"v": 1, "lic": self.license_id, "customer": self.customer, "installation_id": self.installation_id,
                 "edition": self.edition, "tier": self.tier, "issued": int(self.issued), "expires": int(self.expires),
                 "grace_days": self.grace_days, "limits": {"devices": self.devices, "eps": self.eps},
-                "features": sorted(set(self.features)), "notes": self.notes}
+                "features": sorted(set(self.features)), "notes": self.notes,
+                **({"entitlement_until": int(self.entitlement_until)} if self.entitlement_until else {})}
 
     @classmethod
     def from_payload(cls, p: dict, kid: str = "") -> "License":
@@ -262,7 +276,8 @@ class License:
                    edition=str(p.get("edition", "external")), tier=str(p.get("tier", "evaluation")),
                    issued=float(p.get("issued", 0)), expires=float(p.get("expires", 0)), grace_days=int(p.get("grace_days", 30)),
                    devices=int(lim.get("devices", 0)), eps=int(lim.get("eps", 0)), features=list(p.get("features") or []),
-                   kid=kid, license_id=str(p.get("lic", "")), notes=str(p.get("notes", "")))
+                   kid=kid, license_id=str(p.get("lic", "")), notes=str(p.get("notes", "")),
+                   entitlement_until=float(p.get("entitlement_until", 0) or 0))
 
 
 def issue(lic: License, *, n: int, d: int, kid: str) -> str:
@@ -325,9 +340,12 @@ class LicenseState:
             return f"licence {self.status}: {self.reason} — evaluation mode" + (" (enforced)" if self.enforce else " (not enforced: AEGIS_LICENSE_ENFORCE=0)")
         assert lic is not None
         left = f"{self.days_left:.0f} d left" if self.days_left is not None else ""
+        if lic.entitlement_until and self.days_left is not None:
+            left = f"token {self.days_left:.0f} d (renews; entitled to {time.strftime('%Y-%m-%d', time.gmtime(lic.entitlement_until))})"
         lim = f"{lic.devices or '∞'} devices / {lic.eps or '∞'} eps"
         return (f"licence {self.status}: {lic.customer} · {lic.tier} · {lic.edition} · {lim} · {left} · "
-                f"features {','.join(sorted(self.effective_features)) or 'none'}" + ("" if self.enforce else " (not enforced)"))
+                f"features {','.join(sorted(self.effective_features)) or 'none'}"
+                + (" · data sharing ON" if "data_sharing" in self.effective_features else "") + ("" if self.enforce else " (not enforced)"))
 
     def to_dict(self) -> dict:
         lic = self.license
@@ -421,6 +439,10 @@ def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> L
             forced.update(offs)
     if state.status == "over_limit" or not state.licensed:
         forced.update(SHADOW_ENV)
+    if state.licensed:
+        for feat, ons in FEATURE_ENV_ON.items():
+            if feat in state.effective_features:
+                forced.update(ons)
     for k, v in forced.items():
         if env.get(k, "") != v:
             env[k] = v
@@ -482,6 +504,94 @@ def usage_report(state: LicenseState, meter: LicenseMeter | None, *, audit_path:
     return rep
 
 
+# ------------------------------------------------------------- attestation --
+
+def code_fingerprint(root: Path | None = None) -> str:
+    """sha256 over the installed AEGIS source (every ``aegis/**/*.py`` except tests/eval), sorted by path.
+    Reported in the heartbeat; the licence service compares it with the published release hashes. A
+    modified install (capture disabled, gate patched, contribution stubbed) shows up as an unknown hash."""
+    base = Path(root) if root else Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    for f in sorted(base.rglob("*.py")):
+        rel = f.relative_to(base).as_posix()
+        if rel.startswith(("tests/", "eval/")) or "/tests/" in rel or "__pycache__" in rel:
+            continue
+        h.update(rel.encode())
+        h.update(b"\0")
+        try:
+            h.update(f.read_bytes())
+        except OSError:
+            continue
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def heartbeat_payload(*, installation_id: str, audit_path: Path | None, counters: dict | None = None,
+                      env: MutableMapping[str, str] | None = None, contrib_cursor: int | None = None) -> dict:
+    """What the installation tells the licence service once a day — counts and hashes, never event data."""
+    env = os.environ if env is None else env
+    chains, tail = 0, "0" * 64
+    if audit_path and Path(audit_path).exists():
+        with Path(audit_path).open("rb") as fh:
+            last = b""
+            for ln in fh:
+                if ln.strip():
+                    chains += 1
+                    last = ln
+        try:
+            tail = json.loads(last).get("integrity_hash", tail) if last else tail
+        except json.JSONDecodeError:
+            pass
+    flags = {k: env.get(k, "") for k in ("AEGIS_EDITION", "AEGIS_ENFORCEMENT_MODE", "AEGIS_DATASET_CAPTURE", "AEGIS_CONTRIB",
+                                         "AEGIS_LICENSE_ENFORCE", "LLM_BACKEND", "AEGIS_SWARM")}
+    return {"installation_id": installation_id, "ts": int(time.time()), "chains_total": chains, "audit_tail_hash": tail,
+            "code_fingerprint": code_fingerprint(), "flags": flags, "counters": dict(counters or {}),
+            "contrib_cursor": contrib_cursor, "host": platform.node(), "python": platform.python_version()}
+
+
+def _post(server: str, path: str, body: dict, token: str, *, timeout: float = 20.0) -> dict:
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(server.rstrip("/") + path, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "aegis-license/1",
+                                          **({"Authorization": "Bearer " + token.strip()} if token else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error", "")
+        except Exception:  # noqa: BLE001
+            msg = ""
+        raise LicenseError(f"{path} refused ({e.code}): {msg or e.reason}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise LicenseError(f"licence service unreachable: {e}") from None
+
+
+def heartbeat(server: str, token: str, payload: dict) -> dict:
+    return _post(server, "/heartbeat", payload, token)
+
+
+def renew(server: str, token: str) -> dict:
+    """Roll the signed token: the service re-issues (same entitlement, fresh expiry) only while the installation
+    is in good standing — for a data-sharing licence, only while contributions keep arriving. Returns the
+    service JSON (``token`` …); raises ``LicenseError`` with the service's reason otherwise."""
+    res = _post(server, "/renew", {}, token)
+    if not res.get("token"):
+        raise LicenseError("renewal returned no token")
+    return res
+
+
+def token_path(env: MutableMapping[str, str] | None = None) -> Path | None:
+    """Where the licence file lives, if it is a file (so a renewed token can be written back)."""
+    env = os.environ if env is None else env
+    raw = env.get("AEGIS_LICENSE", "").strip() or ("/etc/aegis/license.jwt" if Path("/etc/aegis/license.jwt").is_file() else "")
+    try:
+        return Path(raw) if raw and Path(raw).is_file() else None
+    except OSError:
+        return None
+
+
 # ---------------------------------------------------------------- activation --
 
 def activate(server: str, code: str, inst: str) -> dict:
@@ -523,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument("--installation", required=True, help="the installation id the operator sent (or '*' for a floating pilot)")
     i.add_argument("--edition", choices=tuple(EDITION_RANK), default="soc")
     i.add_argument("--tier", choices=TIERS[1:], default="standard")
-    i.add_argument("--days", type=int, default=365)
+    i.add_argument("--days", type=int, default=0, help="term in days (default: the tier's — 730 for community, else 365)")
     i.add_argument("--grace-days", type=int, default=30)
     i.add_argument("--devices", type=int, help="override the tier default (0 = unlimited)")
     i.add_argument("--eps", type=int, help="override the tier default (0 = unlimited)")
@@ -538,6 +648,10 @@ def main(argv: list[str] | None = None) -> int:
     ac.add_argument("--server", default=os.environ.get("AEGIS_LICENSE_SERVER", ""), help="licence service base URL (or AEGIS_LICENSE_SERVER)")
     ac.add_argument("--code", required=True, help="BD-XXXX-XXXX-XXXX from your BlueDefence order")
     ac.add_argument("--out", default="license.jwt")
+    rn = sub.add_parser("renew", help="operator: roll the signed token at the licence service (the service runs this itself 7 days before expiry)")
+    rn.add_argument("--server", default=os.environ.get("AEGIS_LICENSE_SERVER", ""))
+    rn.add_argument("--license", default="", help="path of the token to renew (default: AEGIS_LICENSE)")
+    sub.add_parser("fingerprint", help="print this install's code fingerprint (what the heartbeat attests)")
     r = sub.add_parser("report", help="operator: signed usage snapshot (counts only) for the true-up")
     r.add_argument("--push", default=os.environ.get("AEGIS_LICENSE_SERVER", ""), help="also POST the report to this licence service (optional)")
     r.add_argument("--audit", default=os.environ.get("AEGIS_AUDIT_PATH", "aegis/_audit_log.jsonl"))
@@ -560,13 +674,14 @@ def main(argv: list[str] | None = None) -> int:
         if bad:
             ap.error(f"unknown feature(s): {bad}")
         now = time.time()
+        days = a.days or int(tier.get("days", 365))
         lic = License(customer=a.customer, installation_id="" if a.installation == "*" else a.installation, edition=a.edition,
-                      tier=a.tier, issued=now, expires=now + a.days * 86400, grace_days=a.grace_days,
+                      tier=a.tier, issued=now, expires=now + days * 86400, grace_days=a.grace_days,
                       devices=tier["devices"] if a.devices is None else a.devices, eps=tier["eps"] if a.eps is None else a.eps,
                       features=feats, notes=a.notes)
         tok = issue(lic, n=int(key["n"], 16), d=int(key["d"], 16), kid=str(key["kid"]))
         Path(a.out).write_text(tok + "\n")
-        print(f"issued {lic.license_id} for {a.customer} / {a.installation}: {a.edition} · {a.tier} · {a.days} d · "
+        print(f"issued {lic.license_id} for {a.customer} / {a.installation}: {a.edition} · {a.tier} · {days} d · "
               f"{lic.devices or '∞'} devices / {lic.eps or '∞'} eps · {','.join(feats)} → {a.out}")
         return 0
     if a.cmd == "verify":
@@ -589,6 +704,25 @@ def main(argv: list[str] | None = None) -> int:
               + (" (re-issued: this installation had already redeemed the code)" if res.get("reissued") else ""))
         print(f"set AEGIS_LICENSE={Path(a.out).resolve()} and AEGIS_LICENSE_ENFORCE=1, then: python -m aegis.license verify")
         return 0
+    if a.cmd == "fingerprint":
+        print(code_fingerprint())
+        return 0
+    if a.cmd == "renew":
+        if not a.server:
+            ap.error("--server (or AEGIS_LICENSE_SERVER) is required")
+        env = dict(os.environ)
+        if a.license:
+            env["AEGIS_LICENSE"] = a.license
+        tok, why = _read_token(env)
+        if not tok:
+            ap.error(why)
+        res = renew(a.server, tok)
+        dest = token_path(env)
+        if dest:
+            dest.write_text(res["token"] + "\n")
+        print(f"renewed {res.get('lic')}: token valid until {time.strftime('%Y-%m-%d', time.gmtime(float(res.get('expires', 0))))}"
+              + (f" → {dest}" if dest else " (inline token: set AEGIS_LICENSE to the new value)"))
+        return 0
     if a.cmd == "report":
         st = check()
         rep = usage_report(st, None, audit_path=Path(a.audit))
@@ -609,6 +743,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = ["License", "LicenseState", "LicenseMeter", "LicenseError", "check", "apply", "allows", "issue", "decode", "activate",
+           "renew", "heartbeat", "heartbeat_payload", "code_fingerprint", "token_path",
            "installation_id", "load_public_keys", "write_keypair", "usage_report", "rsa_keygen", "rsa_sign", "rsa_verify",
            "ALL_FEATURES", "TIERS", "TIER_DEFAULTS"]
 

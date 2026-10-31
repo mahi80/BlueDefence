@@ -408,6 +408,86 @@ class Service:
     def stop(self, *_: Any) -> None:
         self._stop = True
 
+    _last_contrib: float = 0.0
+    _last_heartbeat: float = 0.0
+
+    def _maybe_heartbeat_and_renew(self) -> None:
+        """With a licence service configured: a daily heartbeat (counts + code fingerprint + effective flags, never
+        event data), and a token roll when fewer than AEGIS_LICENSE_RENEW_DAYS (7) remain. The service re-issues only
+        while the installation is in good standing — for a data-sharing licence, only while contributions arrive."""
+        server = os.environ.get("AEGIS_LICENSE_SERVER", "").strip()
+        lic = self.p.license
+        if not server or lic is None:
+            return
+        every = float(os.environ.get("AEGIS_HEARTBEAT_INTERVAL_S", "86400"))
+        if time.time() - self._last_heartbeat < every:
+            return
+        self._last_heartbeat = time.time()
+        from aegis import license as licensing
+        token, _ = licensing._read_token(os.environ)
+        if not token:
+            return
+        counters = {"cycles": self.cycles, "alerts": sum(h.alerts for h in self.history), "executed": sum(h.executed for h in self.history),
+                    "hitl_queued": sum(h.hitl_queued for h in self.history), "decisions": sum(h.decisions for h in self.history)}
+        try:
+            from aegis.dataset.contrib import read_cursor
+            cur = read_cursor(Path(os.environ.get("AEGIS_CONTRIB_CURSOR", str(self.p.audit_path.parent / ".contrib.cursor"))))
+            res = licensing.heartbeat(server, token, licensing.heartbeat_payload(
+                installation_id=lic.installation_id, audit_path=self.p.audit_path, counters=counters, contrib_cursor=cur))
+            if res.get("attestation") == "unknown":
+                logger.warning("[license] the licence service does not recognise this install's code fingerprint — "
+                               "a modified install will not be renewed")
+            if res.get("standing") and res["standing"] != "good":
+                logger.warning("[license] standing with the licence service: %s — %s", res["standing"], res.get("reason", ""))
+        except Exception as e:  # noqa: BLE001 — a heartbeat failure never affects the SOC
+            logger.warning("[license] heartbeat failed: %s", str(e)[:200])
+        try:
+            if lic.license is not None and lic.days_left is not None and lic.days_left < float(os.environ.get("AEGIS_LICENSE_RENEW_DAYS", "7")):
+                res = licensing.renew(server, token)
+                dest = licensing.token_path()
+                if dest is not None:
+                    dest.write_text(res["token"] + "\n")
+                    self.p.license = licensing.apply(licensing.check())
+                    _license_metrics(self.p.license)
+                    logger.info("[license] token renewed until %s", time.strftime("%Y-%m-%d", time.gmtime(float(res.get("expires", 0)))))
+                else:
+                    logger.warning("[license] renewed token received but AEGIS_LICENSE is inline — set it to the new value: %s…", res["token"][:24])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[license] renewal failed: %s", str(e)[:200])
+
+    def _maybe_contribute(self) -> None:
+        """Community licence (``AEGIS_CONTRIB=1``): every ``AEGIS_CONTRIB_INTERVAL_S`` (3600) build the scrubbed
+        bundle of new chains + analyst decisions and push it to ``AEGIS_LICENSE_SERVER`` (or write it to
+        ``AEGIS_CONTRIB_OUT`` on an air-gapped host). A refused bundle leaves nothing; a failed push retries next time."""
+        if os.environ.get("AEGIS_CONTRIB", "0").strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        every = float(os.environ.get("AEGIS_CONTRIB_INTERVAL_S", "3600"))
+        if time.time() - self._last_contrib < every:
+            return
+        self._last_contrib = time.time()
+        try:
+            from aegis.dataset.contrib import contribute
+            from aegis.license import _read_token
+            token, _ = _read_token(os.environ)
+            lic = self.p.license
+            res = contribute(audit_path=self.p.audit_path, installation_id=lic.installation_id if lic else "unknown",
+                             license_token=token, license_id=(lic.license.license_id if lic and lic.license else ""),
+                             hitl_dir=os.environ.get("AEGIS_HITL_DIR") or None,
+                             cursor_path=os.environ.get("AEGIS_CONTRIB_CURSOR", str(self.p.audit_path.parent / ".contrib.cursor")),
+                             server=os.environ.get("AEGIS_LICENSE_SERVER", "").strip(),
+                             out=(os.environ.get("AEGIS_CONTRIB_OUT", "").strip() and
+                                  str(Path(os.environ["AEGIS_CONTRIB_OUT"]) / f"contrib-{int(time.time())}.json.gz")) or None)
+            if res.get("sent") or res.get("file"):
+                logger.info("[contrib] %d record(s) (%d with analyst decisions) %s", res["records"], res["counts"]["human_decided"],
+                            "pushed" if res.get("sent") else f"written to {res['file']}")
+            elif res.get("reason") == "privacy gate":
+                logger.error("[contrib] bundle refused by the privacy gate — nothing left this host (%d finding(s))", len(res["findings"]))
+            from aegis.agents.shared.observability import METRICS
+            METRICS.inc("aegis_contrib_records_total", res.get("records", 0))
+            METRICS.set("aegis_contrib_last_ok", 1.0 if res.get("sent") or res.get("file") or res.get("reason") == "nothing new" else 0.0)
+        except Exception as e:  # noqa: BLE001 — contribution must never take the SOC down
+            logger.warning("[contrib] failed: %s", str(e)[:200])
+
     def run(self, *, once: bool = False, max_cycles: int = 0) -> int:
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -424,6 +504,8 @@ class Service:
         while not self._stop:
             stats = run_cycle(self.p, max_alerts=self.max_alerts)
             self.cycles += 1
+            self._maybe_contribute()
+            self._maybe_heartbeat_and_renew()
             self.history.append(stats)
             del self.history[:-100]
             logger.info("[service] cycle %d: %s", self.cycles, stats.line())
