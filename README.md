@@ -8,6 +8,38 @@ Detection is **deterministic** (scorers, fast-paths, policy-as-code); the LLMs
 **triage and judge**; a multi-model vote guards the irreversible calls; and every
 containment action is auditable and, by default, held for a human.
 
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph IN[Ingest]
+    SIEM[Sentinel / Splunk]
+    WAF[WAF: Imperva / F5 / Cloudflare]
+    GOVE[ACP governance events]
+  end
+  IN --> ORCH[Orchestrator]
+  ORCH --> DET["Deterministic detection<br/>scorers · fast-paths · policy-as-code"]
+  ORCH --> TRI["LLM triage<br/>fine-tuned model"]
+  TRI --> VOTE["Independent / ensemble vote<br/>guards irreversible calls"]
+  ORCH --> SW["Swarm fan-out<br/>blast radius · min-cut plan · attacker twin"]
+  DET --> CH[(Evidence chain)]
+  VOTE --> CH
+  SW --> CH
+  CH --> HITL[HITL approval card]
+  HITL --> RESP["Response connectors<br/>WAF / SOAR · shadow by default"]
+  CH -. HTTP .-> DASH[(ACP dashboard<br/>/api/soc · /api/approvals)]
+  DASH --> CON[soc-console]
+  SDK["acp-sdk (pinned package)"] -. governs .-> ORCH
+```
+
+A detection flows **ingest → orchestrator**, where the deterministic layer reaches a verdict
+where it can and the LLM triages the rest; an independent (or multi-model ensemble) vote guards
+the irreversible calls; a swarm of short-lived workers walks the blast radius and plans the
+**minimum cut**. It all lands in a hash-linked **evidence chain** → a **HITL** approval card →
+**response connectors** (shadow until receipts prove an action safe; containment always waits for
+a human). The dashboard and console are HTTP consumers; `acp-sdk` governs the brain as an optional,
+pinned package. Full detail: [`aegis/README.md`](aegis/README.md).
+
 ## Layout
 
 | Path | What it is |
@@ -26,23 +58,43 @@ containment action is auditable and, by default, held for a human.
    AEGIS posts to `ACP_DASHBOARD_URL` (`/api/soc/*`, `/api/approvals`). That API is the
    frozen contract between the two repos.
 
-## Run it
+## Install
+
+Prerequisites: **Python ≥ 3.11**; **Node 22** for the console; (optional) read access to the
+private `mahi80/rbi` for the governance SDK.
 
 ```bash
-# SOC brain + eval gates (no governance needed)
-pip install -r aegis/requirements.txt pytest
+# The SOC brain (base deps). AEGIS runs without governance — the acp-sdk import is optional.
+pip install -e .                      # from pyproject; or: pip install -r aegis/requirements.txt
+
+# Optional: the governance runtime (SOC-AGENTQ-01 under ACPGuard). Needs access to the private SDK.
+pip install -e ".[governance]"        # pinned to mahi80/rbi@b2e9d97 (acp-sdk 0.8.3)
+#   private install needs a token — either `gh auth setup-git`, or:
+#   pip install "acp-sdk @ git+https://x-access-token:$GH_READ_TOKEN@github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk"
+
+# The console
+cd soc-console && npm install
+```
+
+## Run
+
+```bash
+# Tests + the end-to-end eval gate
 python -m pytest aegis/tests -q
-python -m aegis.eval.fault_injection          # end-to-end over synthetic campaigns
+python -m aegis.eval.fault_injection          # whole pipeline over synthetic campaigns
 
-# With governance (SOC-AGENTQ-01 under ACPGuard) — needs access to the private SDK:
-pip install "acp-sdk @ git+https://x-access-token:$GH_READ_TOKEN@github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk"
+# One real service cycle over the built-in sample alerts (external edition, shadow enforcement)
+python -m aegis.service
 
-# The console (renders the demo scenario)
+# The console against the presenter-paced demo scenario
 python scripts/soc_demo.py --port 8799
 cd soc-console && AEGIS_API_ORIGIN=http://localhost:8799 \
   AEGIS_AUTH_MODE=demo AEGIS_CONSOLE_SECRET=demo AEGIS_DEMO_USER=soc AEGIS_DEMO_PASSWORD=demo \
-  npm install && npm run dev
+  npm run dev
 ```
+
+Point AEGIS at a live dashboard with `ACP_DASHBOARD_URL` + `ACP_API_KEY` (persistence + HITL);
+see the flags below and [`aegis/README.md`](aegis/README.md) for the full configuration reference.
 
 ## Key env flags
 
@@ -61,9 +113,11 @@ WAF/SOAR vendors: `AEGIS_WAF_VENDOR`, `AEGIS_SOAR_VENDOR` (+ creds) — see `aeg
 ## CI
 
 - `.github/workflows/aegis-ci.yml` — eval gates (historical + injection, investigation
-  quality, fault injection, property tests), plus `pytest aegis/tests` under governance.
-  The governed job installs `acp-sdk` from the pinned URL and needs the repo secret
-  **`GH_READ_TOKEN`** (a read-scoped PAT for `mahi80/rbi`).
+  quality, fault injection, property tests) and `pytest aegis/tests`. The governed job runs
+  the unit tests always; it installs `acp-sdk` and runs the governance eval **only when the
+  repo secret `GH_READ_TOKEN` is set** (a read-scoped PAT for `mahi80/rbi`). Without the
+  secret it stays green — governance-only tests self-skip — and the full governed gate turns
+  on automatically the day a token is added. No token is required to keep CI green.
 - `.github/workflows/soc-console-ci.yml` — `npm ci` + typecheck + build.
 
 ## Provenance
