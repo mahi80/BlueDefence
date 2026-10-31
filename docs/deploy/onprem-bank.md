@@ -211,6 +211,13 @@ PII tokenization (`AEGIS_PII_TOKENIZATION=1`, default) runs **before** any model
 
 ## 4. Install
 
+> **Shortcut.** `install.sh` at the repo root performs steps 4a–4e (system user, venv, `/etc/aegis/aegis.env`,
+> licence, hardened `aegis-soc.service`) in one run — `sudo ./install.sh` interactive, or fully flagged
+> (`--community`, `--code`, `--license`, `--llm vllm --vllm-url …`, `--sources`, `--non-interactive`). It is
+> idempotent and keeps the licence, the dataset salt and the audit log across re-runs. For an air-gapped host,
+> copy the repo and run it with `--license <file>` (or `--no-license`); the steps below remain the reference
+> for what it does and for environments that need a different layout.
+
 Two profiles. The **base SOC** profile is pip-light and is all the SOC host needs when the model
 is served from a separate GPU box. The **local-inference** profile adds the GPU stack and is
 installed on the model host (or on the SOC host if it has a GPU).
