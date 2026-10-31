@@ -69,10 +69,12 @@ class AegisSinkTest {
         t.start();
         Thread.sleep(150);
         assertTrue(t.isAlive(), "the fourth offer waits — that wait is the backpressure the Streams thread feels");
-        sink.flush();
+        sink.flush();                       // drains, which wakes the waiting offer; flush may send "4" too
         t.join(2_000);
         assertTrue(!t.isAlive());
-        assertEquals(1, sink.buffered());
+        sink.flush();
+        assertEquals(0, sink.buffered());
+        assertEquals(4, sink.linesSent.get(), "nothing was dropped while the producer waited");
         assertTrue(sink.blockedMs.get() >= 100);
     }
 }
