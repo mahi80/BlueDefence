@@ -24,6 +24,7 @@ from .auth_abuse import auth_burst_chain, is_auth_burst
 from .low_and_slow import is_low_and_slow, low_and_slow_chain
 from .bola import is_object_walk, object_walk_chain
 from .egress import egress_chain, is_egress_finding
+from .model_pull import is_dealigned_model_pull, model_pull_chain
 from .spoofed_client import is_spoofed_client, spoofed_client_chain
 from .host_endpoint import host_route
 from .pxe_firmware import is_pxe_firmware_finding, pxe_firmware_chain
@@ -175,6 +176,13 @@ class SOCOrchestrator:
                 obs.record_alert_processed("object_walk")
                 obs.record_verdict(chain.verdict, "object_walk")
                 sp.attributes["specialist"] = "object_walk"
+                sp.attributes["verdict"] = chain.verdict
+            # Fast-path: a web-proxy record of an "uncensored" / abliterated model pulled from Hugging Face.
+            elif is_dealigned_model_pull(alert):
+                chain = model_pull_chain(alert)
+                obs.record_alert_processed("model_pull")
+                obs.record_verdict(chain.verdict, "model_pull")
+                sp.attributes["specialist"] = "model_pull"
                 sp.attributes["verdict"] = chain.verdict
             # Fast-path: an egress finding from the network sensor (beacon, exfiltration, known-bad TLS, shadow AI).
             elif is_egress_finding(alert):
