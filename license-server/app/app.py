@@ -23,7 +23,16 @@ Routes (HTTP API v2 payload):
     POST /contrib         gzip bundle      scrubbed chains + analyst decisions → privacy gate → hash-chain
                                            continuity → S3 contrib/<inst>/<ts>.json.gz; counts recorded
 
+    GET  /updates?channel=&base=&current=  (bearer) the newest published model release for this installation's
+                                           channel/base beyond ``current`` → {manifest_token (signed), url (presigned
+                                           S3 GET, 1 h), release}; 204 when up to date — "definitions updates"
+
   admin (header ``x-admin-key`` = SSM /bluedefence/license/admin-key):
+    POST /releases        {version, channel, base_model, sha256, size, rollout_pct, notes}
+                                           register a model release → presigned S3 PUT for the adapter tar.gz
+    POST /releases/{v}/publish             sign the manifest and make it live; /rollout {pct} widens a staged rollout;
+                                           /withdraw pulls it
+    GET  /releases[?channel=]              the release list
     POST /orders          {customer, edition, tier, days, devices?, eps?, features?, notes?}
                                            → an activation code the bank operator redeems
     GET  /orders/{code}
@@ -45,6 +54,7 @@ Table (single, on-demand): PK / SK
     INST#<id>           HB#<ts>        heartbeats (counts only)
     INST#<id>           CONTRIB#<ts>   one row per accepted bundle (counts + s3 key)
     ORG#<domain>        META           community sign-ups per e-mail domain (abuse cap)
+    REL#<version>       META           model release: manifest fields, s3 key, status registered|published|withdrawn
 
   Scheduled (EventBridge, daily): scan the fleet, publish anomalies to SNS (``ALERT_TOPIC_ARN``).
 """
@@ -146,6 +156,15 @@ class Store:
         if ALERT_TOPIC_ARN:
             boto3.client("sns").publish(TopicArn=ALERT_TOPIC_ARN, Subject=subject[:99], Message=message)
 
+    def presign(self, key: str, method: str, expires: int = 3600, content_type: str = "") -> str:
+        import boto3  # type: ignore
+        if not CONTRIB_BUCKET:
+            raise RuntimeError("CONTRIB_BUCKET is not configured")
+        params: dict[str, Any] = {"Bucket": CONTRIB_BUCKET, "Key": key}
+        if method == "put_object" and content_type:
+            params["ContentType"] = content_type
+        return boto3.client("s3").generate_presigned_url(method, Params=params, ExpiresIn=expires)
+
 
 class MemoryStore(Store):
     def __init__(self):  # noqa: D107 — no boto3
@@ -179,6 +198,9 @@ class MemoryStore(Store):
 
     def notify(self, subject: str, message: str) -> None:
         self.notices.append((subject, message))
+
+    def presign(self, key: str, method: str, expires: int = 3600, content_type: str = "") -> str:
+        return f"mem://{method}/{key}?expires={expires}"
 
 
 # -------------------------------------------------------------------- config --
@@ -426,6 +448,38 @@ def _continuity(records: list[dict]) -> tuple[int, int]:
     return len(have), 0
 
 
+# ------------------------------------------------------------- releases --
+
+MANIFEST_TYP = "AEGIS-MODEL-RELEASE"
+_VERSION_RX = __import__("re").compile(r"^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,3}$")
+
+
+def _sign_manifest(cfg: Config, rel: dict) -> str:
+    k = cfg.signing_key
+    header = L._b64u(json.dumps({"alg": "RS256", "typ": MANIFEST_TYP, "kid": str(k["kid"])}, separators=(",", ":")).encode())
+    body = L._b64u(json.dumps(rel, sort_keys=True, separators=(",", ":")).encode())
+    sig = L.rsa_sign(f"{header}.{body}".encode(), int(k["n"], 16), int(k["d"], 16))
+    return f"{header}.{body}.{L._b64u(sig)}"
+
+
+def _manifest_fields(rec: dict) -> dict:
+    return {k: rec[k] for k in ("version", "channel", "base_model", "sha256", "size", "rollout_pct", "min_aegis", "notes", "published_at") if k in rec}
+
+
+def _version_key(v: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
+
+
+def _latest_release(store: Store, channel: str, base: str, current: str) -> dict | None:
+    rows = [r for r in store.scan_meta("REL#") if r.get("status") == "published" and r.get("channel") == channel
+            and (base in ("", "any") or r.get("base_model") in (base, "any"))]
+    rows = [r for r in rows if not current or _version_key(str(r["version"])) > _version_key(current)]
+    return max(rows, key=lambda r: _version_key(str(r["version"]))) if rows else None
+
+
 def fleet_scan(cfg: Config, store: Store, now: float | None = None, *, notify: bool = False) -> dict:
     """Daily: standing for every installation; roll the 30-day chain counter; SNS on anything not good."""
     now = time.time() if now is None else now
@@ -614,6 +668,20 @@ def handle(event: dict, *, cfg: Config, store: Store, now: float | None = None) 
             log.info("contrib %s: %d records (%d decided) → %s", inst, len(records), decided, where)
             return _resp(202, {"ok": True, "stored": key, "records": len(records), "decided": decided})
 
+        if method == "GET" and path == "/updates":
+            lic, why = _bearer_license(event, cfg, now)
+            if lic is None:
+                return _resp(401, {"error": why})
+            q = event.get("queryStringParameters") or {}
+            channel = str(q.get("channel") or "stable")[:16]
+            base = str(q.get("base") or "any")[:120]
+            current = str(q.get("current") or "")[:40]
+            rel = _latest_release(store, channel, base, current)
+            if rel is None:
+                return {"statusCode": 204, "headers": {"cache-control": "no-store"}, "body": ""}
+            url = store.presign(rel["key"], "get_object", 3600)
+            return _resp(200, {"manifest_token": rel["manifest_token"], "url": url, "release": _manifest_fields(rel)})
+
         if method == "POST" and path == "/usage":
             b = _body(event)
             rep = b.get("report") if isinstance(b.get("report"), dict) else b
@@ -660,6 +728,58 @@ def handle(event: dict, *, cfg: Config, store: Store, now: float | None = None) 
             store.update(f"LIC#{parts[1]}", "META", status="revoked", revoked_at=int(now), reason=str(_body(event).get("reason", ""))[:200])
             return _resp(200, {"lic": parts[1], "status": "revoked",
                                "note": "the offline file keeps verifying until its expiry; revocation blocks re-activation and marks the record"})
+        if method == "POST" and path == "/releases":
+            b = _body(event)
+            v = str(b.get("version", "")).strip()
+            if not _VERSION_RX.match(v):
+                return _resp(400, {"error": "version must look like 2026.11.1"})
+            channel = str(b.get("channel", "stable"))
+            if channel not in ("stable", "beta"):
+                return _resp(400, {"error": "channel must be stable or beta"})
+            sha = str(b.get("sha256", "")).lower()
+            if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+                return _resp(400, {"error": "sha256 must be 64 hex chars"})
+            try:
+                size, pct = int(b.get("size", 0)), int(b.get("rollout_pct", 100))
+            except (TypeError, ValueError):
+                return _resp(400, {"error": "size and rollout_pct must be integers"})
+            if size <= 0 or not 0 <= pct <= 100:
+                return _resp(400, {"error": "size must be > 0 and rollout_pct 0..100"})
+            if store.get(f"REL#{v}", "META"):
+                return _resp(409, {"error": f"release {v} already exists"})
+            key = f"releases/{channel}/{v}/adapter.tar.gz"
+            rec = {"PK": f"REL#{v}", "SK": "META", "version": v, "channel": channel, "base_model": str(b.get("base_model", "any"))[:120],
+                   "sha256": sha, "size": size, "rollout_pct": pct, "min_aegis": str(b.get("min_aegis", ""))[:40],
+                   "notes": str(b.get("notes", ""))[:500], "key": key, "status": "registered", "created": int(now)}
+            store.put(rec)
+            return _resp(201, {"version": v, "key": key, "upload_url": store.presign(key, "put_object", 3600, "application/gzip")})
+        if method == "GET" and path == "/releases":
+            q = event.get("queryStringParameters") or {}
+            rows = [{k: r.get(k) for k in ("version", "channel", "base_model", "size", "rollout_pct", "status", "published_at", "notes")}
+                    for r in store.scan_meta("REL#") if not q.get("channel") or r.get("channel") == q.get("channel")]
+            return _resp(200, {"releases": sorted(rows, key=lambda r: _version_key(str(r["version"])), reverse=True)})
+        if method == "POST" and len(parts) == 3 and parts[0] == "releases":
+            rec = store.get(f"REL#{parts[1]}", "META")
+            if not rec:
+                return _resp(404, {"error": "unknown release"})
+            if parts[2] == "publish":
+                rec["published_at"] = int(now)
+                manifest = _manifest_fields(rec)
+                token = _sign_manifest(cfg, manifest)
+                store.update(f"REL#{parts[1]}", "META", status="published", published_at=int(now), manifest_token=token)
+                return _resp(200, {**manifest, "status": "published", "kid": cfg.signing_key["kid"]})
+            if parts[2] == "rollout":
+                pct = int(_body(event).get("pct", 100))
+                if not 0 <= pct <= 100:
+                    return _resp(400, {"error": "pct 0..100"})
+                rec["rollout_pct"] = pct
+                token = _sign_manifest(cfg, _manifest_fields(rec))
+                store.update(f"REL#{parts[1]}", "META", rollout_pct=pct, manifest_token=token)
+                return _resp(200, {"version": parts[1], "rollout_pct": pct})
+            if parts[2] == "withdraw":
+                store.update(f"REL#{parts[1]}", "META", status="withdrawn", withdrawn_at=int(now), reason=str(_body(event).get("reason", ""))[:200])
+                return _resp(200, {"version": parts[1], "status": "withdrawn"})
+            return _resp(404, {"error": "not found"})
         if method == "GET" and path == "/fleet":
             scan = fleet_scan(cfg, store, now)
             return _resp(200, {"installations": scan["rows"], "need_attention": scan["alerts"]})

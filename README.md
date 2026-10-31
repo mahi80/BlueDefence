@@ -177,6 +177,15 @@ domain); terms in `license-server/TERMS-COMMUNITY.md`. Your side: `aws s3 sync s
 ./contrib && python -m aegis.dataset import-contrib ./contrib --out datasets/community-v1` → SFT + DPO views →
 `aegis.finetune` → the next brain, shipped back to every installation.
 
+**Model updates — the brain ships like antivirus definitions.** You train on the pool, gate the adapter, and
+`python -m aegis.finetune.publish --adapter … --version 2026.11.1 --channel stable --rollout-pct 10` uploads it
+and has the licence service sign a release manifest with the issuer key. Every licensed installation asks
+`GET /updates` on its daily heartbeat, verifies the manifest against `aegis/keys/`, downloads, checks sha256 +
+size against the *signed* manifest, extracts to `AEGIS_MODEL_DIR/<version>/`, writes the promotion pointer and
+hot-reloads (vLLM `set_model`) or applies at the next restart. Staged rollout by installation-id bucket; `rollout`
+widens, `withdraw` pulls; `python -m aegis.model_updates rollback` repoints to the previous release kept on disk.
+`AEGIS_MODEL_UPDATES` (on when a licence server is set), `AEGIS_MODEL_CHANNEL`, `AEGIS_MODEL_BASE`.
+
 What happens when things go wrong (`AEGIS_LICENSE_ENFORCE=1`): **grace** (expired < `grace_days`, 30) runs
 as licensed and warns hourly; **over_limit** (24 h peak above devices/eps for > `AEGIS_LICENSE_OVERLIMIT_DAYS`, 7)
 forces enforcement to shadow — never a stop; **expired** past grace refuses to *start* (audit, verify and

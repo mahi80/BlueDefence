@@ -441,6 +441,21 @@ class Service:
                 logger.warning("[license] standing with the licence service: %s — %s", res["standing"], res.get("reason", ""))
         except Exception as e:  # noqa: BLE001 — a heartbeat failure never affects the SOC
             logger.warning("[license] heartbeat failed: %s", str(e)[:200])
+        # model updates — the brain ships like antivirus definitions: pull, verify the signed manifest, point, hot-reload
+        try:
+            from aegis import model_updates
+            if model_updates.enabled() and lic.licensed:
+                r = model_updates.update_once(server=server, token=token, installation_id=lic.installation_id)
+                if r.get("updated"):
+                    logger.info("[model_updates] %s → %s installed; %s", r.get("previous") or "base", r["version"],
+                                "hot-reloading" if os.environ.get("AEGIS_HOT_RELOAD", "").lower() in ("1", "true", "yes", "on")
+                                else "applies at the next restart (set AEGIS_HOT_RELOAD=1 for an in-place swap on vLLM)")
+                    from aegis.agents.shared.observability import METRICS
+                    METRICS.inc("aegis_model_updates_total")
+                    if os.environ.get("AEGIS_HOT_RELOAD", "").lower() in ("1", "true", "yes", "on"):
+                        self.p.hot_reload_from_pointer()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[model_updates] %s", str(e)[:200])
         try:
             if lic.license is not None and lic.days_left is not None and lic.days_left < float(os.environ.get("AEGIS_LICENSE_RENEW_DAYS", "7")):
                 res = licensing.renew(server, token)

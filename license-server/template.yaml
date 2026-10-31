@@ -116,6 +116,7 @@ Resources:
           ALERT_TOPIC_ARN: !Ref AlertTopic
       Policies:
         - S3WritePolicy: { BucketName: !Ref ContribBucket }
+        - S3ReadPolicy: { BucketName: !Ref ContribBucket }        # presigned GETs for model releases run under this role
         - SNSPublishMessagePolicy: { TopicName: !GetAtt AlertTopic.TopicName }
         - DynamoDBCrudPolicy: { TableName: !Ref LicenseTable }
         - Statement:
@@ -149,7 +150,7 @@ Outputs:
   TableName:
     Value: !Ref LicenseTable
   ContribBucket:
-    Description: community contributions land here — aws s3 sync s3://<bucket>/contrib ./contrib && python -m aegis.dataset import-contrib ./contrib --out datasets/community-v1
+    Description: community contributions (contrib/) and published model releases (releases/) — aws s3 sync s3://<bucket>/contrib ./contrib && python -m aegis.dataset import-contrib ./contrib --out datasets/community-v1
     Value: !Ref ContribBucket
   AlertTopic:
     Value: !Ref AlertTopic

@@ -249,3 +249,50 @@ def test_contrib_refuses_pii_and_wrong_installation(cfg2):
     code, c = _contrib(cfg2, s, b["token"], inst="bd-other", n=3, now=NOW)
     assert code == 403
     assert app.handle({"requestContext": {"http": {"method": "POST", "path": "/contrib"}}, "headers": {}, "body": "{}"}, cfg=cfg2, store=s, now=NOW)["statusCode"] == 401
+
+
+# ------------------------------------------------------------- releases --
+
+def test_release_publish_and_updates_feed(cfg2):
+    s = app.MemoryStore()
+    _, b = _call(cfg2, s, "POST", "/signup", {"org": "Bank R", "email": "x@bankr.in", "installation_id": "bd-r", "accept_terms": True})
+    tok = b["token"]
+    sha = "ab" * 32
+    # register → upload url → publish
+    code, reg = _call(cfg2, s, "POST", "/releases", {"version": "2026.11.1", "channel": "stable", "base_model": "Qwen/Qwen3-8B",
+                                                      "sha256": sha, "size": 12345, "rollout_pct": 100, "notes": "first"}, admin=True)
+    assert code == 201 and reg["key"] == "releases/stable/2026.11.1/adapter.tar.gz" and reg["upload_url"].startswith("mem://put_object/")
+    assert _call(cfg2, s, "POST", "/releases", {"version": "bad", "sha256": sha, "size": 1}, admin=True)[0] == 400
+    assert _call(cfg2, s, "POST", "/releases", {"version": "2026.11.1", "sha256": sha, "size": 1}, admin=True)[0] == 409
+    # not published yet → nothing offered
+    ev = {"requestContext": {"http": {"method": "GET", "path": "/updates"}}, "headers": _bearer(tok),
+          "queryStringParameters": {"channel": "stable", "base": "Qwen/Qwen3-8B", "current": ""}, "body": ""}
+    assert app.handle(ev, cfg=cfg2, store=s, now=NOW)["statusCode"] == 204
+    code, pub = _call(cfg2, s, "POST", "/releases/2026.11.1/publish", {}, admin=True)
+    assert code == 200 and pub["status"] == "published" and pub["kid"] == "srv-kid"
+    r = app.handle(ev, cfg=cfg2, store=s, now=NOW)
+    assert r["statusCode"] == 200
+    body = json.loads(r["body"])
+    assert body["release"]["version"] == "2026.11.1" and body["url"].startswith("mem://get_object/releases/stable/2026.11.1/")
+    # the manifest verifies against the issuer key and carries the sha the installation will check the download against
+    sys.path.insert(0, str(ROOT))
+    from aegis import model_updates as mu
+    rel, why = mu.verify_manifest(body["manifest_token"], {"srv-kid": (int(cfg2.signing_key["n"], 16), 65537)})
+    assert rel is not None and why == "" and rel["sha256"] == sha and rel["size"] == 12345
+    assert mu.verify_manifest(body["manifest_token"][:-4] + "AAAA", {"srv-kid": (int(cfg2.signing_key["n"], 16), 65537)})[0] is None
+    # a licence token is not a release manifest
+    assert mu.verify_manifest(tok, {"srv-kid": (int(cfg2.signing_key["n"], 16), 65537)})[1] == "not a model-release manifest"
+    # already on that version → 204; a wrong base → 204; beta channel → 204
+    ev["queryStringParameters"]["current"] = "2026.11.1"
+    assert app.handle(ev, cfg=cfg2, store=s, now=NOW)["statusCode"] == 204
+    ev["queryStringParameters"] = {"channel": "stable", "base": "mistralai/Mistral-7B", "current": ""}
+    assert app.handle(ev, cfg=cfg2, store=s, now=NOW)["statusCode"] == 204
+    # staged rollout + withdraw
+    assert _call(cfg2, s, "POST", "/releases/2026.11.1/rollout", {"pct": 10}, admin=True)[1]["rollout_pct"] == 10
+    ev["queryStringParameters"] = {"channel": "stable", "base": "Qwen/Qwen3-8B", "current": ""}
+    assert json.loads(app.handle(ev, cfg=cfg2, store=s, now=NOW)["body"])["release"]["rollout_pct"] == 10
+    assert _call(cfg2, s, "POST", "/releases/2026.11.1/withdraw", {"reason": "regression"}, admin=True)[1]["status"] == "withdrawn"
+    assert app.handle(ev, cfg=cfg2, store=s, now=NOW)["statusCode"] == 204
+    assert _call(cfg2, s, "GET", "/releases", admin=True)[1]["releases"][0]["status"] == "withdrawn"
+    # no bearer → 401
+    assert app.handle({**ev, "headers": {}}, cfg=cfg2, store=s, now=NOW)["statusCode"] == 401

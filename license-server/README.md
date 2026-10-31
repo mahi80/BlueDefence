@@ -62,6 +62,14 @@ heartbeats) vs records contributed (from bundles) over 30 days; code fingerprint
 `AEGIS_DATASET_CAPTURE` / `AEGIS_CONTRIB` not switched off. `bad` standing refuses renewal → the token lapses
 → evaluation mode. An on-prem install can always be modified; this makes it visible within days and self-penalising.
 
+**Shipping the brain back (model releases):**
+
+| Call | Who | What |
+|---|---|---|
+| `python -m aegis.finetune.publish --adapter runs/…/adapter --version 2026.11.1 --channel stable --rollout-pct 10 --server $API --admin-key $ADMIN` | you | tar.gz + sha256 → `POST /releases` → presigned PUT to `releases/<channel>/<version>/adapter.tar.gz` → `POST /releases/{v}/publish` signs the manifest |
+| `POST /releases/{v}/rollout {pct}` · `POST /releases/{v}/withdraw` · `GET /releases` | you | widen a staged rollout, pull a bad one, list |
+| `GET /updates?channel=&base=&current=` (bearer) | every installation, daily | signed manifest + 1 h presigned GET; 204 when up to date; installations verify sha256 against the signed manifest before installing |
+
 **Training on the pool:** `aws s3 sync s3://<ContribBucket>/contrib ./contrib` then
 `python -m aegis.dataset import-contrib ./contrib --out datasets/community-v1` (re-runs the privacy gate, builds
 `records.jsonl`, `sft/triage.jsonl`, `dpo/preferences.jsonl`), then `python -m aegis.finetune.train --data …` /
