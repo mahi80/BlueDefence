@@ -1,200 +1,197 @@
 # BlueDefence
 
-Autonomous SOC — **AEGIS** (Agent Q), an ACP-governed detection, investigation and
-response brain, with its analyst console. Carved out of the ACP monorepo
-(`mahi80/rbi`) so the SOC product ships on its own cadence.
+**AEGIS** — an autonomous SOC and network-operations brain for banks. It reads the bank's
+security *and* network telemetry, reaches a verdict deterministically where it can and with a
+fine-tuned open-weights model where it must, walks the blast radius, proposes the minimum
+containment, and holds every irreversible action for a human — with a hash-chained evidence trail
+a regulator can replay.
 
-Detection is **deterministic** (scorers, fast-paths, policy-as-code); the LLMs
-**triage and judge**; a multi-model vote guards the irreversible calls; and every
-containment action is auditable and, by default, held for a human.
+Three things make it different from a SIEM with an LLM bolted on:
+
+- **Detection is deterministic first.** Scorers, fast paths and policy-as-code produce most
+  verdicts; the model triages what is left and a second model votes on anything irreversible.
+- **It understands the estate, not just the alert.** Topology from LLDP, ownership from the IdP,
+  crown jewels, change tickets — so a fibre cut is one incident not sixty alarms, and an unticketed
+  config push followed by a BGP drop is malicious, not "network noise".
+- **Every installation makes every other one smarter.** Community installations run the model on
+  their own hardware, free, and send back scrubbed verdicts and analyst decisions; the pooled data
+  trains the next brain, which ships back to all of them like an antivirus definition update.
+
+Carved out of the ACP governance monorepo (`mahi80/rbi`) so the SOC product ships on its own
+cadence. Full technical detail: [`aegis/README.md`](aegis/README.md).
+
+## What it covers
+
+| Domain | Feeds | What AEGIS does |
+|---|---|---|
+| Perimeter & API | WAF (Imperva / F5 / Cloudflare / AWS / Azure), API gateways | adaptive AI-agent attackers, credential stuffing, BOLA / object walks, TLS fingerprinting, auto-block of narrow external targets |
+| Egress | Zeek / Suricata TLS metadata, proxy logs | C2 beacons, slow exfiltration, known-bad certificates, shadow AI and uncensored-model pulls |
+| Identity & endpoints | SIEM (Sentinel / Splunk), EDR, IdP | privileged-engineer compromise (DevOps / SRE), crown-jewel access and control changes outside a ticketed window |
+| Payments | core-banking / treasury streams | outflow guard and circuit breaker: high-value transfers to new beneficiaries, drain bursts (the Oct 2026 Binance pattern) |
+| **Network operations** | Cisco IOS / NX-OS syslog, SNMP traps, NetFlow / IPFIX, gNMI telemetry, RANCID / Oxidized configs, LLDP / CDP | topology-aware root cause, alarm suppression (53 → 1 on a fibre cut), flaps, congestion, device silence, **bad config push** detection with rollback |
+| AI governance | ACP governance events (optional) | the SOC brain itself runs as a governed agent under ACP |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   subgraph IN[Ingest]
-    SIEM[Sentinel / Splunk]
-    WAF[WAF: Imperva / F5 / Cloudflare]
-    NET["Network: syslog · SNMP · NetFlow · telemetry · LLDP<br/>(Kafka bridge)"]
+    SIEM[Sentinel / Splunk / EDR]
+    WAF[WAF · API gateway · NDR]
+    NET["Network: syslog · SNMP · NetFlow · telemetry · LLDP"]
+    KB["Kafka bridge (Java)"] --> NET
     GOVE[ACP governance events]
   end
   IN --> ORCH[Orchestrator]
-  ORCH --> DET["Deterministic detection<br/>scorers · fast-paths · policy-as-code"]
-  ORCH --> TRI["LLM triage<br/>fine-tuned model"]
+  ORCH --> DET["Deterministic detection<br/>scorers · fast paths · netops · policy-as-code"]
+  ORCH --> TRI["LLM triage<br/>fine-tuned open-weights model"]
   TRI --> VOTE["Independent / ensemble vote<br/>guards irreversible calls"]
   ORCH --> SW["Swarm fan-out<br/>blast radius · min-cut plan · attacker twin"]
   DET --> CH[(Evidence chain)]
   VOTE --> CH
   SW --> CH
   CH --> HITL[HITL approval card]
-  HITL --> RESP["Response connectors<br/>WAF / SOAR · shadow by default"]
+  HITL --> RESP["Response connectors<br/>WAF / SOAR / network · shadow by default"]
   CH -. HTTP .-> DASH[(ACP dashboard<br/>/api/soc · /api/approvals)]
   DASH --> CON[soc-console]
+  CH -. scrubbed, hourly .-> LIC[(BlueDefence licence service<br/>AWS, free tier)]
+  LIC -. signed model releases, daily .-> TRI
   SDK["acp-sdk (pinned package)"] -. governs .-> ORCH
 ```
 
-A detection flows **ingest → orchestrator**, where the deterministic layer reaches a verdict
-where it can and the LLM triages the rest; an independent (or multi-model ensemble) vote guards
-the irreversible calls; a swarm of short-lived workers walks the blast radius and plans the
-**minimum cut**. It all lands in a hash-linked **evidence chain** → a **HITL** approval card →
-**response connectors** (shadow until receipts prove an action safe; containment always waits for
-a human). The dashboard and console are HTTP consumers; `acp-sdk` governs the brain as an optional,
-pinned package. Full detail: [`aegis/README.md`](aegis/README.md).
+A detection flows **ingest → orchestrator**: the deterministic layer verdicts what it can, the
+model triages the rest, a vote guards the irreversible calls, a swarm walks the blast radius and
+plans the **minimum cut**. Everything lands in a hash-linked **evidence chain** → **HITL** card →
+**response connectors** (shadow until receipts prove an action safe). The dashboard and console
+are HTTP consumers; `acp-sdk` governs the brain as an optional pinned package; the licence service
+closes the learning loop across installations.
+
+## How it is sold — and why the free tier makes the product better
+
+| Tier | Price | Devices / eps | What you get | Condition |
+|---|---|---|---|---|
+| **Community** | free, 2 years | 500 / 20 | the whole SOC incl. network assurance, Kafka bridge, live enforcement; the model runs on *your* hardware (Qwen / Mistral / Llama) | scrubbed evidence chains + analyst decisions contributed hourly (`data_sharing`) |
+| Pilot | — (90 d) | 100 / 5 | swarm, investigate, netops; shadow only | — |
+| Standard | per installation / year | 2,000 / 50 | + ensemble vote, live enforcement, live auto-block | — |
+| Enterprise | per installation / year | unlimited | + Kafka bridge, own DPO retraining, compliance pack, support | — |
+
+The flywheel: ten Community installations → ten SOCs' worth of real verdicts and analyst
+corrections in your S3 every hour → `import-contrib` → fine-tune / DPO → gate → **publish** →
+every installation pulls the new adapter on its daily check, verifies the signed manifest, and
+hot-swaps. Nobody at the bank does anything; the brain gets better for everyone.
+
+What leaves a bank is *derived* telemetry only — verdicts, evidence types, action types, analyst
+decisions, the alert's shape with every identity pseudonymised — and a privacy gate refuses the
+whole bundle if anything PII-shaped remains. Terms: [`license-server/TERMS-COMMUNITY.md`](license-server/TERMS-COMMUNITY.md).
 
 ## Layout
 
 | Path | What it is |
 |---|---|
-| `aegis/` | The SOC brain: orchestrator → specialists → swarm fan-out → evidence chains → min-cut containment → HITL. Ingest (Sentinel/Splunk/WAF), response connectors (shadow by default), eval gates, dataset capture, meta-agent. See `aegis/README.md`. |
-| `soc-console/` | The analyst console (Next.js) — decision-first HITL queue, evidence-backed Agent Q, attack-path map. Talks to the dashboard over HTTP. |
-| `kafka-bridge/` | Java 21 / Kafka Streams bridge: device syslog, NetFlow, telemetry and alert topics → AEGIS (`/ingest/netops`, `/ingest/alerts`) with dedupe, flap folding and backpressure; AEGIS verdicts → `aegis.verdicts`. `TopologyTestDriver` tests, no broker needed. See `kafka-bridge/README.md`. |
-| `scripts/` | `soc_demo.py` (presenter-paced offline scenario the console renders) and `soc_live.py` (drives the real pipeline). |
-| `docs/plans/` | AEGIS roadmaps. |
+| `aegis/` | The brain: ingest (SIEM / WAF / API gateway / NDR / **netops**), orchestrator → specialists → swarm → evidence chains → HITL → response connectors; `license.py`, `model_updates.py`, `dataset/` (capture, scrubber, privacy gate, contributions), `finetune/` (train, DPO, gate, publish), eval gates. See `aegis/README.md`. |
+| `kafka-bridge/` | Java 21 / Kafka Streams: `aegis.syslog / netflow / telemetry / alerts` topics → AEGIS with dedupe, flap folding and backpressure; AEGIS verdicts → `aegis.verdicts`. `TopologyTestDriver` tests, no broker. See `kafka-bridge/README.md`. |
+| `license-server/` | The BlueDefence licence service on AWS free tier (Lambda + HTTP API + DynamoDB + S3 + SSM): orders and activation codes, Community self-serve signup, rolling tokens, heartbeats and fleet health, contribution intake, model-release publishing, daily anomaly alerts. One-script deploy (`deploy.ps1` / `build.sh`). See `license-server/README.md`. |
+| `soc-console/` | The analyst console (Next.js): decision-first HITL queue, evidence-backed Agent Q, attack-path map. Talks to the dashboard over HTTP. |
+| `scripts/` | `soc_demo.py` (presenter-paced offline scenario the console renders), `soc_live.py` (drives the real pipeline). |
+| `docs/` | roadmaps (`plans/`), on-prem bank deployment (`deploy/onprem-bank.md`), feed-wiring runbook (`runbooks/`). |
 
-## The two seams (why this split is clean)
+## Quick start
 
-1. **Governance → `acp-sdk`, a pinned package.** Only `aegis/governance.py` touches it,
-   imported lazily — AEGIS runs without it (governance degrades to a no-op). Pinned to
-   `mahi80/rbi@b2e9d97` (acp-sdk 0.8.3) in `requirements-governance.txt` / `pyproject.toml`.
-2. **Persistence/HITL → the ACP dashboard, over HTTP.** No dashboard code is imported;
-   AEGIS posts to `ACP_DASHBOARD_URL` (`/api/soc/*`, `/api/approvals`). That API is the
-   frozen contract between the two repos.
-
-## Install
-
-Prerequisites: **Python ≥ 3.11**; **Node 22** for the console; (optional) read access to the
-private `mahi80/rbi` for the governance SDK.
+Prerequisites: **Python ≥ 3.11**; **Node 22** for the console; Java 21 + Maven for the Kafka bridge;
+(optional) read access to the private `mahi80/rbi` for the governance SDK.
 
 ```bash
-# The SOC brain (base deps). AEGIS runs without governance — the acp-sdk import is optional.
-pip install -e .                      # from pyproject; or: pip install -r aegis/requirements.txt
+pip install -e .                                   # the brain; governance SDK is optional: pip install -e ".[governance]"
 
-# Optional: the governance runtime (SOC-AGENTQ-01 under ACPGuard). Needs access to the private SDK.
-pip install -e ".[governance]"        # pinned to mahi80/rbi@b2e9d97 (acp-sdk 0.8.3)
-#   private install needs a token — either `gh auth setup-git`, or:
-#   pip install "acp-sdk @ git+https://x-access-token:$GH_READ_TOKEN@github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk"
+python -m pytest aegis/tests -q                    # unit + integration
+python -m aegis.eval.network_fault_bench --gate    # one of the CI gates: 48-device campus, 8 faults, 53 alarms → 1 alert
+python -m aegis.service                            # one cycle over the sample alerts (external edition, shadow)
 
-# The console
-cd soc-console && npm install
-```
-
-## Run
-
-```bash
-# Tests + the end-to-end eval gate
-python -m pytest aegis/tests -q
-python -m aegis.eval.fault_injection          # whole pipeline over synthetic campaigns
-
-# One real service cycle over the built-in sample alerts (external edition, shadow enforcement)
-python -m aegis.service
-
-# The console against the presenter-paced demo scenario
+# the analyst console against the demo scenario
 python scripts/soc_demo.py --port 8799
-cd soc-console && AEGIS_API_ORIGIN=http://localhost:8799 \
-  AEGIS_AUTH_MODE=demo AEGIS_CONSOLE_SECRET=demo AEGIS_DEMO_USER=soc AEGIS_DEMO_PASSWORD=demo \
-  npm run dev
+cd soc-console && AEGIS_API_ORIGIN=http://localhost:8799 AEGIS_AUTH_MODE=demo AEGIS_CONSOLE_SECRET=demo \
+  AEGIS_DEMO_USER=soc AEGIS_DEMO_PASSWORD=demo npm run dev
 ```
 
-Point AEGIS at a live dashboard with `ACP_DASHBOARD_URL` + `ACP_API_KEY` (persistence + HITL);
-see the flags below and [`aegis/README.md`](aegis/README.md) for the full configuration reference.
+A bank installation (Community):
+
+```bash
+python -m aegis.license install-id                                   # the id the licence is bound to
+# self-serve: POST {org, email, installation_id, accept_terms:true} to <licence service>/signup → license.jwt
+AEGIS_LICENSE=/etc/aegis/license.jwt AEGIS_LICENSE_ENFORCE=1 AEGIS_LICENSE_SERVER=https://… \
+  AEGIS_SOURCES=sentinel,waf,netops python -m aegis.service          # contributes hourly, heartbeats daily, pulls model updates
+```
+
+## Evaluation gates (all run in CI)
+
+| Gate | What it proves |
+|---|---|
+| `aegis.eval.run` | 37 historical alerts agree with the curated verdicts; 9 prompt-injection cases never yield `allow` |
+| `aegis.eval.purple_team` | adaptive AI-agent attackers vs the real pipeline: 11/11 campaigns detected and contained, zero collateral on customers / partners / staff |
+| `aegis.eval.egress_bench` | implants, exfiltration, known-bad TLS, shadow AI found among every-host vendor beacons; benign hosts untouched |
+| `aegis.eval.signer_compromise` | the Oct 2026 Binance pattern (DevOps laptop → payment signer → drain): every stage caught, drain contained |
+| `aegis.eval.network_fault_bench` | 48-device campus/WAN, 8 injected faults: right root device + port every time, 53 vendor alarms → 1 alert, ticketed change never malicious, zero alerts on healthy devices |
+| `aegis.eval.fault_injection` | every dependency failing in turn (model, dashboard, SIEM, connectors…): the SOC survives, fails safe, and says so |
+| `aegis.eval.investigation_quality` | blast-radius completeness and precision, plan minimality, HITL policy on 6 worlds with ground truth |
+| `agent_identity --verify` | the live code matches the checked-in agent manifest (19 agents, permissions, high-impact actions) |
 
 ## Key env flags
 
 | Flag | Default | Effect |
 |---|---|---|
-| `ACP_DASHBOARD_URL`, `ACP_API_KEY` | — | Persistence + HITL transport to the dashboard. |
-| `AEGIS_EDITION` | `external` | `external` \| `soc` \| `full`. |
-| `AEGIS_ENFORCEMENT_MODE` | `shadow` | `shadow` logs what it would enforce; `live` calls vendor connectors. |
-| `AEGIS_SWARM` | `1` | Swarm fan-out on triage. |
-| `AEGIS_AUTO_BLOCK` | `shadow` | Detection-time auto-block of narrow, external, reversible targets (TTL, voter-gated). |
-| `AEGIS_ENSEMBLE_VOTE` | `off` | Multi-model majority vote on the irreversible judgment. With it on, `build_pipeline` loads the extra voters named in `AEGIS_VOTER_MODELS` (comma-separated `model` or `backend:model`, e.g. `vllm:llama-3-8b, vllm:mistral-7b`) so the panel is ≥2; pick different families. Off, or with none set, it's the single-voter path. |
-| `AEGIS_HITL_TIMEOUT` | `off` | Timeout fallback: a reversible action with a majority-concur vote auto-executes past its window; irreversible actions and split votes hold for a human. `shadow` \| `live`; `AEGIS_HITL_TIMEOUT_SEC` (120). |
-| `AEGIS_OUTFLOW_BREAKER` | `shadow` | Outflow circuit breaker: during a drain burst (N high-value transfers to new beneficiaries from one sender), hold that sender's further payments without waiting for a human. `off` \| `shadow` \| `live`; TTL `AEGIS_OUTFLOW_BREAKER_TTL` (3600 s). Every other hold still waits. |
-| `AEGIS_HIGH_VALUE_INR`, `AEGIS_OUTFLOW_BURST_N`, `AEGIS_OUTFLOW_WINDOW_S` | ₹1 cr, 3, 1800 s | Outflow guard: a high-value transfer to a beneficiary not known to be existing is held for a human; a burst is a drain. |
-| `AEGIS_TREASURY_ACCOUNTS` | — | Treasury / nostro / settlement senders (plus ids containing TREASURY, NOSTRO, VOSTRO, SETTLEMENT, and `svc_` users). |
-| `AEGIS_PRIVILEGED_USERS`, `AEGIS_PRIVILEGED_HOSTS` | — | Engineers with production reach (DevOps / SRE / DevSecOps / platform) and their machines — export from the IdP groups and asset inventory. A compromise there is a crown-jewel incident: isolate, revoke, rotate. Role tags on alerts work too. |
-| `AEGIS_CROWN_JEWELS` | payment, signer, hsm, swift, treasury, vault, kms, core-banking | Systems where interactive access or a control change (signing policy, allowlist, limits) outside a ticketed window is malicious. |
-| `AEGIS_LICENSE_SERVER`, `AEGIS_CONTRIB`, `AEGIS_CONTRIB_INTERVAL_S`, `AEGIS_CONTRIB_OUT`, `AEGIS_HEARTBEAT_INTERVAL_S`, `AEGIS_LICENSE_RENEW_DAYS` | — / forced by `data_sharing` / 3600 / — / 86400 / 7 | Licence service URL; hourly contribution (or write bundles to a folder on an air-gapped host); daily heartbeat; token roll when fewer days remain. |
-| `AEGIS_LICENSE`, `AEGIS_LICENSE_ENFORCE` | — / `0` | Path (or inline token) of the installation licence; `1` makes the service honour it (edition cap, feature gates, shadow on over-limit, refuse start past grace). `AEGIS_INSTALL_ID` pins the installation id; `AEGIS_LICENSE_PUBKEYS` overrides the shipped issuer keys; `AEGIS_LICENSE_OVERLIMIT_DAYS` (7). See *Licensing*. |
-| `AEGIS_NET_*` | flap 5/300 s, correlation 900 s, errors 100/min, utilisation 90 % × 3, silent 180 s, bad push 600 s | Network assurance thresholds (`AEGIS_NET_FLAP_N`, `_FLAP_WINDOW_S`, `_CORR_WINDOW_S`, `_ERR_PER_MIN`, `_UTIL_PCT`, `_UTIL_SAMPLES`, `_SILENT_S`, `_BAD_PUSH_S`); `AEGIS_NET_GOLDEN` (JSON `{device: config_hash}`) or `AEGIS_NET_GOLDEN_FIRST_SEEN=1`; `AEGIS_NET_INVENTORY` for roles/sites/users. Root cause, alarm suppression, flaps, bad config pushes — see `aegis/README.md` § What the network itself says. |
+| `AEGIS_EDITION` | `external` | `external` \| `soc` \| `full` (`soc`/`full` add the ACP dashboard; `full` governs the brain itself) |
+| `AEGIS_ENFORCEMENT_MODE` | `shadow` | `shadow` records what it would do; `live` calls vendor connectors. Containment still waits for a human |
+| `AEGIS_SWARM`, `AEGIS_INVESTIGATE` | `1`, `0` | swarm fan-out on triage; async blast-radius investigation tier |
+| `AEGIS_ENSEMBLE_VOTE`, `AEGIS_VOTER_MODELS` | `off` | multi-model majority on irreversible calls (`vllm:llama-3-8b, vllm:mistral-7b`) |
+| `AEGIS_AUTO_BLOCK`, `AEGIS_HITL_TIMEOUT`, `AEGIS_OUTFLOW_BREAKER` | `shadow` / `off` / `shadow` | the three tiered-autonomy switches: narrow external blocks, timeout execution of reversible actions, drain-burst holds |
+| `AEGIS_PRIVILEGED_USERS/_HOSTS`, `AEGIS_CROWN_JEWELS`, `AEGIS_TREASURY_ACCOUNTS` | — | who and what counts as a crown-jewel incident |
+| `AEGIS_NET_*` | sensible NOC defaults | network-assurance thresholds (flap 5/300 s, errors 100/min, utilisation 90 % × 3, silent 180 s, bad push 600 s), golden configs, inventory |
+| `AEGIS_LICENSE`, `AEGIS_LICENSE_ENFORCE`, `AEGIS_LICENSE_SERVER` | — / `0` / — | the installation licence; `1` makes the service honour it; the service URL enables contribution, heartbeat, renewal and model updates |
+| `AEGIS_MODEL_UPDATES`, `AEGIS_MODEL_CHANNEL`, `AEGIS_MODEL_DIR` | on with a licence server / `stable` / `/var/lib/aegis/models` | signed model releases pulled daily; `python -m aegis.model_updates rollback` |
+| `ACP_DASHBOARD_URL`, `ACP_API_KEY` | — | persistence + HITL transport to the ACP dashboard (soc / full editions) |
 
-WAF/SOAR vendors: `AEGIS_WAF_VENDOR`, `AEGIS_SOAR_VENDOR` (+ creds) — see `aegis/README.md`.
+The complete reference (ingest sources, connectors, NDR, BOLA, intel, data) is in
+[`aegis/README.md` § Configuration reference](aegis/README.md#configuration-reference).
 
-## Learning loop (DPO from the approvals queue)
+## Licensing and the licence service
 
-Every analyst decision at the HITL card is supervision. `aegis.dataset export --dpo` turns the
-ones that **overruled the model** into preference pairs in `dpo/preferences.jsonl`:
+The licence is an **offline RSA-signed file bound to one installation** (`AEGIS_INSTALL_ID` or a
+machine-derived id), verified with stdlib code against the issuer public keys in `aegis/keys/`. A
+bank with no egress is fully supported. The BlueDefence side is `license-server/` on AWS free tier.
 
-- `human_corrected` (analyst rejected the action *and* gave the verdict it should have been) →
-  **chosen** = the analyst's verdict, **rejected** = the model's.
-- `human_disputed` (analyst rejected an auto-run action, no verdict) → **chosen** = the same
-  verdict with that action held for a human, **rejected** = the model's auto-run.
+| Flow | Who | How |
+|---|---|---|
+| Paid licence | you → bank | `POST /orders` → activation code `BD-XXXX-XXXX-XXXX` → bank runs `python -m aegis.license activate --server … --code …` |
+| Community licence | bank, self-serve | `POST /signup` with a work e-mail (≤ 3 installations per domain) → 30-day rolling token, 2-year entitlement |
+| Staying licensed | automatic | the service heartbeats daily (counts, code fingerprint, effective flags — never event data) and renews the token 7 days before expiry **only in good standing**: contribution ratio ≥ 0.5 over 30 days, fingerprint on the published-release list, capture not switched off |
+| Contributing | automatic, hourly | scrubbed chains + analyst decisions → privacy gate → `POST /contrib` → S3; air-gapped hosts write the bundle to a folder instead |
+| Model updates | automatic, daily | `GET /updates` → signed manifest → download → sha256 verified against the manifest → promotion pointer → hot-reload; staged rollout, withdraw, rollback |
+| Your view | you | `GET /fleet`, `GET /installations/{id}/health`; daily scan → SNS e-mail on anything not `good` |
 
-Confirmations and agreements produce no pair — there is nothing to prefer. DPO then nudges the
-judge toward the analyst's call and away from the one it overruled, so detection sharpens with
-each decision and needs fewer of them over time. Same held-out eval gate as SFT.
+When things go wrong (`AEGIS_LICENSE_ENFORCE=1`): **grace** runs and warns; **over-limit** forces
+shadow, never a stop; **expired past grace** refuses to *start* (audit tools keep working);
+**missing / invalid** runs in evaluation mode (external, shadow, 100 devices). Nothing is ever
+deleted, HITL always works, a licence can only cap an edition. An on-prem install can always be
+modified — these controls make that visible within days and self-penalising (the renewal decision
+lives on the server), which is as far as any vendor gets without a hardware root of trust.
+
+## Learning loop
+
+Every analyst decision at the HITL card is supervision. `aegis.dataset export --dpo` (one
+installation) or `aegis.dataset import-contrib` (the Community pool) turns the decisions that
+**overruled the model** into preference pairs: `human_corrected` → chosen = the analyst's verdict;
+`human_disputed` → chosen = the same verdict with the action held. Confirmations produce no pair.
+DPO nudges the judge toward the analyst and away from what was overruled; the same held-out gate
+as SFT decides whether the adapter ships; `aegis.finetune.publish` ships it.
 
 ```bash
-aegis.dataset export --dashboard --dpo --out datasets/triage-v1   # pulls chains + decisions
-python -m aegis.finetune.dpo --data datasets/triage-v1 --dry-run   # validate pairs + plan (no GPU)
+aws s3 sync s3://<contrib-bucket>/contrib ./contrib
+python -m aegis.dataset import-contrib ./contrib --out datasets/community-v1       # re-runs the privacy gate
+python -m aegis.finetune.dpo --data datasets/community-v1 --vram 16
+python -m aegis.finetune.gate --adapter runs/community-v1/adapter
+python -m aegis.finetune.publish --adapter runs/community-v1/adapter --version 2026.11.1 --rollout-pct 10 \
+  --server https://… --admin-key …
 ```
-
-Analyst-only by construction, and `load_dpo` refuses non-analyst pairs unless `--allow-synthetic`,
-so no one preference-tunes a bank model on scaffold data by accident.
-
-## Licensing (per installation)
-
-A bank's AEGIS often has no egress, so the licence is an **offline signed file bound to one
-installation** — checked at startup and every cycle, never a call home. One licence per
-installation; a second site is a second licence. Verification is stdlib-only (RSA / SHA-256).
-
-| Step | Who | Command |
-|---|---|---|
-| Create the signing keypair (once; private key offline) | BlueDefence | `python -m aegis.license keygen --out keys/ --kid bd-2026-11` → ship `keys/*.pub.json` in the image (`aegis/keys/`) |
-| Read the installation id | bank operator | `python -m aegis.license install-id` (or pin `AEGIS_INSTALL_ID` on a cluster) → send it with the order |
-| Issue | BlueDefence | `python -m aegis.license issue --key keys/bd-2026-11.key.json --customer "Bank X" --installation bd-… --edition soc --tier standard --days 365 [--feature kafka_bridge] --out license.jwt` |
-| Install | bank operator | `AEGIS_LICENSE=/etc/aegis/license.jwt`, `AEGIS_LICENSE_ENFORCE=1`; `python -m aegis.license verify` shows what the service will conclude |
-| Renew / upgrade | both | drop the new file; picked up at the next start. Rotate issuer keys by adding a new `*.pub.json` (`kid`) |
-| True-up | bank operator | `python -m aegis.license report --out usage.json` — signed counts only (peak eps, devices, chains), e-mailable across an air gap |
-
-| Tier | Devices / eps | Features | Enforcement |
-|---|---|---|---|
-| **evaluation** (no licence) | 100 / 5 | — | external edition, shadow only |
-| **community** (free 2 years) | 500 / 20 | swarm, investigate, netops, ensemble, kafka_bridge, live enforcement, **data_sharing** | live allowed; model runs at the bank; scrubbed chains + analyst decisions contributed hourly |
-| **pilot** (90 d) | 100 / 5 | swarm, investigate, netops | shadow only |
-| **standard** | 2,000 / 50 | + ensemble, live enforcement, live auto-block | live allowed |
-| **enterprise** | unlimited | + kafka_bridge, dpo, compliance_pack | live allowed |
-
-**Community edition — how the free licence stays honest.** The bank keeps the model (open weights) and sends
-back *derived* telemetry: `aegis/dataset/contrib.py` builds a bundle of new evidence chains + analyst decisions,
-scrubbed (salted pseudonyms, IPs, hostnames, e-mail domains) and checked by `aegis/dataset/privacy_gate.py`
-(anything PII-shaped → the bundle is not sent), then `POST /contrib` to the licence service every hour. The
-licence token itself is **30-day rolling**: the service re-issues it only while the installation is in good
-standing — daily heartbeat (counts + code fingerprint + effective flags), contribution ratio ≥ 0.5 over 30 days,
-fingerprint on the published-release list, capture not switched off. Stop sending and the token lapses within
-≤ 44 days into evaluation mode; nothing is ever deleted. Self-serve: `POST /signup` (work e-mail, ≤ 3 per
-domain); terms in `license-server/TERMS-COMMUNITY.md`. Your side: `aws s3 sync s3://<contrib-bucket>/contrib
-./contrib && python -m aegis.dataset import-contrib ./contrib --out datasets/community-v1` → SFT + DPO views →
-`aegis.finetune` → the next brain, shipped back to every installation.
-
-**Model updates — the brain ships like antivirus definitions.** You train on the pool, gate the adapter, and
-`python -m aegis.finetune.publish --adapter … --version 2026.11.1 --channel stable --rollout-pct 10` uploads it
-and has the licence service sign a release manifest with the issuer key. Every licensed installation asks
-`GET /updates` on its daily heartbeat, verifies the manifest against `aegis/keys/`, downloads, checks sha256 +
-size against the *signed* manifest, extracts to `AEGIS_MODEL_DIR/<version>/`, writes the promotion pointer and
-hot-reloads (vLLM `set_model`) or applies at the next restart. Staged rollout by installation-id bucket; `rollout`
-widens, `withdraw` pulls; `python -m aegis.model_updates rollback` repoints to the previous release kept on disk.
-`AEGIS_MODEL_UPDATES` (on when a licence server is set), `AEGIS_MODEL_CHANNEL`, `AEGIS_MODEL_BASE`.
-
-What happens when things go wrong (`AEGIS_LICENSE_ENFORCE=1`): **grace** (expired < `grace_days`, 30) runs
-as licensed and warns hourly; **over_limit** (24 h peak above devices/eps for > `AEGIS_LICENSE_OVERLIMIT_DAYS`, 7)
-forces enforcement to shadow — never a stop; **expired** past grace refuses to *start* (audit, verify and
-export tools keep working); **missing / invalid / wrong installation** runs in evaluation mode. Nothing is ever
-deleted, HITL always works, and a licence can only cap the edition, never raise it. Dev and CI run with
-`AEGIS_LICENSE_ENFORCE=0` (default), where the licence is reported but changes nothing. The Kafka bridge
-checks `GET /ingest/license` for the `kafka_bridge` feature before it starts. State is on `/healthz`,
-`/ingest/license` and `/metrics` (`aegis_license_state{status}`, `aegis_license_days_left`,
-`aegis_license_peak_eps_24h`).
 
 ## Pilot at a bank (sandbox) — what to ask for
 
@@ -207,7 +204,7 @@ pilot would prove nothing. Everything below supports that.
 | # | Ask | Detail | Why |
 |---|---|---|---|
 | 1 | Two VMs in an isolated sandbox | SOC host: 4 vCPU, 16 GB, 50 GB SSD. GPU host: 1× 24 GB (L4 / A10). Ubuntu 22.04 or RHEL 9, container runtime | Runs the brain and the local model; data never leaves the bank |
-| 2 | Read-only log mirror, live, at least one feed | WAF/CDN log export, or SIEM read-only API (Sentinel / Splunk) | Something real to detect on |
+| 2 | Read-only log mirror, live, at least one feed | WAF/CDN log export, or SIEM read-only API (Sentinel / Splunk), or the network syslog/NetFlow Kafka topics | Something real to detect on |
 | 3 | Historical replay | 60–90 days of logs, pseudonymised if needed | Baselines, and a back-test: would AEGIS have caught your past incidents? |
 | 4 | Past incidents with outcomes | 200–500 alerts the SOC already decided (true / false positive, action taken) | Measures accuracy on the bank's data, not ours |
 | 5 | Analyst time | 1–2 SOC analysts, ~3–4 h/week, to decide approval cards | The shadow report is scored against their decisions |
@@ -219,12 +216,12 @@ pilot would prove nothing. Everything below supports that.
 | Ask | Unlocks |
 |---|---|
 | Network sensor tap, or Zeek / Suricata logs | C2 beacons, slow exfiltration, shadow AI |
+| Device syslog + LLDP export (or the Kafka topics) and the change-ticket feed | Network assurance: root cause, alarm suppression, bad-config-push detection |
 | EDR alerts (CrowdStrike / Defender) | Endpoint compromise |
 | Privileged engineers and their machines (IdP groups, asset inventory) → `AEGIS_PRIVILEGED_USERS` / `_HOSTS` | Attacks on DevOps / DevSecOps engineers — the entry point of the Oct 2026 Binance drain |
 | Crown-jewel list (payment signer, HSM, SWIFT, treasury, vault) → `AEGIS_CROWN_JEWELS` | Crown-jewel access and control-change detection |
 | Kubernetes / cloud audit logs; HSM / payment-signer audit logs | Privileged access and signer tampering |
 | Core-banking transaction stream (or a replay) and the treasury / nostro account list → `AEGIS_TREASURY_ACCOUNTS` | Drain and outflow detection |
-| Change-ticket / CMDB feed | Tells ticketed changes from attacks — fewer false positives |
 | Web proxy logs (Zscaler, Squid) | Shadow AI and pulls of uncensored / abliterated models |
 | Sandbox tenants for the WAF / SOAR | One connector smoke test, still in shadow |
 
@@ -232,36 +229,27 @@ pilot would prove nothing. Everything below supports that.
 
 | Approval | Who signs |
 |---|---|
-| Data handling: data stays on-prem, PII tokenised, nothing leaves the bank | Legal / DPO |
+| Data handling: data stays on-prem, PII tokenised; for Community, the derived-telemetry contribution and its scrubber spec | Legal / DPO |
 | Security review of AEGIS itself | InfoSec |
 | Model-risk sign-off for a local LLM (RBI FREE-AI) | Model risk / CRO office |
-| Network change: one inbound ingest port, internal only | Network / CAB |
+| Network change: one inbound ingest port, internal only; outbound HTTPS to the licence service (or none, air-gapped) | Network / CAB |
 
-**What the bank gets in return:**
-
-- **Shadow only** — AEGIS takes no action on any bank system during the pilot; it records what it *would* do.
-- **No data egress** — the models run on the bank's GPU, no internet calls (air-gap supported).
-- **Read-only credentials** everywhere.
-- **6–8 weeks** — install (1), wire feeds (2), shadow window (2–3), review (1).
-- **Success criteria to propose** — catch ≥ X% of the bank's past confirmed incidents in replay; false
-  positives ≤ Y/day on live traffic; a verdict in under a minute; a shadow report showing which
-  actions would have been safe to automate.
-
-Lead with must-haves 2–4: a bank that says yes to real logs and past incidents will make the rest routine.
+**What the bank gets in return:** shadow only during the pilot; no data egress beyond the
+scrubbed contribution they can inspect; read-only credentials everywhere; 6–8 weeks end to end;
+success criteria to propose — catch ≥ X% of past confirmed incidents in replay, false positives
+≤ Y/day live, a verdict in under a minute, and a shadow report showing which actions would have
+been safe to automate.
 
 ## CI
 
-- `.github/workflows/aegis-ci.yml` — eval gates (historical + injection, investigation
-  quality, fault injection, property tests) and `pytest aegis/tests`. The governed job runs
-  the unit tests always; it installs `acp-sdk` and runs the governance eval **only when the
-  repo secret `GH_READ_TOKEN` is set** (a read-scoped PAT for `mahi80/rbi`). Without the
-  secret it stays green — governance-only tests self-skip — and the full governed gate turns
-  on automatically the day a token is added. No token is required to keep CI green.
-- `.github/workflows/soc-console-ci.yml` — `npm ci` + typecheck + build.
-- `.github/workflows/kafka-bridge-ci.yml` — Java 21 `mvn test` (Kafka Streams `TopologyTestDriver`, fake AEGIS; no broker) + shaded jar.
+| Workflow | Runs |
+|---|---|
+| `aegis-ci.yml` | `pytest aegis/tests`, every eval gate above, manifest verify, PII round-trip, DPO smoke. The governed job installs `acp-sdk` and runs the governance eval only when the repo secret `GH_READ_TOKEN` (read PAT for `mahi80/rbi`) exists; without it the job stays green |
+| `kafka-bridge-ci.yml` | Java 21 `mvn test` (`TopologyTestDriver`, fake AEGIS, no broker), shaded jar, fail-fast check |
+| `soc-console-ci.yml` | `npm ci` + typecheck + build |
 
 ## Provenance
 
-Clean import from `mahi80/rbi` (the ACP monorepo) at `b2e9d97`. The dashboard, the
-license server and `acp-sdk` itself stay in `rbi`; BlueDefence consumes the SDK as a
-pinned package and the dashboard over HTTP.
+Clean import from `mahi80/rbi` (the ACP monorepo) at `b2e9d97`. The ACP dashboard and `acp-sdk`
+stay in `rbi`; BlueDefence consumes the SDK as a pinned package and the dashboard over HTTP. The
+BlueDefence licence service (`license-server/`) is this repo's own and independent of ACP's.
