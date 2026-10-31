@@ -107,6 +107,11 @@ see the flags below and [`aegis/README.md`](aegis/README.md) for the full config
 | `AEGIS_AUTO_BLOCK` | `shadow` | Detection-time auto-block of narrow, external, reversible targets (TTL, voter-gated). |
 | `AEGIS_ENSEMBLE_VOTE` | `off` | Multi-model majority vote on the irreversible judgment. With it on, `build_pipeline` loads the extra voters named in `AEGIS_VOTER_MODELS` (comma-separated `model` or `backend:model`, e.g. `vllm:llama-3-8b, vllm:mistral-7b`) so the panel is ≥2; pick different families. Off, or with none set, it's the single-voter path. |
 | `AEGIS_HITL_TIMEOUT` | `off` | Timeout fallback: a reversible action with a majority-concur vote auto-executes past its window; irreversible actions and split votes hold for a human. `shadow` \| `live`; `AEGIS_HITL_TIMEOUT_SEC` (120). |
+| `AEGIS_OUTFLOW_BREAKER` | `shadow` | Outflow circuit breaker: during a drain burst (N high-value transfers to new beneficiaries from one sender), hold that sender's further payments without waiting for a human. `off` \| `shadow` \| `live`; TTL `AEGIS_OUTFLOW_BREAKER_TTL` (3600 s). Every other hold still waits. |
+| `AEGIS_HIGH_VALUE_INR`, `AEGIS_OUTFLOW_BURST_N`, `AEGIS_OUTFLOW_WINDOW_S` | ₹1 cr, 3, 1800 s | Outflow guard: a high-value transfer to a beneficiary not known to be existing is held for a human; a burst is a drain. |
+| `AEGIS_TREASURY_ACCOUNTS` | — | Treasury / nostro / settlement senders (plus ids containing TREASURY, NOSTRO, VOSTRO, SETTLEMENT, and `svc_` users). |
+| `AEGIS_PRIVILEGED_USERS`, `AEGIS_PRIVILEGED_HOSTS` | — | Engineers with production reach (DevOps / SRE / DevSecOps / platform) and their machines — export from the IdP groups and asset inventory. A compromise there is a crown-jewel incident: isolate, revoke, rotate. Role tags on alerts work too. |
+| `AEGIS_CROWN_JEWELS` | payment, signer, hsm, swift, treasury, vault, kms, core-banking | Systems where interactive access or a control change (signing policy, allowlist, limits) outside a ticketed window is malicious. |
 
 WAF/SOAR vendors: `AEGIS_WAF_VENDOR`, `AEGIS_SOAR_VENDOR` (+ creds) — see `aegis/README.md`.
 

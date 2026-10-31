@@ -25,6 +25,8 @@ from .low_and_slow import is_low_and_slow, low_and_slow_chain
 from .bola import is_object_walk, object_walk_chain
 from .egress import egress_chain, is_egress_finding
 from .model_pull import is_dealigned_model_pull, model_pull_chain
+from .privileged import is_privileged_event, privileged_chain
+from .treasury import is_treasury_outflow, treasury_outflow_chain
 from .spoofed_client import is_spoofed_client, spoofed_client_chain
 from .host_endpoint import host_route
 from .pxe_firmware import is_pxe_firmware_finding, pxe_firmware_chain
@@ -155,6 +157,21 @@ class SOCOrchestrator:
                 obs.record_alert_processed("control_plane")
                 obs.record_verdict(chain.verdict, "control_plane")
                 sp.attributes["specialist"] = "control_plane"
+                sp.attributes["verdict"] = chain.verdict
+            # Fast-path: an engineer with production reach, or a crown jewel they can touch (DevOps laptop
+            # compromise, interactive access to the payment signer, a signer policy change).
+            elif is_privileged_event(alert):
+                chain = privileged_chain(alert)
+                obs.record_alert_processed("privileged")
+                obs.record_verdict(chain.verdict, "privileged")
+                sp.attributes["specialist"] = "privileged"
+                sp.attributes["verdict"] = chain.verdict
+            # Fast-path: a high-value transfer to a new beneficiary, and the burst that is a drain.
+            elif is_treasury_outflow(alert):
+                chain = treasury_outflow_chain(alert)
+                obs.record_alert_processed("treasury")
+                obs.record_verdict(chain.verdict, "treasury")
+                sp.attributes["specialist"] = "treasury"
                 sp.attributes["verdict"] = chain.verdict
             # Fast-path: a client that retries at machine speed after every stop (campaign context).
             elif is_adaptive_attacker(alert):

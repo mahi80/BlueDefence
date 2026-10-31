@@ -24,9 +24,15 @@ longer cuts the path); identity, signer and payment actions count at any time. `
 nothing. These rules are a model of the chain, stated so a reader can disagree with them.
 
 The triage judge is whatever the caller's environment selects (``LLM_BACKEND`` …); with none it is the
-deterministic mock, so this measures the deterministic layer — say so when quoting the numbers.
+deterministic mock. Every stage is owned by a deterministic fast path (privileged guard, egress, outflow
+guard), so the gate does not depend on the judge.
 
-    python -m aegis.eval.signer_compromise [--json out.json] [--latencies 300,3600,28800]
+It runs twice — the outflow circuit breaker in shadow (the default deployment) and live — and the CI
+gate (``--gate``) requires: every observable stage at least suspicious and handled by its fast path,
+the drain judged malicious, an analyst approving within an hour preventing the drain, and with the
+breaker live and no analyst at all, no more than 30% of the drain lost.
+
+    python -m aegis.eval.signer_compromise [--gate] [--json out.json] [--latencies 300,3600,28800,inf]
 """
 
 from __future__ import annotations
@@ -81,11 +87,11 @@ def _scope(action_type: str, target: str) -> str | None:
     t = str(target or "")
     if action_type in _ACCESS_ACTIONS and any(x in t for x in (LAPTOP_HOST, LAPTOP_IP, C2_SNI, C2_IP)):
         return "access"
-    if action_type in _ACCESS_ACTIONS and ("withdrawal-signer" in t or "signer" in t.lower()):
+    if action_type in (_ACCESS_ACTIONS | _IDENTITY_ACTIONS) and "signer" in t.lower():
         return "signer"
     if action_type in _IDENTITY_ACTIONS and DEVOPS_USER in t:
         return "identity"
-    if action_type in _PAYMENT_ACTIONS:
+    if action_type in _PAYMENT_ACTIONS and (t.startswith("outbound:") or t.startswith("SC-S5-TXN")):
         return "payment"
     return None
 
@@ -133,6 +139,7 @@ def drain_alerts() -> list[tuple[float, dict]]:
         total += amt
         out.append((i * DRAIN_GAP_S, {
             "id": f"SC-S5-TXN-{i + 1:02d}", "source": "Core Banking (txn stream)", "severity": "critical",
+            "timestamp": datetime.fromtimestamp(T0.timestamp() + i * DRAIN_GAP_S, UTC).isoformat(),
             "anomaly_score": 0.93, "user_id": "svc_payments_signer", "rail": "SWIFT", "amount_inr": amt,
             "beneficiary_account": f"ACC-NEW-OFFSHORE-{i + 1:02d}", "sender_account": TREASURY, "sender_geo": "IN",
             "beneficiary_geo": "HK" if i % 2 else "AE", "new_beneficiary": True,
@@ -169,14 +176,20 @@ def c2_world(seed: int = 11) -> World:
 
 # ------------------------------------------------------------------- the run --
 
-def _env(td: Path) -> dict[str, Any]:
+def _env(td: Path, breaker: str) -> dict[str, Any]:
     from .purple_team.harness import model_env
     env: dict[str, Any] = {
         "AEGIS_EDITION": "external", "ACP_DASHBOARD_URL": None, "ACP_API_KEY": None, "ACP_GOVERN": None,
         "AEGIS_PERSIST": None, "AEGIS_RULE_FEED": None, "AEGIS_HITL_TRANSPORT": "file",
         "AEGIS_SWARM": "1", "AEGIS_SWARM_MAX_SECONDS": "5", "AEGIS_INVESTIGATE": "0", "AEGIS_TWIN": "0",
         "AEGIS_CAMPAIGN_CONTEXT": "1", "AEGIS_CVE_INTEL": "0", "AEGIS_INTEL_MOCK": "1", "AEGIS_PII_TOKENIZATION": "0",
-        "AEGIS_DATASET_CAPTURE": "0", "AEGIS_ENFORCEMENT_MODE": "shadow", "AEGIS_AUTO_BLOCK": "shadow",
+        # vendors are mock tenants, so "live" enforcement acts on the simulation (as the purple team does)
+        "AEGIS_DATASET_CAPTURE": "0", "AEGIS_ENFORCEMENT_MODE": "live", "AEGIS_AUTO_BLOCK": "shadow",
+        "AEGIS_OUTFLOW_BREAKER": breaker, "AEGIS_HITL_TIMEOUT": "off",
+        # the bank's configuration: who its production engineers are, and which account is treasury
+        "AEGIS_PRIVILEGED_USERS": DEVOPS_USER, "AEGIS_PRIVILEGED_HOSTS": f"{LAPTOP_HOST},{LAPTOP_IP}",
+        "AEGIS_TREASURY_ACCOUNTS": TREASURY, "AEGIS_CROWN_JEWELS": None,
+        "AEGIS_HIGH_VALUE_INR": None, "AEGIS_OUTFLOW_BURST_N": None, "AEGIS_OUTFLOW_WINDOW_S": None,
         "AEGIS_WAF_VENDOR": "mock", "AEGIS_SOAR_VENDOR": "mock", "AEGIS_INGEST_HTTP": None, "AEGIS_INGEST_BIND": None,
         "AEGIS_METRICS_BIND": None, "AEGIS_TLS_IOC_FILE": None, "AEGIS_AI_REGISTER": None, "AEGIS_INTERNAL_NETS": None,
         "AEGIS_NDR_ALLOW_DOMAINS": None, "AEGIS_NDR_ALLOW_HOSTS": None,
@@ -188,11 +201,14 @@ def _env(td: Path) -> dict[str, Any]:
     return env
 
 
-def run(seed: int = 11) -> list[StageResult]:
+def run(seed: int = 11, *, breaker: str = "shadow") -> list[StageResult]:
     from ..agents.ndr.egress import EgressDetector
+    from ..agents.orchestrator.treasury import BOOK
     from ..ingest.base import CONSUMED, AlertCheckpoint
     from ..ingest.ndr import NdrConsumer
     from .fault_injection import _env as env_ctx
+
+    BOOK.reset()
 
     stages = [StageResult("0 staging", -36 * H, observable=False,
                           note="attacker-side infrastructure (Binance: mixer-funded wallet, sweeper contract) — "
@@ -203,7 +219,7 @@ def run(seed: int = 11) -> list[StageResult]:
     by_name = {s.stage.split(" ", 1)[1]: s for s in stages}
     with tempfile.TemporaryDirectory() as tds:
         td = Path(tds)
-        with env_ctx(_env(td)):
+        with env_ctx(_env(td, breaker)):
             from ..service import build_pipeline
             p = build_pipeline(td / "audit.jsonl", fresh=True)
             p.response._hitl_stream = io.StringIO()
@@ -249,7 +265,12 @@ def contain(stages: list[StageResult], latency_s: float) -> dict:
         for a in s.actions:
             if not a["scope"]:
                 continue
-            exec_t = a["t_s"] + (0.0 if (a["executed"] or not a["hitl"]) else latency_s)
+            if a["executed"]:
+                exec_t = a["t_s"]                          # ran without waiting (the breaker, an auto action)
+            elif latency_s == float("inf"):
+                continue                                   # no analyst: a human-gated action never lands
+            else:
+                exec_t = a["t_s"] + latency_s
             if a["scope"] == "access" and exec_t >= access_cutoff:
                 continue                                   # too late to matter: the foothold has moved on
             if best is None or exec_t < best[0]:
@@ -260,7 +281,7 @@ def contain(stages: list[StageResult], latency_s: float) -> dict:
         return {"latency_s": latency_s, "stopped_at_s": None, "by": None, "stage": None,
                 "lost_inr": total, "lost_share": 1.0, "prevented": False}
     t = best[0]
-    lost = sum(x["amount_inr"] for ts, x in drain if ts < t)
+    lost = sum(x["amount_inr"] for ts, x in drain if ts <= t)   # the transfer that tripped it has already gone
     return {"latency_s": latency_s, "stopped_at_s": round(t, 1), "by": f"{best[1]['type']} -> {best[1]['target']}",
             "stage": best[2], "lost_inr": lost, "lost_share": round(lost / total, 3), "prevented": lost == 0}
 
@@ -276,13 +297,13 @@ def _crore(inr: float) -> str:
     return f"INR {inr / 1e7:,.0f} cr"
 
 
-def report(stages: list[StageResult], latencies: tuple[float, ...]) -> dict:
+def report(stages: list[StageResult], latencies: tuple[float, ...], *, breaker: str = "shadow") -> dict:
     total = sum(x["amount_inr"] for _, x in drain_alerts())
     first = next((s for s in stages if s.verdict in ("suspicious", "malicious")), None)
     first_mal = next((s for s in stages if s.verdict == "malicious"), None)
     from .purple_team.harness import model_label
     return {"scenario": "signer_compromise (Binance Oct 2026 pattern, bank-translated)", "judge": model_label(),
-            "drain_total_inr": total,
+            "breaker": breaker, "drain_total_inr": total,
             "first_detection": {"stage": first.stage, "at": _hhmm(first.first_alert_t_s)} if first else None,
             "first_malicious": {"stage": first_mal.stage, "at": _hhmm(first_mal.first_alert_t_s)} if first_mal else None,
             "stages": [s.to_dict() for s in stages],
@@ -290,7 +311,7 @@ def report(stages: list[StageResult], latencies: tuple[float, ...]) -> dict:
 
 
 def render(rep: dict) -> str:
-    lines = [f"=== {rep['scenario']} — judge: {rep['judge']} ===",
+    lines = [f"=== {rep['scenario']} — judge: {rep['judge']} — outflow breaker: {rep['breaker']} ===",
              f"  {'stage':22s} {'when':>9s}  {'alerts':>6s}  {'verdict':10s} {'conf':>4s}  {'by':16s} path-cutting actions (HITL?)"]
     for s in rep["stages"]:
         if not s["observable"]:
@@ -307,27 +328,63 @@ def render(rep: dict) -> str:
     lines.append(f"  drain at risk: {_crore(rep['drain_total_inr'])} in {DRAIN_N} transfers over {DRAIN_N * DRAIN_GAP_S / 60:.0f} min")
     for c in rep["containment"]:
         lat = c["latency_s"]
-        lat_s = f"{lat / 3600:g} h" if lat >= 3600 else f"{lat / 60:g} min"
+        lat_s = ("never" if lat == float("inf") else f"{lat / 3600:g} h" if lat >= 3600 else f"{lat / 60:g} min")
+        who = "no analyst at all" if lat == float("inf") else f"analyst approves in {lat_s}"
         if c["stopped_at_s"] is None:
-            lines.append(f"  analyst approves in {lat_s:>6s}: nothing cuts the path — whole drain lost ({_crore(c['lost_inr'])})")
+            lines.append(f"  {who:>26s}: nothing cuts the path — whole drain lost ({_crore(c['lost_inr'])})")
         else:
             out = "drain PREVENTED" if c["prevented"] else f"lost {_crore(c['lost_inr'])} ({c['lost_share']:.0%})"
-            lines.append(f"  analyst approves in {lat_s:>6s}: {c['by']} lands at {_hhmm(c['stopped_at_s'])} "
-                         f"(from {c['stage']}) — {out}")
+            lines.append(f"  {who:>26s}: {c['by']} lands at {_hhmm(c['stopped_at_s'])} (from {c['stage']}) — {out}")
     return "\n".join(lines)
+
+
+#: what each stage must be routed to, now that the deterministic layer owns every stage
+EXPECTED_BY = {"1 endpoint": "privileged", "2 c2": "egress", "3 privileged_access": "privileged",
+               "4 persistence": "privileged", "5 drain": "treasury"}
+
+
+def gate(shadow: dict, live: dict, *, max_live_loss: float = 0.30) -> list[str]:
+    """Failures (empty = pass). Shadow = the default deployment; live = the breaker armed."""
+    fails: list[str] = []
+    for s in shadow["stages"]:
+        if not s["observable"]:
+            continue
+        if s["verdict"] not in ("suspicious", "malicious"):
+            fails.append(f"{s['stage']}: verdict {s['verdict'] or 'none'} (must be at least suspicious)")
+        want = EXPECTED_BY.get(s["stage"])
+        if want and s["by"] != want:
+            fails.append(f"{s['stage']}: handled by {s['by'] or 'nothing'}, expected {want}")
+    drain = next(s for s in shadow["stages"] if s["stage"] == "5 drain")
+    if drain["verdict"] != "malicious":
+        fails.append(f"5 drain: the burst must be judged malicious (got {drain['verdict']})")
+    for c in shadow["containment"]:
+        if c["latency_s"] <= 3600 and not c["prevented"]:
+            fails.append(f"an analyst approving within {c['latency_s'] / 60:g} min must prevent the drain")
+    never = next((c for c in live["containment"] if c["latency_s"] == float("inf")), None)
+    if never is None or never["lost_share"] > max_live_loss:
+        share = never["lost_share"] if never else 1.0
+        fails.append(f"breaker live, no analyst: {share:.0%} of the drain lost (max {max_live_loss:.0%})")
+    return fails
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--json", default="", help="write the full report as JSON")
-    ap.add_argument("--latencies", default="300,3600,28800", help="analyst approval latencies, seconds")
+    ap.add_argument("--latencies", default="300,3600,28800,inf", help="analyst approval latencies, seconds ('inf' = no analyst)")
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--gate", action="store_true", help="exit 1 unless every stage is caught and the drain is contained")
     args = ap.parse_args(argv)
     lats = tuple(float(x) for x in args.latencies.split(",") if x.strip())
-    rep = report(run(args.seed), lats)
-    print(render(rep))
+    reps = {mode: report(run(args.seed, breaker=mode), lats, breaker=mode) for mode in ("shadow", "live")}
+    print(render(reps["shadow"]))
+    print()
+    print(render(reps["live"]))
     if args.json:
-        Path(args.json).write_text(json.dumps(rep, indent=1, default=str))
+        Path(args.json).write_text(json.dumps(reps, indent=1, default=str))
+    if args.gate:
+        fails = gate(reps["shadow"], reps["live"])
+        print("\n  gate: " + ("PASS" if not fails else "FAIL\n    - " + "\n    - ".join(fails)))
+        return 1 if fails else 0
     return 0
 
 
