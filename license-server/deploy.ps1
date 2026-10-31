@@ -1,12 +1,12 @@
-<#
+﻿<#
 .SYNOPSIS
   Deploy the BlueDefence licence service with nothing but AWS CLI v2 (no SAM CLI, no Docker).
 
   .\deploy.ps1 -SigningKeyFile C:\secure\bd-2026-10-bootstrap.key.json          # first time: also writes the SSM secrets
   .\deploy.ps1                                                                   # redeploy after a code change
 
-  Steps: copy aegis/license.py into the function → zip → upload to an S3 bucket (created if missing) →
-  `aws cloudformation package` rewrites CodeUri → `aws cloudformation deploy` with the Serverless transform.
+  Steps: copy aegis/license.py into the function -> zip -> upload to an S3 bucket (created if missing) ->
+  `aws cloudformation package` rewrites CodeUri -> `aws cloudformation deploy` with the Serverless transform.
   Everything stays inside the free tier (Lambda / HTTP API / DynamoDB on-demand / SSM standard params / S3 < 5 GB).
 #>
 param(
@@ -22,8 +22,8 @@ $p = @(); if ($Profile) { $p = @("--profile", $Profile) }
 if (-not $Region) { throw "No region: pass -Region ap-southeast-2 or run 'aws configure set region ap-southeast-2'" }
 
 $account = aws sts get-caller-identity --query Account --output text @p
-if (-not $account) { throw "not signed in — run 'aws login' first" }
-Write-Host "account $account · region $Region · stack $Stack"
+if (-not $account) { throw "not signed in - run 'aws login' first" }
+Write-Host "account $account | region $Region | stack $Stack"
 
 # --- secrets (first time, or when rotating) ------------------------------------------------
 if ($SigningKeyFile) {
@@ -31,10 +31,10 @@ if ($SigningKeyFile) {
   $key = Get-Content $SigningKeyFile -Raw
   if ($key -notmatch '"d"') { throw "$SigningKeyFile is not a PRIVATE key (.key.json from 'python -m aegis.license keygen')" }
   aws ssm put-parameter --name /bluedefence/license/signing-key --type SecureString --overwrite --value $key --region $Region @p | Out-Null
-  Write-Host "signing key → SSM /bluedefence/license/signing-key"
+  Write-Host "signing key -> SSM /bluedefence/license/signing-key"
   if (-not $AdminKey) { $AdminKey = -join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) }
   aws ssm put-parameter --name /bluedefence/license/admin-key --type SecureString --overwrite --value $AdminKey --region $Region @p | Out-Null
-  Write-Host "admin key   → SSM /bluedefence/license/admin-key   (read it back: aws ssm get-parameter --name /bluedefence/license/admin-key --with-decryption --query Parameter.Value --output text)"
+  Write-Host "admin key   -> SSM /bluedefence/license/admin-key   (read it back: aws ssm get-parameter --name /bluedefence/license/admin-key --with-decryption --query Parameter.Value --output text)"
 }
 
 # --- package --------------------------------------------------------------------------------
@@ -61,5 +61,5 @@ $api = aws cloudformation describe-stacks --stack-name $Stack --query "Stacks[0]
 Write-Host ""
 Write-Host "deployed. API: $api"
 Write-Host "  health : curl $api/health"
-Write-Host "  order  : curl -X POST $api/orders -H ""x-admin-key: <admin key>"" -H ""content-type: application/json"" -d ""{\""customer\"":\""Bank X\"",\""edition\"":\""soc\"",\""tier\"":\""pilot\"",\""days\"":90}"""
-Write-Host "  bank   : python -m aegis.license activate --server $api --code BD-XXXX-XXXX-XXXX"
+Write-Host ('  order  : curl -X POST ' + $api + '/orders -H "x-admin-key: ADMINKEY" -H "content-type: application/json" -d "{\"customer\":\"Bank X\",\"edition\":\"soc\",\"tier\":\"pilot\",\"days\":90}"')
+Write-Host ('  bank   : python -m aegis.license activate --server ' + $api + ' --code BD-XXXX-XXXX-XXXX')
