@@ -72,6 +72,13 @@ def _ensemble_enabled() -> bool:
     return os.getenv("AEGIS_ENSEMBLE_VOTE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def ensemble_enabled() -> bool:
+    """Public: is the majority-vote ensemble armed? Used by build_pipeline to decide
+    whether to construct the extra voter clients (so a single-voter deployment loads
+    no extra models)."""
+    return _ensemble_enabled()
+
+
 def _vote_user_msg(chain: EvidenceChain) -> str:
     summary = (
         f"verdict={chain.verdict} confidence={chain.confidence}\n"
