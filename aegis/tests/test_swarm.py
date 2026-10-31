@@ -105,6 +105,7 @@ def test_worker_crash_and_timeout_are_recorded_not_fatal(orch):
 
 
 def test_swarm_workers_are_governed_tool_calls_and_pause_stops_them(orch):
+    pytest.importorskip("acp", reason="requires acp-sdk (governance runtime)")
     from aegis.governance import govern_soc, tool_allowlist
     import os
     os.environ["ACP_GOVERN"] = "1"
@@ -147,6 +148,7 @@ def test_swarm_from_env_off_by_default(orch, monkeypatch):
 def test_governed_swarm_over_the_whole_eval_set_is_never_rate_limited(orch):
     """Regression: ~9 governed calls per alert used to trip Q33's 100/min default
     after a dozen alerts and block the orchestrator itself (ACP-733)."""
+    pytest.importorskip("acp", reason="requires acp-sdk (governance runtime)")
     from aegis.governance import govern_soc
     import os
     os.environ["ACP_GOVERN"] = "1"
