@@ -36,9 +36,17 @@ if ($SigningKeyFile) {
   $check = aws ssm get-parameter --name /bluedefence/license/signing-key --with-decryption --query Parameter.Value --output text --region $Region @p
   if ($check -notmatch '"kid"') { throw "signing key did not round-trip through SSM intact; stored value starts: $($check.Substring(0, [Math]::Min(40, $check.Length)))" }
   Write-Host "signing key -> SSM /bluedefence/license/signing-key"
-  if (-not $AdminKey) { $AdminKey = -join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) }
-  aws ssm put-parameter --name /bluedefence/license/admin-key --type SecureString --overwrite --value $AdminKey --region $Region @p | Out-Null
-  Write-Host "admin key   -> SSM /bluedefence/license/admin-key   (read it back: aws ssm get-parameter --name /bluedefence/license/admin-key --with-decryption --query Parameter.Value --output text)"
+  $eap2 = $ErrorActionPreference; $ErrorActionPreference = "SilentlyContinue"
+  $haveAdmin = aws ssm get-parameter --name /bluedefence/license/admin-key --query Parameter.Name --output text --region $Region @p 2>$null
+  $ErrorActionPreference = $eap2
+  if ($AdminKey -or -not $haveAdmin) {
+    # generate only when there is none yet (or one was given): re-running with -SigningKeyFile must not rotate the admin key
+    if (-not $AdminKey) { $AdminKey = -join ((1..48) | ForEach-Object { '{0:x}' -f (Get-Random -Maximum 16) }) }
+    aws ssm put-parameter --name /bluedefence/license/admin-key --type SecureString --overwrite --value $AdminKey --region $Region @p | Out-Null
+    Write-Host "admin key   -> SSM /bluedefence/license/admin-key   (read it back: aws ssm get-parameter --name /bluedefence/license/admin-key --with-decryption --query Parameter.Value --output text)"
+  } else {
+    Write-Host "admin key   : kept (pass -AdminKey to rotate)"
+  }
 }
 
 # --- package --------------------------------------------------------------------------------

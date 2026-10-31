@@ -135,10 +135,14 @@ class Config:
             self._signing = json.loads(self._ssm(KEY_PARAM, True))
         return self._signing
 
+    _admin_read_at: float = 0.0
+
     @property
     def admin_key(self) -> str:
-        if self._admin is None:
+        """Re-read every 5 minutes so a rotated admin key takes effect without redeploying the function."""
+        if self._admin is None or (self._admin_read_at and time.time() - self._admin_read_at > 300):
             self._admin = self._ssm(ADMIN_PARAM, True).strip()
+            self._admin_read_at = time.time()
         return self._admin
 
     def pubkeys(self) -> list[dict]:
