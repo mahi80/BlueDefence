@@ -55,11 +55,14 @@ $zip = ".build\app.zip"
 if (Test-Path $zip) { Remove-Item $zip }
 Compress-Archive -Path app\app.py, app\aegis_license.py -DestinationPath $zip
 # the template's CodeUri points at app/ (for SAM); point it at the zip for plain CloudFormation
-(Get-Content template.yaml -Raw) -replace 'CodeUri: app/', "CodeUri: $($zip -replace '\\','/')" | Set-Content .build\template.src.yaml
+# CodeUri is resolved relative to the template's own folder (.build/), so the zip is referenced by bare name
+(Get-Content template.yaml -Raw) -replace 'CodeUri: app/', "CodeUri: app.zip" | Set-Content .build\template.src.yaml
 aws cloudformation package --template-file .build\template.src.yaml --s3-bucket $bucket --s3-prefix $Stack --output-template-file .build\template.packaged.yaml --region $Region @p | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "cloudformation package failed" }
 
 # --- deploy ---------------------------------------------------------------------------------
-aws cloudformation deploy --template-file .build\template.packaged.yaml --stack-name $Stack --capabilities CAPABILITY_IAM --region $Region --no-fail-on-empty-changeset @p
+aws cloudformation deploy --template-file .build\template.packaged.yaml --stack-name $Stack --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND --region $Region --no-fail-on-empty-changeset @p
+if ($LASTEXITCODE -ne 0) { throw "cloudformation deploy failed - see the events: aws cloudformation describe-stack-events --stack-name $Stack --region $Region --max-items 10" }
 $api = aws cloudformation describe-stacks --stack-name $Stack --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text --region $Region @p
 Write-Host ""
 Write-Host "deployed. API: $api"
