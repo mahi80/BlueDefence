@@ -49,6 +49,19 @@ with sync_playwright() as p:
             bb = loc.first.bounding_box()
             if bb: f.move(bb["x"]+60, bb["y"]+bb["height"]/2, .7); f.hold(1.1)
     f.move(1700, 540, .9); f.hold(2.0)
+    # Agent Q: hover (mood tooltip), drag it out of the corner, tap to open, ask why, close
+    q = pg.locator(".qm").first
+    if q.count():
+        bb = q.bounding_box(); cx, cy = bb["x"]+bb["width"]/2, bb["y"]+bb["height"]/2
+        f.move(cx, cy, .8); f.hold(1.4)
+        pg.mouse.down()
+        for (tx, ty) in [(cx-200, cy-120), (cx-420, cy-260)]:
+            f.move(tx, ty, .6)
+        pg.mouse.up(); f.hold(.8)
+        f.click(None, 0.9)                       # tap → the drawer opens beside it
+        chip = pg.locator(".aq-chip").first
+        if chip.count(): f.click(".aq-chip >> nth=0", 2.6)
+        pg.keyboard.press("Escape"); f.hold(.6)
     # scroll the blast map / cards into view, then approve the first pending action with a rationale
     card = pg.locator(".action-card").first
     if card.count():
