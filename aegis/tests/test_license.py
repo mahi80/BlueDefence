@@ -175,6 +175,9 @@ def test_pipeline_banner_and_license_endpoint(tmp_path, keys, monkeypatch):
                 body = json.loads(r.read())
             assert body["status"] == "valid" and body["tier"] == "enterprise" and "kafka_bridge" in body["features"]
             with urllib.request.urlopen(f"{srv.url}/healthz", timeout=10) as r:
+                assert "license" not in json.loads(r.read())                             # public probe: liveness only
+            rq = urllib.request.Request(f"{srv.url}/healthz", headers={"Authorization": "Bearer tok"})
+            with urllib.request.urlopen(rq, timeout=10) as r:
                 hz = json.loads(r.read())["license"]
                 assert hz["status"] == "valid" and "installation_id" not in hz          # the id is only on the authenticated endpoint
         finally:

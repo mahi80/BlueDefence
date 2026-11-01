@@ -5,11 +5,13 @@
 
 import { NextResponse } from "next/server";
 import { answerLocally } from "../../../lib/ask";
+import { getSession } from "../../../lib/auth";
 import type { Chain } from "../../../lib/types";
 
 export const runtime = "nodejs";
 
 export async function POST(req: Request) {
+  if (!(await getSession())) return NextResponse.json({ error: "not signed in" }, { status: 401 });
   let question = "";
   let chain: Chain | undefined;
   try {

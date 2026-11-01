@@ -431,7 +431,12 @@ class _Handler(BaseHTTPRequestHandler):
                     body.update(self.server_ref.status())
                 except Exception:  # noqa: BLE001
                     pass
-            self._reply(503 if body.get("degraded") else 200, body)
+            degraded = bool(body.get("degraded"))
+            if not self.server_ref.read_authorized(self.headers):
+                # the public probe (load balancer, pilot.ps1 status, uptime check) learns liveness only — never
+                # paths, counters, hash tails or licence days: those are for the read token
+                body = {"ok": body.get("ok", True), "degraded": degraded}
+            self._reply(503 if degraded else 200, body)
             return
         if path == "/ingest/license":
             if not self.server_ref.read_authorized(self.headers):

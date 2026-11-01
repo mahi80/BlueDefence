@@ -174,7 +174,8 @@ def test_auth_size_and_backpressure(server):
     assert status == 200 and len(q) == 100
     status, out = _post(f"{srv.url}/ingest/cloudflare", "\n".join(_cf_lines(1)).encode())
     assert status == 503 and "retry" in out["error"] and q.stats.rejected_full == 1
-    assert _get(f"{srv.url}/healthz")[1]["queue"] == 100
+    assert set(_get(f"{srv.url}/healthz")[1]) == {"ok", "degraded"}          # the public probe learns liveness only
+    assert _get(f"{srv.url}/healthz", TOKEN)[1]["queue"] == 100               # counters need the read token
     assert _get(f"{srv.url}/ingest/blocklist")[0] == 401
 
 

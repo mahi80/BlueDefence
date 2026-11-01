@@ -88,7 +88,7 @@ export interface Chain extends ChainSummary {
 // HITL card from GET /api/approvals (args carry the AEGIS context).
 export interface Approval {
   id: string;
-  status: "pending" | "approved" | "rejected";
+  status: "pending" | "approved" | "rejected" | "expired";
   created_at: string;
   action_type: string;
   target: string;

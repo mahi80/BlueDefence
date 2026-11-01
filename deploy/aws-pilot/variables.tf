@@ -61,13 +61,6 @@ variable "letsencrypt_email" {
   default     = null
 }
 
-variable "aegis_ingest_token" {
-  description = "Push token for the host's /ingest/* receiver. Leave null to generate one (recommended)."
-  type        = string
-  default     = null
-  sensitive   = true
-}
-
 variable "aegis_branch" {
   description = "BlueDefence git ref install.sh checks out."
   type        = string

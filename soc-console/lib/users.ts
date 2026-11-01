@@ -41,8 +41,14 @@ export function loadUsers(): UsersFile | null {
 
 export function saveUsers(u: UsersFile): void {
   const file = usersPath();
-  const tmp = file + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(u, null, 2) + "\n", { mode: 0o600 });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;   // two concurrent adds never share a temp file
+  const fd = fs.openSync(tmp, "w", 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(u, null, 2) + "\n");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, file);
 }
 

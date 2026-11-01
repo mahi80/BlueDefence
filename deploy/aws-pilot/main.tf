@@ -13,7 +13,6 @@ terraform {
   required_version = ">= 1.6"
   required_providers {
     aws    = { source = "hashicorp/aws", version = "~> 5.70" }
-    random = { source = "hashicorp/random", version = "~> 3.6" }
   }
 }
 
@@ -33,16 +32,37 @@ locals {
   tags = { project = "bluedefence-pilot", mode = "shadow", managed_by = "terraform" }
 }
 
-# one ingest token for the host's push receiver (the puller uses it locally); never printed
-resource "random_password" "ingest_token" {
-  length  = 48
-  special = false
+# evidence backups (audit chain, HITL files, licence) leave the host daily; the bucket outlives the instance
+resource "aws_s3_bucket" "backups" {
+  bucket        = "${var.name}-backups-${data.aws_caller_identity.me.account_id}"
+  force_destroy = true
 }
 
-resource "random_password" "console_admin" {
-  length  = 20
-  special = false
+resource "aws_s3_bucket_public_access_block" "backups" {
+  bucket                  = aws_s3_bucket.backups.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
+
+resource "aws_s3_bucket_versioning" "backups" {
+  bucket = aws_s3_bucket.backups.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "backups" {
+  bucket = aws_s3_bucket.backups.id
+  rule {
+    id     = "keep-90-days"
+    status = "Enabled"
+    filter {}
+    expiration { days = 90 }
+    noncurrent_version_expiration { noncurrent_days = 30 }
+  }
+}
+
+data "aws_caller_identity" "me" {}
 
 module "aegis_host" {
   source = "./modules/aegis-host"
@@ -56,8 +76,8 @@ module "aegis_host" {
   community_org          = var.community_org
   community_email        = var.community_email
   letsencrypt_email      = coalesce(var.letsencrypt_email, var.community_email)
-  ingest_token           = coalesce(var.aegis_ingest_token, random_password.ingest_token.result)
-  console_admin_password = random_password.console_admin.result
+  name                   = var.name
+  backup_bucket_arn      = aws_s3_bucket.backups.arn
   aegis_branch           = var.aegis_branch
   waf_log_group_arn      = module.decoy_waf.log_group_arn
   waf_log_group_name     = module.decoy_waf.log_group_name

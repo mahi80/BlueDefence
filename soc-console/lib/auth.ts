@@ -12,7 +12,16 @@ export interface Session {
 
 export const SESSION_COOKIE = "aegis_session";
 export const SESSION_TTL = 60 * 60 * 8; // 8h
-const SECRET = process.env.AEGIS_CONSOLE_SECRET || "dev-insecure-change-me";
+// Resolved on first use, not at import: `next build` evaluates modules without the runtime env.
+function secret(): string {
+  const v = process.env.AEGIS_CONSOLE_SECRET;
+  if (v && v.length >= 16) return v;
+  if (process.env.NODE_ENV === "production") {
+    // a known default would let anyone who has read the repo forge an admin cookie
+    throw new Error("AEGIS_CONSOLE_SECRET must be set (16+ chars) in production");
+  }
+  return "dev-insecure-change-me";
+}
 const ROLES: Role[] = ["admin", "cio", "ciso", "bu_head", "analyst"];
 
 // "local": accounts from the users file (or the single demo account) — pilots and the weeks before SSO.
@@ -29,7 +38,7 @@ export function canDecide(role: Role): boolean {
 export function signSession(s: Session): string {
   const payload = JSON.stringify({ u: s.user, r: s.role, exp: Math.floor(Date.now() / 1000) + SESSION_TTL });
   const body = Buffer.from(payload).toString("base64url");
-  const sig = crypto.createHmac("sha256", SECRET).update(body).digest("base64url");
+  const sig = crypto.createHmac("sha256", secret()).update(body).digest("base64url");
   return `${body}.${sig}`;
 }
 
@@ -38,7 +47,7 @@ function verify(token: string): Session | null {
   if (dot < 0) return null;
   const body = token.slice(0, dot);
   const sig = token.slice(dot + 1);
-  const expect = crypto.createHmac("sha256", SECRET).update(body).digest("base64url");
+  const expect = crypto.createHmac("sha256", secret()).update(body).digest("base64url");
   const a = Buffer.from(sig);
   const b = Buffer.from(expect);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
@@ -54,7 +63,20 @@ function verify(token: string): Session | null {
 
 export async function getSession(): Promise<Session | null> {
   const c = (await cookies()).get(SESSION_COOKIE);
-  return c ? verify(c.value) : null;
+  const s = c ? verify(c.value) : null;
+  if (!s) return null;
+  // Local mode: the session is only as good as the account behind it — a disabled user or a changed role
+  // takes effect on the next request, not at the next login 8 hours later.
+  if (authMode() === "local") {
+    const { loadUsers } = await import("./users");
+    const users = loadUsers();
+    if (users) {
+      const rec = Object.hasOwn(users.users, s.user) ? users.users[s.user] : undefined;
+      if (!rec || rec.disabled) return null;
+      if (rec.role !== s.role) return { user: s.user, role: ROLES.includes(rec.role) ? rec.role : "analyst" };
+    }
+  }
+  return s;
 }
 
 // OIDC group → role mapping for production SSO (Entra ID / SAML groups).

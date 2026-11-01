@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import Console from "../components/Console";
-import { getRecentChains, listApprovals, listProposals, isFixtureMode } from "../lib/api";
+import { getRecentChains, listApprovals, listProposals, isFixtureMode, lastBackendError } from "../lib/api";
 import { getSession, canDecide } from "@/lib/auth";
 
 // Always render against the latest SOC state (or fixtures when no backend is set).
@@ -17,6 +17,7 @@ export default async function Page() {
       approvals={approvals}
       proposals={proposals}
       fixtureMode={isFixtureMode}
+      backendError={lastBackendError()}
       session={{ user: session.user, role: session.role }}
       canDecide={canDecide(session.role)}
     />

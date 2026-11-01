@@ -1,5 +1,5 @@
 # Linux/macOS equivalent of pilot.ps1
-REGION ?= ap-south-1
+REGION ?= ap-southeast-2
 .PHONY: up plan status shell update stop start down
 plan:   ; terraform init -upgrade && terraform plan
 up:     ; terraform init -upgrade && terraform apply
