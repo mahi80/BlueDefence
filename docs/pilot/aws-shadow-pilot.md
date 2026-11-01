@@ -89,6 +89,18 @@ If `route53_zone_id` was empty: create `A  <domain>  → aegis_host_ip` at your 
 within 5 minutes of the record propagating; `status` shows `/healthz` answering over https once it has.
 WAF events flow regardless of DNS — the puller works over the instance role, not the domain.
 
+## Update the host after a merge
+
+Code-only changes (console, brain) do not change the bootstrap, so Terraform sees "no changes". Pull and
+rebuild in place over SSM:
+
+```powershell
+.\pilot.ps1 update      # git pull on the host, pip install, console rebuild, restart both services
+```
+
+A change to `user-data.sh.tftpl` itself is different: `.\pilot.ps1 up` then replaces the host (same
+Elastic IP, DNS untouched, new console password).
+
 ## Verify the chain end to end
 
 ```powershell

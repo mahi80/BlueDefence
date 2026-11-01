@@ -2,8 +2,9 @@
 #   .\pilot.ps1 up        plan + apply (asks for confirmation)
 #   .\pilot.ps1 status    outputs + host health + WAF log group state
 #   .\pilot.ps1 shell     SSM session onto the host (needs the Session Manager plugin)
+#   .\pilot.ps1 update    pull main on the host, rebuild the console, restart both services (no Terraform change)
 #   .\pilot.ps1 down      destroy everything (the Community licence record stays on the licence service)
-param([Parameter(Position = 0)][ValidateSet("up", "status", "shell", "down", "plan")][string]$cmd = "status")
+param([Parameter(Position = 0)][ValidateSet("up", "status", "shell", "update", "down", "plan")][string]$cmd = "status")
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 if (-not (Test-Path terraform.tfvars)) { throw "copy terraform.tfvars.example to terraform.tfvars and fill it in" }
@@ -26,5 +27,15 @@ switch ($cmd) {
     Write-Host "`nconsole admin password: terraform output -raw console_admin_password"
   }
   "shell"  { aws ssm start-session --region $region --target (terraform output -raw aegis_instance_id) }
+  "update" {
+    $iid = terraform output -raw aegis_instance_id
+    $cmdline = "cd /opt/aegis/app && sudo -u aegis git pull -q && /opt/aegis/venv/bin/pip install -q -e . && cd soc-console && sudo -u aegis -H npm ci --no-audit --no-fund && sudo -u aegis -H npm run build && systemctl restart aegis-console aegis-soc && sleep 5 && systemctl is-active aegis-console aegis-soc"
+    $params = @{ commands = @($cmdline); executionTimeout = @("900") } | ConvertTo-Json -Compress
+    $pfile = Join-Path $env:TEMP "bd-update.json"; Set-Content -Path $pfile -Value $params -Encoding ascii
+    $cid = aws ssm send-command --region $region --instance-ids $iid --document-name AWS-RunShellScript --parameters "file://$pfile" --query Command.CommandId --output text
+    Write-Host "updating host $iid (command $cid) — this takes 2-3 minutes"
+    do { Start-Sleep 15; $st = aws ssm get-command-invocation --region $region --command-id $cid --instance-id $iid --query Status --output text } while ($st -eq "InProgress" -or $st -eq "Pending")
+    aws ssm get-command-invocation --region $region --command-id $cid --instance-id $iid --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
+  }
   "down"   { terraform destroy }
 }
