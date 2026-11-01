@@ -90,6 +90,20 @@ What leaves a bank is *derived* telemetry only — verdicts, evidence types, act
 decisions, the alert's shape with every identity pseudonymised — and a privacy gate refuses the
 whole bundle if anything PII-shaped remains. Terms: [`docs/TERMS-COMMUNITY.md`](docs/TERMS-COMMUNITY.md).
 
+## What is open, and what is not
+
+| | Status | Why |
+|---|---|---|
+| The code — pipeline, swarm, netops, connectors, console, installer, `aegis/license.py` | **Open, Apache-2.0** | Banks review code before they run it; copying it is allowed and expected |
+| Trained model weights shipped through the release channel | **Licensed installations only** | The brain is what improves with every installation; it is signed with the BlueDefence key and only reaches installations in good standing |
+| Pooled Community contribution data | **BlueDefence only** | Scrubbed chains and analyst decisions from every installation; never redistributed |
+| The licence service (`mahi80/Blueteamlicence`), its signing keys, the fleet view | **Private** | Issues licences, model updates and renewals |
+| The BlueDefence / AEGIS names | **Trademark** | A fork is welcome to the code, not the name |
+
+So: a fork gets today's code and a base open-weights model, and stays there. An installation on the Community or a
+commercial licence gets a brain that keeps learning from the whole fleet. That is the deal, and it is the whole business model.
+Full terms: [`docs/TERMS-COMMUNITY.md`](docs/TERMS-COMMUNITY.md) · [`LICENSE`](LICENSE) · [`NOTICE`](NOTICE).
+
 ## Layout
 
 | Path | What it is |
