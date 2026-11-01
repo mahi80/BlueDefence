@@ -55,7 +55,7 @@ switch ($cmd) {
         if ($a1 -notmatch '^[a-z0-9._-]{2,32}$' -or $a2 -notmatch '^(analyst|bu_head|ciso|cio|admin)$') { throw "bad name or role" }
         # the password is generated on the host and printed once; SSM keeps command output for 30 days, so change it after
         # the demo if that matters (.\pilot.ps1 shell -> npm run user -- add <name> <role>)
-        $cmdline = "pw=`$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | cut -c1-18); sudo -u aegis AEGIS_CONSOLE_USERS=$users AEGIS_USER_PASSWORD=`$pw node /opt/aegis/app/soc-console/scripts/users.mjs add $a1 $a2 && echo \"password for $a1: `$pw\""
+        $cmdline = "pw=`$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | cut -c1-18); sudo -u aegis AEGIS_CONSOLE_USERS=$users AEGIS_USER_PASSWORD=`$pw node /opt/aegis/app/soc-console/scripts/users.mjs add $a1 $a2 && echo `"password for ${a1}: `$pw`""
       }
     }
     $params = @{ commands = @($cmdline) } | ConvertTo-Json -Compress
