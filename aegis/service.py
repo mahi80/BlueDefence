@@ -198,7 +198,9 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     # path, unchanged.
     extra_voters = get_extra_voter_clients() if ensemble_enabled() else []
     persist_sink = sink_from_env()                       # Phase 0.3 — chains/receipts → dashboard
-    audit = AuditLog(audit_path, sink=persist_sink)
+    from aegis.store import store_from_env
+    index = store_from_env(audit_path)                   # derived DuckDB/SQLite/Postgres/MSSQL index of the chain (AEGIS_INDEX_URL)
+    audit = AuditLog(audit_path, sink=persist_sink, index=index)
     receipt_log = receipt_log_from_env(audit_path.parent, sink=persist_sink)   # Phase 1.5
     connectors = registry_from_env(on_receipt=[receipt_log] if receipt_log else [])
     response = ResponseAgent(self_healing=SelfHealingPipeline(), hitl=hitl_from_env(), connectors=connectors)
@@ -245,9 +247,11 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
                          "last_error": audit.last_error, "tail": audit.tail_hash[:16]},
                "netops_checkpoint_age_s": int(time.time() - _last_checkpoint) if _last_checkpoint and _state_path() else None}
         out["degraded"] = audit.degraded
+        if index is not None:
+            out["index"] = {"dialect": index.dialect, "stale": index.stale, "failures": index.failures}
         return out
     push_server = push_server_from_env(blocklist=lambda: connectors.active_receipts, audit_path=audit_path,
-                                       license=lambda: _lic_holder["state"], status=_status)
+                                       license=lambda: _lic_holder["state"], status=_status, index=index)
     eventhub = None
     if "eventhub" in [x.strip().lower() for x in os.environ.get("AEGIS_SOURCES", "").split(",")]:
         from aegis.ingest.eventhub import eventhub_from_env

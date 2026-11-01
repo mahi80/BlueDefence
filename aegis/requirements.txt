@@ -2,3 +2,7 @@ pydantic>=2.6
 anthropic>=0.40.0
 python-dotenv>=1.0
 pyyaml>=6.0
+# derived index (aegis/store): the ORM + the embedded default; Postgres/MSSQL drivers are optional extras
+sqlalchemy>=2.0,<2.1
+duckdb-engine>=0.17
+duckdb>=1.1
