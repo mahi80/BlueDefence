@@ -111,7 +111,9 @@ ok "aegis user, $PREFIX $ETC $VAR"
 # ------------------------------------------------------------------ 3. code + venv
 say "code"
 git config --global --add safe.directory "$PREFIX/app" >/dev/null 2>&1 || true     # the tree is owned by the aegis user after install
+PREV_SHA=""
 if [[ -d "$PREFIX/app/.git" ]]; then
+  PREV_SHA=$(git -C "$PREFIX/app" rev-parse HEAD 2>/dev/null || true)       # the release to roll back to if this one fails its health check
   if ! { git -C "$PREFIX/app" remote set-url origin "$REPO_URL" \
       && git -C "$PREFIX/app" fetch -q --depth 1 origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" \
       && git -C "$PREFIX/app" checkout -q -B "$BRANCH" "origin/$BRANCH"; }; then
@@ -247,7 +249,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=180
 User=aegis
 Group=aegis
 WorkingDirectory=$PREFIX/app
@@ -255,6 +259,7 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$PREFIX/venv/bin/python -m aegis.service --audit $VAR/audit.jsonl
 Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=$VAR
@@ -285,13 +290,67 @@ if [[ $HAVE_SYSTEMD -eq 1 ]]; then
   systemctl daemon-reload
   systemctl enable -q aegis-soc
   systemctl restart aegis-soc
-  sleep 4
-  if systemctl is-active -q aegis-soc; then ok "aegis-soc running"; else journalctl -u aegis-soc -n 30 --no-pager; die "service failed to start — see the log above"; fi
+  # health check: Type=notify means "active" is only reported once the service said READY; give it 60 s
+  healthy=0
+  for i in $(seq 1 30); do
+    if systemctl is-active -q aegis-soc && curl -fsS "http://127.0.0.1:${INGEST_BIND##*:}/healthz" >/dev/null 2>&1; then healthy=1; break; fi
+    if systemctl is-failed -q aegis-soc; then break; fi
+    sleep 2
+  done
+  if [[ $healthy -eq 1 ]]; then
+    ok "aegis-soc running and healthy"
+    echo "$VERSION_SHA" > "$PREFIX/.current-release"; [[ -n "$PREV_SHA" ]] && echo "$PREV_SHA" > "$PREFIX/.previous-release"
+  else
+    journalctl -u aegis-soc -n 30 --no-pager
+    if [[ -n "$PREV_SHA" ]]; then
+      warn "new release $VERSION_SHA failed its health check — rolling back to ${PREV_SHA:0:7}"
+      git -C "$PREFIX/app" checkout -q "$PREV_SHA" && "$PREFIX/venv/bin/pip" install -q -e "$PREFIX/app" >/dev/null
+      chown -R root:aegis "$PREFIX/app" && chmod -R g-w,o-rwx "$PREFIX/app"
+      systemctl restart aegis-soc; sleep 6
+      if systemctl is-active -q aegis-soc; then die "rolled back to ${PREV_SHA:0:7} and running; the failed release is $VERSION_SHA — see the log above"; fi
+      die "rollback to ${PREV_SHA:0:7} also failed — see the log above"
+    fi
+    die "service failed to start — see the log above"
+  fi
 else
   warn "no systemd here (container?) — unit written to $UNIT; running one smoke cycle instead"
   (cd "$PREFIX/app" && set -a && . "$ENV_FILE" && set +a && AEGIS_INGEST_HTTP=0 timeout 300 "$PREFIX/venv/bin/python" -m aegis.service --once --audit "$VAR/audit.jsonl" 2>&1 | tail -5) || die "smoke cycle failed"
   ok "one service cycle completed"
 fi
+
+# ------------------------------------------------------------------ 6b. operator helpers
+cat > /usr/local/bin/aegis-backup <<'EOS'
+#!/usr/bin/env bash
+# aegis-backup [DEST_DIR] [--with-models]  — one tar.gz of everything that cannot be re-created:
+# config + licence + salt (/etc/aegis), audit chain + segments, HITL journals, ingest/contrib cursors,
+# netops checkpoint, deferred backlog, model pointer (+ adapters with --with-models). Safe while the service runs.
+set -euo pipefail
+DEST=${1:-/var/backups/aegis}; WITH_MODELS=0; [[ "${2:-}" == "--with-models" || "${1:-}" == "--with-models" ]] && WITH_MODELS=1
+[[ "$DEST" == "--with-models" ]] && DEST=/var/backups/aegis
+mkdir -p "$DEST"; OUT="$DEST/aegis-$(hostname -s)-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+EX=(--exclude='models/*/*.safetensors' --exclude='models/*/*.bin' --exclude='models/*.part'); [[ $WITH_MODELS -eq 1 ]] && EX=()
+tar -czf "$OUT" "${EX[@]}" -C / etc/aegis var/lib/aegis 2>/dev/null
+sha256sum "$OUT" > "$OUT.sha256"
+echo "backup: $OUT ($(du -h "$OUT" | cut -f1)); verify with: sha256sum -c $OUT.sha256"
+echo "contains: /etc/aegis (config, licence, salt) · /var/lib/aegis (audit, hitl, cursors, state$( [[ $WITH_MODELS -eq 1 ]] && echo ', model weights' ))"
+EOS
+cat > /usr/local/bin/aegis-restore <<'EOS'
+#!/usr/bin/env bash
+# aegis-restore BACKUP.tar.gz — stop the service, restore /etc/aegis + /var/lib/aegis, fix ownership, start, verify the chain.
+set -euo pipefail
+B=${1:?usage: aegis-restore BACKUP.tar.gz}; [[ -f "$B" ]] || { echo "no such file: $B"; exit 2; }
+[[ -f "$B.sha256" ]] && (cd "$(dirname "$B")" && sha256sum -c "$(basename "$B").sha256")
+systemctl stop aegis-soc 2>/dev/null || true
+NOW=$(date -u +%Y%m%dT%H%M%SZ); for d in /etc/aegis /var/lib/aegis; do [[ -d $d ]] && mv "$d" "$d.pre-restore-$NOW"; done
+tar -xzf "$B" -C /
+chown root:aegis /etc/aegis; chmod 750 /etc/aegis; chmod 640 /etc/aegis/* 2>/dev/null || true
+chown -R aegis:aegis /var/lib/aegis
+systemctl start aegis-soc 2>/dev/null || true
+(cd /opt/aegis/app && set -a && . /etc/aegis/aegis.env && set +a && /opt/aegis/venv/bin/python -m aegis.audit verify --audit /var/lib/aegis/audit.jsonl --all) || echo "WARNING: audit chain did not verify"
+echo "restored from $B; previous state kept at /etc/aegis.pre-restore-$NOW and /var/lib/aegis.pre-restore-$NOW"
+EOS
+chmod 755 /usr/local/bin/aegis-backup /usr/local/bin/aegis-restore
+ok "aegis-backup / aegis-restore installed"
 
 # ------------------------------------------------------------------ 7. verify
 say "verification"
@@ -307,7 +366,9 @@ cat <<EOF
 
 $(printf '\033[1;32m')BlueDefence AEGIS is installed.$(printf '\033[0m')
 
-  service        systemctl status aegis-soc · journalctl -u aegis-soc -f
+  service        systemctl status aegis-soc · journalctl -u aegis-soc -f · cd $PREFIX/app && sudo -u aegis $PREFIX/venv/bin/python -m aegis.service --status
+  backup         aegis-backup [/var/backups/aegis] [--with-models] · aegis-restore <file.tar.gz>
+  rollback       automatic when a re-run's release fails its health check (previous release in $PREFIX/.previous-release)
   config         $ENV_FILE   (edit, then systemctl restart aegis-soc)
   audit log      $VAR/audit.jsonl (append-only, hash-chained)
   approvals      $VAR/hitl/cards.jsonl → append decisions to $VAR/hitl/decisions.jsonl   (HITL transport: $HITL)

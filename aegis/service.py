@@ -51,6 +51,7 @@ from aegis.agents.shared.llm_client import get_client, get_voter_client, get_ext
 from aegis.agents.orchestrator.voting import ensemble_enabled
 from aegis.agents.shared.audit import AuditWriteError
 from aegis.ingest.netops import checkpoint_shared_detector
+from aegis.ops import sdnotify
 from aegis.agents.threat_intel.agent import ThreatIntelAgent
 from aegis.agents.threat_intel.cve_feeds import cve_intel_from_env
 from aegis.agents.transaction.agent import TransactionAgent
@@ -285,6 +286,8 @@ class CycleStats:
     rolled_back: int = 0
     errors: int = 0
     audit_failures: int = 0
+    deferred: int = 0
+    redelivered: int = 0
     seconds: float = 0.0
     investigations: int = 0
     containment_checks: int = 0
@@ -296,8 +299,9 @@ class CycleStats:
     def line(self) -> str:
         v = " ".join(f"{k}={n}" for k, n in sorted(self.verdicts.items()))
         lag = f" streamed={self.streamed} lag_ms={self.max_lag_ms} handle_ms={self.max_handle_ms}" if self.streamed else ""
+        extra = (f"deferred={self.deferred} " if self.deferred else "") + (f"redelivered={self.redelivered} " if self.redelivered else "")
         return (f"alerts={self.alerts} executed={self.executed} hitl_queued={self.hitl_queued} "
-                f"decisions={self.decisions} rolled_back={self.rolled_back} errors={self.errors} "
+                f"decisions={self.decisions} rolled_back={self.rolled_back} errors={self.errors} {extra}"
                 f"{self.seconds:.1f}s{lag} {v}".rstrip())
 
 
@@ -322,16 +326,22 @@ def _stream_alerts(p: Pipeline) -> Iterator[dict]:
 
 
 def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: int = 0,
-              sweep: bool = True, hitl: bool = True) -> CycleStats:
+              sweep: bool = True, hitl: bool = True, storm: "StormControl | None" = None) -> CycleStats:
     """One pass: new alerts → orchestrator → response; then HITL sync, TTL sweep, flush.
     ``hitl=False`` / ``sweep=False`` make the short stream-triggered pass between polls skip
-    the dashboard round-trips; the interval cycle still does them."""
+    the dashboard round-trips; the interval cycle still does them. In storm mode (``storm.active``)
+    model-bound alerts are spilled to the deferred queue and only fast paths run."""
     stats = CycleStats()
     t0 = time.time()
     for alert in (alerts if alerts is not None else _alerts_from_env(p.watchdog)):
         if max_alerts and stats.alerts >= max_alerts:
             break
         stats.alerts += 1
+        sdnotify.watchdog()
+        if storm is not None and storm.active and not alert.get("deferred_at") and not p.orch.is_fast_path(alert):
+            if storm.queue.push(alert):
+                stats.deferred += 1
+                continue
         try:
             chain = p.orch.handle(alert)
             summary = p.response.execute(chain)
@@ -442,6 +452,46 @@ def _meter_license(p: Pipeline, stats: CycleStats) -> None:
     METRICS.set("aegis_license_devices_seen", float(meter.devices_seen))
 
 
+class StormControl:
+    """When the loop cannot keep up, keep the fast paths flowing and spill everything else to disk.
+
+    Storm = receiver queue above ``AEGIS_STORM_QUEUE_PCT`` (80 %) of capacity, or the last cycle handled more
+    than ``AEGIS_STORM_ALERTS`` (500) alerts, or took longer than ``AEGIS_STORM_CYCLE_S`` (the poll interval).
+    It ends when the queue is below half that and the last cycle was small; deferred alerts are then re-fed
+    ``AEGIS_STORM_DRAIN`` (200) per cycle, oldest first. Nothing is dropped; the spill file is bounded."""
+
+    def __init__(self, queue: "DeferredQueue", stream: Any, interval_s: float):
+        self.queue, self.stream = queue, stream
+        self.active = False
+        self.since = 0.0
+        self.pct = _envf("AEGIS_STORM_QUEUE_PCT", 80.0) / 100.0
+        self.alerts = int(_envf("AEGIS_STORM_ALERTS", 500))
+        self.cycle_s = _envf("AEGIS_STORM_CYCLE_S", interval_s)
+        self.drain = int(_envf("AEGIS_STORM_DRAIN", 200))
+
+    def occupancy(self) -> float:
+        try:
+            return len(self.stream) / float(self.stream.capacity) if self.stream is not None and self.stream.capacity else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def update(self, last: "CycleStats | None") -> bool:
+        occ = self.occupancy()
+        big = last is not None and (last.alerts >= self.alerts or last.seconds >= self.cycle_s)
+        if not self.active and (occ >= self.pct or big):
+            self.active, self.since = True, time.time()
+            logger.warning("[service] STORM MODE on: queue %.0f%% full, last cycle %s alerts in %.1fs — model-bound alerts are deferred to %s, "
+                           "fast paths keep running", occ * 100, last.alerts if last else 0, last.seconds if last else 0, self.queue.path)
+        elif self.active and occ < self.pct / 2 and not big:
+            self.active = False
+            logger.warning("[service] storm mode off after %.0fs; %d alert(s) deferred, draining %d per cycle",
+                           time.time() - self.since, self.queue.pending(), self.drain)
+        return self.active
+
+    def redeliver(self) -> list[dict]:
+        return [] if self.active else self.queue.pop(self.drain)
+
+
 class Service:
     """Poll loop with graceful stop (SIGTERM/SIGINT → finish the cycle, exit)."""
 
@@ -453,6 +503,9 @@ class Service:
         self.stream_cycles = 0
         self.history: list[CycleStats] = []
         self._stop = False
+        from aegis.ops.deferred import DeferredQueue
+        spill = os.environ.get("AEGIS_DEFERRED_PATH", "").strip() or str(Path(pipeline.audit_path).parent / "deferred.jsonl")
+        self.storm = StormControl(DeferredQueue(spill), pipeline.stream, self.interval)
 
     def stop(self, *_: Any) -> None:
         self._stop = True
@@ -578,9 +631,28 @@ class Service:
                         r.version, len(r.applied), len(r.already), len(r.rejected))
         stream = self.p.stream
         hot_reload = os.environ.get("AEGIS_HOT_RELOAD", "").strip().lower() in ("1", "true", "yes", "on")
+        sdnotify.ready(f"AEGIS up: {self.p.banner()[:120]}")
+        wd = sdnotify.watchdog_interval_s()
+        if wd:
+            logger.info("[service] systemd watchdog armed: pinging every ≤%.0fs", wd)
         while not self._stop:
-            stats = run_cycle(self.p, max_alerts=self.max_alerts)
+            stats = run_cycle(self.p, max_alerts=self.max_alerts, storm=self.storm)
             self.cycles += 1
+            self.storm.update(stats)
+            budget = time.time() + self.interval * 0.5          # drain the backlog in batches, up to half the poll interval
+            while not self._stop and time.time() < budget:
+                pend = self.storm.redeliver()
+                if not pend:
+                    break
+                st2 = run_cycle(self.p, alerts=iter(pend), sweep=False, hitl=False, storm=self.storm)
+                stats.redelivered += st2.alerts
+                stats.executed += st2.executed
+                sdnotify.watchdog()
+                logger.info("[service] re-fed %d deferred alert(s): %s (%d still pending)", st2.alerts, st2.line(), self.storm.queue.pending())
+                if self.storm.update(st2):                          # the backlog itself must not restart the storm
+                    break
+            sdnotify.watchdog()
+            sdnotify.status(f"cycle {self.cycles}: {stats.alerts} alerts, {stats.errors} errors" + (" · STORM" if self.storm.active else ""))
             checkpoint_shared_detector()                           # netops links + open incidents survive a restart
             self._maybe_contribute()
             self._maybe_heartbeat_and_renew()
@@ -609,10 +681,12 @@ class Service:
                 remaining = deadline - time.time()
                 # wake the moment a receiver queues something: pushed events get a verdict in
                 # milliseconds instead of waiting for the next poll
+                sdnotify.watchdog()
                 if stream is not None and stream.enabled:
                     if stream.wait(min(1.0, remaining)):
+                        self.storm.update(self.history[-1] if self.history else None)
                         st = run_cycle(self.p, alerts=_stream_alerts(self.p), max_alerts=self.max_alerts,
-                                       sweep=False, hitl=False)
+                                       sweep=False, hitl=False, storm=self.storm)
                         self.stream_cycles += 1
                         self.history.append(st)
                         del self.history[:-100]
@@ -621,6 +695,7 @@ class Service:
                     time.sleep(min(1.0, remaining))
         if self.p.persist_sink is not None:
             self.p.persist_sink.flush()
+        sdnotify.stopping()
         self.p.close()
         checkpoint_shared_detector(force=True)                 # final checkpoint on clean shutdown
         logger.info("[service] stopped after %d cycle(s), %d stream pass(es)", self.cycles, self.stream_cycles)
@@ -630,16 +705,58 @@ class Service:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--once", action="store_true", help="one cycle, then exit (smoke test)")
+    ap.add_argument("--status", action="store_true", help="print the running service's health (from its receiver) and exit")
     ap.add_argument("--interval", type=float, default=float(os.environ.get("AEGIS_POLL_SECONDS", "60")))
     ap.add_argument("--max-alerts", type=int, default=int(os.environ.get("AEGIS_MAX_ALERTS_PER_CYCLE", "0")),
                     help="cap alerts handled per cycle (0 = all)")
     ap.add_argument("--audit", default=str(DEFAULT_AUDIT), help="append-only audit log path")
     ap.add_argument("--log-level", default=os.environ.get("AEGIS_LOG_LEVEL", "INFO"))
     args = ap.parse_args(argv)
+    if args.status:
+        return status_main(args.audit)
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     pipeline = build_pipeline(args.audit)
     return Service(pipeline, interval=args.interval, max_alerts=args.max_alerts).run(once=args.once)
+
+
+def status_main(audit: str) -> int:
+    """``--status``: one screen for the operator — receiver health (incl. audit + checkpoint state), the audit chain's
+    tail, deferred backlog — without touching the running service's state."""
+    import json
+    import urllib.request
+    bind = os.environ.get("AEGIS_INGEST_BIND", "127.0.0.1:8787").strip()
+    host, _, port = bind.rpartition(":")
+    url = f"http://{'127.0.0.1' if host in ('', '0.0.0.0') else host}:{port or 8787}/healthz"
+    ok = True
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:  # noqa: S310 — loopback
+            h = json.loads(r.read())
+            code = r.status
+    except Exception as e:  # noqa: BLE001
+        print(f"receiver   {url}: unreachable ({str(e)[:80]}) — service down or AEGIS_INGEST_HTTP off")
+        h, code, ok = {}, 0, False
+    if h:
+        a = h.get("audit") or {}
+        print(f"receiver   {url}: HTTP {code} · queue {h.get('queue', '?')} · received {h.get('received', '?')} · rejected_full {h.get('rejected_full', 0)}")
+        print(f"audit      {'DEGRADED — ' + str(a.get('last_error')) if a.get('degraded') else 'writable'} · tail {a.get('tail', '?')}")
+        if h.get("netops_checkpoint_age_s") is not None:
+            print(f"netops     checkpoint {h['netops_checkpoint_age_s']}s old")
+        lic = h.get("license") or {}
+        if lic:
+            print(f"licence    {lic.get('status')} · {lic.get('days_left')} days left")
+        ok = ok and not h.get("degraded")
+    p = Path(audit)
+    if p.exists():
+        from aegis.agents.shared.audit import AuditLog
+        rep = AuditLog(p).verify_report(all_files=False)
+        print(f"chain      {p}: {'intact' if rep['ok'] else 'BROKEN at ' + str(rep['broken_at'])} · {rep['entries']} entries in the live segment")
+        ok = ok and rep["ok"]
+    dq = Path(os.environ.get("AEGIS_DEFERRED_PATH", "").strip() or str(p.parent / "deferred.jsonl"))
+    if dq.exists():
+        from aegis.ops.deferred import DeferredQueue
+        print(f"deferred   {DeferredQueue(dq).pending()} alert(s) waiting (storm backlog)")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

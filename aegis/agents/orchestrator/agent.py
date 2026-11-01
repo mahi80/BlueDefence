@@ -141,6 +141,17 @@ class SOCOrchestrator:
         self._audit = audit
         self._system = _build_system_prompt()
 
+    def is_fast_path(self, alert: dict) -> bool:
+        """True when ``handle()`` would reach a verdict deterministically (no model call). The service uses this
+        in storm mode: fast paths keep flowing at full speed, model-bound alerts are deferred, not dropped."""
+        try:
+            return bool(self._honeytoken.alert_touches_decoy(alert) or is_control_plane_fact(alert) or is_network_fault(alert)
+                        or is_privileged_event(alert) or is_treasury_outflow(alert) or is_adaptive_attacker(alert)
+                        or is_low_and_slow(alert) or is_object_walk(alert) or is_dealigned_model_pull(alert)
+                        or is_egress_finding(alert) or is_pxe_firmware_finding(alert) or is_auth_burst(alert) or is_spoofed_client(alert))
+        except Exception:  # noqa: BLE001 — a predicate that chokes on an odd alert means "not a fast path"
+            return False
+
     def handle(self, alert: dict) -> EvidenceChain:
         from ..shared import observability as obs
 
