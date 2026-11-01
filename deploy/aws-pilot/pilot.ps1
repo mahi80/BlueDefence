@@ -3,8 +3,10 @@
 #   .\pilot.ps1 status    outputs + host health + WAF log group state
 #   .\pilot.ps1 shell     SSM session onto the host (needs the Session Manager plugin)
 #   .\pilot.ps1 update    pull main on the host, rebuild the console, restart both services (no Terraform change)
+#   .\pilot.ps1 stop      stop the EC2 host to save money (~$49/mo → ~$8/mo: disk + idle Elastic IP); everything else stays
+#   .\pilot.ps1 start     start it again — same IP, same DNS, same certificate; services come back by themselves
 #   .\pilot.ps1 down      destroy everything (the Community licence record stays on the licence service)
-param([Parameter(Position = 0)][ValidateSet("up", "status", "shell", "update", "down", "plan")][string]$cmd = "status")
+param([Parameter(Position = 0)][ValidateSet("up", "status", "shell", "update", "stop", "start", "down", "plan")][string]$cmd = "status")
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 if (-not (Test-Path terraform.tfvars)) { throw "copy terraform.tfvars.example to terraform.tfvars and fill it in" }
@@ -37,6 +39,20 @@ switch ($cmd) {
     Write-Host "updating host $iid (command $cid) — this takes 2-3 minutes"
     do { Start-Sleep 15; $st = aws ssm get-command-invocation --region $region --command-id $cid --instance-id $iid --query Status --output text } while ($st -eq "InProgress" -or $st -eq "Pending")
     aws ssm get-command-invocation --region $region --command-id $cid --instance-id $iid --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
+  }
+  "stop"   {
+    $iid = terraform output -raw aegis_instance_id
+    aws ec2 stop-instances --region $region --instance-ids $iid --query 'StoppingInstances[0].CurrentState.Name' --output text
+    aws ec2 wait instance-stopped --region $region --instance-ids $iid
+    Write-Host "host stopped. Billing now: root disk (~`$4/mo) + Elastic IP while detached from a running host (~`$3.60/mo); WAF/CloudFront/log group unchanged (~`$13/mo). .\pilot.ps1 start to resume."
+  }
+  "start"  {
+    $iid = terraform output -raw aegis_instance_id
+    aws ec2 start-instances --region $region --instance-ids $iid --query 'StartingInstances[0].CurrentState.Name' --output text
+    aws ec2 wait instance-running --region $region --instance-ids $iid
+    Write-Host "host starting; services need ~60 s. The WAF puller resumes from its checkpoint (up to 14 days of log group retention), so nothing was missed."
+    Start-Sleep 60
+    try { (Invoke-WebRequest -UseBasicParsing (terraform output -raw healthz_url) -TimeoutSec 15).Content } catch { Write-Host "  not answering yet: $($_.Exception.Message) — try .\pilot.ps1 status in a minute" }
   }
   "down"   { terraform destroy }
 }

@@ -36,9 +36,12 @@ compares against (`python -m aegis.service --status`, and the per-connector shad
 | Elastic IP (attached) | $0 |
 | **Total** | **≈ $65–75** |
 
-A `.click` domain is $3/year on Route 53. Stop the instance when idle (`aws ec2 stop-instances`) and the
-EC2 line drops to the volume only; the Elastic IP then costs $3.60/month while detached from a running
-instance.
+**Pausing to save money.** `.\pilot.ps1 stop` stops the host; `.\pilot.ps1 start` brings it back with
+the same IP, DNS and certificate, services restart on their own and the WAF puller resumes from its
+checkpoint (the log group keeps 14 days, so nothing is lost). While stopped you pay ~$8/month for the host
+side (root disk + the idle Elastic IP) plus the WAF/CloudFront/log group (~$13) — about **$20/month**
+instead of ~$70. The `down` command removes everything and `up` rebuilds it (new Community signup,
+new console password; Route 53/GoDaddy records untouched).
 
 ## Before you apply
 
