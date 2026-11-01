@@ -30,10 +30,12 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Optional
 
 from .base import CONSUMED, AlertCheckpoint, BaseConsumer
 
@@ -436,13 +438,49 @@ class NetopsConsumer(BaseConsumer):
 _shared: Any = None
 
 
+def _state_path() -> Optional[Path]:
+    """Where the detector checkpoints (AEGIS_NETOPS_STATE; default next to the audit log; empty string disables)."""
+    raw = os.environ.get("AEGIS_NETOPS_STATE")
+    if raw is not None:
+        return Path(raw) if raw.strip() else None
+    audit = os.environ.get("AEGIS_AUDIT_PATH", "").strip()
+    return Path(audit).parent / "netops-state.json" if audit else None
+
+
 def shared_detector() -> Any:
-    """One detector per process: pushed and file-read records share topology, link history and counters."""
+    """One detector per process: pushed and file-read records share topology, link history and counters.
+    On first use it restores the previous process's checkpoint, so a restart mid-outage keeps the open
+    incident (no re-alert storm) and the learned topology."""
     global _shared
     if _shared is None:
         from ..agents.netops.assurance import NetworkAssurance
         _shared = NetworkAssurance.from_env()
+        sp = _state_path()
+        if sp is not None and sp.exists():
+            n = _shared.restore_from(sp)
+            logger.info("[netops] restored detector state from %s (%d open incident(s))", sp, n)
     return _shared
+
+
+_last_checkpoint = 0.0
+
+
+def checkpoint_shared_detector(every_s: float = 5.0, *, force: bool = False) -> bool:
+    """Called from the service loop: write the checkpoint at most every ``every_s`` seconds. Never raises."""
+    global _last_checkpoint
+    sp = _state_path()
+    if _shared is None or sp is None:
+        return False
+    now = time.time()
+    if not force and now - _last_checkpoint < every_s:
+        return False
+    try:
+        _shared.checkpoint(sp)
+        _last_checkpoint = now
+        return True
+    except OSError as e:
+        logger.warning("[netops] checkpoint to %s failed: %s", sp, e)
+        return False
 
 
 def reset_shared_detector() -> None:

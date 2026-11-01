@@ -97,7 +97,8 @@ class PushServer:
 
     def __init__(self, *, token: str, bind: str = DEFAULT_BIND, queue: Optional[StreamQueue] = None,
                  max_mb: int = DEFAULT_MAX_MB, blocklist: Optional[Callable[[], list[Any]]] = None,
-                 audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None, read_token: str = ""):
+                 audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None, read_token: str = "",
+                 status: Optional[Callable[[], dict]] = None):
         host, _, port = bind.rpartition(":")
         self.host, self.port = (host or "0.0.0.0"), int(port or 8787)
         if not token and not _is_loopback(self.host):
@@ -112,6 +113,7 @@ class PushServer:
         self.blocklist = blocklist
         self.audit_path = Path(audit_path) if audit_path else None
         self.license = license
+        self.status = status                       # extra operator-facing health (audit writable? last checkpoint?)
         self.limiter = _AuthFailLimiter()
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -342,7 +344,12 @@ class _Handler(BaseHTTPRequestHandler):
                     body["license"] = {"status": st.status, "days_left": st.days_left}     # the id is on the authenticated /ingest/license
                 except Exception:  # noqa: BLE001
                     pass
-            self._reply(200, body)
+            if self.server_ref.status is not None:
+                try:
+                    body.update(self.server_ref.status())
+                except Exception:  # noqa: BLE001
+                    pass
+            self._reply(503 if body.get("degraded") else 200, body)
             return
         if path == "/ingest/license":
             if not self.server_ref.read_authorized(self.headers):
@@ -438,7 +445,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
-                         audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None) -> Optional[PushServer]:
+                         audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None,
+                         status: Optional[Callable[[], dict]] = None) -> Optional[PushServer]:
     """``AEGIS_INGEST_HTTP=1`` (or any ``AEGIS_INGEST_BIND``) starts the receiver; ``AEGIS_INGEST_TOKEN``
     is required off loopback. Returns the running server or ``None``."""
     on = os.environ.get("AEGIS_INGEST_HTTP", "").strip().lower() in ("1", "true", "yes", "on")
@@ -448,7 +456,8 @@ def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
     try:
         srv = PushServer(token=os.environ.get("AEGIS_INGEST_TOKEN", "").strip(), bind=bind or DEFAULT_BIND,
                          max_mb=int(os.environ.get("AEGIS_INGEST_MAX_MB", str(DEFAULT_MAX_MB))), blocklist=blocklist,
-                         audit_path=audit_path, license=license, read_token=os.environ.get("AEGIS_INGEST_READ_TOKEN", "").strip())
+                         audit_path=audit_path, license=license, read_token=os.environ.get("AEGIS_INGEST_READ_TOKEN", "").strip(),
+                         status=status)
         return srv.start()
     except Exception as e:  # noqa: BLE001 — a bad bind must not take the SOC down; polling still works
         logger.error("[ingest:http] push receiver not started: %s", str(e)[:200])
