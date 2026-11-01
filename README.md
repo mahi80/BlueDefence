@@ -2,7 +2,7 @@
 
 # BlueDefence
 
-https://github.com/user-attachments/assets/8cc79b65-1d4f-472d-a71c-736ef091d082
+https://github.com/user-attachments/assets/9b6db3dd-427d-48ac-a590-9e3192f9af3b
 
 **How it works (4:52)** — an alarm storm becomes one governed, evidenced decision: correlation, the agent swarm, the console, approval, audit. Full-resolution copy: [`docs/media/BlueDefence-how-it-works.mp4`](docs/media/BlueDefence-how-it-works.mp4).
 
