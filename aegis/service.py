@@ -482,6 +482,8 @@ class Service:
                                "a modified install will not be renewed")
             if res.get("standing") and res["standing"] != "good":
                 logger.warning("[license] standing with the licence service: %s — %s", res["standing"], res.get("reason", ""))
+            else:
+                logger.info("[license] heartbeat ok: standing=%s attestation=%s", res.get("standing", "?"), res.get("attestation", "?"))
         except Exception as e:  # noqa: BLE001 — a heartbeat failure never affects the SOC
             logger.warning("[license] heartbeat failed: %s", str(e)[:200])
         # model updates — the brain ships like antivirus definitions: pull, verify the signed manifest, point, hot-reload
