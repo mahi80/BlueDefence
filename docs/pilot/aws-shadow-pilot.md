@@ -5,7 +5,7 @@ attack traffic — no bank, no vendor tenant, no Azure. It exists to answer the 
 before a pilot: *"what would AEGIS have said about traffic my WAF already judged?"*
 
 ```
-                     us-east-1 (CloudFront edge)                        ap-south-1 (Mumbai)
+                     us-east-1 (CloudFront edge)                        ap-southeast-2 (Sydney)
    internet ──► CloudFront ──► AWS WAF ──► S3 decoy page           ┌──────────────────────────────┐
    scanners        │          (managed rules,                       │ aegis-host  t4g.large         │
    bots            │           rate rule)                           │  nginx :443 (Let's Encrypt)   │
@@ -22,7 +22,7 @@ it never touches the WAF. The WAF's own `action` field on every record is the ba
 compares against (`python -m aegis.service --status`, and the per-connector shadow comparison in
 `aegis/README.md`).
 
-## Cost (on-demand, ap-south-1 + us-east-1, light traffic)
+## Cost (on-demand, ap-southeast-2 + us-east-1, light traffic)
 
 | Item | Monthly |
 |---|---|
@@ -43,7 +43,12 @@ instance.
 
 1. **Terraform** ≥ 1.6 on your PC (`winget install Hashicorp.Terraform`) and the AWS CLI signed in to the
    account (a paid plan — the Free Tier plan blocks Route 53 Domains and will close the account when its
-   credits end).
+   credits end). If you sign in with `aws login`, the Terraform provider cannot read that session yet:
+   `pilot.ps1` runs `aws configure export-credentials --format powershell | Invoke-Expression` for you
+   (do the same by hand before a bare `terraform` command). **Region**: accounts created under an AWS
+   organisation often carry a service control policy that denies some regions — `terraform plan` shows
+   `explicit deny in a service control policy` if so. Sydney (`ap-southeast-2`) is the default; set
+   `region = "ap-south-1"` only if the plan goes through there.
 2. **A domain** that will point at the host. Firehose only delivers to a public HTTPS endpoint with a
    certificate a public CA issued, so `https://<ip>` is not an option.
    - Route 53: `aws route53domains register-domain --region us-east-1 …` (registration creates the

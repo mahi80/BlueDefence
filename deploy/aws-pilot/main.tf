@@ -1,7 +1,7 @@
 #
 # BlueDefence — all-AWS shadow pilot
 #
-#   ap-south-1 (Mumbai)      aegis-host: one EC2 (Ubuntu 24.04 arm64) running install.sh in shadow mode with a
+#   var.region (Sydney)      aegis-host: one EC2 (Ubuntu 24.04 arm64) running install.sh in shadow mode with a
 #                            Community licence, the analyst console (local sign-in), nginx + Let's Encrypt on :443
 #   us-east-1 (CloudFront)   decoy-waf: S3 static decoy → CloudFront → AWS WAF (managed rule groups + rate rule)
 #                            → Kinesis Data Firehose HTTP endpoint → https://<domain>/ingest/firehose

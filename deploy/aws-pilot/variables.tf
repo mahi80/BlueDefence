@@ -5,9 +5,9 @@ variable "name" {
 }
 
 variable "region" {
-  description = "Region for the AEGIS host. Mumbai keeps the pilot's data in India."
+  description = "Region for the AEGIS host. Default Sydney (where the licence service runs); ap-south-1 keeps data in India but new AWS organisation accounts may have it SCP-denied — the plan tells you."
   type        = string
-  default     = "ap-south-1"
+  default     = "ap-southeast-2"
 }
 
 variable "domain" {
