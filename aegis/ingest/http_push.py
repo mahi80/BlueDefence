@@ -551,7 +551,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
                          audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None,
-                         status: Optional[Callable[[], dict]] = None) -> Optional[PushServer]:
+                         status: Optional[Callable[[], dict]] = None, index: Any = None) -> Optional[PushServer]:
     """``AEGIS_INGEST_HTTP=1`` (or any ``AEGIS_INGEST_BIND``) starts the receiver; ``AEGIS_INGEST_TOKEN``
     is required off loopback. Returns the running server or ``None``."""
     on = os.environ.get("AEGIS_INGEST_HTTP", "").strip().lower() in ("1", "true", "yes", "on")
@@ -562,7 +562,7 @@ def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
         srv = PushServer(token=os.environ.get("AEGIS_INGEST_TOKEN", "").strip(), bind=bind or DEFAULT_BIND,
                          max_mb=int(os.environ.get("AEGIS_INGEST_MAX_MB", str(DEFAULT_MAX_MB))), blocklist=blocklist,
                          audit_path=audit_path, license=license, read_token=os.environ.get("AEGIS_INGEST_READ_TOKEN", "").strip(),
-                         status=status, console=console_api_from_env(audit_path),
+                         status=status, console=console_api_from_env(audit_path, index=index),
                          console_token=os.environ.get("AEGIS_CONSOLE_TOKEN", "").strip())
         return srv.start()
     except Exception as e:  # noqa: BLE001 — a bad bind must not take the SOC down; polling still works

@@ -16,6 +16,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Derived index of the audit chain (aegis/store): one ORM, pick the database by AEGIS_INDEX_URL.
+index = ["sqlalchemy>=2.0,<2.1", "duckdb-engine>=0.17", "duckdb>=1.1"]
+postgres = ["sqlalchemy>=2.0,<2.1", "psycopg2-binary>=2.9"]
+mssql = ["sqlalchemy>=2.0,<2.1", "pyodbc>=5.0"]
 # Governance runtime — the ACP SDK that governs SOC-AGENTQ-01. Optional: AEGIS runs
 # without it (the acp import degrades to a no-op). Pinned to mahi80/rbi @ b2e9d97.
 # Private; see requirements-governance.txt for how to authenticate the install.
