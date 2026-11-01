@@ -1,5 +1,9 @@
 # BlueDefence
 
+[![BlueDefence — how it works (4:52, narrated)](docs/media/how-it-works-poster.jpg)](docs/media/BlueDefence-how-it-works.mp4)
+
+**▶ Watch how it works (4:52)** — an alarm storm becomes one governed, evidenced decision: correlation, the agent swarm, the console, approval, audit.
+
 **AEGIS** — an autonomous SOC and network-operations brain for banks. It reads the bank's
 security *and* network telemetry, reaches a verdict deterministically where it can and with a
 fine-tuned open-weights model where it must, walks the blast radius, proposes the minimum
@@ -16,10 +20,6 @@ Three things make it different from a SIEM with an LLM bolted on:
 - **Every installation makes every other one smarter.** Community installations run the model on
   their own hardware, free, and send back scrubbed verdicts and analyst decisions; the pooled data
   trains the next brain, which ships back to all of them like an antivirus definition update.
-
-**Three-minute walkthrough** — how an alarm storm becomes one governed, evidenced decision:
-
-[![BlueDefence — how it works (3:20, narrated)](docs/media/how-it-works-poster.jpg)](docs/media/BlueDefence-how-it-works.mp4)
 
 Carved out of the ACP governance monorepo (`mahi80/rbi`) so the SOC product ships on its own
 cadence. Full technical detail: [`aegis/README.md`](aegis/README.md).
