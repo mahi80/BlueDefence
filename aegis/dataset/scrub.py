@@ -71,6 +71,8 @@ _AADHAAR_RX = re.compile(r"(?<![\w-])[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}(?![\w-])")
 _PAN_RX = re.compile(r"(?<![A-Za-z0-9])[A-Z]{5}\d{4}[A-Z](?![A-Za-z0-9])")
 _IN_MOBILE_RX = re.compile(r"(?<![\w+])(?:\+91[ -]?|0)?[6-9]\d{4}[ -]?\d{5}(?!\w)")
 _IPV4_RX = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+# arn:aws:iam::123456789012:user/x — the 12-digit account id names the bank's cloud tenant; tokenised, the rest kept
+_ARN_ACCOUNT_RX = re.compile(r"(arn:aws[a-z-]*:[a-z0-9-]*:[a-z0-9-]*:)(\d{12})(?=:|$)")
 # keep a short prefix only when the rest is a number / hex id (u_42891, emp-00123); "rverma_admin" is a handle, tokenised whole
 _PREFIXED_ID_RX = re.compile(r"^([A-Za-z]{1,4}[_\-])(\d{2,}|[0-9a-f]{6,})$")
 
@@ -227,6 +229,7 @@ class Scrubber:
         out = _AADHAAR_RX.sub(self._sub_aadhaar, out)
         out = _PAN_RX.sub(self._sub_pan, out)
         out = _IN_MOBILE_RX.sub(self._sub_mobile, out)
+        out = _ARN_ACCOUNT_RX.sub(self._sub_arn, out)
         if self.scrub_ips:
             out = _IPV4_RX.sub(self._sub_ip, out)
         for lit in literals:
@@ -240,6 +243,10 @@ class Scrubber:
         p = self._pseudonym_for_field(lit)
         self.replacements = saved
         return p
+
+    def _sub_arn(self, m: re.Match) -> str:
+        self.replacements += 1
+        return f"{m.group(1)}acct_{self.token('acct', m.group(2))}"
 
     def _sub_email(self, m: re.Match) -> str:
         self.replacements += 1

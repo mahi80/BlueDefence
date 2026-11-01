@@ -121,3 +121,13 @@ def test_push_uses_a_binary_content_type_and_caps_size(monkeypatch):
     monkeypatch.setattr(contrib, "MAX_PUSH_BYTES", 10)
     with pytest.raises(RuntimeError, match="over the"):
         contrib.push_bundle("https://s", {"schema": "aegis-contrib/1", "records": [{"x": "y" * 100}]}, "tok")
+
+
+def test_aws_account_ids_in_arns_are_tokenised_not_quarantined():
+    """Seen on the first live contribution: a CloudTrail userIdentity.arn tripped the account-number rule."""
+    sc = Scrubber(salt="s")
+    out = sc.scrub({"event": {"userIdentity": {"arn": "arn:aws:iam::123456789012:user/rverma", "accountId": "123456789012"}},
+                    "msg": "AssumeRole by arn:aws:sts::123456789012:assumed-role/Admin/sess"})
+    text = json.dumps(out)
+    assert "123456789012" not in text and "arn:aws:iam::acct_" in text and "arn:aws:sts::acct_" in text
+    assert privacy_gate.gate(out)[0]
