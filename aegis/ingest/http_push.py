@@ -50,6 +50,7 @@ import base64
 import gzip
 import hashlib
 import hmac
+import re
 import json
 import logging
 import os
@@ -60,6 +61,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
+from .console_api import console_api_from_env
 from .stream import StreamQueue, get_stream, lines_from_body
 
 logger = logging.getLogger("aegis.ingest.http")
@@ -98,7 +100,7 @@ class PushServer:
     def __init__(self, *, token: str, bind: str = DEFAULT_BIND, queue: Optional[StreamQueue] = None,
                  max_mb: int = DEFAULT_MAX_MB, blocklist: Optional[Callable[[], list[Any]]] = None,
                  audit_path: Optional[Path] = None, license: Optional[Callable[[], Any]] = None, read_token: str = "",
-                 status: Optional[Callable[[], dict]] = None):
+                 status: Optional[Callable[[], dict]] = None, console: Optional[Any] = None, console_token: str = ""):
         host, _, port = bind.rpartition(":")
         self.host, self.port = (host or "0.0.0.0"), int(port or 8787)
         if not token and not _is_loopback(self.host):
@@ -114,6 +116,9 @@ class PushServer:
         self.audit_path = Path(audit_path) if audit_path else None
         self.license = license
         self.status = status                       # extra operator-facing health (audit writable? last checkpoint?)
+        # the analyst console's read/decide API (/api/soc/*, /api/approvals); decisions need their own token
+        self.console = console
+        self.console_token = console_token
         self.limiter = _AuthFailLimiter()
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -162,7 +167,52 @@ class PushServer:
         if not self.read_token:
             return True
         presented = self._presented(headers)
-        return bool(presented) and hmac.compare_digest(presented.encode(), self.read_token.encode())
+        if not presented:
+            return False
+        return (hmac.compare_digest(presented.encode(), self.read_token.encode())
+                or (bool(self.console_token) and hmac.compare_digest(presented.encode(), self.console_token.encode())))
+
+    def console_authorized(self, headers: Any) -> bool:
+        """Decisions: only the console token (never the push or read token, which relays and bridges hold)."""
+        if not self.console_token:
+            return False
+        presented = self._presented(headers)
+        return bool(presented) and hmac.compare_digest(presented.encode(), self.console_token.encode())
+
+    def console_get(self, path: str, query: dict) -> tuple[int, dict]:
+        api = self.console
+        if api is None:
+            return 404, {"error": "console API not attached"}
+        if path == "/api/soc/chains":
+            try:
+                limit = int((query.get("limit") or ["200"])[0])
+            except ValueError:
+                return 400, {"error": "limit must be an integer"}
+            return 200, api.chains(limit)
+        if path.startswith("/api/soc/chains/"):
+            c = api.chain(path[len("/api/soc/chains/"):])
+            return (200, c) if c else (404, {"error": "unknown chain"})
+        if path == "/api/approvals":
+            return 200, api.approvals()
+        if path == "/api/soc/proposals":
+            return 200, api.proposals()
+        return 404, {"error": "not found"}
+
+    def console_post(self, path: str, body: dict, headers: Any) -> tuple[int, dict]:
+        api = self.console
+        if api is None:
+            return 404, {"error": "console API not attached"}
+        who = str(headers.get("X-AEGIS-User", "") or "")[:120]
+        m = re.match(r"^/api/approvals/([^/]+)/(approve|reject)$", path)
+        if m:
+            status = "approved" if m.group(2) == "approve" else "rejected"
+            return api.decide(m.group(1), status, decided_by=who, reason=str(body.get("rationale") or body.get("reason") or ""),
+                              corrected_verdict=str(body.get("corrected_verdict") or ""))
+        m = re.match(r"^/api/soc/proposals/([^/]+)/decide$", path)
+        if m:
+            return api.decide_proposal(m.group(1), str(body.get("decision") or ""), decided_by=who,
+                                       rationale=str(body.get("rationale") or ""))
+        return 404, {"error": "not found"}
 
     # -- the four ingest shapes; each returns (status, body_dict)
     def ingest_cloudflare(self, body: bytes) -> tuple[int, dict]:
@@ -394,12 +444,34 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._reply(200, self.server_ref.verdicts_payload(max(0, after), limit))
             return
+        if path.startswith("/api/"):
+            if not self.server_ref.read_authorized(self.headers):
+                self._reply(401, {"error": "unauthorized"})
+                return
+            status, out = self.server_ref.console_get(path, parse_qs(urlsplit(self.path).query))
+            self._reply(status, out)
+            return
         self._reply(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         srv = self.server_ref
         parts = urlsplit(self.path)
         path = parts.path
+        if path.startswith("/api/"):
+            if not srv.console_authorized(self.headers):
+                self._reply(401, {"error": "unauthorized"})
+                return
+            raw = self._body()
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+            except (ValueError, UnicodeDecodeError):
+                self._reply(400, {"error": "body must be JSON"})
+                return
+            status, out = srv.console_post(path, body if isinstance(body, dict) else {}, self.headers)
+            self._reply(status, out)
+            return
         if not path.startswith("/ingest/"):
             self._reply(404, {"error": "not found"})
             return
@@ -457,7 +529,8 @@ def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,
         srv = PushServer(token=os.environ.get("AEGIS_INGEST_TOKEN", "").strip(), bind=bind or DEFAULT_BIND,
                          max_mb=int(os.environ.get("AEGIS_INGEST_MAX_MB", str(DEFAULT_MAX_MB))), blocklist=blocklist,
                          audit_path=audit_path, license=license, read_token=os.environ.get("AEGIS_INGEST_READ_TOKEN", "").strip(),
-                         status=status)
+                         status=status, console=console_api_from_env(audit_path),
+                         console_token=os.environ.get("AEGIS_CONSOLE_TOKEN", "").strip())
         return srv.start()
     except Exception as e:  # noqa: BLE001 — a bad bind must not take the SOC down; polling still works
         logger.error("[ingest:http] push receiver not started: %s", str(e)[:200])

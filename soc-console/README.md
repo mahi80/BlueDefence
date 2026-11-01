@@ -22,14 +22,18 @@ npm run dev          # http://localhost:3000 — uses bundled fixtures, no backe
 Point it at a real backend:
 
 ```bash
-AEGIS_API_ORIGIN=https://dashboard.acpgovernance.com npm run dev
+AEGIS_API_ORIGIN=http://127.0.0.1:8787 AEGIS_API_KEY=<AEGIS_CONSOLE_TOKEN from aegis.env> npm run dev
 ```
 
 | Env | Meaning |
 |---|---|
-| `AEGIS_API_ORIGIN` | Origin of the ACP dashboard FastAPI backend. Empty → bundled fixtures. |
+| `AEGIS_API_ORIGIN` | The AEGIS host's push receiver (`aegis/ingest/http_push.py`), which serves `/api/soc/chains`, `/api/soc/chains/{id}`, `/api/approvals`, `/api/soc/proposals` from the audit chain and HITL files (`aegis/ingest/console_api.py`). The ACP dashboard's `/api/soc/*` has the same shape and also works. Empty → bundled fixtures ("sample stream" in the header). |
 | `NEXT_PUBLIC_AEGIS_USE_FIXTURES` | Force fixtures even when an origin is set (`1`). |
-| `AEGIS_API_KEY` | Optional bearer for server-side reads of api-key-gated routes. |
+| `AEGIS_API_KEY` | Bearer for server-side calls — `AEGIS_CONSOLE_TOKEN` on the host. Reads work with the read token too; **decisions need the console token**. |
+
+Decisions (`Approve` / `Reject`, model-loop `Promote`) never go browser → backend: `app/api/approvals/[id]/[decision]`
+and `app/api/soc/proposals/[id]/decide` check the session cookie, refuse roles that may not decide, then forward
+with the key and `X-AEGIS-User: role:user`, which the host writes into the decision row.
 | `AEGIS_ASK_URL` | Optional LLM-backed **Agent Q** endpoint. Empty → Q answers deterministically from the chain. |
 
 Same-origin `/api/*` calls are proxied to `AEGIS_API_ORIGIN` (see `next.config.mjs`),

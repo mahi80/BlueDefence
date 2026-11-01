@@ -198,6 +198,7 @@ ask INGEST_BIND "ingest receiver bind (host:port) for WAF/syslog/Kafka-bridge pu
 [[ -n "$INGEST_TOKEN" ]] || INGEST_TOKEN=$( { grep -s '^AEGIS_INGEST_TOKEN=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1)   # re-runs keep the token the relays already use
 [[ -n "$INGEST_TOKEN" ]] || INGEST_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 READ_TOKEN=$( { grep -s '^AEGIS_INGEST_READ_TOKEN=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$READ_TOKEN" ]] || READ_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+CONSOLE_TOKEN=$( { grep -s '^AEGIS_CONSOLE_TOKEN=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$CONSOLE_TOKEN" ]] || CONSOLE_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 SALT=$( { grep -s '^AEGIS_DATASET_SALT=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$SALT" ]] || SALT=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 HOST_IP=$( { hostname -I 2>/dev/null || echo 127.0.0.1; } | awk '{print $1}')
 
@@ -220,6 +221,8 @@ HOST_IP=$( { hostname -I 2>/dev/null || echo 127.0.0.1; } | awk '{print $1}')
   echo "# push token for relays / WAF / Kafka bridge; the read token is for the bridge's verdict feed and SOAR only"
   echo "AEGIS_INGEST_TOKEN=$INGEST_TOKEN"
   echo "AEGIS_INGEST_READ_TOKEN=$READ_TOKEN"
+  echo "# the analyst console's key: reads /api/soc/* and /api/approvals and may record decisions (soc-console AEGIS_API_KEY)"
+  echo "AEGIS_CONSOLE_TOKEN=$CONSOLE_TOKEN"
   echo "# keys the pseudonyms; never change it after go-live"
   echo "AEGIS_DATASET_SALT=$SALT"
   echo "AEGIS_MODEL_DIR=$VAR/models"

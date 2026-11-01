@@ -275,6 +275,7 @@ env for the SOC host follows the project deploy checklist.
 | `AEGIS_INGEST_BIND` | `0.0.0.0:8787` | Default bind; put the bank's LB/reverse proxy in front for TLS |
 | `AEGIS_INGEST_TOKEN` | `<secret>` | **Required off loopback**; bearer token on every `/ingest/*` call |
 | `AEGIS_INGEST_READ_TOKEN` | `<secret>` | Optional; when set, `GET /ingest/verdicts`, `/ingest/blocklist`, `/ingest/license` need this token instead of the push token — relays that only push cannot read verdicts. `install.sh` writes both |
+| `AEGIS_CONSOLE_TOKEN` | `<secret>` | The analyst console's key (`soc-console` `AEGIS_API_KEY`): reads `/api/soc/chains`, `/api/approvals`, `/api/soc/proposals` and may `POST` a decision, which lands in `<AEGIS_HITL_DIR>/decisions.jsonl` with `decided_by` = the console's signed-in role:user. Unset → the console is read-only. `install.sh` writes it |
 | `AEGIS_AUDIT_MAX_MB` | `512` | Rotate the audit log at this size (`audit.jsonl.<ms>`); the hash chain continues across segments — `python -m aegis.audit verify --all` walks them as one |
 | `AEGIS_AUDIT_FSYNC` | `1` | fsync every audit row (set `0` only on a WORM/replicated mount that guarantees durability itself) |
 | `AEGIS_NETOPS_STATE` | `<audit dir>/netops-state.json` | Network-assurance checkpoint (links, open incidents, learned roles) written every 5 s and on shutdown; restored on start so a restart mid-outage does not re-alert. Empty string disables |
@@ -350,15 +351,18 @@ journalctl -u aegis-soc -f        # the banner prints the edition and model back
 > `/var/lib/aegis` on durable storage and back it up — it is the authoritative record,
 > especially in `external`.
 
-### 4f. Console SSO (`soc` / `full` only)
+### 4f. Analyst console (`soc` / `full` only)
 
-The analyst console is the ACP dashboard. On-prem it supports Microsoft Entra ID, SAML 2.0
-(Okta / OneLogin / PingFederate) and generic OIDC, with SSO-group → role mapping (Admin / CIO /
-BU-head / Developer). Configure it per the SSO section of
-[`docs/enterprise-deployment/01-installation.md`](../enterprise-deployment/01-installation.md)
-— but deploy the dashboard from the canonical monolith image in this repo, not the retired
-`AgentControl` clone that guide references. The **`external`** edition has no console, so there is
-no SSO to configure; approvals are ServiceNow or the file queue.
+The console is `soc-console/` (Next.js), served on the SOC host itself — no second product. It reads
+incidents, evidence and HITL cards from the host's own push receiver (`AEGIS_API_ORIGIN=http://127.0.0.1:8787`,
+`AEGIS_API_KEY=<AEGIS_CONSOLE_TOKEN>`), which answers `/api/soc/chains`, `/api/approvals` and
+`/api/soc/proposals` from `audit.jsonl` and the HITL directory. An analyst's approve/reject goes through
+the console's server-side route (session checked, role must be `admin`/`cio`/`ciso`/`bu_head`) to
+`POST /api/approvals/{id}/approve|reject` on the host, which appends to `decisions.jsonl` — the file the
+service executes from on its next cycle — with `decided_by` recorded. Sign-in: `AEGIS_AUTH_MODE=local`
+(named accounts, scrypt) for pilots, `oidc` (Entra ID / SAML-federated, group → role map) for production;
+see `soc-console/README.md`. `deploy/aws-pilot/` shows the whole wiring under systemd + nginx. The
+**`external`** edition has no console; approvals are ServiceNow or the file queue.
 
 ### 4g. Agent Q — ask the detection (`soc` / `full`)
 
