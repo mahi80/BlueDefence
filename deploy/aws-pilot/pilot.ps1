@@ -8,7 +8,10 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 if (-not (Test-Path terraform.tfvars)) { throw "copy terraform.tfvars.example to terraform.tfvars and fill it in" }
 # `aws login` sessions are not understood by the Terraform AWS provider yet — hand it the short-lived keys as env vars
-if (-not $env:AWS_ACCESS_KEY_ID) { aws configure export-credentials --format powershell | Invoke-Expression }
+# (stale exported keys shadow the profile, so drop them first — the CLI reads env vars before ~/.aws)
+Remove-Item Env:AWS_ACCESS_KEY_ID, Env:AWS_SECRET_ACCESS_KEY, Env:AWS_SESSION_TOKEN, Env:AWS_CREDENTIAL_EXPIRATION -ErrorAction SilentlyContinue
+aws sts get-caller-identity --query Arn --output text 2>$null | Out-Null; if ($LASTEXITCODE -ne 0) { aws login }
+aws configure export-credentials --format powershell | Invoke-Expression
 $region = (Select-String -Path terraform.tfvars -Pattern '^\s*region\s*=\s*"([^"]+)"' | % { $_.Matches[0].Groups[1].Value }); if (-not $region) { $region = "ap-south-1" }
 
 switch ($cmd) {
