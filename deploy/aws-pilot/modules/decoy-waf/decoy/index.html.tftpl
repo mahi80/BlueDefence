@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>${title}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color:#1b2430}
+code{background:#eef1f5;padding:.1em .35em;border-radius:3px}</style></head>
+<body>
+<h1>${title}</h1>
+<p>This host is an instrumented test target for the <a href="https://github.com/mahi80/BlueDefence">BlueDefence</a>
+shadow pilot. It is not a real service and holds no data. Every request to it is evaluated by AWS WAF and
+streamed to an AEGIS instance running in shadow mode, so its verdicts can be compared with the WAF's.</p>
+<p>If you are a security researcher: thank you for the traffic. There is nothing to find here beyond
+<code>/login.html</code>, <code>/robots.txt</code> and a 404 for everything else.</p>
+</body></html>

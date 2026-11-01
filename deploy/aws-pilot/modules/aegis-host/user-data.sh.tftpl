@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# BlueDefence pilot host bootstrap (cloud-init user-data). Runs once on first boot; log: /var/log/bluedefence-bootstrap.log
+set -euo pipefail
+exec > >(tee -a /var/log/bluedefence-bootstrap.log) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+
+DOMAIN='${domain}'
+LICENSE_SERVER='${license_server}'
+BRANCH='${aegis_branch}'
+umask 077
+# secrets go to root-only files, never into command lines (ps) or this log
+printf '%s' '${ingest_token}' > /root/.aegis-ingest-token
+printf '%s' '${console_admin_password}' > /root/.aegis-console-admin
+umask 022
+
+echo "▸ packages"
+apt-get update -q
+apt-get install -y -q git python3 python3-venv python3-pip nginx certbot python3-certbot-nginx curl jq
+
+echo "▸ AEGIS (shadow mode, Community licence)"
+curl -fsSL "https://raw.githubusercontent.com/mahi80/BlueDefence/$BRANCH/install.sh" -o /root/install.sh
+AEGIS_BRANCH="$BRANCH" bash /root/install.sh --non-interactive --yes \
+  --community --org '${community_org}' --email '${community_email}' --server "$LICENSE_SERVER" \
+  --sources stream --ingest-bind 127.0.0.1:8787 --ingest-token "$(cat /root/.aegis-ingest-token)" \
+  --branch "$BRANCH"
+
+echo "▸ analyst console (local sign-in)"
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y -q nodejs
+cd /opt/aegis/app/soc-console
+npm ci --no-audit --no-fund
+npm run build
+install -d -o aegis -g aegis -m 750 /var/lib/aegis/console
+cat > /etc/aegis/console.env <<EOF
+# analyst console — local accounts until the bank's IdP is wired (AEGIS_AUTH_MODE=oidc)
+AEGIS_AUTH_MODE=local
+AEGIS_CONSOLE_USERS=/var/lib/aegis/console/users.json
+AEGIS_CONSOLE_SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+AEGIS_API_ORIGIN=
+PORT=3000
+HOSTNAME=127.0.0.1
+EOF
+chown root:aegis /etc/aegis/console.env; chmod 640 /etc/aegis/console.env
+AEGIS_CONSOLE_USERS=/var/lib/aegis/console/users.json AEGIS_USER_PASSWORD="$(cat /root/.aegis-console-admin)" \
+  sudo -u aegis --preserve-env=AEGIS_CONSOLE_USERS,AEGIS_USER_PASSWORD node scripts/users.mjs add admin admin
+cat > /etc/systemd/system/aegis-console.service <<'EOF'
+[Unit]
+Description=BlueDefence analyst console
+After=network-online.target aegis-soc.service
+Wants=network-online.target
+
+[Service]
+User=aegis
+Group=aegis
+WorkingDirectory=/opt/aegis/app/soc-console
+EnvironmentFile=/etc/aegis/console.env
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/aegis/console /opt/aegis/app/soc-console/.next
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now aegis-console
+
+echo "▸ nginx (http now; https once the certificate is issued)"
+cat > /etc/nginx/sites-available/aegis <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    client_max_body_size 32m;
+
+    # Firehose / forwarders → push receiver. /healthz is unauthenticated by design (liveness only).
+    location /ingest/ { proxy_pass http://127.0.0.1:8787; proxy_read_timeout 60s; }
+    location = /healthz { proxy_pass http://127.0.0.1:8787; }
+    location = /metrics { allow 127.0.0.1; deny all; proxy_pass http://127.0.0.1:8787; }
+
+    # analyst console
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+ln -sf /etc/nginx/sites-available/aegis /etc/nginx/sites-enabled/aegis
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl reload nginx
+
+echo "▸ TLS: retry certbot until $DOMAIN resolves to this host"
+cat > /usr/local/bin/aegis-tls <<EOF
+#!/usr/bin/env bash
+# issue the Let's Encrypt certificate once DNS points here; the timer calls this every 5 min until it succeeds
+set -u
+me=\$(curl -fsS --max-time 5 https://checkip.amazonaws.com | tr -d '[:space:]')
+got=\$(getent ahostsv4 "$DOMAIN" | awk 'NR==1{print \$1}')
+if [[ -z "\$got" || "\$got" != "\$me" ]]; then echo "waiting: $DOMAIN -> \$got, this host is \$me"; exit 0; fi
+certbot --nginx --non-interactive --agree-tos -m '${letsencrypt_email}' -d "$DOMAIN" --redirect && systemctl disable --now aegis-tls.timer
+EOF
+chmod 755 /usr/local/bin/aegis-tls
+cat > /etc/systemd/system/aegis-tls.service <<'EOF'
+[Unit]
+Description=BlueDefence TLS issuance (runs until the certificate exists)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aegis-tls
+EOF
+cat > /etc/systemd/system/aegis-tls.timer <<'EOF'
+[Unit]
+Description=Retry TLS issuance every 5 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now aegis-tls.timer
+/usr/local/bin/aegis-tls || true
+
+echo "▸ WAF log puller (CloudWatch Logs → /ingest/waf every 30 s)"
+/opt/aegis/venv/bin/pip install -q boto3
+cat > /usr/local/bin/aegis-cwlogs-pull <<'PYEOF'
+${cwlogs_pull_py}
+PYEOF
+chmod 755 /usr/local/bin/aegis-cwlogs-pull
+cat > /etc/aegis/cwlogs.env <<EOF
+AEGIS_CWLOGS_GROUP=${waf_log_group}
+AEGIS_CWLOGS_REGION=us-east-1
+AEGIS_INGEST_URL=http://127.0.0.1:8787
+AEGIS_INGEST_TOKEN=$(cat /root/.aegis-ingest-token)
+AEGIS_CWLOGS_CHECKPOINT=/var/lib/aegis/cwlogs-checkpoint.json
+EOF
+chown root:aegis /etc/aegis/cwlogs.env; chmod 640 /etc/aegis/cwlogs.env
+cat > /etc/systemd/system/aegis-cwlogs.service <<'EOF'
+[Unit]
+Description=BlueDefence: pull AWS WAF events from CloudWatch Logs
+After=aegis-soc.service
+[Service]
+Type=oneshot
+User=aegis
+Group=aegis
+EnvironmentFile=/etc/aegis/cwlogs.env
+ExecStart=/usr/local/bin/aegis-cwlogs-pull
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/aegis
+EOF
+cat > /etc/systemd/system/aegis-cwlogs.timer <<'EOF'
+[Unit]
+Description=Pull WAF events every 30 s
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=30s
+AccuracySec=5s
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now aegis-cwlogs.timer
+
+echo "▸ daily backup (audit chain, licence, state) → /var/backups/aegis"
+cat > /etc/cron.daily/aegis-backup <<'EOF'
+#!/usr/bin/env bash
+[[ -x /usr/local/bin/aegis-backup ]] && /usr/local/bin/aegis-backup /var/backups/aegis >/dev/null 2>&1
+find /var/backups/aegis -name '*.tar.gz' -mtime +14 -delete 2>/dev/null
+EOF
+chmod 755 /etc/cron.daily/aegis-backup
+
+echo "✓ bootstrap done — $(date -u +%FT%TZ)"
+curl -fsS http://127.0.0.1:8787/healthz | jq -c . || true
