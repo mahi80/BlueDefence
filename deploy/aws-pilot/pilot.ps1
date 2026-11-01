@@ -29,7 +29,8 @@ switch ($cmd) {
   "shell"  { aws ssm start-session --region $region --target (terraform output -raw aegis_instance_id) }
   "update" {
     $iid = terraform output -raw aegis_instance_id
-    $cmdline = "cd /opt/aegis/app && sudo -u aegis git pull -q && /opt/aegis/venv/bin/pip install -q -e . && cd soc-console && sudo -u aegis -H npm ci --no-audit --no-fund && sudo -u aegis -H npm run build && systemctl restart aegis-console aegis-soc && sleep 5 && systemctl is-active aegis-console aegis-soc"
+    # the checkout is root-owned (install.sh); build as root, hand .next back to the service user
+    $cmdline = "cd /opt/aegis/app && git pull -q && /opt/aegis/venv/bin/pip install -q -e . && cd soc-console && npm ci --no-audit --no-fund && npm run build && chown -R aegis:aegis .next && systemctl restart aegis-console aegis-soc && sleep 5 && systemctl is-active aegis-console aegis-soc"
     $params = @{ commands = @($cmdline); executionTimeout = @("900") } | ConvertTo-Json -Compress
     $pfile = Join-Path $env:TEMP "bd-update.json"; Set-Content -Path $pfile -Value $params -Encoding ascii
     $cid = aws ssm send-command --region $region --instance-ids $iid --document-name AWS-RunShellScript --parameters "file://$pfile" --query Command.CommandId --output text
