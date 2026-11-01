@@ -28,9 +28,17 @@ UNIT=/etc/systemd/system/aegis-soc.service
 DEFAULT_SERVER="${AEGIS_LICENSE_SERVER:-}"
 
 MODE=""; ORG=""; EMAIL=""; CODE=""; SERVER="$DEFAULT_SERVER"; LICENSE_PATH=""
-LLM="deterministic"; VLLM_URL=""; VLLM_MODEL=""; LOCAL_MODEL=""
-SOURCES="stream"; INGEST_BIND="0.0.0.0:8787"; INGEST_TOKEN=""
-HITL="file"; EDITION="external"; NONINTERACTIVE=0; YES=0
+# re-runs start from what the previous install wrote, so `curl … | sudo bash` on a tuned host changes nothing it did not ask to
+_prev() { { grep -s "^$1=" "$ETC/aegis.env" || true; } | head -1 | cut -d= -f2- | cut -d' ' -f1; }
+LLM="deterministic"; VLLM_URL="$(_prev AEGIS_VLLM_URL)"; VLLM_MODEL="$(_prev AEGIS_VLLM_MODEL)"; LOCAL_MODEL="$(_prev AEGIS_MODEL)"
+case "$(_prev LLM_BACKEND)" in vllm) LLM=vllm;; local) LLM=local;; anthropic) LLM=anthropic;; esac
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] || ANTHROPIC_API_KEY="$(_prev ANTHROPIC_API_KEY)"
+SOURCES="$(_prev AEGIS_SOURCES)"; SOURCES="${SOURCES:-stream}"
+INGEST_BIND="$(_prev AEGIS_INGEST_BIND)"; INGEST_BIND="${INGEST_BIND:-0.0.0.0:8787}"
+INGEST_TOKEN="${AEGIS_INGEST_TOKEN:-}"
+HITL="$(_prev AEGIS_HITL_TRANSPORT)"; HITL="${HITL:-file}"
+EDITION="$(_prev AEGIS_EDITION)"; EDITION="${EDITION:-external}"
+NONINTERACTIVE=0; YES=0
 
 usage() { if [[ -f "$0" ]]; then sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; else echo "see https://github.com/mahi80/BlueDefence#install"; fi; exit "${1:-0}"; }
 say()  { printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
@@ -53,7 +61,7 @@ while [[ $# -gt 0 ]]; do
     --local-model) LOCAL_MODEL="$2"; shift 2;;
     --sources) SOURCES="$2"; shift 2;;              # e.g. waf,netops  (push receiver is always on)
     --ingest-bind) INGEST_BIND="$2"; shift 2;;
-    --ingest-token) INGEST_TOKEN="$2"; shift 2;;
+    --ingest-token) INGEST_TOKEN="$2"; shift 2;;              # prefer AEGIS_INGEST_TOKEN in the environment: argv shows in ps
     --hitl) HITL="$2"; shift 2;;                    # file | servicenow
     --edition) EDITION="$2"; shift 2;;
     --branch) BRANCH="$2"; shift 2;;
@@ -202,6 +210,7 @@ CONSOLE_TOKEN=$( { grep -s '^AEGIS_CONSOLE_TOKEN=' "$ENV_FILE" || true; } | cut 
 SALT=$( { grep -s '^AEGIS_DATASET_SALT=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$SALT" ]] || SALT=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 HOST_IP=$( { hostname -I 2>/dev/null || echo 127.0.0.1; } | awk '{print $1}')
 
+umask 027
 {
   echo "# BlueDefence / AEGIS — written by install.sh on $(date -u +%FT%TZ); edit and 'systemctl restart aegis-soc'"
   echo "AEGIS_EDITION=$EDITION"
@@ -242,6 +251,7 @@ HOST_IP=$( { hostname -I 2>/dev/null || echo 127.0.0.1; } | awk '{print $1}')
     [[ -n "$SERVER" ]] && echo "AEGIS_LICENSE_SERVER=$SERVER"
   fi
 } > "$ENV_FILE"
+umask 022
 chmod 640 "$ENV_FILE"; chown root:aegis "$ENV_FILE"
 ok "$ENV_FILE"
 

@@ -17,9 +17,14 @@ if (-not (Test-Path terraform.tfvars)) { throw "copy terraform.tfvars.example to
 # `aws login` sessions are not understood by the Terraform AWS provider yet - hand it the short-lived keys as env vars
 # (stale exported keys shadow the profile, so drop them first - the CLI reads env vars before ~/.aws)
 Remove-Item Env:AWS_ACCESS_KEY_ID, Env:AWS_SECRET_ACCESS_KEY, Env:AWS_SESSION_TOKEN, Env:AWS_CREDENTIAL_EXPIRATION -ErrorAction SilentlyContinue
-aws sts get-caller-identity --query Arn --output text 2>$null | Out-Null; if ($LASTEXITCODE -ne 0) { aws login }
+# Windows PowerShell 5.1 turns a native command's stderr into a terminating error under "Stop": relax it for the probe
+$eap = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+$null = (aws sts get-caller-identity --query Arn --output text 2>&1 | Out-String)
+$loggedIn = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $eap
+if (-not $loggedIn) { aws login }
 aws configure export-credentials --format powershell | Invoke-Expression
-$region = (Select-String -Path terraform.tfvars -Pattern '^\s*region\s*=\s*"([^"]+)"' | % { $_.Matches[0].Groups[1].Value }); if (-not $region) { $region = "ap-south-1" }
+$region = (Select-String -Path terraform.tfvars -Pattern '^\s*region\s*=\s*"([^"]+)"' | % { $_.Matches[0].Groups[1].Value }); if (-not $region) { $region = "ap-southeast-2" }
 
 switch ($cmd) {
   "plan"   { terraform init -upgrade; terraform plan }
@@ -30,7 +35,7 @@ switch ($cmd) {
     $domain = terraform output -raw console_url
     Write-Host "`nhost health:"; try { (Invoke-WebRequest -UseBasicParsing "$($domain)healthz" -TimeoutSec 10).Content } catch { Write-Host "  not answering yet: $($_.Exception.Message)" }
     Write-Host "`nWAF log group, last event (epoch ms):"; aws logs describe-log-streams --region us-east-1 --log-group-name (terraform output -raw waf_log_group) --order-by LastEventTime --descending --max-items 1 --query 'logStreams[0].lastEventTimestamp' --output text
-    Write-Host "`nconsole admin password: terraform output -raw console_admin_password"
+    Write-Host "`nsecrets live in SSM Parameter Store (generated on the host): terraform output secrets"
   }
   "shell"  { aws ssm start-session --region $region --target (terraform output -raw aegis_instance_id) }
   "update" {

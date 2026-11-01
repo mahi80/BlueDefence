@@ -51,23 +51,33 @@ export default function HitlPanel({
   const approvalFor = (a: RecommendedAction): Approval | undefined =>
     approvals.find((p) => p.alert_id === chain.alert_id && p.action_type === a.action_type && p.target === a.target);
 
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
   async function decide(a: RecommendedAction, status: "approved" | "rejected") {
     const k = key(a.action_type, a.target);
     const note = draft[k] ?? "";
-    setDecided((d) => ({ ...d, [k]: { status, note } })); // optimistic
+    setError(null);
+    if (fixtureMode) { setDecided((d) => ({ ...d, [k]: { status, note } })); return; }
     const appr = approvalFor(a);
-    if (appr && !fixtureMode) {
-      try {
-        await fetch(`/api/approvals/${encodeURIComponent(appr.id)}/${status === "approved" ? "approve" : "reject"}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(
-          status === "approved" ? { rationale: note } : { reason: note, corrected_verdict: corrected[k] ?? "" },
-        ),
-        });
-      } catch {
-        /* console degrades to the optimistic state; the card shows "sample stream" context */
+    if (!appr) { setError("This action has no approval card yet — the service has not filed it."); return; }
+    setBusy(k);
+    try {
+      const r = await fetch(`/api/approvals/${encodeURIComponent(appr.id)}/${status === "approved" ? "approve" : "reject"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(status === "approved" ? { rationale: note } : { reason: note, corrected_verdict: corrected[k] ?? "" }),
+      });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        setError(`${status === "approved" ? "Approve" : "Reject"} failed (${r.status}): ${body.error ?? r.statusText}`);
+        return;                                               // nothing recorded: the card stays open
       }
+      setDecided((d) => ({ ...d, [k]: { status, note } }));
+    } catch (e) {
+      setError(`Could not reach the console server: ${(e as Error).message}`);
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -76,6 +86,7 @@ export default function HitlPanel({
 
   return (
     <aside className="panel" aria-label="Human-in-the-loop actions">
+      {error && <div className="hitl-error" role="alert">{error}</div>}
       <div className="panel-head">
         <h2>Human-in-the-loop</h2>
         <div className="sub">
@@ -145,8 +156,8 @@ export default function HitlPanel({
                   <div className="foot">
                     <span className="conf">{Math.round((a.confidence ?? chain.confidence) * 100)}%</span>
                     <span className="btns">
-                      <button className="btn btn-reject" onClick={() => decide(a, "rejected")}>Reject</button>
-                      <button className="btn btn-approve" onClick={() => decide(a, "approved")}>Approve</button>
+                      <button className="btn btn-reject" disabled={busy === key(a.action_type, a.target)} onClick={() => decide(a, "rejected")}>Reject</button>
+                      <button className="btn btn-approve" disabled={busy === key(a.action_type, a.target)} onClick={() => decide(a, "approved")}>Approve</button>
                     </span>
                   </div>
                 </>

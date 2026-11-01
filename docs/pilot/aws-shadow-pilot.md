@@ -58,9 +58,11 @@ new console password; Route 53/GoDaddy records untouched).
    - Route 53: `aws route53domains register-domain --region us-east-1 …` (registration creates the
      hosted zone; its id goes into `route53_zone_id` and the A record is managed for you), or
    - any registrar: leave `route53_zone_id` empty and create the A record yourself after the first apply.
-3. **A work e-mail** for the Community licence (`community_email`): the licence service refuses gmail/yahoo/…
+3. **Sign-in works only over https** (the session cookie is `Secure`): until the certificate is issued, the login
+   page loads over http but the browser drops the cookie. Wait for `status` to show https answering.
+4. **A work e-mail** for the Community licence (`community_email`): the licence service refuses gmail/yahoo/…
    by design; any address on your own domain works (it is not verified by mail).
-4. **Session Manager plugin** for `.\pilot.ps1 shell`
+5. **Session Manager plugin** for `.\pilot.ps1 shell`
    (https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
    No SSH port is opened unless you set `admin_cidr`.
 
@@ -79,9 +81,10 @@ What the first boot does on the host (log: `/var/log/bluedefence-bootstrap.log`)
 | `install.sh --community --non-interactive` | signs up a Community licence for `community_org`, writes `/etc/aegis/aegis.env` with `AEGIS_ENFORCEMENT_MODE=shadow`, `AEGIS_SOURCES=stream`, the ingest token, starts `aegis-soc` (systemd `Type=notify`, watchdog, rollback — see the on-prem guide) |
 | index | `AEGIS_INDEX_URL=duckdb:////var/lib/aegis/index.duckdb` — the console's `/api/soc/*` answer from SQL, not a file scan; `python -m aegis.store stats` on the host |
 | WAF puller | `aegis-cwlogs.timer` runs `/usr/local/bin/aegis-cwlogs-pull` every 30 s: `FilterLogEvents` on the WAF log group (instance role, read-only) → gzip NDJSON → `POST /ingest/waf?source=aws-waf` on loopback; checkpoint in `/var/lib/aegis/cwlogs-checkpoint.json` |
-| console | `soc-console` built from the same checkout, `AEGIS_AUTH_MODE=local`, one `admin` account (password: `terraform output -raw console_admin_password`); reads live incidents from the host's own `/api/soc/*` (`AEGIS_CONSOLE_TOKEN`), approvals land in `/var/lib/aegis/hitl/decisions.jsonl` |
+| console | `soc-console` built from the same checkout, `AEGIS_AUTH_MODE=local`, one `admin` account (password generated on the host and stored in SSM Parameter Store — `terraform output secrets` prints the `aws ssm get-parameter` command); reads live incidents from the host's own `/api/soc/*` (`AEGIS_CONSOLE_TOKEN`), approvals land in `/var/lib/aegis/hitl/decisions.jsonl` |
 | nginx | `:80` immediately; `:443` + redirect the moment the domain resolves here (a 5-minute timer retries certbot until it succeeds) |
-| backup | `/etc/cron.daily/aegis-backup` → `/var/backups/aegis`, 14 days kept |
+| backup | `/etc/cron.daily/aegis-backup` → `/var/backups/aegis` (14 days) **and** `s3://<name>-backups-<account>/<name>/` (versioned, 90 days) — the host is disposable, the evidence is not |
+| secrets | ingest token, console token and the admin password are generated **on the host** and written to SSM Parameter Store (`/bluedefence/<name>/…`, SecureString); nothing secret is in user-data or Terraform state |
 
 Then:
 
@@ -102,8 +105,10 @@ rebuild in place over SSM:
 .\pilot.ps1 update      # git pull on the host, pip install, console rebuild, restart both services
 ```
 
-A change to `user-data.sh.tftpl` itself is different: `.\pilot.ps1 up` then replaces the host (same
-Elastic IP, DNS untouched, new console password).
+A change to `user-data.sh.tftpl` is deliberately **ignored** by Terraform (`ignore_changes = [user_data]`) so an
+edit can never destroy the pilot's evidence by accident. To rebuild the host on a new bootstrap, do it on purpose:
+`terraform apply -replace=module.aegis_host.aws_instance.host` (same Elastic IP and DNS; new secrets in SSM;
+restore the evidence from the S3 backup with `aegis-restore` if you need continuity).
 
 ## Demo accounts: who may press the button
 

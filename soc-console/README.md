@@ -36,8 +36,10 @@ and `app/api/soc/proposals/[id]/decide` check the session cookie, refuse roles t
 with the key and `X-AEGIS-User: role:user`, which the host writes into the decision row.
 | `AEGIS_ASK_URL` | Optional LLM-backed **Agent Q** endpoint. Empty → Q answers deterministically from the chain. |
 
-Same-origin `/api/*` calls are proxied to `AEGIS_API_ORIGIN` (see `next.config.mjs`),
-so the browser needs no CORS and no key in client code.
+The browser never talks to the backend: every call goes through a console route handler that checks the
+session and adds the key server-side (there is no pass-through rewrite). `AEGIS_CONSOLE_SECRET` (16+ chars)
+is **required** in production — the server refuses to sign a session without it. Security headers
+(frame-ancestors none, nosniff, HSTS) are set by `next.config.mjs`.
 
 ## Auth
 
@@ -84,7 +86,7 @@ Two modes, chosen with `AEGIS_AUTH_MODE`:
 
 | Mode | When | How |
 |---|---|---|
-| `local` (default) | pilots, labs, the weeks before SSO is wired | named accounts in a JSON users file (`AEGIS_CONSOLE_USERS`, default `.aegis-console-users.json`), scrypt-hashed passwords, one role per account, lock-out for 15 min after 5 failed attempts per user+IP. Manage with `npm run user -- add <name> <role>` (prompts for the password; 12+ chars), `list`, `disable <name>`, `remove <name>`. With no users file, `AEGIS_DEMO_USER` / `AEGIS_DEMO_PASSWORD` / `AEGIS_DEMO_ROLE` keep a single demo account. |
+| `local` (default) | pilots, labs, the weeks before SSO is wired | named accounts in a JSON users file (`AEGIS_CONSOLE_USERS`, default `.aegis-console-users.json`), scrypt-hashed passwords, one role per account, lock-out for 15 min after 5 failed attempts per account (and per account+IP, taken from `X-Real-IP` set by the proxy — a client-supplied `X-Forwarded-For` cannot reset it); a disabled account or a role change takes effect on the next request, not the next login. Manage with `npm run user -- add <name> <role>` (prompts for the password; 12+ chars), `list`, `disable <name>`, `remove <name>`. With no users file, `AEGIS_DEMO_USER` / `AEGIS_DEMO_PASSWORD` / `AEGIS_DEMO_ROLE` keep a single demo account. |
 | `oidc` | production | the bank's identity provider (Entra ID, or any SAML-federated OIDC provider). `AEGIS_OIDC_AUTHORIZE_URL`, `AEGIS_OIDC_CLIENT_ID`, `AEGIS_OIDC_REDIRECT_URI`, and `AEGIS_OIDC_ROLE_MAP="group:role,…"` map IdP groups to console roles. The callback completes the code exchange with **verified** id_tokens at deployment (it answers 501 until that is wired, so no unverified path can reach production). |
 
 Roles: `analyst` (view, propose) · `bu_head`, `ciso`, `cio`, `admin` (may approve containment actions and model promotions). Set `AEGIS_CONSOLE_SECRET` to a long random string — it signs the 8-hour session cookie.

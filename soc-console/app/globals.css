@@ -364,3 +364,8 @@ button { font-family: inherit; }
   .aq-typing i { animation: none; opacity: 0.6; }
   .qm:hover .qm-body { transform: none; }
 }
+
+/* review round 2: decisions report what the server actually did */
+.hitl-error { margin: 0 0 8px; padding: 8px 10px; border-radius: 6px; background: rgba(217,45,75,.08); color: var(--v-malicious); font-size: 12px; }
+.ferror { color: var(--v-malicious); }
+.mini-reject { margin-left: 4px; }

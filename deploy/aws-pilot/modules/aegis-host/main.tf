@@ -16,14 +16,8 @@ variable "letsencrypt_email" { type = string }
 variable "aegis_branch" { type = string }
 variable "waf_log_group_arn" { type = string }
 variable "waf_log_group_name" { type = string }
-variable "ingest_token" {
-  type      = string
-  sensitive = true
-}
-variable "console_admin_password" {
-  type      = string
-  sensitive = true
-}
+variable "name" { type = string }
+variable "backup_bucket_arn" { type = string }
 
 data "aws_vpc" "default" {
   default = true
@@ -92,17 +86,30 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# read-only on the WAF log group: the puller's only AWS permission
-resource "aws_iam_role_policy" "cwlogs" {
-  name = "waf-log-pull"
+# the host's own permissions: read the WAF log group, write its secrets to Parameter Store (generated on the
+# host, so they never sit in user-data / Terraform state), and ship the daily backup to S3
+resource "aws_iam_role_policy" "host" {
+  name = "pilot-host"
   role = aws_iam_role.host.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
-      Resource = [var.waf_log_group_arn, "${var.waf_log_group_arn}:*"]
-    }]
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["logs:FilterLogEvents"]
+        Resource = [var.waf_log_group_arn, "${var.waf_log_group_arn}:*"]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ssm:PutParameter"]
+        Resource = "arn:aws:ssm:*:*:parameter/bluedefence/${var.name}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "${var.backup_bucket_arn}/*"
+      }
+    ]
   })
 }
 
@@ -119,7 +126,7 @@ resource "aws_instance" "host" {
   iam_instance_profile        = aws_iam_instance_profile.host.name
   key_name                    = var.admin_cidr == "" ? null : var.key_name
   associate_public_ip_address = true
-  user_data_replace_on_change = true # the bootstrap only runs on first boot; a changed bootstrap means a new host
+  user_data_replace_on_change = false # a bootstrap edit must never destroy the pilot's evidence; `pilot.ps1 update` rolls code
 
   metadata_options {
     http_tokens = "required" # IMDSv2 only
@@ -138,8 +145,8 @@ resource "aws_instance" "host" {
     community_org          = var.community_org
     community_email        = var.community_email
     letsencrypt_email      = var.letsencrypt_email
-    ingest_token           = var.ingest_token
-    console_admin_password = var.console_admin_password
+    name                   = var.name
+    backup_bucket          = replace(var.backup_bucket_arn, "arn:aws:s3:::", "")
     aegis_branch           = var.aegis_branch
     waf_log_group          = var.waf_log_group_name
     cwlogs_pull_py         = file("${path.module}/cwlogs-pull.py")
@@ -148,7 +155,7 @@ resource "aws_instance" "host" {
   tags = { Name = "bluedefence-aegis-host" }
 
   lifecycle {
-    ignore_changes = [ami] # a new Canonical image must not recreate a running pilot
+    ignore_changes = [ami, user_data] # a new image or an edited bootstrap must not recreate a running pilot
   }
 }
 

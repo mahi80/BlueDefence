@@ -80,6 +80,7 @@ export default function Console({
   approvals,
   proposals,
   fixtureMode,
+  backendError = null,
   session,
   canDecide,
 }: {
@@ -87,6 +88,7 @@ export default function Console({
   approvals: Approval[];
   proposals: Proposal[];
   fixtureMode: boolean;
+  backendError?: string | null;
   session: { user: string; role: string };
   canDecide: boolean;
 }) {
@@ -143,7 +145,8 @@ export default function Console({
           <span className="tag">autonomous defense · human-in-the-loop</span>
         </div>
         <div className="live">
-          <span className="pulse-dot" aria-hidden /> {fixtureMode ? "sample stream" : "live"}
+          <span className="pulse-dot" aria-hidden style={backendError ? { background: "var(--v-malicious)" } : undefined} />{" "}
+          {fixtureMode ? "sample stream" : backendError ? `backend unreachable · ${backendError}` : "live"}
         </div>
         <div className="counts">
           <span className="chip"><span className="dot" style={{ background: "var(--v-malicious)" }} /> malicious <span className="n">{counts.malicious}</span></span>
