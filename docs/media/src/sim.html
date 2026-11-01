@@ -1,0 +1,232 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>BlueDefence simulation</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+  html,body{margin:0;background:#000}
+  canvas{display:block}
+</style>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// ------------------------------------------------------------ setup --
+const W = 1920, H = 1080;
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const C = { bg:"#0b1220", panel:"#111a2c", line:"#24324a", fg:"#e8edf5", mute:"#8b98ad", acc:"#3ddc97", warn:"#ffb454", bad:"#ff6b6b", blue:"#5aa9ff", swarm:"#b388ff", dim:"#1a2538" };
+const SANS = "'IBM Plex Sans', system-ui, sans-serif", MONO = "'IBM Plex Mono', monospace";
+window.SCENES = window.SCENES || [9,16,20,24,28,27,21,28,16,10];   // overridden by the driver
+const clamp = (x,a,b)=>Math.max(a,Math.min(b,x));
+const lerp = (a,b,t)=>a+(b-a)*t;
+const ease = t=>{t=clamp(t,0,1);return t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2};
+const eo = t=>1-Math.pow(1-clamp(t,0,1),3);
+const seeded = (s)=>{let x=Math.sin(s*9301+49297)*233280;return x-Math.floor(x)};
+function font(sz,w=400,m=false){ctx.font=`${w} ${sz}px ${m?MONO:SANS}`}
+function txt(s,x,y,{sz=28,w=400,col=C.fg,m=false,al="left",a=1}={}){ctx.save();ctx.globalAlpha*=clamp(a,0,1);font(sz,w,m);ctx.fillStyle=col;ctx.textAlign=al;ctx.textBaseline="alphabetic";ctx.fillText(s,x,y);ctx.restore()}
+function rr(x,y,w,h,r,fill,stroke,lw=1.5,a=1){ctx.save();ctx.globalAlpha*=clamp(a,0,1);ctx.beginPath();ctx.roundRect(x,y,w,h,r);if(fill){ctx.fillStyle=fill;ctx.fill()}if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=lw;ctx.stroke()}ctx.restore()}
+function dot(x,y,r,col,glow=0,a=1){ctx.save();ctx.globalAlpha*=clamp(a,0,1);if(glow){ctx.shadowColor=col;ctx.shadowBlur=glow}ctx.fillStyle=col;ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();ctx.restore()}
+function line(x1,y1,x2,y2,col,lw=2,a=1,dash){ctx.save();ctx.globalAlpha*=clamp(a,0,1);ctx.strokeStyle=col;ctx.lineWidth=lw;if(dash)ctx.setLineDash(dash);ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();ctx.restore()}
+function wrap(s,x,y,maxw,lh,o={}){font(o.sz||28,o.w||400,o.m);const words=s.split(" ");let ln="",yy=y;for(const w of words){const t=ln?ln+" "+w:w;if(ctx.measureText(t).width>maxw&&ln){txt(ln,x,yy,o);yy+=lh;ln=w}else ln=t}if(ln)txt(ln,x,yy,o);return yy+lh}
+function typed(s,t,cps=40){return s.slice(0,Math.floor(t*cps))}
+
+// particles (background)
+const P = Array.from({length:70},(_,i)=>({x:seeded(i)*W,y:seeded(i+100)*H,vx:(seeded(i+200)-.5)*18,vy:(seeded(i+300)-.5)*18}));
+function bg(t,glow=.1){
+  ctx.fillStyle=C.bg;ctx.fillRect(0,0,W,H);
+  let g=ctx.createRadialGradient(W*.85,H*.1,0,W*.85,H*.1,900);g.addColorStop(0,`rgba(90,169,255,${glow})`);g.addColorStop(1,"rgba(0,0,0,0)");ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  g=ctx.createRadialGradient(W*.1,H,0,W*.1,H,700);g.addColorStop(0,`rgba(61,220,151,${glow*.8})`);g.addColorStop(1,"rgba(0,0,0,0)");ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  const pts=P.map(p=>({x:((p.x+p.vx*t)%W+W)%W,y:((p.y+p.vy*t)%H+H)%H}));
+  for(let i=0;i<pts.length;i++){for(let j=i+1;j<pts.length;j++){const d=Math.hypot(pts[i].x-pts[j].x,pts[i].y-pts[j].y);if(d<170)line(pts[i].x,pts[i].y,pts[j].x,pts[j].y,C.line,1,(1-d/170)*.6)}dot(pts[i].x,pts[i].y,1.6,C.mute,0,.5)}
+}
+function chrome(kicker,title,t,{logo=true,sub=""}={}){
+  if(logo)txt("BlueDefence",W-120,96,{sz:28,w:600,col:C.mute,m:true,al:"right",a:ease(t/.5)});
+  txt(kicker,120,118,{sz:26,w:500,col:C.acc,m:true,a:ease(t/.6)});
+  wrap(title,120,205,1500,76,{sz:66,w:600,a:ease((t-.2)/.7)});
+  if(sub)wrap(sub,120,H-120,1500,42,{sz:30,col:C.mute,a:ease((t-.8)/.7)});
+}
+function scene(t){let i=0,acc=0;for(;i<SCENES.length;i++){if(t<acc+SCENES[i])return[i,t-acc,SCENES[i]];acc+=SCENES[i]}return[SCENES.length-1,t-acc+SCENES[SCENES.length-1],SCENES[SCENES.length-1]]}
+
+// ------------------------------------------------------------ topology --
+// 2 cores, 4 dists, 12 access; DIST-03 single-homed → its 3 access switches strand when its uplink dies
+const TOPO = (()=>{
+  const n={}, e=[];
+  const add=(id,role,x,y,users=0)=>n[id]={id,role,x,y,users};
+  add("CORE-01","core",730,160);add("CORE-02","core",1130,160);e.push(["CORE-01","CORE-02"]);
+  const dx=[430,730,1030,1330];
+  for(let i=0;i<4;i++){const id=`DIST-0${i+1}`;add(id,"dist",dx[i],330);e.push([id,i===2?"CORE-01":"CORE-01"]);if(i!==2)e.push([id,"CORE-02"]);
+    for(let j=0;j<3;j++){const a=`ACC-${String(i*3+j+1).padStart(2,"0")}`;add(a,"acc",dx[i]-100+j*100,520,120+((i*3+j)*37)%160);e.push([a,id])}}
+  return {n,e};
+})();
+const STRANDED=["ACC-07","ACC-08","ACC-09"];
+function drawTopo(ox,oy,sc,t,{cut=false,cutAt=0,stranded=false,alpha=1,labels=true}={}){
+  ctx.save();ctx.translate(ox,oy);ctx.scale(sc,sc);ctx.globalAlpha*=alpha;
+  for(const [a,b] of TOPO.e){const A=TOPO.n[a],B=TOPO.n[b];const isCut=cut&&a==="DIST-03"&&b==="CORE-01";
+    const col=isCut?C.bad:(stranded&&(STRANDED.includes(a)))?C.warn:C.line;line(A.x,A.y,B.x,B.y,col,isCut?4:2.2,1,isCut?[10,8]:null);
+    if(isCut){const k=(t-cutAt)*2%1;dot(lerp(A.x,B.x,k),lerp(A.y,B.y,k),5,C.bad,16)}}
+  for(const id in TOPO.n){const d=TOPO.n[id];const r=d.role==="core"?22:d.role==="dist"?17:12;
+    let col=d.role==="core"?C.blue:d.role==="dist"?C.fg:C.mute;
+    if(stranded&&STRANDED.includes(id))col=C.warn;if(cut&&id==="DIST-03")col=C.bad;
+    dot(d.x,d.y,r+6,col,0,.12);dot(d.x,d.y,r,C.panel);ctx.save();ctx.strokeStyle=col;ctx.lineWidth=2.5;ctx.beginPath();ctx.arc(d.x,d.y,r,0,Math.PI*2);ctx.stroke();ctx.restore();
+    if(labels)txt(id,d.x,d.y+r+22,{sz:d.role==="acc"?15:18,col,m:true,al:"center"})}
+  ctx.restore();
+}
+
+// ------------------------------------------------------------ swarm force sim (pre-baked) --
+const SWARM=(()=>{
+  const nodes=[{id:"Imperva WAF",k:"alert",v:"malicious"},{id:"AEGIS",k:"aegis"},
+    ...["ioc_extract","intel_enrich","blast_radius","log_hunt","deception_check"].map(w=>({id:w,k:"worker"})),
+    {id:"edge-waf",k:"service",v:"malicious"},{id:"api-gw-01",k:"service",v:"malicious"},{id:"app-ledger-07",k:"host",v:"suspicious",act:true},
+    {id:"svc-acct-pay",k:"identity",v:"suspicious",act:true},{id:"db-core",k:"data",v:"uncertain",crit:true}];
+  const ix=Object.fromEntries(nodes.map((n,i)=>[n.id,i]));
+  const links=[["Imperva WAF","AEGIS","swarm"],...nodes.filter(n=>n.k==="worker").map(n=>["AEGIS",n.id,"swarm"]),
+    ["Imperva WAF","edge-waf","attack"],["edge-waf","api-gw-01","attack"],["api-gw-01","app-ledger-07","lateral"],["svc-acct-pay","app-ledger-07","lateral"],["app-ledger-07","db-core","choke"]]
+    .map(([a,b,k])=>({a:ix[a],b:ix[b],k}));
+  const cx=0,cy=0;nodes.forEach((n,i)=>{n.x=cx+Math.cos(i*2.1)*(40+i*22);n.y=cy+Math.sin(i*2.1)*(40+i*22);n.vx=0;n.vy=0});
+  nodes[0].x=-345;nodes[0].y=0;
+  const frames=[];
+  for(let f=0;f<900;f++){
+    const alpha=Math.max(.02,1-f/600);
+    for(const l of links){const A=nodes[l.a],B=nodes[l.b];const want=l.k==="swarm"?120:210;const dx=B.x-A.x,dy=B.y-A.y,d=Math.hypot(dx,dy)||1;const k=(d-want)/d*(l.k==="swarm"?.09:.05)*alpha;A.vx+=dx*k;A.vy+=dy*k;B.vx-=dx*k;B.vy-=dy*k}
+    for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){const A=nodes[i],B=nodes[j];let dx=B.x-A.x,dy=B.y-A.y;let d2=dx*dx+dy*dy;if(d2<1)d2=1;const f2=-1600*alpha/d2;const d=Math.sqrt(d2);A.vx+=dx/d*f2;A.vy+=dy/d*f2;B.vx-=dx/d*f2;B.vy-=dy/d*f2;
+      const minD=95;if(d<minD){const push=(minD-d)/2;A.x-=dx/d*push;A.y-=dy/d*push;B.x+=dx/d*push;B.y+=dy/d*push}}
+    for(const n of nodes){n.vx-=n.x*.012*alpha;n.vy-=n.y*.018*alpha;n.vx*=.78;n.vy*=.78;n.x+=n.vx;n.y+=n.vy}
+    nodes[0].x=-345;nodes[0].y=0;
+    frames.push(nodes.map(n=>[n.x,n.y]));
+  }
+  return {nodes,links,frames};
+})();
+const VC={malicious:C.bad,suspicious:C.warn,benign:C.acc,uncertain:C.mute};
+const GL={alert:"!",host:"H",service:"S",identity:"ID",data:"DB"};
+function drawSwarm(ox,oy,t,a=1){
+  const f=SWARM.frames[clamp(Math.floor(t*30),0,SWARM.frames.length-1)];
+  ctx.save();ctx.translate(ox,oy);ctx.scale(1.25,1.25);ctx.globalAlpha*=a;
+  const vis=i=>{const n=SWARM.nodes[i];if(n.k==="worker")return ease((t-1-(i-2)*.25)/.5);if(n.k==="aegis")return ease((t-.4)/.5);if(n.k==="alert")return 1;return ease((t-3-(i-7)*.5)/.6)};
+  for(const l of SWARM.links){const [x1,y1]=f[l.a],[x2,y2]=f[l.b];const al=Math.min(vis(l.a),vis(l.b));const col=l.k==="swarm"?C.swarm:l.k==="choke"?C.acc:C.bad;
+    line(x1,y1,x2,y2,col,l.k==="swarm"?1.5:2.5,al*.8,l.k==="choke"?[8,6]:null);
+    if(l.k!=="swarm"&&al>.9){const k=(t*.6+l.a*.3)%1;dot(lerp(x1,x2,k),lerp(y1,y2,k),4,col,12,al)}}
+  SWARM.nodes.forEach((n,i)=>{const [x,y]=f[i];const al=vis(i);if(al<=0)return;const r=n.k==="alert"?20:n.k==="aegis"?17:n.k==="worker"?10:n.crit?17:13;
+    const col=n.k==="worker"||n.k==="aegis"?C.swarm:VC[n.v];
+    if(n.crit){ctx.save();ctx.globalAlpha*=al;ctx.strokeStyle=C.acc;ctx.setLineDash([4,4]);ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,r+7,0,Math.PI*2);ctx.stroke();ctx.restore()}
+    dot(x,y,r+8,col,0,.12*al);dot(x,y,r,col,n.k==="aegis"?18:0,al);
+    if(GL[n.k])txt(GL[n.k],x,y+5,{sz:13,w:600,col:"#0b1220",m:true,al:"center",a:al});
+    if(n.act)dot(x+r-3,y-r+3,5,C.acc,8,al);
+    txt(n.id,x,y+r+18,{sz:n.k==="worker"?14:16,col:n.k==="worker"?C.swarm:C.fg,m:true,al:"center",a:al})});
+  ctx.restore();
+}
+
+// ------------------------------------------------------------ scenes --
+const ALARMS=["%LINK-3-UPDOWN DIST-03 Ethernet1/49 changed state to down","%OSPF-5-ADJCHG ACC-07 Nbr 10.2.0.1 FULL to DOWN","%LINEPROTO-5-UPDOWN ACC-08 Gi1/0/49 down","%BGP-5-ADJCHANGE CORE-01 neighbor 10.0.3.2 Down","device_unreachable ACC-09 (180 s silent)","%LINK-3-UPDOWN ACC-07 Gi1/0/49 down","%ETHPORT-5-IF_DOWN_LINK_FAILURE DIST-03 Eth1/49","%OSPF-5-ADJCHG ACC-08 FULL to DOWN","SNMP linkDown trap DIST-03 ifIndex 49","%LINK-3-UPDOWN ACC-09 Gi1/0/49 down","telemetry: ACC-07 in_errors spike","%OSPF-5-ADJCHG ACC-09 FULL to DOWN","NetFlow: 0 flows from 10.2.7.0/24","device_unreachable ACC-07","%LINEPROTO-5-UPDOWN ACC-09 down","Sentinel: 412 failed logons ACC-07 segment","%BGP-5-ADJCHANGE CORE-01 Down","device_unreachable ACC-08","telemetry: DIST-03 Eth1/49 oper-down","%LINK-3-UPDOWN ACC-08 Gi1/0/49 down"];
+function s1(t,T){bg(t,.14);
+  txt("BLUEDEFENCE · AEGIS",120,330,{sz:28,w:500,col:C.acc,m:true,a:ease(t/.8)});
+  wrap("An autonomous SOC that runs inside the bank — and shows its work.",120,440,1500,96,{sz:86,w:600,a:ease((t-.4)/.9)});
+  wrap("Correlates every alarm into one root cause · triages with a model you host · keeps a human on every irreversible action · leaves an audit trail a regulator can verify.",120,720,1400,46,{sz:32,col:C.mute,a:ease((t-1.4)/.9)});
+  txt("github.com/mahi80/BlueDefence",120,H-64,{sz:24,col:C.mute,m:true,a:ease((t-2)/.8)});
+  rr(0,0,W,H,0,null,null,0);ctx.fillStyle=`rgba(11,18,32,${1-ease(t/.6)})`;ctx.fillRect(0,0,W,H);}
+function s2(t,T){bg(t);chrome("THE PROBLEM","One fibre cut. Fifty-three alarms. An analyst with twenty minutes.",t);
+  // left: streaming alarm log
+  const n=Math.min(53,Math.floor(Math.max(0,t-1.5)*4.2));
+  rr(120,330,900,620,16,"#070c16",C.line);txt("vendor consoles · live",150,368,{sz:20,col:C.mute,m:true});
+  for(let i=Math.max(0,n-15);i<n;i++){const row=i-Math.max(0,n-15);const y=405+row*35;const s=ALARMS[i%ALARMS.length];const first=i===0;
+    txt(`${String(i+1).padStart(2,"0")}  ${s}`,150,y,{sz:19,col:first?C.bad:(i%7===0?"#ffb3b3":C.mute),m:true,a:row===14?1:1})}
+  // counter
+  txt(String(n),1500,560,{sz:230,w:600,col:C.bad,al:"center",a:ease((t-1.5)/.6)});txt("alarms in 90 seconds",1500,620,{sz:28,col:C.mute,al:"center",a:ease((t-1.5)/.6)});
+  const left=Math.max(0,20-Math.floor(Math.max(0,t-1.5)*1.2));txt(`analyst time left: ${left} min`,1500,700,{sz:26,col:left<8?C.warn:C.mute,m:true,al:"center",a:ease((t-3)/.6)});
+  // mini topology
+  drawTopo(1090,690,.42,t,{cut:t>2.2,cutAt:2.2,stranded:t>4,alpha:ease((t-.8)/.6),labels:false});
+  txt("Every console is right. None of them says what happened.",120,H-72,{sz:30,col:C.mute,a:ease((t-9)/.8)});}
+const FEEDS=[["WAF / CDN",C.blue],["Sentinel · Splunk",C.blue],["EDR",C.blue],["syslog · LLDP",C.acc],["NetFlow · gNMI",C.acc],["Zeek · Suricata",C.blue],["Kafka bridge",C.warn],["Cloud trails",C.blue]];
+function s3(t,T){bg(t);chrome("STEP 1 · EVERYTHING COMES IN","One receiver, every feed you already have.",t,{sub:"Push or poll. No agents on endpoints, no SIEM replacement — it sits on top of what is already there."});
+  const cx=960,cy=640;const R=330;
+  rr(cx-170,cy-70,340,140,18,C.panel,C.acc,2,ease((t-.5)/.6));txt("/ingest/*",cx,cy-8,{sz:30,w:600,m:true,al:"center",a:ease((t-.5)/.6)});txt("Bearer AEGIS_INGEST_TOKEN",cx,cy+32,{sz:18,col:C.mute,m:true,al:"center",a:ease((t-.5)/.6)});
+  const ev=Math.floor(Math.max(0,t-2)*137);txt(`${ev.toLocaleString()} events`,cx,cy+118,{sz:24,col:C.acc,m:true,al:"center",a:ease((t-2)/.5)});
+  FEEDS.forEach(([name,col],i)=>{const a=-Math.PI/2+i*(Math.PI*2/8);const x=cx+Math.cos(a)*R*1.75,y=cy+Math.sin(a)*R*.8;const al=ease((t-.8-i*.18)/.5);
+    rr(x-120,y-28,240,56,12,C.panel,col,1.5,al);txt(name,x,y+9,{sz:22,col,al:"center",a:al});
+    if(t>1.6+i*.18){for(let p=0;p<3;p++){const k=((t*.55)+p/3+i*.11)%1;const px=lerp(x,cx,k),py=lerp(y,cy,k);dot(px,py,4,col,10,al*(1-k*.3))}}});}
+function s4(t,T){bg(t);chrome("STEP 2 · CORRELATE","Topology-aware correlation turns the storm into one incident.",t);
+  drawTopo(-150,230,.78,t,{cut:t>2,cutAt:2,stranded:t>3.5,alpha:ease(t/.6)});
+  // alarm dots spawn at stranded nodes + dist-03 and fly into the incident card
+  const card={x:1180,y:330,w:620,h:300};
+  const nAl=Math.min(53,Math.floor(Math.max(0,t-2.5)*5));
+  for(let i=0;i<nAl;i++){const src=TOPO.n[["DIST-03",...STRANDED,"CORE-01"][i%5]];const born=2.5+i/5;const k=ease((t-born)/1.1);if(k>=1)continue;
+    const sx=-150+src.x*.78+(seeded(i)-.5)*40,sy=230+src.y*.78+30+(seeded(i+9)-.5)*40;dot(lerp(sx,card.x+card.w/2,k),lerp(sy,card.y+card.h/2,k)-Math.sin(k*Math.PI)*120,5,C.bad,12,1-k*.4)}
+  const folded=Math.max(0,Math.min(52,Math.floor((t-3.6)*5)));
+  rr(card.x,card.y,card.w,card.h,18,C.panel,C.acc,2,ease((t-2.4)/.6));
+  txt("link_down",card.x+30,card.y+52,{sz:30,w:600,col:C.acc,m:true,a:ease((t-2.6)/.4)});txt("critical",card.x+200,card.y+52,{sz:26,w:600,col:C.bad,a:ease((t-2.8)/.4)});
+  txt("DIST-03 Ethernet1/49 · link to CORE-01",card.x+30,card.y+96,{sz:22,col:C.fg,m:true,a:ease((t-3)/.4)});
+  txt(`${t>3.6?3:0} switches · ${t>4?"1,240":"0"} users stranded · no redundant path`,card.x+30,card.y+140,{sz:22,col:C.warn,a:ease((t-3.4)/.4)});
+  txt(`${folded} / 52 alarms folded in as symptoms`,card.x+30,card.y+184,{sz:22,col:C.mute,m:true,a:ease((t-3.6)/.4)});
+  txt("no change ticket in the last 10 min · bad push? no",card.x+30,card.y+228,{sz:20,col:C.mute,a:ease((t-6)/.5)});
+  txt("1 incident",card.x+30,card.y+272,{sz:24,w:600,col:C.acc,a:ease((t-14)/.5)});
+  const big=ease((t-14)/.8);txt("53",1300,870,{sz:150,w:600,col:C.bad,al:"center",a:big});txt("→",1490,850,{sz:90,col:C.mute,al:"center",a:big});txt("1",1680,870,{sz:150,w:600,col:C.acc,al:"center",a:big});
+  wrap("What it knows: LLDP topology · who sits behind which uplink · redundant paths · users per switch · recent config pushes and their tickets.",120,H-120,1000,38,{sz:26,col:C.mute,a:ease((t-8)/.8)});}
+function s5(t,T){bg(t);chrome("STEP 3 · TRIAGE","Specialist agents and a model the bank hosts decide what it is.",t);
+  rr(120,300,900,660,18,"#070c16",C.line,1.5,ease((t-.3)/.5));txt("live swarm · AEGIS orchestrator",150,340,{sz:20,col:C.swarm,m:true,a:ease((t-.3)/.5)});
+  ctx.save();ctx.beginPath();ctx.rect(120,300,900,660);ctx.clip();drawSwarm(640,650,t-.6,ease((t-.6)/.5));ctx.restore();
+  // right pipeline
+  const steps=[["Specialists","perimeter · identity · endpoint · network · threat intel",1.5],["Model verdict (bank-hosted)","",7],["Independent reviewer","second model family votes",15],["Evidence chain","hash-chained, append-only",19]];
+  steps.forEach(([n,d,at],i)=>{const y=330+i*158;const al=ease((t-at)/.6);const on=t>at;rr(1080,y,720,130,16,C.panel,on?C.acc:C.line,on?2:1.5,Math.max(.25,al));
+    txt(n,1110,y+44,{sz:26,w:600,a:Math.max(.3,al)});
+    if(i===1){const p=clamp((t-7)/5,0,1);rr(1110,y+68,640,10,5,C.dim);rr(1110,y+68,640*p,10,5,C.swarm);
+      if(p<1)txt(`thinking · ${Math.floor(p*100)}%`,1110,y+108,{sz:20,col:C.mute,m:true,a:al});else{txt("malicious · 0.88",1110,y+108,{sz:22,w:600,col:C.bad,m:true,a:ease((t-12)/.4)});txt("T1190 · T1021 · T1078",1400,y+108,{sz:20,col:C.mute,m:true,a:ease((t-12.4)/.4)})}}
+    else if(i===2){txt(d,1110,y+80,{sz:20,col:C.mute,a:al});const v1=ease((t-16)/.4),v2=ease((t-17)/.4);txt("Qwen3-8B ✓ malicious",1110,y+112,{sz:18,col:C.acc,m:true,a:v1});txt("Mistral-7B ✓ malicious · 2/2 concur",1400,y+112,{sz:18,col:C.acc,m:true,a:v2})}
+    else if(i===3){txt(d,1110,y+80,{sz:20,col:C.mute,a:al});const nb=Math.min(5,Math.floor(Math.max(0,t-19.5)*2.5));for(let b=0;b<nb;b++){const bx=1110+b*126;rr(bx,y+92,112,26,6,"#0a2a1e",C.acc,1.2);txt(["9f3a…c41e","77b0…12d9","a1c4…0e77","5d0e…b2a3","c9f1…44d0"][b],bx+56,y+110,{sz:14,col:C.acc,m:true,al:"center"});if(b)line(bx-14,y+105,bx,y+105,C.acc,1.5)}}
+    else txt(d,1110,y+80,{sz:20,col:C.mute,a:al});});
+  txt("The model runs on your GPU. Prompts, evidence and verdicts never leave the premises.",120,H-56,{sz:26,col:C.mute,a:ease((t-23)/.8)});}
+function s6(t,T){bg(t);chrome("STEP 4 · RESPOND, WITH A HUMAN IN THE LOOP","Reversible actions run. Irreversible ones wait for an analyst.",t);
+  const acts=[["monitor","db-core",0,"auto"],["enrich","203.0.113.77 · KEV · EPSS 0.91",1.4,"auto"],["block_ip","203.0.113.77 @ WAF",3,"auto"],["isolate_host","app-ledger-07 (EDR)",6,"hitl",13],["revoke_sessions","svc-acct-pay",8,"hitl",18],["config_rollback","DIST-02 — untracked change + connectivity loss",10,"hitl",21]];
+  acts.forEach(([a,tg,at,kind,dec],i)=>{const y=320+i*98;const k=ease((t-at)/.6);if(k<=0)return;const x=lerp(2100,120,k);
+    const decided=dec&&t>dec;const col=kind==="auto"?C.acc:decided?C.acc:C.warn;
+    rr(x,y,1100,80,14,C.panel,col,1.5);txt(a,x+28,y+50,{sz:26,w:600,m:true,col});txt(tg,x+330,y+50,{sz:22,col:C.mute});
+    const st=kind==="auto"?"executed ✓":decided?"approved by analyst ✓":("awaiting analyst "+["·","··","···"][Math.floor(t*2)%3]);
+    txt(st,x+1070,y+50,{sz:22,w:500,col,m:true,al:"right"});
+    if(kind==="auto"&&t>at+.6)txt("receipt → audit",x+1070,y+72,{sz:14,col:C.mute,m:true,al:"right"})});
+  // mode toggle
+  const live=t>15;rr(1330,920,470,70,35,C.panel,C.line);rr(live?1565:1335,925,230,60,30,live?C.acc:C.blue);txt("shadow",1450,964,{sz:24,w:600,col:live?C.mute:"#0b1220",al:"center"});txt("live",1680,964,{sz:24,w:600,col:live?"#0b1220":C.mute,al:"center"});
+  txt("per connector, after the shadow report agrees with your analysts",1330,1030,{sz:18,col:C.mute,m:true});
+  txt("self-healing: an action that makes things worse is rolled back in the same cycle",120,H-56,{sz:24,col:C.mute,a:ease((t-22)/.8)});}
+function s7(t,T){bg(t);chrome("STEP 5 · PROVE IT","Every decision lands in a tamper-evident audit chain — and in your governance dashboard.",t);
+  const rows=[["evidence_chain","net-link_down-9f3a","malicious 0.88"],["action_receipt","block_ip 203.0.113.77","executed"],["hitl_decision","isolate_host app-ledger-07","approved · analyst r.verma"],["action_receipt","isolate_host app-ledger-07","executed"],["policy_check","ACP: autonomy_level=2","allowed"],["hitl_decision","config_rollback DIST-02","approved · netops lead"],["action_receipt","config_rollback DIST-02","executed · rolled 1 device"]];
+  const n=Math.min(rows.length,Math.floor(Math.max(0,t-1)*1.1));
+  rr(120,330,1080,560,16,"#070c16",C.line);txt("audit.jsonl · append-only · hash-chained",150,368,{sz:20,col:C.mute,m:true});
+  for(let i=0;i<n;i++){const y=420+i*62;const al=ease((t-1-i/1.1)/.4);rr(150,y-30,1020,48,8,C.panel,C.line,1,al);
+    txt(rows[i][0],170,y+2,{sz:18,col:C.blue,m:true,a:al});txt(rows[i][1],400,y+2,{sz:18,m:true,a:al});txt(rows[i][2],760,y+2,{sz:18,col:C.mute,a:al});
+    txt(["9f3a","77b0","a1c4","5d0e","c9f1","e2b8","41aa"][i]+"…",1150,y+2,{sz:16,col:C.acc,m:true,al:"right",a:al});if(i)line(1140,y-30,1140,y-14,C.acc,2,al)}
+  // dashboard tiles
+  const tiles=[["agents governed","7",C.blue],["policies","12",C.fg],["approvals today","3",C.warn],["rogue behaviour","0",C.acc]];
+  tiles.forEach(([k,v,col],i)=>{const x=1260+(i%2)*280,y=330+Math.floor(i/2)*200;const al=ease((t-4-i*.4)/.5);rr(x,y,260,170,16,C.panel,C.line,1.5,al);txt(v,x+130,y+100,{sz:72,w:600,col,al:"center",a:al});txt(k,x+130,y+140,{sz:18,col:C.mute,al:"center",a:al})});
+  txt("ACP governance dashboard",1260,770,{sz:20,col:C.mute,m:true,a:ease((t-6)/.5)});
+  txt("who decided what, on which evidence, under which policy, approved by whom — exportable for RBI, CERT-In and audit",120,H-56,{sz:24,col:C.mute,a:ease((t-12)/.8)});}
+function s8(t,T){bg(t);chrome("THE COMMUNITY EDITION","Free for two years. The brain gets smarter from every installation.",t);
+  const banks=[["Bank A",420],["Bank B",640],["Bank C",860]];const gx=1000,bx=1640,cy=640;
+  banks.forEach(([n,y],i)=>{const al=ease((t-.5-i*.3)/.5);rr(130,y-45,300,90,14,C.panel,C.blue,1.5,al);txt(n+" · AEGIS",280,y-2,{sz:24,w:600,al:"center",a:al});txt("model runs here",280,y+28,{sz:16,col:C.mute,m:true,al:"center",a:al})});
+  // privacy gate
+  const ga=ease((t-1.5)/.5);rr(gx-70,380,140,520,18,C.panel,C.acc,2,ga);txt("privacy",gx,620,{sz:22,w:600,al:"center",a:ga});txt("gate",gx,650,{sz:22,w:600,al:"center",a:ga});txt("scrub · salt · refuse",gx,690,{sz:14,col:C.mute,m:true,al:"center",a:ga});
+  rr(bx-180,cy-110,360,220,18,C.panel,C.swarm,2,ease((t-2)/.5));txt("BlueDefence",bx,cy-40,{sz:30,w:600,al:"center",a:ease((t-2)/.5)});txt("the brain",bx,cy,{sz:22,col:C.swarm,al:"center",a:ease((t-2)/.5)});txt("trains on pooled chains + decisions",bx,cy+40,{sz:16,col:C.mute,m:true,al:"center",a:ease((t-2)/.5)});
+  // packets: contributions (t 3..17), some red refused at the gate; updates back (t 17..)
+  if(t>3&&t<19)banks.forEach(([n,y],i)=>{for(let p=0;p<4;p++){const k=((t-3)*.28+p/4+i*.13)%1;const bad=((p+i)%5===0);const x1=430,x2=bx-180;
+    if(bad){const kk=Math.min(k,.5);const px=lerp(x1,gx,kk*2),py=lerp(y,cy,kk*2);if(k<.55)dot(px,py,6,C.bad,12,k<.5?1:1-(k-.5)*20);else if(k<.62){txt("refused",gx,340,{sz:18,col:C.bad,m:true,al:"center",a:1-(k-.55)*14})}}
+    else{const px=k<.5?lerp(x1,gx,k*2):lerp(gx,x2,(k-.5)*2),py=k<.5?lerp(y,cy,k*2):cy+(seeded(p+i)-.5)*60;dot(px,py,5,k<.5?C.blue:C.acc,10)}}});
+  const cnt=Math.floor(clamp((t-3)*11,0,170));txt(`${cnt} scrubbed records · ${Math.floor(cnt*.06)} refused · 0 identities`,gx,930,{sz:20,col:C.mute,m:true,al:"center",a:ease((t-3)/.5)});
+  if(t>19){banks.forEach(([n,y],i)=>{for(let p=0;p<2;p++){const k=((t-19)*.35+p/2+i*.2)%1;dot(lerp(bx-180,430,k),lerp(cy,y,k),6,C.swarm,14)}});
+    rr(560,340,360,54,27,"#1a1433",C.swarm,1.5,ease((t-19)/.5));txt("model release 2026.11.1 · signed ✓",740,374,{sz:18,col:C.swarm,m:true,al:"center",a:ease((t-19)/.5)})}
+  wrap("Out: pseudonymised evidence chains and analyst decisions, never raw logs or identities. Back: signed weights, like antivirus definitions — verified, staged, reversible.",120,H-100,1500,38,{sz:26,col:C.mute,a:ease((t-8)/.8)});}
+function s9(t,T){bg(t);chrome("INSTALL","One command on a Linux host. Wire a feed. Watch the fleet.",t);
+  const lines=[["$ curl -fsSL https://raw.githubusercontent.com/mahi80/BlueDefence/main/install.sh | sudo bash",0,C.fg,true],["✔ python 3.12, git · aegis user · /opt/aegis · /etc/aegis/aegis.env",3.2,C.acc],["✔ Community licence issued · entitled until 2028-10-30 · data sharing on",4.4,C.acc],["✔ systemd aegis-soc running · receiver on :8787 · shadow mode",5.6,C.acc],["$ journalctl -u aegis-soc -f",7,C.fg,true],["[service] cycle 1: alerts=18 executed=11 hitl_queued=27 errors=0",8.6,C.mute],["[license] heartbeat ok: standing=good attestation=ok",9.6,C.acc]];
+  rr(120,330,1680,420,16,"#070c16",C.line);
+  lines.forEach(([s,at,col,ty],i)=>{const y=385+i*48;if(t<at)return;const shown=ty?typed(s,t-at,45):s;txt(shown,150,y,{sz:24,col,m:true});if(ty&&shown.length<s.length&&Math.floor(t*3)%2)txt("▌",150+ctx.measureText(shown).width+4,y,{sz:24,col:C.acc,m:true})});
+  // fleet card
+  const fa=ease((t-11)/.6);rr(120,790,1680,150,16,C.panel,C.acc,1.5,fa);txt("fleet",150,830,{sz:20,col:C.mute,m:true,a:fa});
+  [["bd-community-demo-01","Sandbox Bank","good","ok","1.0"],["bd-7a1f…","Bank B","good","ok","0.96"],["bd-c33e…","Bank C","warn","unknown","0.71"]].forEach((r,i)=>{const y=870+i*0;const x=150+i*560;txt(r[0],x,880,{sz:18,m:true,a:fa});txt(r[1],x,908,{sz:16,col:C.mute,a:fa});txt(r[2],x+330,880,{sz:18,w:600,col:r[2]==="good"?C.acc:C.warn,m:true,a:fa});txt("attest "+r[3]+" · ratio "+r[4],x+330,908,{sz:14,col:C.mute,m:true,a:fa})});
+  txt("a tampered or silent install is visible the same day",120,H-56,{sz:24,col:C.mute,a:ease((t-13)/.8)});}
+function s10(t,T){bg(t,.14);
+  txt("BLUEDEFENCE · AEGIS",120,330,{sz:28,w:500,col:C.acc,m:true,a:ease(t/.6)});
+  wrap("Fewer alarms. Faster decisions. Evidence for every one of them.",120,440,1500,96,{sz:86,w:600,a:ease((t-.3)/.8)});
+  txt("Open source · model stays at the bank · governed by ACP",120,660,{sz:32,col:C.mute,a:ease((t-1.2)/.7)});
+  rr(120,730,640,70,35,C.panel,C.acc,1.5,ease((t-2)/.6));txt("github.com/mahi80/BlueDefence",440,775,{sz:26,col:C.acc,m:true,al:"center",a:ease((t-2)/.6)});
+  rr(790,730,760,70,35,C.panel,C.line,1.5,ease((t-2.4)/.6));txt("curl -fsSL …/install.sh | sudo bash",1170,775,{sz:24,col:C.fg,m:true,al:"center",a:ease((t-2.4)/.6)});
+  txt("Built in India for BFSI security teams",120,H-64,{sz:24,col:C.mute,m:true,a:ease((t-3)/.8)});
+  if(t>T-1.2){ctx.fillStyle=`rgba(0,0,0,${ease((t-(T-1.2))/1.2)})`;ctx.fillRect(0,0,W,H)}}
+const FN=[s1,s2,s3,s4,s5,s6,s7,s8,s9,s10];
+window.render=function(t){const [i,lt,T]=scene(t);ctx.save();FN[i](lt,T);ctx.restore();
+  // scene fade in/out
+  const f=Math.min(ease(lt/.45),ease((T-lt)/.45));ctx.fillStyle=`rgba(11,18,32,${1-f})`;ctx.fillRect(0,0,W,H);}
+window.render(0);
+</script>
