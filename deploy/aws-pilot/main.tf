@@ -29,6 +29,12 @@ provider "aws" {
   default_tags { tags = local.tags }
 }
 
+# Firehose without default tags: some organisation SCPs deny firehose:TagDeliveryStream even where CreateDeliveryStream is allowed
+provider "aws" {
+  alias  = "us_east_1_untagged"
+  region = "us-east-1"
+}
+
 locals {
   tags = { project = "bluedefence-pilot", mode = "shadow", managed_by = "terraform" }
 }
@@ -63,7 +69,7 @@ module "aegis_host" {
 
 module "decoy_waf" {
   source = "./modules/decoy-waf"
-  providers = { aws = aws.us_east_1, aws.home = aws }
+  providers = { aws = aws.us_east_1, aws.home = aws, aws.untagged = aws.us_east_1_untagged }
 
   name          = var.name
   aegis_url     = "https://${var.domain}"

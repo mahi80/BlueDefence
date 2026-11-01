@@ -6,7 +6,7 @@
 #
 terraform {
   required_providers {
-    aws = { source = "hashicorp/aws", configuration_aliases = [aws.home] }
+    aws = { source = "hashicorp/aws", configuration_aliases = [aws.home, aws.untagged] }
   }
 }
 
@@ -247,6 +247,7 @@ resource "aws_cloudwatch_log_stream" "firehose" {
 
 # WAF only logs to streams whose name starts with aws-waf-logs-
 resource "aws_kinesis_firehose_delivery_stream" "waf" {
+  provider    = aws.untagged
   name        = "aws-waf-logs-${var.name}"
   destination = "http_endpoint"
 
