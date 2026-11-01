@@ -109,6 +109,7 @@ class BaseHITL:
         self._jlock = threading.Lock()
         self.restored = 0
         self._timeout_noted: set[str] = set()   # approvals already shadow-logged / escalated by the timeout policy
+        self._poll_failed: set[tuple[str, str]] = set()   # (approval, error) pairs already warned about
 
     # ---- journal
     def _journal_dir(self) -> Optional[Path]:
@@ -261,12 +262,21 @@ class BaseHITL:
             try:
                 res = self._poll(p)
             except Exception as e:  # noqa: BLE001
-                logger.debug("[hitl:%s] poll failed for %s: %s", self.name, approval_id, str(e)[:120])
+                # loud, once per approval per failure message: a wedged transport must not look like "nobody decided yet"
+                key = (approval_id, str(e)[:80])
+                if key not in self._poll_failed:
+                    self._poll_failed.add(key)
+                    logger.warning("[hitl:%s] poll failed for %s: %s", self.name, approval_id, str(e)[:160])
                 res = None
             if res:
                 status, decided_by, reason = res
                 if status == "approved":
-                    executed = response_agent.approve(p.action, approver=decided_by or self.name, source_alert_id=p.alert_id)
+                    try:
+                        executed = response_agent.approve(p.action, approver=decided_by or self.name, source_alert_id=p.alert_id)
+                    except Exception as e:  # noqa: BLE001 — one connector failure must not stall every other pending decision
+                        logger.error("[hitl:%s] approved %s on alert %s but execution failed: %s", self.name,
+                                     p.action.action_type, p.alert_id, str(e)[:200])
+                        executed = {"error": str(e)[:200]}
                     made.append(self._settle(p, "approved", decided_by or self.name, "", executed=executed)); continue
                 if status == "rejected":
                     made.append(self._settle(p, "rejected", decided_by or self.name, reason)); continue
@@ -274,7 +284,12 @@ class BaseHITL:
             if timeout_policy is not None:
                 decision, why = timeout_policy.evaluate(p.action, p.chain, age_sec=age)
                 if decision == "execute":
-                    executed = response_agent.approve(p.action, approver="aegis:hitl-timeout", source_alert_id=p.alert_id)
+                    try:
+                        executed = response_agent.approve(p.action, approver="aegis:hitl-timeout", source_alert_id=p.alert_id)
+                    except Exception as e:  # noqa: BLE001
+                        logger.error("[hitl:%s] timeout auto-execute of %s on alert %s failed: %s", self.name,
+                                     p.action.action_type, p.alert_id, str(e)[:200])
+                        executed = {"error": str(e)[:200]}
                     logger.warning("[hitl:%s] timeout auto-execute: %s on alert %s — %s",
                                    self.name, p.action.action_type, p.alert_id, why)
                     made.append(self._settle(p, "approved", "aegis:hitl-timeout", why, executed=executed)); continue
@@ -312,6 +327,11 @@ class BaseHITL:
     def _poll(self, p: PendingApproval) -> Optional[tuple[str, str, str]]:
         raise NotImplementedError
 
+    def _record_settled(self, p: PendingApproval, status: str, decided_by: str, reason: str) -> None:
+        """Transport hook: note that an approval is no longer pending (expired, timed out, decided), so a
+        reader of the transport's own files (the console) does not show it as open forever."""
+        return None
+
     def _annotate(self, p: PendingApproval, card: dict) -> bool:
         return False
 
@@ -321,6 +341,10 @@ class BaseHITL:
         self._by_key.pop((p.alert_id, str(p.action.action_type), str(p.action.target)), None)
         self._timeout_noted.discard(p.approval_id)
         self._journal_append({"op": "settled", "approval_id": p.approval_id, "status": status})
+        try:
+            self._record_settled(p, status, decided_by, reason)
+        except Exception as e:  # noqa: BLE001 — a console marker is best-effort; the decision itself is already made
+            logger.debug("[hitl:%s] settled marker not written for %s: %s", self.name, p.approval_id, str(e)[:120])
         d = Decision(approval_id=p.approval_id, alert_id=p.alert_id, action_type=str(p.action.action_type), target=str(p.action.target),
                      status=status, decided_by=decided_by, reason=reason, executed=executed)
         self.decisions.append(d)

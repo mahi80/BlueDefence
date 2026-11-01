@@ -191,7 +191,7 @@ def main() -> int:
     args = p.parse_args()
 
     audit_path = Path(args.audit)
-    integrity = AuditLog(audit_path).verify() if audit_path.exists() else True
+    integrity = AuditLog(audit_path, repair=False).verify() if audit_path.exists() else True
     entries = _load_entries(audit_path)
 
     since = _parse_date(args.since) if args.since else None

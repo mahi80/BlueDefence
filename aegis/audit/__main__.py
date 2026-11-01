@@ -17,7 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--all", action="store_true", help="include rotated segments (audit.jsonl.<ts>) as one chain")
     v.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
-    log = AuditLog(Path(args.audit))
+    log = AuditLog(Path(args.audit), repair=False)
     rep = log.verify_report(all_files=args.all)
     if args.json:
         print(json.dumps(rep))

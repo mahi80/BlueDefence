@@ -28,6 +28,7 @@ alerts reach the orchestrator.
 from __future__ import annotations
 
 import gzip
+import logging
 import hashlib
 import json
 import os
@@ -36,6 +37,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
+
+logger = logging.getLogger("aegis.ingest.netops")
 
 from .base import CONSUMED, AlertCheckpoint, BaseConsumer
 

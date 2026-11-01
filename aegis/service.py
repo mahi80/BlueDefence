@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -333,7 +334,17 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
     model-bound alerts are spilled to the deferred queue and only fast paths run."""
     stats = CycleStats()
     t0 = time.time()
-    for alert in (alerts if alerts is not None else _alerts_from_env(p.watchdog)):
+    it = iter(alerts if alerts is not None else _alerts_from_env(p.watchdog))
+    while True:
+        try:
+            alert = next(it)
+        except StopIteration:
+            break
+        except Exception as e:  # noqa: BLE001 — a vendor API down (Sentinel 503, bad bearer) ends THIS source's pass, not the service
+            stats.errors += 1
+            logger.error("[service] source stopped mid-cycle: %s: %s — remaining sources skipped until the next cycle",
+                         type(e).__name__, str(e)[:200])
+            break
         if max_alerts and stats.alerts >= max_alerts:
             break
         stats.alerts += 1
@@ -346,12 +357,16 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             chain = p.orch.handle(alert)
             summary = p.response.execute(chain)
         except AuditWriteError as e:
-            # the evidence could not be written, so nothing was executed for this alert (fail closed); the alert stays
-            # in the source for the next cycle. One line per cycle, not one per alert — a full disk is noisy enough.
+            # the evidence could not be written, so nothing was executed for this alert (fail closed). The consumer
+            # has already checkpointed it, so "retry from the source" is not an option: park it in the deferred
+            # queue and re-feed it once the log is writable. One line per cycle — a full disk is noisy enough.
             stats.errors += 1
             stats.audit_failures += 1
+            if storm is not None and not alert.get("audit_deferred"):
+                if storm.queue.push({**alert, "audit_deferred": True}):
+                    stats.deferred += 1
             if stats.audit_failures == 1:
-                logger.error("[service] audit log not writable (%s): alerts are triaged but no action is executed until it is", e)
+                logger.error("[service] audit log not writable (%s): alerts are parked in the deferred queue and re-fed once it is", e)
             continue
         except Exception:
             stats.errors += 1
@@ -513,15 +528,27 @@ class Service:
     _last_contrib: float = 0.0
     _last_heartbeat: float = 0.0
 
+    _hb_thread: "threading.Thread | None" = None
+
     def _maybe_heartbeat_and_renew(self) -> None:
         """Once per AEGIS_HEARTBEAT_INTERVAL_S (86400): re-evaluate the licence (expiry and grace are clock-driven —
         a service that runs for months must notice them), heartbeat (counts + code fingerprint + effective flags,
         never event data), pull model updates, and roll the token when fewer than AEGIS_LICENSE_RENEW_DAYS (7) remain.
-        The service re-issues only while the installation is in good standing."""
+        The service re-issues only while the installation is in good standing. The network work (heartbeat,
+        a multi-GB model download) runs in a daemon thread so the cycle loop keeps answering the systemd watchdog."""
         every = _envf("AEGIS_HEARTBEAT_INTERVAL_S", 86400)
         if time.time() - self._last_heartbeat < every:
             return
+        if self._hb_thread is not None and self._hb_thread.is_alive():
+            return                                                  # the previous one (a long download) is still going
         self._last_heartbeat = time.time()
+        if os.environ.get("AEGIS_HEARTBEAT_INLINE", "").strip() in ("1", "true"):   # tests / --once
+            self._heartbeat_and_renew()
+            return
+        self._hb_thread = threading.Thread(target=self._heartbeat_and_renew, name="aegis-heartbeat", daemon=True)
+        self._hb_thread.start()
+
+    def _heartbeat_and_renew(self) -> None:
         from aegis import license as licensing
         lic = self.p.license
         if lic is not None:
@@ -599,6 +626,11 @@ class Service:
             from aegis.dataset.contrib import contribute
             from aegis.license import _read_token
             token, _ = _read_token(os.environ)
+            if os.environ.get("AEGIS_LICENSE_SERVER", "").strip() and not token and not os.environ.get("AEGIS_CONTRIB_OUT", "").strip():
+                if not getattr(self, "_contrib_no_token_noted", False):
+                    self._contrib_no_token_noted = True
+                    logger.warning("[contrib] AEGIS_CONTRIB=1 but no licence token (AEGIS_LICENSE) — contributions are off until one is installed")
+                return
             lic = self.p.license
             res = contribute(audit_path=self.p.audit_path, installation_id=lic.installation_id if lic else "unknown",
                              license_token=token, license_id=(lic.license.license_id if lic and lic.license else ""),
@@ -636,7 +668,11 @@ class Service:
         if wd:
             logger.info("[service] systemd watchdog armed: pinging every ≤%.0fs", wd)
         while not self._stop:
-            stats = run_cycle(self.p, max_alerts=self.max_alerts, storm=self.storm)
+            try:
+                stats = run_cycle(self.p, max_alerts=self.max_alerts, storm=self.storm)
+            except Exception:  # noqa: BLE001 — the loop is the service; log, count, and keep going
+                logger.exception("[service] cycle %d crashed", self.cycles + 1)
+                stats = CycleStats(); stats.errors += 1
             self.cycles += 1
             self.storm.update(stats)
             budget = time.time() + self.interval * 0.5          # drain the backlog in batches, up to half the poll interval
@@ -644,7 +680,12 @@ class Service:
                 pend = self.storm.redeliver()
                 if not pend:
                     break
-                st2 = run_cycle(self.p, alerts=iter(pend), sweep=False, hitl=False, storm=self.storm)
+                try:
+                    st2 = run_cycle(self.p, alerts=iter(pend), sweep=False, hitl=False, storm=self.storm)
+                except Exception:  # noqa: BLE001
+                    logger.exception("[service] re-feed cycle crashed")
+                    break
+                self.storm.queue.ack()                              # processed (or re-spilled): commit the cursor
                 stats.redelivered += st2.alerts
                 stats.executed += st2.executed
                 sdnotify.watchdog()
@@ -653,12 +694,19 @@ class Service:
                     break
             sdnotify.watchdog()
             sdnotify.status(f"cycle {self.cycles}: {stats.alerts} alerts, {stats.errors} errors" + (" · STORM" if self.storm.active else ""))
-            checkpoint_shared_detector()                           # netops links + open incidents survive a restart
+            try:
+                checkpoint_shared_detector()                       # netops links + open incidents survive a restart
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[service] netops checkpoint failed: %s", str(e)[:200])
             self._maybe_contribute()
-            self._maybe_heartbeat_and_renew()
+            self._maybe_heartbeat_and_renew()                      # runs in a side thread; the loop keeps pinging the watchdog
             self.history.append(stats)
             del self.history[:-100]
-            logger.info("[service] cycle %d: %s", self.cycles, stats.line())
+            if stats.alerts or stats.errors or stats.redelivered or self.cycles % 60 == 1:
+                logger.info("[service] cycle %d: %s%s", self.cycles, stats.line(),
+                            f" deferred_dropped={self.storm.queue.dropped}" if getattr(self.storm.queue, "dropped", 0) else "")
+            else:
+                logger.debug("[service] cycle %d: %s", self.cycles, stats.line())
             if self.p.watchdog is not None:
                 # pushed/streamed vendors are counted from the cumulative queue stats; then
                 # evaluate every armed feed so a source gone quiet raises an alert this cycle
@@ -717,6 +765,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     pipeline = build_pipeline(args.audit)
+    if args.once:
+        os.environ.setdefault("AEGIS_HEARTBEAT_INLINE", "1")        # a one-shot run must finish its heartbeat before exiting
     return Service(pipeline, interval=args.interval, max_alerts=args.max_alerts).run(once=args.once)
 
 
@@ -749,7 +799,7 @@ def status_main(audit: str) -> int:
     p = Path(audit)
     if p.exists():
         from aegis.agents.shared.audit import AuditLog
-        rep = AuditLog(p).verify_report(all_files=False)
+        rep = AuditLog(p, repair=False).verify_report(all_files=False)
         print(f"chain      {p}: {'intact' if rep['ok'] else 'BROKEN at ' + str(rep['broken_at'])} · {rep['entries']} entries in the live segment")
         ok = ok and rep["ok"]
     dq = Path(os.environ.get("AEGIS_DEFERRED_PATH", "").strip() or str(p.parent / "deferred.jsonl"))

@@ -305,7 +305,11 @@ class WafConsumer(BaseConsumer):
     def normalize(self, line: str) -> Optional[dict]:
         line = line.strip()
         if line.startswith("{"):
-            return self._from_json(json.loads(line))
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, RecursionError):
+                return None                      # counted as invalid by the caller; not worth a log line per record
+            return self._from_json(obj)
         cef = parse_cef(line)
         if cef is not None:
             return self._from_cef(cef)

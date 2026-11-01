@@ -45,6 +45,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import platform
 import secrets
 import socket
@@ -650,13 +651,16 @@ def install_token(token: str, dest: Path, *, env: MutableMapping[str, str] | Non
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
-    tmp.write_text(token.strip() + "\n")
+    with tmp.open("w") as fh:
+        fh.write(token.strip() + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     if dest.exists():
         try:
-            dest.replace(dest.with_suffix(dest.suffix + ".prev"))
+            shutil.copy2(dest, dest.with_suffix(dest.suffix + ".prev"))   # copy, not rename: dest is never absent
         except OSError:
             pass
-    os.replace(tmp, dest)
+    os.replace(tmp, dest)                                                # the only moment dest changes, atomically
     _CACHE["state"] = None
     return lic
 

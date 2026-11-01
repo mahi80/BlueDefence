@@ -293,6 +293,7 @@ def test_running_service_notices_expiry_and_connectors_follow_the_mode(tmp_path,
         real_time = L.time.time
         monkeypatch.setattr(L.time, "time", lambda: real_time() + 10 * 86400)
         svc._last_heartbeat = 0
+        monkeypatch.setenv("AEGIS_HEARTBEAT_INLINE", "1")
         svc._maybe_heartbeat_and_renew()
         assert p.license.status == "expired"
         assert enforcement_mode() == "shadow"                                           # forced for the running service

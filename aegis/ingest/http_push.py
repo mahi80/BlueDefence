@@ -62,7 +62,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from .console_api import console_api_from_env
-from .stream import StreamQueue, get_stream, lines_from_body
+from .stream import InflateTooLarge, StreamQueue, get_stream, gunzip_bounded, lines_from_body
 
 logger = logging.getLogger("aegis.ingest.http")
 
@@ -202,7 +202,7 @@ class PushServer:
         api = self.console
         if api is None:
             return 404, {"error": "console API not attached"}
-        who = str(headers.get("X-AEGIS-User", "") or "")[:120]
+        who = re.sub(r"[^A-Za-z0-9 ._:@/-]", "", str(headers.get("X-AEGIS-User", "") or ""))[:120]   # role:user shape only — no log/line injection
         m = re.match(r"^/api/approvals/([^/]+)/(approve|reject)$", path)
         if m:
             status = "approved" if m.group(2) == "approve" else "rejected"
@@ -228,7 +228,7 @@ class PushServer:
         now_ms = int(time.time() * 1000)
         try:
             if body[:2] == b"\x1f\x8b":
-                body = gzip.decompress(body)
+                body = gunzip_bounded(body)
             payload = json.loads(body.decode("utf-8"))
             req_id = req_id or str(payload.get("requestId", ""))
             records = payload["records"]
@@ -236,9 +236,13 @@ class PushServer:
             for rec in records:
                 data = base64.b64decode(rec["data"])
                 if data[:2] == b"\x1f\x8b":
-                    data = gzip.decompress(data)
+                    data = gunzip_bounded(data)
                 lines.extend(lines_from_body(data))
-        except (KeyError, TypeError, ValueError, UnicodeDecodeError) as e:
+                if sum(len(x) for x in lines) > self.max_bytes * 4:
+                    raise InflateTooLarge("records expand past the receiver's inflate budget")
+        except InflateTooLarge as e:
+            return 413, {"requestId": req_id, "timestamp": now_ms, "errorMessage": str(e)[:120]}
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError) as e:
             return 400, {"requestId": req_id, "timestamp": now_ms, "errorMessage": f"malformed Firehose request: {str(e)[:120]}"}
         if not self.queue.put_many("firehose", lines):
             return 503, {"requestId": req_id, "timestamp": now_ms, "errorMessage": "queue full, retry"}
@@ -377,14 +381,42 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _unauthorized(self, path: str, body: Optional[dict] = None) -> None:
+        ip = self.client_address[0] if self.client_address else "?"
+        if self.server_ref.limiter.should_log(ip):
+            logger.warning("[ingest:http] unauthorized %s %s from %s", self.command, path, ip)
+        self._refuse(401, body or {"error": "unauthorized"})
+
+    def _refuse(self, status: int, body: dict) -> None:
+        """Reply without reading the body and drop the connection — leftover bytes must not be parsed as the next request."""
+        self.close_connection = True
+        self._reply(status, body)
+
     def _body(self) -> Optional[bytes]:
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._refuse(400, {"error": "bad Content-Length"})
+            return None
+        if n < 0:
+            self._refuse(400, {"error": "bad Content-Length"})
+            return None
         if n > self.server_ref.max_bytes:
-            self._reply(413, {"error": f"body over {self.server_ref.max_bytes} bytes"})
+            self._refuse(413, {"error": f"body over {self.server_ref.max_bytes} bytes"})
             return None
         return self.rfile.read(n) if n else b""
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib naming
+        try:
+            self._get()
+        except Exception as e:  # noqa: BLE001 — a bad row in a file must answer 500, not a dropped socket + stderr traceback
+            logger.error("[ingest:http] GET %s failed: %s", urlsplit(self.path).path, str(e)[:200], exc_info=True)
+            try:
+                self._reply(500, {"error": "internal"})
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _get(self) -> None:
         path = urlsplit(self.path).path
         if path == "/healthz":
             body = {"ok": True, "queue": len(self.server_ref.queue), **self.server_ref.queue.stats.to_dict()}
@@ -446,7 +478,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/"):
             if not self.server_ref.read_authorized(self.headers):
-                self._reply(401, {"error": "unauthorized"})
+                self._unauthorized(path)
                 return
             status, out = self.server_ref.console_get(path, parse_qs(urlsplit(self.path).query))
             self._reply(status, out)
@@ -459,28 +491,29 @@ class _Handler(BaseHTTPRequestHandler):
         path = parts.path
         if path.startswith("/api/"):
             if not srv.console_authorized(self.headers):
-                self._reply(401, {"error": "unauthorized"})
+                self._unauthorized(path)
                 return
             raw = self._body()
             if raw is None:
                 return
             try:
                 body = json.loads(raw.decode("utf-8")) if raw.strip() else {}
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 self._reply(400, {"error": "body must be JSON"})
                 return
-            status, out = srv.console_post(path, body if isinstance(body, dict) else {}, self.headers)
+            try:
+                status, out = srv.console_post(path, body if isinstance(body, dict) else {}, self.headers)
+            except Exception as e:  # noqa: BLE001
+                logger.error("[ingest:http] %s failed: %s", path, str(e)[:200], exc_info=True)
+                status, out = 500, {"error": "internal"}
             self._reply(status, out)
             return
         if not path.startswith("/ingest/"):
             self._reply(404, {"error": "not found"})
             return
         if not srv.authorized(self.headers):
-            ip = self.client_address[0] if self.client_address else "?"
-            if srv.limiter.should_log(ip):
-                logger.warning("[ingest:http] unauthorized push to %s from %s", path, ip)
-            self._reply(401, {"error": "unauthorized", "requestId": self.headers.get("X-Amz-Firehose-Request-Id", ""),
-                              "timestamp": int(time.time() * 1000), "errorMessage": "unauthorized"})
+            self._unauthorized(path, {"error": "unauthorized", "requestId": self.headers.get("X-Amz-Firehose-Request-Id", ""),
+                                      "timestamp": int(time.time() * 1000), "errorMessage": "unauthorized"})
             return
         body = self._body()
         if body is None:

@@ -68,6 +68,7 @@ class StreamQueue:
         self.capacity = max(1, int(capacity))
         self._q: collections.deque[StreamItem] = collections.deque()
         self._cv = threading.Condition()
+        self._full_logged = 0.0
         self.stats = StreamStats()
         self.enabled = False            # a receiver has been started → the registry drains this queue
 
@@ -81,8 +82,10 @@ class StreamQueue:
         with self._cv:
             if len(self._q) + len(lines) > self.capacity:
                 self.stats.rejected_full += len(lines)
-                logger.warning("[stream] queue full (%d/%d): rejected %d %s records — vendor will retry",
-                               len(self._q), self.capacity, len(lines), source)
+                if now - self._full_logged >= 10:          # one line per 10 s while full, not one per rejected batch
+                    self._full_logged = now
+                    logger.warning("[stream] queue full (%d/%d): rejected %d %s records (%d total) — vendor will retry",
+                                   len(self._q), self.capacity, len(lines), source, self.stats.rejected_full)
                 return False
             for ln in lines:
                 self._q.append(StreamItem(source=source, line=ln, received_at=now, passthrough=passthrough))
@@ -295,13 +298,36 @@ def _is_apigw(item: StreamItem) -> bool:
     return '"GatewayLogs"' in head or '"ApimSubscriptionId"' in head or '"apimSubscriptionId"' in head
 
 
+MAX_INFLATE = 64 * 1024 * 1024      # decompressed bytes one body may expand to (AEGIS_INGEST_MAX_INFLATE_MB)
+
+
+class InflateTooLarge(ValueError):
+    pass
+
+
+def gunzip_bounded(body: bytes, limit: Optional[int] = None) -> bytes:
+    """gzip-decompress with a hard cap on the *output* — a 1000:1 bomb inside a 64 MB body must not become
+    64 GB in process. Raises ``InflateTooLarge`` (a ``ValueError``) past the cap."""
+    import os as _os
+    import zlib
+    if limit is None:
+        try:
+            limit = int(_os.environ.get("AEGIS_INGEST_MAX_INFLATE_MB", "")) * 1024 * 1024
+        except ValueError:
+            limit = MAX_INFLATE
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = d.decompress(body, limit + 1)
+    if len(out) > limit or d.unconsumed_tail:
+        raise InflateTooLarge(f"decompressed body over {limit} bytes")
+    return out
+
+
 def lines_from_body(body: bytes) -> list[str]:
-    """Split a (possibly gzip-compressed) NDJSON / syslog body into lines."""
+    """Split a (possibly gzip-compressed) NDJSON / syslog body into lines (inflation bounded)."""
     if body[:2] == b"\x1f\x8b":
-        import gzip
-        body = gzip.decompress(body)
+        body = gunzip_bounded(body)
     text = body.decode("utf-8", errors="replace")
     return [ln.rstrip("\r") for ln in text.split("\n") if ln.strip()]
 
 
-__all__ = ["StreamQueue", "StreamItem", "StreamStats", "StreamConsumer", "get_stream", "reset_stream", "lines_from_body"]
+__all__ = ["StreamQueue", "StreamItem", "StreamStats", "StreamConsumer", "get_stream", "reset_stream", "lines_from_body", "gunzip_bounded", "InflateTooLarge"]

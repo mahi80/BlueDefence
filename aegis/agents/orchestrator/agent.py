@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from ..api_abuse.agent import APIAbuseAgent
 from ..auth.agent import AuthAgent
@@ -156,6 +156,18 @@ class SOCOrchestrator:
         from ..shared import observability as obs
 
         with obs.span("aegis.orchestrator.handle", alert_id=alert.get("id", "?")) as sp:
+            try:
+                chain = self._route(alert, sp)
+            except Exception as exc:  # noqa: BLE001 — an LLM / specialist outage, or a fast-path builder choking on an
+                chain = self._degraded_chain(alert, exc)   # odd alert shape, must not drop the alert: it gets an uncertain chain + HITL
+                sp.attributes["specialist"] = "degraded"
+                sp.attributes["verdict"] = chain.verdict
+            return self.record(alert, chain)
+
+    def _route(self, alert: dict, sp: Any) -> EvidenceChain:
+        """Fast paths first (deterministic builders), then the LLM-backed inner pipeline."""
+        from ..shared import observability as obs
+        if True:
             # Fast-path: honeytoken bypass.
             if self._honeytoken.alert_touches_decoy(alert):
                 chain = self._honeytoken.build_chain(alert)
@@ -250,13 +262,8 @@ class SOCOrchestrator:
                 sp.attributes["specialist"] = "spoofed_client"
                 sp.attributes["verdict"] = chain.verdict
             else:
-                try:
-                    chain = self._handle_inner(alert, sp)
-                except Exception as exc:  # noqa: BLE001 — an LLM / specialist outage must not drop the alert
-                    chain = self._degraded_chain(alert, exc)
-                    sp.attributes["specialist"] = "degraded"
-                    sp.attributes["verdict"] = chain.verdict
-            return self.record(alert, chain)
+                chain = self._handle_inner(alert, sp)
+            return chain
 
     def _degraded_chain(self, alert: dict, exc: Exception) -> EvidenceChain:
         """When the brain cannot run (LLM outage, specialist crash) the alert still reaches a
@@ -391,7 +398,9 @@ class SOCOrchestrator:
         resp = complete_for_json(self._primary, self._system, user_msg, max_tokens=1024, want=("next",))
         try:
             decision = _normalise_triage(parse_json(resp.text))
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[orchestrator] triage response for alert %s did not parse (%s: %s) — routing to perimeter",
+                           alert.get("id", "?"), type(e).__name__, str(e)[:120])
             decision = {
                 "next": "dispatch_perimeter",
                 "reason": "Triage parse failed; default to deeper investigation",

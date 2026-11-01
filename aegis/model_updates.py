@@ -147,6 +147,8 @@ def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
 
 def check(server: str, token: str, *, channel: str, base_model: str, current: str, timeout: float = 20.0) -> dict | None:
     """Ask the service for the latest release; ``None`` when there is nothing newer for this installation."""
+    from aegis.license import _require_https
+    _require_https(server)                                   # bearer token on the request
     q = f"/updates?channel={channel}&base={urllib.request.quote(base_model, safe='')}&current={urllib.request.quote(current, safe='')}"
     req = urllib.request.Request(server.rstrip("/") + q, headers={"Authorization": "Bearer " + token.strip(), "User-Agent": "aegis-model-updates/1"})
     try:
@@ -181,6 +183,8 @@ def download_and_install(res: dict, *, dest_root: Path, keys: dict | None = None
     with tempfile.NamedTemporaryFile(dir=dest_root, suffix=".part", delete=False) as tmp:
         tmp_path = Path(tmp.name)
         try:
+            from aegis.license import _require_https
+            _require_https(str(res["url"]))                  # a signed manifest still must not be fetched over plain http
             req = urllib.request.Request(res["url"], headers={"User-Agent": "aegis-model-updates/1"})
             got_bytes = 0
             with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — URL came from the verified service response

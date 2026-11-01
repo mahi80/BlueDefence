@@ -403,6 +403,12 @@ evidence chain already holds (which is PII-tokenised upstream).
 `python -m aegis.service --status` prints receiver health, audit writability and chain state, checkpoint age, licence and storm backlog in one screen (exit 1 when anything is wrong — usable from monitoring).
 
 Verify the chain any time: `python -m aegis.audit verify --audit /var/lib/aegis/audit.jsonl --all` (exit 1 and the file:line on the first break).
+| Audit log unwritable (disk full, read-only) | nothing executes (fail closed); the alert is parked in the deferred queue and re-fed once the log is writable; `/healthz` → 503 `degraded` |
+| A source API down mid-cycle (Sentinel 503, bad bearer) | that source's pass ends with one ERROR line; other sources and the next cycle carry on |
+| A crash between `pop` and processing of deferred alerts | the batch is re-delivered after restart (`ack` moves the cursor only after processing) |
+| A corrupt row in the middle of `audit.jsonl` | left in place and reported by `verify` (`broken_at`); only a torn *tail* is repaired at start |
+| `--status` / `verify` / reports run beside the live service | read-only (`repair=False`): never truncate a row being written |
+| Audit rotation between two contributions | the contribution cursor is segment-aware (`{ino, offset}`): nothing is skipped or re-sent |
 
 ## 5. Air-gap bootstrap
 
