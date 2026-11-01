@@ -1,6 +1,6 @@
 """The last check before a dataset bundle leaves a bank — and the first check when it arrives.
 
-Stdlib only, on purpose: this same file is copied into the licence service (``license-server/``),
+Stdlib only, on purpose: this same file is vendored into the licence service (private repo ``mahi80/Blueteamlicence``),
 so the sender and the receiver refuse exactly the same things. The ``Scrubber`` has already
 pseudonymised identities; this gate looks for what must never appear in derived telemetry at all,
 whatever the scrubber did: raw public IPs (v4 and v6), MAC addresses, e-mail addresses, credentials

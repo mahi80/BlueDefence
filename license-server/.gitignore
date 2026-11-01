@@ -1,5 +1,0 @@
-app/aegis_license.py
-app/privacy_gate.py
-.aws-sam/
-samconfig.toml
-.build/
