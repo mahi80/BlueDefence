@@ -15,8 +15,10 @@ export const SESSION_TTL = 60 * 60 * 8; // 8h
 const SECRET = process.env.AEGIS_CONSOLE_SECRET || "dev-insecure-change-me";
 const ROLES: Role[] = ["admin", "cio", "ciso", "bu_head", "analyst"];
 
-export function authMode(): "demo" | "oidc" {
-  return process.env.AEGIS_AUTH_MODE === "oidc" ? "oidc" : "demo";
+// "local": accounts from the users file (or the single demo account) — pilots and the weeks before SSO.
+// "oidc":  the bank's IdP (Entra ID / any SAML-federated OIDC provider); groups map to roles below.
+export function authMode(): "local" | "oidc" {
+  return process.env.AEGIS_AUTH_MODE === "oidc" ? "oidc" : "local";
 }
 
 // Only these roles may approve a containment action or promote a model.

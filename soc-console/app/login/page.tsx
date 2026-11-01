@@ -3,7 +3,7 @@
 import { useState, type FormEvent } from "react";
 
 export default function LoginPage() {
-  const mode = process.env.NEXT_PUBLIC_AEGIS_AUTH_MODE === "oidc" ? "oidc" : "demo";
+  const mode = process.env.NEXT_PUBLIC_AEGIS_AUTH_MODE === "oidc" ? "oidc" : "local";
   const [user, setUser] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState("");
@@ -66,7 +66,7 @@ export default function LoginPage() {
             <button className="login-btn" disabled={busy} type="submit">
               {busy ? "Signing in…" : "Sign in"}
             </button>
-            <p className="login-note">Demo sign-in. Production uses your organization's single sign-on (Entra ID / SAML).</p>
+            <p className="login-note">Local accounts (managed with <code>npm run user</code>). Production uses your organization's single sign-on (Entra ID / SAML).</p>
           </form>
         )}
       </div>

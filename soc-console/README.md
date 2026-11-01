@@ -69,3 +69,14 @@ Deep-navy command center; color is the verdict taxonomy (malicious / suspicious 
 benign / uncertain) plus the swarm cyan and crown-jewel gold — not decoration.
 IBM Plex Sans for UI, IBM Plex Mono for telemetry values. One orchestrated motion:
 the swarm fan-out + blast reveal on select. `prefers-reduced-motion` respected.
+
+## Sign-in
+
+Two modes, chosen with `AEGIS_AUTH_MODE`:
+
+| Mode | When | How |
+|---|---|---|
+| `local` (default) | pilots, labs, the weeks before SSO is wired | named accounts in a JSON users file (`AEGIS_CONSOLE_USERS`, default `.aegis-console-users.json`), scrypt-hashed passwords, one role per account, lock-out for 15 min after 5 failed attempts per user+IP. Manage with `npm run user -- add <name> <role>` (prompts for the password; 12+ chars), `list`, `disable <name>`, `remove <name>`. With no users file, `AEGIS_DEMO_USER` / `AEGIS_DEMO_PASSWORD` / `AEGIS_DEMO_ROLE` keep a single demo account. |
+| `oidc` | production | the bank's identity provider (Entra ID, or any SAML-federated OIDC provider). `AEGIS_OIDC_AUTHORIZE_URL`, `AEGIS_OIDC_CLIENT_ID`, `AEGIS_OIDC_REDIRECT_URI`, and `AEGIS_OIDC_ROLE_MAP="group:role,…"` map IdP groups to console roles. The callback completes the code exchange with **verified** id_tokens at deployment (it answers 501 until that is wired, so no unverified path can reach production). |
+
+Roles: `analyst` (view, propose) · `bu_head`, `ciso`, `cio`, `admin` (may approve containment actions and model promotions). Set `AEGIS_CONSOLE_SECRET` to a long random string — it signs the 8-hour session cookie.
