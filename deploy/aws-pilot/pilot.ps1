@@ -5,8 +5,12 @@
 #   .\pilot.ps1 update    pull main on the host, rebuild the console, restart both services (no Terraform change)
 #   .\pilot.ps1 stop      stop the EC2 host to save money (~$49/mo → ~$8/mo: disk + idle Elastic IP); everything else stays
 #   .\pilot.ps1 start     start it again — same IP, same DNS, same certificate; services come back by themselves
+#   .\pilot.ps1 user <name> <role>   add a console account (analyst | bu_head | ciso | cio | admin); prints its password once
+#   .\pilot.ps1 user list            list console accounts
+#   .\pilot.ps1 user disable <name>  lock an account
 #   .\pilot.ps1 down      destroy everything (the Community licence record stays on the licence service)
-param([Parameter(Position = 0)][ValidateSet("up", "status", "shell", "update", "stop", "start", "down", "plan")][string]$cmd = "status")
+param([Parameter(Position = 0)][ValidateSet("up", "status", "shell", "update", "stop", "start", "user", "down", "plan")][string]$cmd = "status",
+      [Parameter(Position = 1)][string]$a1, [Parameter(Position = 2)][string]$a2)
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 if (-not (Test-Path terraform.tfvars)) { throw "copy terraform.tfvars.example to terraform.tfvars and fill it in" }
@@ -38,6 +42,26 @@ switch ($cmd) {
     $cid = aws ssm send-command --region $region --instance-ids $iid --document-name AWS-RunShellScript --parameters "file://$pfile" --query Command.CommandId --output text
     Write-Host "updating host $iid (command $cid) — this takes 2-3 minutes"
     do { Start-Sleep 15; $st = aws ssm get-command-invocation --region $region --command-id $cid --instance-id $iid --query Status --output text } while ($st -eq "InProgress" -or $st -eq "Pending")
+    aws ssm get-command-invocation --region $region --command-id $cid --instance-id $iid --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
+  }
+  "user"   {
+    $iid = terraform output -raw aegis_instance_id
+    $users = "/var/lib/aegis/console/users.json"
+    switch ($a1) {
+      "list"    { $cmdline = "sudo -u aegis AEGIS_CONSOLE_USERS=$users node /opt/aegis/app/soc-console/scripts/users.mjs list" }
+      "disable" { if (-not $a2) { throw "usage: .\pilot.ps1 user disable <name>" }; $cmdline = "sudo -u aegis AEGIS_CONSOLE_USERS=$users node /opt/aegis/app/soc-console/scripts/users.mjs disable $a2" }
+      default   {
+        if (-not $a1 -or -not $a2) { throw "usage: .\pilot.ps1 user <name> <analyst|bu_head|ciso|cio|admin>" }
+        if ($a1 -notmatch '^[a-z0-9._-]{2,32}$' -or $a2 -notmatch '^(analyst|bu_head|ciso|cio|admin)$') { throw "bad name or role" }
+        # the password is generated on the host and printed once; SSM keeps command output for 30 days, so change it after
+        # the demo if that matters (.\pilot.ps1 shell → npm run user -- add <name> <role>)
+        $cmdline = "pw=`$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | cut -c1-18); sudo -u aegis AEGIS_CONSOLE_USERS=$users AEGIS_USER_PASSWORD=`$pw node /opt/aegis/app/soc-console/scripts/users.mjs add $a1 $a2 && echo \"password for $a1: `$pw\""
+      }
+    }
+    $params = @{ commands = @($cmdline) } | ConvertTo-Json -Compress
+    $pfile = Join-Path $env:TEMP "bd-user.json"; Set-Content -Path $pfile -Value $params -Encoding ascii
+    $cid = aws ssm send-command --region $region --instance-ids $iid --document-name AWS-RunShellScript --parameters "file://$pfile" --query Command.CommandId --output text
+    do { Start-Sleep 3; $st = aws ssm get-command-invocation --region $region --command-id $cid --instance-id $iid --query Status --output text } while ($st -eq "InProgress" -or $st -eq "Pending")
     aws ssm get-command-invocation --region $region --command-id $cid --instance-id $iid --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
   }
   "stop"   {

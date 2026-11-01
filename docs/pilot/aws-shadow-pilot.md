@@ -104,6 +104,22 @@ rebuild in place over SSM:
 A change to `user-data.sh.tftpl` itself is different: `.\pilot.ps1 up` then replaces the host (same
 Elastic IP, DNS untouched, new console password).
 
+## Demo accounts: who may press the button
+
+```powershell
+.\pilot.ps1 user ciso ciso          # prints a generated password once
+.\pilot.ps1 user analyst analyst
+.\pilot.ps1 user list
+```
+
+The 30-second demo a bank asks for: sign in as `analyst` — same incident, same evidence, **Approve is
+disabled** and the host refuses a forged request (403 from the console route, 401 from the receiver
+without the console token); sign in as `ciso`, write a rationale, approve; the decision lands in
+`/var/lib/aegis/hitl/decisions.jsonl` as `decided_by: "ciso:ciso"`. Roles: `analyst` (view, propose) ·
+`bu_head` / `ciso` / `cio` / `admin` (decide). The generated password is shown in the SSM command output
+(kept 30 days by AWS); for anything beyond a demo set your own over `.\pilot.ps1 shell` with
+`npm run user -- add <name> <role>`.
+
 ## Verify the chain end to end
 
 ```powershell
