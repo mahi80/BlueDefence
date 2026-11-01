@@ -88,7 +88,21 @@ hot-swaps. Nobody at the bank does anything; the brain gets better for everyone.
 
 What leaves a bank is *derived* telemetry only — verdicts, evidence types, action types, analyst
 decisions, the alert's shape with every identity pseudonymised — and a privacy gate refuses the
-whole bundle if anything PII-shaped remains. Terms: [`license-server/TERMS-COMMUNITY.md`](license-server/TERMS-COMMUNITY.md).
+whole bundle if anything PII-shaped remains. Terms: [`docs/TERMS-COMMUNITY.md`](docs/TERMS-COMMUNITY.md).
+
+## What is open, and what is not
+
+| | Status | Why |
+|---|---|---|
+| The code — pipeline, swarm, netops, connectors, console, installer, `aegis/license.py` | **Open, Apache-2.0** | Banks review code before they run it; copying it is allowed and expected |
+| Trained model weights shipped through the release channel | **Licensed installations only** | The brain is what improves with every installation; it is signed with the BlueDefence key and only reaches installations in good standing |
+| Pooled Community contribution data | **BlueDefence only** | Scrubbed chains and analyst decisions from every installation; never redistributed |
+| The licence service (`mahi80/Blueteamlicence`), its signing keys, the fleet view | **Private** | Issues licences, model updates and renewals |
+| The BlueDefence / AEGIS names | **Trademark** | A fork is welcome to the code, not the name |
+
+So: a fork gets today's code and a base open-weights model, and stays there. An installation on the Community or a
+commercial licence gets a brain that keeps learning from the whole fleet. That is the deal, and it is the whole business model.
+Full terms: [`docs/TERMS-COMMUNITY.md`](docs/TERMS-COMMUNITY.md) · [`LICENSE`](LICENSE) · [`NOTICE`](NOTICE).
 
 ## Layout
 
@@ -96,7 +110,6 @@ whole bundle if anything PII-shaped remains. Terms: [`license-server/TERMS-COMMU
 |---|---|
 | `aegis/` | The brain: ingest (SIEM / WAF / API gateway / NDR / **netops**), orchestrator → specialists → swarm → evidence chains → HITL → response connectors; `license.py`, `model_updates.py`, `dataset/` (capture, scrubber, privacy gate, contributions), `finetune/` (train, DPO, gate, publish), eval gates. See `aegis/README.md`. |
 | `kafka-bridge/` | Java 21 / Kafka Streams: `aegis.syslog / netflow / telemetry / alerts` topics → AEGIS with dedupe, flap folding and backpressure; AEGIS verdicts → `aegis.verdicts`. `TopologyTestDriver` tests, no broker. See `kafka-bridge/README.md`. |
-| `license-server/` | The BlueDefence licence service on AWS free tier (Lambda + HTTP API + DynamoDB + S3 + SSM): orders and activation codes, Community self-serve signup, rolling tokens, heartbeats and fleet health, contribution intake, model-release publishing, daily anomaly alerts. One-script deploy (`deploy.ps1` / `build.sh`). See `license-server/README.md`. |
 | `soc-console/` | The analyst console (Next.js): decision-first HITL queue, evidence-backed Agent Q, attack-path map. Talks to the dashboard over HTTP. |
 | `scripts/` | `soc_demo.py` (presenter-paced offline scenario the console renders), `soc_live.py` (drives the real pipeline). |
 | `docs/` | roadmaps (`plans/`), on-prem bank deployment (`deploy/onprem-bank.md`), feed-wiring runbook (`runbooks/`). |
@@ -186,7 +199,7 @@ The complete reference (ingest sources, connectors, NDR, BOLA, intel, data) is i
 
 The licence is an **offline RSA-signed file bound to one installation** (`AEGIS_INSTALL_ID` or a
 machine-derived id), verified with stdlib code against the issuer public keys in `aegis/keys/`. A
-bank with no egress is fully supported. The BlueDefence side is `license-server/` on AWS free tier.
+bank with no egress is fully supported. The BlueDefence side is the licence service (private repo `mahi80/Blueteamlicence`, AWS free tier).
 
 | Flow | Who | How |
 |---|---|---|
@@ -281,4 +294,4 @@ been safe to automate.
 
 Clean import from `mahi80/rbi` (the ACP monorepo) at `b2e9d97`. The ACP dashboard and `acp-sdk`
 stay in `rbi`; BlueDefence consumes the SDK as a pinned package and the dashboard over HTTP. The
-BlueDefence licence service (`license-server/`) is this repo's own and independent of ACP's.
+BlueDefence licence service (private repo `mahi80/Blueteamlicence`) is this product's own and independent of ACP's.

@@ -153,7 +153,7 @@ case $MODE in
     ask ORG "organisation name" "$ORG"; ask EMAIL "work e-mail (no gmail/yahoo)" "$EMAIL"
     [[ -n "$ORG" && -n "$EMAIL" ]] || die "org and e-mail are required"
     echo "   Terms: Community edition is free for 2 years; the model runs on this host; scrubbed evidence chains and analyst"
-    echo "   decisions (never raw logs or identities) are contributed hourly. Full text: $PREFIX/app/license-server/TERMS-COMMUNITY.md"
+    echo "   decisions (never raw logs or identities) are contributed hourly. Full text: $PREFIX/app/docs/TERMS-COMMUNITY.md"
     if [[ $YES -ne 1 && $NONINTERACTIVE -ne 1 ]]; then a=""; ask a "accept the Community terms? (yes/no)" "yes"; [[ $a == yes ]] || die "terms not accepted"; fi
     body=$("$PY" -c 'import json,sys; print(json.dumps({"org": sys.argv[1], "email": sys.argv[2], "installation_id": sys.argv[3], "accept_terms": True}))' "$ORG" "$EMAIL" "$INSTALL_ID")
     resp=$(curl -sS -w '\n%{http_code}' -X POST "$SERVER/signup" -H 'content-type: application/json' -d "$body") || die "signup failed: cannot reach $SERVER"

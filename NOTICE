@@ -1,0 +1,14 @@
+BlueDefence — AEGIS autonomous SOC
+Copyright 2026 Mahendra Bhandari
+
+The source code in this repository is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Not covered by that licence, and not granted by it:
+  * the BlueDefence and AEGIS names and marks;
+  * trained model weights (adapters) published to installations through the BlueDefence release channel,
+    and the pooled Community contribution data they are trained on — these are provided to licensed
+    installations only, under the Community Terms (docs/TERMS-COMMUNITY.md) or a commercial licence;
+  * the BlueDefence licence service and its signing keys.
+
+You may run, modify and redistribute the code under Apache-2.0. Doing so does not entitle a fork to the
+release channel, the model weights, or the BlueDefence name.

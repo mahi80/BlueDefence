@@ -15,4 +15,5 @@ so that every Community installation benefits from a brain trained on all of the
 | Use of contributions | training and evaluation of BlueDefence detection models and rules; aggregated, never resold, never attributed to an organisation |
 | Withdrawal | stop contributing at any time; the token then lapses within 30 days (+14 days grace) and the installation continues in evaluation mode (shadow enforcement, 100 devices); a paid licence lifts the obligation |
 | Circumvention | modifying the software to suppress capture or contribution while keeping Community features terminates the licence |
+| Model weights | adapters delivered through the release channel are licensed to the receiving installation for the licence term, not sold; they may not be redistributed, extracted for another product, or used to train a competing model. The code is Apache-2.0 (see LICENSE/NOTICE); the weights and the pooled contribution data are not |
 | Data residency | the contribution bucket is in the AWS region the licence service is deployed to; a Mumbai (ap-south-1) deployment is available on request |
