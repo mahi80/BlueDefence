@@ -26,14 +26,14 @@ output "waf_log_group" {
   value       = module.decoy_waf.log_group_name
 }
 
-output "console_admin_password" {
-  description = "Initial password for the console `admin` account (change it after first sign-in: npm run user -- add …)."
-  value       = random_password.console_admin.result
-  sensitive   = true
+output "secrets" {
+  description = "Where the host put the secrets it generated (SSM Parameter Store, SecureString)."
+  value = {
+    console_admin_password = "aws ssm get-parameter --with-decryption --region ${var.region} --name /bluedefence/${var.name}/console-admin-password --query Parameter.Value --output text"
+    ingest_token           = "aws ssm get-parameter --with-decryption --region ${var.region} --name /bluedefence/${var.name}/ingest-token --query Parameter.Value --output text"
+  }
 }
 
-output "ingest_token" {
-  description = "Push token, if you need it for an extra forwarder."
-  value       = coalesce(var.aegis_ingest_token, random_password.ingest_token.result)
-  sensitive   = true
+output "backup_bucket" {
+  value = aws_s3_bucket.backups.bucket
 }

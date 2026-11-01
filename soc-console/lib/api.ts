@@ -8,7 +8,11 @@ const USE_FIXTURES = !API_ORIGIN || process.env.NEXT_PUBLIC_AEGIS_USE_FIXTURES =
 
 const CHAINS = fixtureChains as unknown as Chain[];
 
-async function backend<T>(path: string, fallback: T): Promise<T> {
+// Set when a live backend call failed during this render; the page shows it instead of pretending.
+// (Module-level is fine: the console is rendered per request in a single Node process.)
+export let backendError: string | null = null;
+
+async function backend<T>(path: string, fallback: T, empty: T): Promise<T> {
   if (USE_FIXTURES) return fallback;
   try {
     const res = await fetch(`${API_ORIGIN}${path}`, {
@@ -16,16 +20,18 @@ async function backend<T>(path: string, fallback: T): Promise<T> {
       cache: "no-store",
     });
     if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+    backendError = null;
     return (await res.json()) as T;
-  } catch {
-    // The console degrades to fixtures rather than erroring the whole page.
-    return fallback;
+  } catch (e) {
+    // Live mode never substitutes sample data: an empty list plus a visible error, so nobody approves a fixture.
+    backendError = `${(e as Error).message}`.slice(0, 160);
+    return empty;
   }
 }
 
 export async function listChains(): Promise<ChainSummary[]> {
-  const live = await backend<{ chains?: ChainSummary[] } | ChainSummary[]>("/api/soc/chains", CHAINS);
-  const rows = Array.isArray(live) ? live : (live.chains ?? CHAINS);
+  const live = await backend<{ chains?: ChainSummary[] } | ChainSummary[]>("/api/soc/chains", CHAINS, []);
+  const rows = Array.isArray(live) ? live : (live.chains ?? []);
   return rows as ChainSummary[];
 }
 
@@ -37,6 +43,7 @@ export async function getChain(id: string): Promise<Chain | null> {
   const live = await backend<(Chain & { chain?: Partial<Chain> }) | null>(
     `/api/soc/chains/${encodeURIComponent(id)}`,
     null,
+    null,
   );
   if (!live) return null;
   const { chain: inner, ...top } = live;
@@ -44,12 +51,12 @@ export async function getChain(id: string): Promise<Chain | null> {
 }
 
 export async function listApprovals(): Promise<Approval[]> {
-  const live = await backend<{ approvals?: Approval[] } | Approval[]>("/api/approvals", fixtureApprovals as Approval[]);
+  const live = await backend<{ approvals?: Approval[] } | Approval[]>("/api/approvals", fixtureApprovals as Approval[], []);
   return (Array.isArray(live) ? live : (live.approvals ?? [])) as Approval[];
 }
 
 export async function listProposals(): Promise<Proposal[]> {
-  const live = await backend<{ proposals?: Proposal[] } | Proposal[]>("/api/soc/proposals", fixtureProposals as Proposal[]);
+  const live = await backend<{ proposals?: Proposal[] } | Proposal[]>("/api/soc/proposals", fixtureProposals as Proposal[], []);
   return (Array.isArray(live) ? live : (live.proposals ?? [])) as Proposal[];
 }
 
@@ -63,3 +70,4 @@ export async function getRecentChains(): Promise<Chain[]> {
 }
 
 export const isFixtureMode = USE_FIXTURES;
+export function lastBackendError(): string | null { return backendError; }

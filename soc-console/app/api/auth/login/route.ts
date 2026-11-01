@@ -12,9 +12,11 @@ export async function POST(req: Request) {
   const { user, password } = await req.json().catch(() => ({ user: "", password: "" }));
   const name = String(user || "").trim();
   const pw = String(password || "");
-  const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim() || "local";
-  const key = `${ip}|${name.toLowerCase()}`;
-  const until = lockedUntil(key);
+  // the proxy (nginx) sets X-Real-IP to the connecting address; X-Forwarded-For is client-controlled, so the
+  // counter is keyed on the account as well — a forged header must not reset the lockout
+  const ip = req.headers.get("x-real-ip")?.trim() || "local";
+  const keys = [`${ip}|${name.toLowerCase()}`, `*|${name.toLowerCase()}`];
+  const until = Math.max(...keys.map((k) => lockedUntil(k) || 0));
   if (until) {
     const mins = Math.ceil((until - Date.now()) / 60000);
     return NextResponse.json({ error: `Too many failed sign-ins. Try again in ${mins} min.` }, { status: 429 });
@@ -22,8 +24,8 @@ export async function POST(req: Request) {
   let role: Role | null = null;
   const users = loadUsers();
   if (users) {
-    const rec = validUsername(name) ? users.users[name] : undefined;
-    if (rec && !rec.disabled && verifyPassword(pw, rec.hash)) role = rec.role;
+    const rec = validUsername(name) && Object.hasOwn(users.users, name) ? users.users[name] : undefined;
+    if (rec && typeof rec.hash === "string" && !rec.disabled && verifyPassword(pw, rec.hash)) role = rec.role;
   } else if (process.env.AEGIS_DEMO_USER || process.env.AEGIS_DEMO_PASSWORD) {
     const U = process.env.AEGIS_DEMO_USER || "soc";
     const P = process.env.AEGIS_DEMO_PASSWORD || "demo";
@@ -32,10 +34,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "No accounts yet. Create one: npm run user -- add <name> <role>" }, { status: 503 });
   }
   if (!role) {
-    noteFailure(key);
+    keys.forEach(noteFailure);
     return NextResponse.json({ error: "Wrong username or password." }, { status: 401 });
   }
-  clearFailures(key);
+  keys.forEach(clearFailures);
   const res = NextResponse.json({ ok: true, role });
   res.cookies.set(SESSION_COOKIE, signSession({ user: name, role }), {
     httpOnly: true,
