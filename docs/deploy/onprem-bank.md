@@ -275,6 +275,9 @@ env for the SOC host follows the project deploy checklist.
 | `AEGIS_INGEST_BIND` | `0.0.0.0:8787` | Default bind; put the bank's LB/reverse proxy in front for TLS |
 | `AEGIS_INGEST_TOKEN` | `<secret>` | **Required off loopback**; bearer token on every `/ingest/*` call |
 | `AEGIS_INGEST_READ_TOKEN` | `<secret>` | Optional; when set, `GET /ingest/verdicts`, `/ingest/blocklist`, `/ingest/license` need this token instead of the push token — relays that only push cannot read verdicts. `install.sh` writes both |
+| `AEGIS_AUDIT_MAX_MB` | `512` | Rotate the audit log at this size (`audit.jsonl.<ms>`); the hash chain continues across segments — `python -m aegis.audit verify --all` walks them as one |
+| `AEGIS_AUDIT_FSYNC` | `1` | fsync every audit row (set `0` only on a WORM/replicated mount that guarantees durability itself) |
+| `AEGIS_NETOPS_STATE` | `<audit dir>/netops-state.json` | Network-assurance checkpoint (links, open incidents, learned roles) written every 5 s and on shutdown; restored on start so a restart mid-outage does not re-alert. Empty string disables |
 | `AEGIS_FEED_WATCHDOG` | `1` | Alert when a feed goes **silent** (a dead push feed is not "no attacks"); tune with `AEGIS_FEED_SILENCE_SECONDS` / `AEGIS_FEED_EXPECT`. Exposes `aegis_feed_silent` on `/metrics` |
 | `AEGIS_VLLM_URL` | `http://gpu-host:8000/v1` | With `LLM_BACKEND=vllm`: the served (OpenAI-compatible) endpoint. Also `AEGIS_VLLM_MODEL`, `AEGIS_VLLM_API_KEY` |
 | `AEGIS_HOT_RELOAD` | `1` | **`soc`/`full`** — apply an approved model promotion at runtime, no restart (vllm backend); reads the pointer below (§8) |
@@ -378,6 +381,19 @@ deterministic answer** if the endpoint is unreachable. Nothing leaves the consol
 evidence chain already holds (which is PII-tokenised upstream).
 
 ---
+
+## What happens when the box misbehaves
+
+| Fault | Behaviour |
+|---|---|
+| Process killed mid-write (kill -9, power) | On start the torn last audit row is moved to `audit.jsonl.torn-<ts>` and the chain resumes from the last intact entry; the network detector reloads its checkpoint (open incidents, link states) so the outage in progress is still one incident |
+| Disk full / read-only mount | Triage continues, **no action is executed** for an alert whose evidence could not be written (fail closed); `/healthz` returns 503 with `audit.degraded=true`; one log line per cycle, not per alert; recovers by itself when space returns |
+| Audit log grows | Rotated at `AEGIS_AUDIT_MAX_MB`; segments stay verifiable as one chain |
+| Feed storm | The receiver answers 503 when its queue is full (senders retry; nothing is dropped silently); the loop drains in bounded batches |
+| Exporter with a broken clock | Timestamps in ms/µs/ns are scaled; absurd ones are clamped to the host clock; a single bad exporter cannot declare the estate dead |
+| Service hung | `systemd` restarts it (`Restart=always`); the checkpoint makes the restart cheap |
+
+Verify the chain any time: `python -m aegis.audit verify --audit /var/lib/aegis/audit.jsonl --all` (exit 1 and the file:line on the first break).
 
 ## 5. Air-gap bootstrap
 

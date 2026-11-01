@@ -49,6 +49,8 @@ from aegis.agents.response.receipts import receipt_log_from_env
 from aegis.agents.shared.audit import AuditLog
 from aegis.agents.shared.llm_client import get_client, get_voter_client, get_extra_voter_clients
 from aegis.agents.orchestrator.voting import ensemble_enabled
+from aegis.agents.shared.audit import AuditWriteError
+from aegis.ingest.netops import checkpoint_shared_detector
 from aegis.agents.threat_intel.agent import ThreatIntelAgent
 from aegis.agents.threat_intel.cve_feeds import cve_intel_from_env
 from aegis.agents.transaction.agent import TransactionAgent
@@ -235,8 +237,15 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     # endpoint serves the active enforcement set to any edge enforcer
     from aegis.ingest.stream import get_stream
     from aegis.ingest.http_push import push_server_from_env
+    def _status() -> dict:
+        from aegis.ingest.netops import _last_checkpoint, _state_path
+        out = {"audit": {"path": str(audit_path), "degraded": audit.degraded, "write_failures": audit.write_failures,
+                         "last_error": audit.last_error, "tail": audit.tail_hash[:16]},
+               "netops_checkpoint_age_s": int(time.time() - _last_checkpoint) if _last_checkpoint and _state_path() else None}
+        out["degraded"] = audit.degraded
+        return out
     push_server = push_server_from_env(blocklist=lambda: connectors.active_receipts, audit_path=audit_path,
-                                       license=lambda: _lic_holder["state"])
+                                       license=lambda: _lic_holder["state"], status=_status)
     eventhub = None
     if "eventhub" in [x.strip().lower() for x in os.environ.get("AEGIS_SOURCES", "").split(",")]:
         from aegis.ingest.eventhub import eventhub_from_env
@@ -275,6 +284,7 @@ class CycleStats:
     decisions: int = 0
     rolled_back: int = 0
     errors: int = 0
+    audit_failures: int = 0
     seconds: float = 0.0
     investigations: int = 0
     containment_checks: int = 0
@@ -325,6 +335,14 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
         try:
             chain = p.orch.handle(alert)
             summary = p.response.execute(chain)
+        except AuditWriteError as e:
+            # the evidence could not be written, so nothing was executed for this alert (fail closed); the alert stays
+            # in the source for the next cycle. One line per cycle, not one per alert — a full disk is noisy enough.
+            stats.errors += 1
+            stats.audit_failures += 1
+            if stats.audit_failures == 1:
+                logger.error("[service] audit log not writable (%s): alerts are triaged but no action is executed until it is", e)
+            continue
         except Exception:
             stats.errors += 1
             logger.exception("[service] alert %s failed", alert.get("id"))
@@ -563,6 +581,7 @@ class Service:
         while not self._stop:
             stats = run_cycle(self.p, max_alerts=self.max_alerts)
             self.cycles += 1
+            checkpoint_shared_detector()                           # netops links + open incidents survive a restart
             self._maybe_contribute()
             self._maybe_heartbeat_and_renew()
             self.history.append(stats)
@@ -603,6 +622,7 @@ class Service:
         if self.p.persist_sink is not None:
             self.p.persist_sink.flush()
         self.p.close()
+        checkpoint_shared_detector(force=True)                 # final checkpoint on clean shutdown
         logger.info("[service] stopped after %d cycle(s), %d stream pass(es)", self.cycles, self.stream_cycles)
         return 0
 

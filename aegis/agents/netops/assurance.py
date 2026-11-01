@@ -44,6 +44,7 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -558,6 +559,80 @@ class NetworkAssurance:
                 self.stats["suppressed"] += 1
                 return True
         return False
+
+    # ---------------------------------------------------------- checkpoint --
+    STATE_VERSION = 1
+
+    def snapshot(self) -> dict:
+        """Everything a restart must not forget: links and their state, open and recent incidents, who was last
+        seen when, learned roles/users/sites, recent config pushes. Counters and telemetry history are not
+        needed — a minute of fresh samples rebuilds them."""
+        with self._lock:
+            now = float(self.clock())
+            links = []
+            for (a, b), members in self._links.items():
+                for m in members:
+                    links.append({"a": m.a, "a_if": m.a_if, "b": m.b, "b_if": m.b_if, "state": m.state, "down_since": m.down_since,
+                                  "transitions": [list(x) for x in list(m.transitions)[-16:]], "flap_open_until": m.flap_open_until})
+            pseudo = [{"a": l.a, "a_if": l.a_if, "b": l.b, "state": l.state, "down_since": l.down_since, "transitions": [list(x) for x in list(l.transitions)[-16:]]}
+                      for (dev, ifc), l in self._iface_link.items() if l.b.endswith(":peer")]
+            incidents = [{"fault": i.fault, "device": i.device, "iface": i.iface, "opened": i.opened, "downstream": sorted(i.downstream),
+                          "suppressed": i.suppressed, "symptoms": list(i.symptoms), "alert_id": i.alert_id, "closed": i.closed}
+                         for i in self._incidents if i.closed is None or now - i.closed <= self.corr_window_s * 2]
+            return {"version": self.STATE_VERSION, "saved_at": now, "links": links, "pseudo_links": pseudo, "incidents": incidents,
+                    "roles": dict(self._roles), "users": dict(self._users), "sites": dict(self._sites), "last_seen": dict(self._last_seen),
+                    "last_tele": dict(self._last_tele), "unreachable": sorted(self._unreachable), "recent_config": self._recent_config,
+                    "config_hash": dict(self._config_hash), "stats": dict(self.stats)}
+
+    def restore(self, snap: dict) -> int:
+        """Load a snapshot taken by the previous process. Returns the number of open incidents carried over.
+        A snapshot from another version, or a corrupt one, is ignored (the detector then relearns)."""
+        if not isinstance(snap, dict) or snap.get("version") != self.STATE_VERSION:
+            return 0
+        with self._lock:
+            self._roles.update({str(k): str(v) for k, v in (snap.get("roles") or {}).items()})
+            self._users.update({str(k): int(v) for k, v in (snap.get("users") or {}).items()})
+            self._sites.update({str(k): str(v) for k, v in (snap.get("sites") or {}).items()})
+            for l in snap.get("links") or []:
+                self.add_link(str(l["a"]), l.get("a_if"), str(l["b"]), l.get("b_if"))
+                link = self._iface_link.get((str(l["a"]), l.get("a_if"))) or self._iface_link.get((str(l["b"]), l.get("b_if")))
+                if link is None:
+                    continue
+                link.state = str(l.get("state") or "up"); link.down_since = l.get("down_since"); link.flap_open_until = float(l.get("flap_open_until") or 0)
+                link.transitions.clear(); link.transitions.extend((float(a), str(b)) for a, b in l.get("transitions") or [])
+            for l in snap.get("pseudo_links") or []:
+                pl = _Link(str(l["a"]), l.get("a_if"), str(l["b"]), None, state=str(l.get("state") or "up"), down_since=l.get("down_since"))
+                pl.transitions.extend((float(a), str(b)) for a, b in l.get("transitions") or [])
+                self._iface_link[(pl.a, pl.a_if)] = pl
+            n = 0
+            for i in snap.get("incidents") or []:
+                inc = _Incident(str(i["fault"]), str(i["device"]), i.get("iface"), float(i["opened"]), set(i.get("downstream") or []),
+                                int(i.get("suppressed") or 0), list(i.get("symptoms") or []), str(i.get("alert_id") or ""), i.get("closed"))
+                self._incidents.append(inc)
+                n += inc.closed is None
+            self._last_seen.update({str(k): float(v) for k, v in (snap.get("last_seen") or {}).items()})
+            self._last_tele.update({str(k): float(v) for k, v in (snap.get("last_tele") or {}).items()})
+            self._unreachable.update(str(x) for x in snap.get("unreachable") or [])
+            self._recent_config.update(snap.get("recent_config") or {})
+            self._config_hash.update({str(k): str(v) for k, v in (snap.get("config_hash") or {}).items()})
+            for k, v in (snap.get("stats") or {}).items():
+                self.stats[str(k)] += int(v)
+            return int(n)
+
+    def checkpoint(self, path: "str | os.PathLike[str]") -> None:
+        """Write the snapshot atomically (tmp + rename) so a crash mid-write leaves the previous checkpoint intact."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.snapshot(), separators=(",", ":")))
+        os.replace(tmp, p)
+
+    def restore_from(self, path: "str | os.PathLike[str]") -> int:
+        p = Path(path)
+        try:
+            return self.restore(json.loads(p.read_text()))
+        except (OSError, ValueError):
+            return 0
 
     def incident_for(self, alert_id: str) -> dict | None:
         with self._lock:
