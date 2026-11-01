@@ -149,3 +149,70 @@ def test_feed_storm_applies_backpressure_instead_of_falling_over():
     assert q.put_many("alerts", ['{"id":"after"}'], passthrough=True)       # and the sender's retry gets in
     q.drain()
     assert len(q) == 0 and q.stats.rejected_full == 5000 - accepted          # every refusal is counted
+
+
+# ---------------------------------------------------------- storm mode / watchdog --
+
+def test_deferred_queue_spills_in_order_survives_restart_and_is_bounded(tmp_path):
+    from aegis.ops.deferred import DeferredQueue
+    q = DeferredQueue(tmp_path / "deferred.jsonl", max_bytes=400)
+    assert q.push({"id": "a"}) and q.push({"id": "b"}) and q.push({"id": "c"})
+    assert q.pending() == 3
+    got = q.pop(2)
+    assert [g["id"] for g in got] == ["a", "b"] and got[0]["deferred_by"] == "storm" and q.pending() == 1
+    q2 = DeferredQueue(tmp_path / "deferred.jsonl")                      # restart: cursor persisted
+    assert [g["id"] for g in q2.pop(5)] == ["c"] and q2.pending() == 0 and not (tmp_path / "deferred.jsonl").exists()
+    q3 = DeferredQueue(tmp_path / "d2.jsonl", max_bytes=120)
+    pushed = sum(q3.push({"id": f"x{i}", "pad": "y" * 50}) for i in range(10))
+    assert 1 <= pushed < 10 and q3.dropped == 10 - pushed                # the spill file is bounded and refusals are counted
+
+
+def test_storm_mode_defers_model_bound_alerts_and_keeps_fast_paths(monkeypatch, tmp_path):
+    from aegis.service import StormControl, CycleStats, run_cycle, build_pipeline
+    from aegis.ops.deferred import DeferredQueue
+    monkeypatch.setenv("LLM_BACKEND", "mock"); monkeypatch.setenv("AEGIS_INGEST_HTTP", "0"); monkeypatch.setenv("AEGIS_SOURCES", "sample")
+    p = build_pipeline(tmp_path / "audit.jsonl", fresh=True)
+    storm = StormControl(DeferredQueue(tmp_path / "deferred.jsonl"), p.stream, 60.0)
+    big = CycleStats(); big.alerts = 10_000
+    assert storm.update(big) is True                                      # a huge cycle switches it on
+    netops = parse_syslog_line("<189>DIST-01: %LINK-3-UPDOWN: Interface Ethernet1/49, changed state to down", ts=T)
+    fast = {"id": "nf-1", "alert_type": "network_fault", "source": "Network Assurance", "netops": {"fault": "link_down", "device": "DIST-01", "iface": "Ethernet1/49", "downstream": [], "root_cause": "x"}}
+    slow = {"id": "waf-1", "source": "Imperva WAF", "src_ip": "203.0.113.5", "path": "/login", "severity": "high"}
+    assert p.orch.is_fast_path(fast) and not p.orch.is_fast_path(slow)
+    st = run_cycle(p, alerts=iter([fast, slow, dict(slow, id="waf-2")]), sweep=False, hitl=False, storm=storm)
+    assert st.deferred == 2 and st.alerts == 3 and storm.queue.pending() == 2
+    small = CycleStats(); small.alerts = 3
+    assert storm.update(small) is False                                   # storm over
+    pend = storm.redeliver()
+    assert [a["id"] for a in pend] == ["waf-1", "waf-2"] and all(a["deferred_at"] for a in pend)
+    st2 = run_cycle(p, alerts=iter(pend), sweep=False, hitl=False, storm=storm)
+    assert st2.alerts == 2 and st2.deferred == 0 and storm.queue.pending() == 0   # re-fed alerts are never re-deferred
+    p.close()
+
+
+def test_sdnotify_is_a_noop_without_systemd_and_speaks_the_protocol_with_it(tmp_path, monkeypatch):
+    import socket
+    from aegis.ops import sdnotify
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    assert not sdnotify.enabled() and sdnotify.ready() is False and sdnotify.watchdog() is False
+    sock_path = str(tmp_path / "notify.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); srv.bind(sock_path); srv.settimeout(2)
+    monkeypatch.setenv("NOTIFY_SOCKET", sock_path); monkeypatch.setenv("WATCHDOG_USEC", "180000000")
+    sdnotify._sock = None; sdnotify._last = 0.0
+    assert sdnotify.ready("up") and srv.recv(200) == b"READY=1\nSTATUS=up"
+    assert sdnotify.watchdog() and srv.recv(200) == b"WATCHDOG=1"
+    assert sdnotify.watchdog() is False                                   # rate-limited
+    assert sdnotify.watchdog_interval_s() == 90.0
+    assert sdnotify.stopping() and srv.recv(200) == b"STOPPING=1"
+    srv.close(); sdnotify._sock = None
+
+
+def test_status_command_reports_chain_and_backlog(tmp_path, monkeypatch, capsys):
+    from aegis.service import status_main
+    from aegis.ops.deferred import DeferredQueue
+    monkeypatch.setenv("AEGIS_INGEST_BIND", "127.0.0.1:1")                 # nothing listening
+    log = AuditLog(tmp_path / "audit.jsonl"); log.append(_chain(0))
+    DeferredQueue(tmp_path / "deferred.jsonl").push({"id": "z"})
+    assert status_main(str(tmp_path / "audit.jsonl")) == 1                # receiver unreachable → non-zero, but still reports
+    out = capsys.readouterr().out
+    assert "unreachable" in out and "intact" in out and "1 alert(s) waiting" in out

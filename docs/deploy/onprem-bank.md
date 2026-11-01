@@ -391,7 +391,12 @@ evidence chain already holds (which is PII-tokenised upstream).
 | Audit log grows | Rotated at `AEGIS_AUDIT_MAX_MB`; segments stay verifiable as one chain |
 | Feed storm | The receiver answers 503 when its queue is full (senders retry; nothing is dropped silently); the loop drains in bounded batches |
 | Exporter with a broken clock | Timestamps in ms/µs/ns are scaled; absurd ones are clamped to the host clock; a single bad exporter cannot declare the estate dead |
-| Service hung | `systemd` restarts it (`Restart=always`); the checkpoint makes the restart cheap |
+| Service hung | the unit is `Type=notify` with `WatchdogSec=180`: the service pings systemd every cycle and every second while idle; a hung model call or a deadlock gets it restarted; the checkpoint makes the restart cheap |
+| Feed storm beyond what the model can triage | **storm mode**: when the receiver queue passes `AEGIS_STORM_QUEUE_PCT` (80 %) or a cycle exceeds `AEGIS_STORM_ALERTS` (500), model-bound alerts are spilled to `deferred.jsonl` (bounded) and only deterministic fast paths (network faults, egress, honeytokens, auth bursts…) run; when it clears, the backlog is re-fed `AEGIS_STORM_DRAIN` (200) per batch for up to half the poll interval each cycle. Nothing is dropped; `--status` shows the backlog |
+| A re-run of `install.sh` ships a bad release | the new release must pass a 60-s health check (`READY` + `/healthz`); otherwise the installer checks out the previous commit, reinstalls and restarts, and says so |
+| Box lost / rebuild | `aegis-backup` (config, licence, salt, audit chain, HITL journals, cursors, checkpoint; `--with-models` for adapters) → `aegis-restore <tar>` on the new box; the audit chain is verified after restore |
+
+`python -m aegis.service --status` prints receiver health, audit writability and chain state, checkpoint age, licence and storm backlog in one screen (exit 1 when anything is wrong — usable from monitoring).
 
 Verify the chain any time: `python -m aegis.audit verify --audit /var/lib/aegis/audit.jsonl --all` (exit 1 and the file:line on the first break).
 
