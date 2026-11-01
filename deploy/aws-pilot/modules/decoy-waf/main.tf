@@ -1,10 +1,12 @@
 #
 # Decoy target behind AWS WAF, every evaluated request streamed to AEGIS via Firehose.
-# Provider must be us-east-1 (CloudFront-scoped WAF + its logging stream live there).
+# Provider `aws` must be us-east-1 (CloudFront-scoped WAF + its logging stream live there); `aws.home` is the
+# host's region and holds the two S3 buckets — organisation SCPs often deny S3 outside the approved regions,
+# and CloudFront / Firehose are happy with a bucket anywhere.
 #
 terraform {
   required_providers {
-    aws = { source = "hashicorp/aws" }
+    aws = { source = "hashicorp/aws", configuration_aliases = [aws.home] }
   }
 }
 
@@ -21,11 +23,13 @@ data "aws_caller_identity" "me" {}
 
 # ---------- decoy site: private S3 bucket served only through CloudFront ----------
 resource "aws_s3_bucket" "decoy" {
+  provider      = aws.home
   bucket        = "${var.name}-decoy-${data.aws_caller_identity.me.account_id}"
   force_destroy = true
 }
 
 resource "aws_s3_bucket_public_access_block" "decoy" {
+  provider                = aws.home
   bucket                  = aws_s3_bucket.decoy.id
   block_public_acls       = true
   block_public_policy     = true
@@ -44,6 +48,7 @@ locals {
 }
 
 resource "aws_s3_object" "decoy" {
+  provider     = aws.home
   for_each     = local.decoy_pages
   bucket       = aws_s3_bucket.decoy.id
   key          = each.key
@@ -60,6 +65,7 @@ resource "aws_cloudfront_origin_access_control" "decoy" {
 }
 
 resource "aws_s3_bucket_policy" "decoy" {
+  provider = aws.home
   bucket = aws_s3_bucket.decoy.id
   policy = jsonencode({
     Version = "2012-10-17"
@@ -175,11 +181,13 @@ resource "aws_cloudfront_distribution" "decoy" {
 
 # ---------- Firehose HTTP endpoint → AEGIS /ingest/firehose ----------
 resource "aws_s3_bucket" "firehose_backup" {
+  provider      = aws.home
   bucket        = "${var.name}-waf-undelivered-${data.aws_caller_identity.me.account_id}"
   force_destroy = true
 }
 
 resource "aws_s3_bucket_public_access_block" "firehose_backup" {
+  provider                = aws.home
   bucket                  = aws_s3_bucket.firehose_backup.id
   block_public_acls       = true
   block_public_policy     = true
@@ -188,6 +196,7 @@ resource "aws_s3_bucket_public_access_block" "firehose_backup" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "firehose_backup" {
+  provider = aws.home
   bucket = aws_s3_bucket.firehose_backup.id
   rule {
     id     = "expire-undelivered"

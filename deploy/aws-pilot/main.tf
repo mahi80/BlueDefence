@@ -63,7 +63,7 @@ module "aegis_host" {
 
 module "decoy_waf" {
   source = "./modules/decoy-waf"
-  providers = { aws = aws.us_east_1 }
+  providers = { aws = aws.us_east_1, aws.home = aws }
 
   name          = var.name
   aegis_url     = "https://${var.domain}"
