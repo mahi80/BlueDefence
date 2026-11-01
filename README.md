@@ -17,6 +17,10 @@ Three things make it different from a SIEM with an LLM bolted on:
   their own hardware, free, and send back scrubbed verdicts and analyst decisions; the pooled data
   trains the next brain, which ships back to all of them like an antivirus definition update.
 
+**Three-minute walkthrough** — how an alarm storm becomes one governed, evidenced decision:
+
+[![BlueDefence — how it works (3:20, narrated)](docs/media/how-it-works-poster.jpg)](docs/media/BlueDefence-how-it-works.mp4)
+
 Carved out of the ACP governance monorepo (`mahi80/rbi`) so the SOC product ships on its own
 cadence. Full technical detail: [`aegis/README.md`](aegis/README.md).
 
