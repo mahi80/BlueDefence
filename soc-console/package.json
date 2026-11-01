@@ -2,13 +2,14 @@
   "name": "aegis-soc-console",
   "version": "0.1.0",
   "private": true,
-  "description": "AEGIS SOC console — live swarm→isolate map (D3), human-in-the-loop queue, and the model-evolution panel, over the existing ACP dashboard Postgres/FastAPI APIs.",
+  "description": "AEGIS SOC console \u2014 live swarm\u2192isolate map (D3), human-in-the-loop queue, and the model-evolution panel, over the existing ACP dashboard Postgres/FastAPI APIs.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "user": "node scripts/users.mjs"
   },
   "dependencies": {
     "d3": "7.9.0",
