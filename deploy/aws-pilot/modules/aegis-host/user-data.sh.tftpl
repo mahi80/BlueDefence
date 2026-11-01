@@ -36,7 +36,9 @@ cat > /etc/aegis/console.env <<EOF
 AEGIS_AUTH_MODE=local
 AEGIS_CONSOLE_USERS=/var/lib/aegis/console/users.json
 AEGIS_CONSOLE_SECRET=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-AEGIS_API_ORIGIN=
+# the host's own API (served by the push receiver from the audit chain + HITL files)
+AEGIS_API_ORIGIN=http://127.0.0.1:8787
+AEGIS_API_KEY=$(grep '^AEGIS_CONSOLE_TOKEN=' /etc/aegis/aegis.env | cut -d= -f2-)
 PORT=3000
 HOSTNAME=127.0.0.1
 EOF
