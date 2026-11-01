@@ -137,6 +137,8 @@ sudo ./install.sh --no-license --non-interactive                 # evaluation mo
 Re-running it changes the answers and keeps the licence, the pseudonym salt and the audit log.
 Air-gapped and Kubernetes deployments: [`docs/deploy/onprem-bank.md`](docs/deploy/onprem-bank.md).
 
+No bank host yet? [`deploy/aws-pilot/`](deploy/aws-pilot/) stands up an all-AWS shadow pilot — a decoy behind AWS WAF streaming every request into AEGIS over Firehose, ~$70/month — with one `terraform apply`: [`docs/pilot/aws-shadow-pilot.md`](docs/pilot/aws-shadow-pilot.md).
+
 ## Quick start (developer)
 
 Prerequisites: **Python ≥ 3.11**; **Node 22** for the console; Java 21 + Maven for the Kafka bridge;

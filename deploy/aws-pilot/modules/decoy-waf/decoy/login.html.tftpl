@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>${title} — sign-in (decoy)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:24rem;margin:4rem auto;padding:0 1rem;color:#1b2430}
+label{display:block;margin:.8rem 0 .2rem}input{width:100%;padding:.5rem;border:1px solid #c3cad4;border-radius:4px}
+button{margin-top:1rem;padding:.55rem 1rem;border:0;border-radius:4px;background:#1b2430;color:#fff}
+small{display:block;margin-top:1.5rem;color:#5c6775}</style></head>
+<body>
+<h1>Sign in</h1>
+<form method="post" action="/api/session" onsubmit="return false">
+<label for="u">User</label><input id="u" name="user" autocomplete="off">
+<label for="p">Password</label><input id="p" name="password" type="password" autocomplete="off">
+<button type="submit">Continue</button>
+</form>
+<small>Decoy form on the BlueDefence shadow-pilot test target. It submits nowhere; the request itself is the signal.</small>
+</body></html>

@@ -1,0 +1,7 @@
+# copy to terraform.tfvars (git-ignored) and fill in
+domain          = "pilot.bluedefence.click"   # must resolve to the host's Elastic IP (output aegis_host_ip)
+route53_zone_id = ""                           # hosted zone id if Route 53 owns the domain, else leave empty and add the A record yourself
+community_org   = "BlueDefence pilot"
+community_email = "you@example.com"            # Community licence + Let's Encrypt contact
+# admin_cidr    = "203.0.113.7/32"             # only if you want SSH; SSM Session Manager works without it
+# key_name      = "my-keypair"
