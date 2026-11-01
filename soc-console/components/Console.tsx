@@ -199,6 +199,8 @@ export default function Console({
         open={ask.open}
         onOpenChange={(o) => setAsk((a) => ({ ...a, open: o }))}
         autoAsk={ask.q ? { q: ask.q, nonce: ask.nonce } : undefined}
+        mood={counts.malicious > 0 ? "critical" : counts.suspicious > 0 ? "alert" : "calm"}
+        pending={approvals.filter((a) => a.status === "pending").length}
       />
     </div>
   );

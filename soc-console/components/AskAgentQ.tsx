@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Chain } from "../lib/types";
 import { answerLocally, greeting, SUGGESTED } from "../lib/ask";
+import QMascot, { type Mood, type Pos } from "./QMascot";
 
 type Msg = { role: "you" | "q"; text: string };
 type AutoAsk = { q: string; nonce: number };
@@ -30,14 +31,30 @@ export default function AskAgentQ({
   open,
   onOpenChange,
   autoAsk,
+  mood = "calm",
+  pending = 0,
 }: {
   chain?: Chain;
   fixtureMode: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   autoAsk?: AutoAsk;
+  mood?: Mood;
+  pending?: number;
 }) {
   const setOpen = (o: boolean) => onOpenChange(o);
+  const [mpos, setMpos] = useState<Pos | null>(null);
+  // the drawer opens on whichever side of the mascot has room
+  const drawerStyle: React.CSSProperties = (() => {
+    if (!mpos || typeof window === "undefined") return {};
+    const W = window.innerWidth, H = window.innerHeight, S = 84, gap = 12;
+    const st: React.CSSProperties = {};
+    if (mpos.x + S / 2 > W / 2) { st.right = Math.max(12, W - (mpos.x + S)); st.left = "auto"; }
+    else { st.left = Math.max(12, mpos.x); st.right = "auto"; }
+    if (mpos.y + S / 2 > H / 2) { st.bottom = Math.max(12, H - mpos.y + gap); st.top = "auto"; }
+    else { st.top = Math.max(12, mpos.y + S + gap); st.bottom = "auto"; }
+    return st;
+  })();
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -93,15 +110,10 @@ export default function AskAgentQ({
     setTimeout(() => inputRef.current?.focus(), 30);
   }
 
-  const dot =
-    chain?.verdict === "malicious" ? "var(--v-malicious)" :
-    chain?.verdict === "suspicious" ? "var(--v-suspicious)" :
-    chain ? "var(--v-benign)" : "var(--ink-faint)";
-
   return (
     <>
       {open && (
-        <aside className="aq-drawer" role="dialog" aria-label="Ask Agent Q">
+        <aside className="aq-drawer" role="dialog" aria-label="Ask Agent Q" style={drawerStyle}>
           <header className="aq-head">
             <span className="aq-ava"><QMark size={24} /></span>
             <div className="aq-id">
@@ -151,16 +163,13 @@ export default function AskAgentQ({
         </aside>
       )}
 
-      <button
-        className={`aq-fab ${open ? "on" : ""}`}
-        onClick={() => setOpen(!open)}
-        aria-label={open ? "Close Agent Q" : "Ask Agent Q about this detection"}
-        title="Ask Agent Q"
-      >
-        <QMark size={30} />
-        <span className="aq-dot" style={{ background: dot }} aria-hidden />
-        {!open && <span className="aq-ring" aria-hidden />}
-      </button>
+      <QMascot
+        mood={fixtureMode ? "offline" : mood}
+        pending={pending}
+        open={open}
+        onTap={() => setOpen(!open)}
+        onMove={setMpos}
+      />
     </>
   );
 }

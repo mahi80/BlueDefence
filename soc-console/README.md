@@ -52,7 +52,11 @@ The session is a signed, httpOnly cookie (`AEGIS_CONSOLE_SECRET` — set a stron
 
 ## Ask Agent Q
 
-A floating **Agent Q** mascot lets an analyst interrogate the selected detection ("why flagged?",
+**Agent Q** is a living sentinel in the corner (`components/QMascot.tsx`, an original SVG character): it
+breathes, blinks, its eyes follow the pointer, its lamp and halo carry the threat level (green calm · amber
+suspicious · red malicious with a pulse ring · grey when on the sample stream) and a badge counts pending
+approvals. Drag it anywhere — the spot is remembered in the browser — and the chat drawer opens on whichever
+side has room; a tap opens Q. Honours `prefers-reduced-motion`. The mascot lets an analyst interrogate the selected detection ("why flagged?",
 "what's at risk?", "what should I do?"). It answers **from the evidence chain itself** — verdict,
 blast radius (reached assets, crown jewels, choke point), recommended actions, who investigated — so
 it never invents facts and works with zero backend. Set `AEGIS_ASK_URL` to forward free-text
