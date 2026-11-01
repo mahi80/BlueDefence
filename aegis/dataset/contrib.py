@@ -133,22 +133,76 @@ def _write_quarantine(cursor_path: Path | str | None, items: list[dict]) -> None
         logger.warning("[contrib] could not write quarantine note: %s", e)
 
 
-def read_cursor(path: Path | None) -> int:
+def read_cursor_state(path: Path | None) -> dict:
+    """``{"ino": <inode of the segment>, "offset": <bytes>}``; a legacy bare-integer cursor is an offset with no
+    segment identity (treated as the live file). Missing/corrupt → start of the live file."""
     try:
-        return int(Path(path).read_text().strip()) if path and Path(path).exists() else 0
-    except (OSError, ValueError):
-        return 0
+        if not path or not Path(path).exists():
+            return {"ino": 0, "offset": 0}
+        raw = Path(path).read_text().strip()
+        if raw.startswith("{"):
+            d = json.loads(raw)
+            return {"ino": int(d.get("ino", 0)), "offset": int(d.get("offset", 0))}
+        return {"ino": 0, "offset": int(raw)}
+    except (OSError, ValueError, TypeError):
+        return {"ino": 0, "offset": 0}
 
 
-def write_cursor(path: Path | None, value: int) -> None:
-    if path:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(str(value))
+def read_cursor(path: Path | None) -> int:
+    """Byte offset into the current segment (what the heartbeat reports)."""
+    return read_cursor_state(path)["offset"]
+
+
+def write_cursor(path: Path | None, value: int | dict) -> None:
+    """Atomic: a crash mid-write must not leave an empty cursor that re-sends everything."""
+    if not path:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    state = value if isinstance(value, dict) else {"ino": 0, "offset": int(value)}
+    tmp = p.with_name(p.name + ".tmp")
+    with tmp.open("w") as fh:
+        fh.write(json.dumps(state, separators=(",", ":")))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, p)
+
+
+def _segments_from(audit: Path, cursor: dict) -> list[tuple[Path, int]]:
+    """The files to read and where to start in each: the segment the cursor points at from its offset, every
+    newer rotated segment from 0, then the live file from 0. A cursor on the live file is just (live, offset)."""
+    rotated = sorted((q for q in audit.parent.glob(audit.name + ".*") if q.name[len(audit.name) + 1:].isdigit()),
+                     key=lambda q: q.name)
+    try:
+        live_ino = audit.stat().st_ino if audit.exists() else 0
+    except OSError:
+        live_ino = 0
+    ino, off = cursor.get("ino", 0), cursor.get("offset", 0)
+    if not ino or ino == live_ino:
+        return [(audit, off)]
+    out: list[tuple[Path, int]] = []
+    found = False
+    for q in rotated:
+        try:
+            if q.stat().st_ino == ino:
+                found = True
+                out.append((q, off))
+                continue
+        except OSError:
+            continue
+        if found:
+            out.append((q, 0))
+    if not found:
+        logger.warning("[contrib] cursor segment (inode %d) no longer exists — reading from the start of the live file", ino)
+        return [(audit, 0)]
+    out.append((audit, 0))
+    return out
 
 
 def build_bundle(audit_path: Path | str, *, installation_id: str, license_id: str = "", hitl_dir: Path | str | None = None,
-                 scrubber: Scrubber | None = None, cursor: int = 0, max_records: int = MAX_RECORDS) -> tuple[dict, int]:
-    """Records for every chain past ``cursor`` (a byte offset into the audit log) → ``(bundle, new_cursor)``.
+                 scrubber: Scrubber | None = None, cursor: int | dict = 0, max_records: int = MAX_RECORDS) -> tuple[dict, dict]:
+    """Records for every chain past ``cursor`` (``{"ino", "offset"}`` — segment-aware, so a rotation between
+    contributions loses nothing; a bare int is an offset into the live file) → ``(bundle, new_cursor)``.
     The scrubber pseudonymises public IPs too — a contribution never carries a real address."""
     sc = scrubber or scrubber_from_env(scrub_ips=True)
     sc.scrub_ips = True
@@ -156,34 +210,50 @@ def build_bundle(audit_path: Path | str, *, installation_id: str, license_id: st
     p = Path(audit_path)
     latest: dict[str, dict] = {}
     order: list[str] = []
-    new_cursor = cursor
+    cur = cursor if isinstance(cursor, dict) else {"ino": 0, "offset": int(cursor)}
+    new_cursor = dict(cur)
     if p.exists():
-        if cursor > p.stat().st_size:
-            logger.warning("[contrib] audit log is shorter than the cursor (%d > %d) — rotated or truncated; reading from the start",
-                           cursor, p.stat().st_size)
-            cursor = new_cursor = 0
-        with p.open("rb") as fh:
-            fh.seek(cursor)
-            while True:
-                pos = fh.tell()
-                line = fh.readline()
-                if not line:
-                    break
-                if not line.endswith(b"\n"):
-                    break                                   # a chain still being written: next time
-                new_cursor = pos + len(line)
-                if not line.strip():
-                    continue
-                try:
-                    chain = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                aid = str(chain.get("alert_id") or chain.get("integrity_hash") or len(order))
-                if aid not in latest:
-                    order.append(aid)
-                latest[aid] = chain
-                if len(order) >= max_records:
-                    break
+        for seg, start in _segments_from(p, cur):
+            try:
+                st = seg.stat()
+            except OSError:
+                continue
+            if start > st.st_size:
+                logger.warning("[contrib] %s is shorter than the cursor (%d > %d) — truncated; reading it from the start",
+                               seg.name, start, st.st_size)
+                start = 0
+            with seg.open("rb") as fh:
+                fh.seek(start)
+                if start:
+                    # an offset that does not sit on a row boundary (legacy cursor, hand edit) is realigned, loudly
+                    fh.seek(start - 1)
+                    if fh.read(1) != b"\n":
+                        skipped = fh.readline()
+                        logger.warning("[contrib] cursor was mid-row in %s; skipped %d byte(s) to the next row", seg.name, len(skipped))
+                        start = fh.tell()
+                new_cursor = {"ino": st.st_ino, "offset": start}
+                while True:
+                    pos = fh.tell()
+                    line = fh.readline()
+                    if not line:
+                        break
+                    if not line.endswith(b"\n"):
+                        break                                   # a chain still being written: next time
+                    new_cursor = {"ino": st.st_ino, "offset": pos + len(line)}
+                    if not line.strip():
+                        continue
+                    try:
+                        chain = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    aid = str(chain.get("alert_id") or chain.get("integrity_hash") or len(order))
+                    if aid not in latest:
+                        order.append(aid)
+                    latest[aid] = chain
+                    if len(order) >= max_records:
+                        break
+            if len(order) >= max_records:
+                break
     records: list[TriageRecord] = []
     for aid in order:
         try:
@@ -243,6 +313,8 @@ def push_bundle(server: str, bundle: dict, license_token: str, *, timeout: float
     verifies it and binds the upload to the installation it names."""
     import urllib.error
     import urllib.request
+    from aegis.license import _require_https
+    _require_https(server)                                   # the licence token rides on this request
     data = gzip.compress(json.dumps(bundle, separators=(",", ":")).encode())
     if len(data) > MAX_PUSH_BYTES:
         raise RuntimeError(f"bundle is {len(data) // 1024} KB compressed — over the {MAX_PUSH_BYTES // (1024 * 1024)} MB limit; "
@@ -266,7 +338,7 @@ def contribute(*, audit_path: Path | str, installation_id: str, license_token: s
                hitl_dir: Path | str | None = None, cursor_path: Path | str | None = None, server: str = "",
                out: Path | str | None = None, min_records: int = 1) -> dict:
     """One contribution run: build → gate → (push | write). Returns a summary; raises nothing on 'nothing new'."""
-    cursor = read_cursor(Path(cursor_path) if cursor_path else None)
+    cursor = read_cursor_state(Path(cursor_path) if cursor_path else None)
     bundle, new_cursor = build_bundle(audit_path, installation_id=installation_id, license_id=license_id, hitl_dir=hitl_dir, cursor=cursor)
     n = bundle["counts"]["records"]
     if n < min_records:
@@ -279,7 +351,8 @@ def contribute(*, audit_path: Path | str, installation_id: str, license_token: s
     quarantined: list[dict] = []
     if bad:
         for i, found in bad.items():
-            quarantined.append({"record_id": bundle["records"][i].get("record_id"), "findings": found[:5]})
+            quarantined.append({"record_id": bundle["records"][i].get("record_id"),
+                                "findings": [{"kind": f.get("kind"), "path": f.get("path")} for f in found[:5]]})   # never the value, not even masked
         logger.error("[contrib] privacy gate quarantined %d of %d record(s) e.g. %s — check what the capture is storing",
                      len(bad), n, quarantined[0]["findings"][:2])
         bundle["records"] = [bundle["records"][i] for i in clean]

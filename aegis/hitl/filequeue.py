@@ -68,21 +68,28 @@ class FileHITL(BaseHITL):
         return card["id"]
 
     def _read_new_decisions(self) -> dict[str, dict]:
+        """New rows since the last byte offset. Binary, line-safe: a row still being written (no trailing
+        newline) is left for the next poll and the offset never lands mid-row; undecodable bytes are
+        replaced rather than wedging the queue (one bad byte must not stop every later decision)."""
         out: dict[str, dict] = {}
         if not self.decisions_file.exists():
             return out
-        with self.decisions_file.open("r", encoding="utf-8") as f:
+        with self.decisions_file.open("rb") as f:
             f.seek(self._consumed)
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning("[hitl:file] malformed decision line skipped: %s", line[:80]); continue
-                if isinstance(d, dict) and d.get("approval_id"):
-                    out[str(d["approval_id"])] = d
-            self._consumed = f.tell()
+            raw = f.read()
+        cut = raw.rfind(b"\n")
+        if cut < 0:
+            return self._buffered if hasattr(self, "_buffered") else out
+        chunk, self._consumed = raw[:cut + 1], self._consumed + cut + 1
+        for line in chunk.decode("utf-8", "replace").split("\n"):
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("[hitl:file] malformed decision line skipped: %s", line[:80]); continue
+            if isinstance(d, dict) and d.get("approval_id"):
+                out[str(d["approval_id"])] = d
         self._buffered = {**getattr(self, "_buffered", {}), **out}
         return self._buffered
 
@@ -94,6 +101,10 @@ class FileHITL(BaseHITL):
         if status not in ("approved", "rejected"):
             logger.warning("[hitl:file] decision for %s has unknown status %r; ignored", p.approval_id, status); return None
         return status, str(d.get("decided_by") or "file"), str(d.get("reason") or "")[:500]
+
+    def _record_settled(self, p: PendingApproval, status: str, decided_by: str, reason: str) -> None:
+        self._append(self.cards, {"kind": "settled", "ts": time.time(), "approval_id": p.approval_id, "alert_id": p.alert_id,
+                                  "status": status, "decided_by": decided_by, "reason": reason[:500]})
 
     def _annotate(self, p: PendingApproval, card: dict) -> bool:
         self._append(self.cards, {"kind": "investigation", "ts": time.time(), "approval_id": p.approval_id, "alert_id": p.alert_id, "investigation": card})

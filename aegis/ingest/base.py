@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -132,13 +133,31 @@ class BaseConsumer:
     def normalize(self, record: Any) -> Optional[dict]:
         raise NotImplementedError
 
+    # a poisoned feed must not turn into a million WARNING lines: the first few per minute are logged,
+    # the rest are counted and summarised when the window rolls over
+    _DROP_LOG_BURST = 5
+
+    def _drop_log(self, why: str) -> None:
+        now = time.time()
+        win = getattr(self, "_drop_win", 0.0)
+        if now - win >= 60:
+            n = getattr(self, "_drop_suppressed", 0)
+            if n:
+                logger.warning("[ingest:%s] %d more records dropped in the last minute (same cause)", self.name, n)
+            self._drop_win, self._drop_n, self._drop_suppressed = now, 0, 0
+        self._drop_n = getattr(self, "_drop_n", 0) + 1
+        if self._drop_n <= self._DROP_LOG_BURST:
+            logger.warning("[ingest:%s] record dropped: %s", self.name, why)
+        else:
+            self._drop_suppressed = getattr(self, "_drop_suppressed", 0) + 1
+
     def iter_alerts(self, **kwargs) -> Iterator[dict]:
         for record in self.fetch(**kwargs):
             try:
                 alert = self.normalize(record)
             except Exception as e:  # noqa: BLE001 — one bad record must not stop the stream
                 self.skipped_invalid += 1
-                logger.warning("[ingest:%s] record dropped: %s", self.name, str(e)[:160])
+                self._drop_log(str(e)[:160])
                 continue
             if alert is CONSUMED:
                 continue

@@ -159,9 +159,19 @@ def test_deferred_queue_spills_in_order_survives_restart_and_is_bounded(tmp_path
     assert q.push({"id": "a"}) and q.push({"id": "b"}) and q.push({"id": "c"})
     assert q.pending() == 3
     got = q.pop(2)
-    assert [g["id"] for g in got] == ["a", "b"] and got[0]["deferred_by"] == "storm" and q.pending() == 1
-    q2 = DeferredQueue(tmp_path / "deferred.jsonl")                      # restart: cursor persisted
-    assert [g["id"] for g in q2.pop(5)] == ["c"] and q2.pending() == 0 and not (tmp_path / "deferred.jsonl").exists()
+    assert [g["id"] for g in got] == ["a", "b"] and got[0]["deferred_by"] == "storm"
+    q_crash = DeferredQueue(tmp_path / "deferred.jsonl")                 # crash before ack: the batch is re-delivered
+    assert [g["id"] for g in q_crash.pop(5)] == ["a", "b", "c"]
+    q.ack()
+    assert q.pending() == 1
+    q2 = DeferredQueue(tmp_path / "deferred.jsonl")                      # restart: acked cursor persisted
+    assert [g["id"] for g in q2.pop(5)] == ["c"]
+    q2.ack()
+    assert q2.pending() == 0 and not (tmp_path / "deferred.jsonl").exists()
+    # a torn last line (crash mid-append) is cut at open so the next push cannot merge with it
+    torn = tmp_path / "torn.jsonl"; torn.write_text('{"id":"t1"}\n{"id":"t2", "pa')
+    qt = DeferredQueue(torn)
+    assert qt.dropped == 1 and qt.push({"id": "t3"}) and [g["id"] for g in qt.pop(5)] == ["t1", "t3"]
     q3 = DeferredQueue(tmp_path / "d2.jsonl", max_bytes=120)
     pushed = sum(q3.push({"id": f"x{i}", "pad": "y" * 50}) for i in range(10))
     assert 1 <= pushed < 10 and q3.dropped == 10 - pushed                # the spill file is bounded and refusals are counted
@@ -186,7 +196,9 @@ def test_storm_mode_defers_model_bound_alerts_and_keeps_fast_paths(monkeypatch, 
     pend = storm.redeliver()
     assert [a["id"] for a in pend] == ["waf-1", "waf-2"] and all(a["deferred_at"] for a in pend)
     st2 = run_cycle(p, alerts=iter(pend), sweep=False, hitl=False, storm=storm)
-    assert st2.alerts == 2 and st2.deferred == 0 and storm.queue.pending() == 0   # re-fed alerts are never re-deferred
+    assert st2.alerts == 2 and st2.deferred == 0 and storm.queue.pending() == 2   # re-fed alerts are never re-deferred…
+    storm.queue.ack()
+    assert storm.queue.pending() == 0                                              # …and the batch is committed after processing
     p.close()
 
 
@@ -216,3 +228,80 @@ def test_status_command_reports_chain_and_backlog(tmp_path, monkeypatch, capsys)
     assert status_main(str(tmp_path / "audit.jsonl")) == 1                # receiver unreachable → non-zero, but still reports
     out = capsys.readouterr().out
     assert "unreachable" in out and "intact" in out and "1 alert(s) waiting" in out
+
+
+# ------------------------------------------------------------ review round 2 --
+
+def test_source_raising_mid_cycle_does_not_kill_the_cycle(tmp_path, monkeypatch):
+    from aegis.service import build_pipeline, run_cycle
+    monkeypatch.setenv("LLM_BACKEND", "mock"); monkeypatch.setenv("AEGIS_INGEST_HTTP", "0"); monkeypatch.setenv("AEGIS_SOURCES", "sample")
+    p = build_pipeline(tmp_path / "audit.jsonl", fresh=True)
+    def feed():
+        yield {"id": "ok-1", "source": "Imperva WAF", "src_ip": "203.0.113.5", "path": "/login", "severity": "high"}
+        raise RuntimeError("Sentinel query failed: HTTP 503")
+    st = run_cycle(p, alerts=feed(), sweep=False, hitl=False)
+    assert st.alerts == 1 and st.errors == 1                                   # one processed, the failure counted, no exception
+    p.close()
+
+
+def test_audit_write_failure_parks_the_alert_for_redelivery(tmp_path, monkeypatch):
+    from aegis.service import build_pipeline, run_cycle, StormControl
+    from aegis.ops.deferred import DeferredQueue
+    from aegis.agents.shared.audit import AuditWriteError
+    monkeypatch.setenv("LLM_BACKEND", "mock"); monkeypatch.setenv("AEGIS_INGEST_HTTP", "0"); monkeypatch.setenv("AEGIS_SOURCES", "sample")
+    p = build_pipeline(tmp_path / "audit.jsonl", fresh=True)
+    storm = StormControl(DeferredQueue(tmp_path / "deferred.jsonl"), p.stream, 60.0)
+    def boom(*a, **k): raise AuditWriteError("audit log not writable: No space left on device", 28)
+    monkeypatch.setattr(p.orch, "handle", boom)
+    alert = {"id": "waf-9", "source": "Imperva WAF", "src_ip": "203.0.113.5", "path": "/login", "severity": "high"}
+    st = run_cycle(p, alerts=iter([alert]), sweep=False, hitl=False, storm=storm)
+    assert st.audit_failures == 1 and st.deferred == 1 and storm.queue.pending() == 1
+    parked = storm.queue.pop(5)
+    assert parked[0]["id"] == "waf-9" and parked[0]["audit_deferred"] is True   # re-fed once the log is writable
+    p.close()
+
+
+def test_torn_tail_repair_keeps_intact_rows_after_a_bad_middle_line(tmp_path):
+    from aegis.agents.shared.audit import AuditLog
+    path = tmp_path / "audit.jsonl"
+    log = AuditLog(path)
+    from aegis.agents.shared.evidence_chain import EvidenceChain
+    for i in range(4):
+        log.append(EvidenceChain(alert_id=f"A{i}", investigated_by="t", verdict="benign", confidence=0.5))
+    rows = path.read_text().splitlines()
+    rows[1] = rows[1][:20]                                                     # corrupt a MIDDLE row (not a torn write)
+    path.write_text("\n".join(rows) + "\n")
+    log2 = AuditLog(path)                                                      # must not discard rows 2-3
+    assert len(path.read_text().splitlines()) == 4
+    assert log2.verify_report(all_files=False)["broken_at"] is not None       # but verify reports it
+    # a genuinely torn TAIL is repaired
+    path.write_text(path.read_text() + '{"alert_id": "A9", "half')
+    AuditLog(path)
+    assert len(path.read_text().splitlines()) == 4 and list(tmp_path.glob("audit.jsonl.torn-*"))
+    # read-only construction never touches the file
+    path.write_text(path.read_text() + '{"alert_id": "A10", "half')
+    AuditLog(path, repair=False)
+    assert path.read_text().endswith('"half')
+
+
+def test_contrib_cursor_survives_audit_rotation(tmp_path, monkeypatch):
+    from aegis.agents.shared.audit import AuditLog
+    from aegis.agents.shared.evidence_chain import EvidenceChain
+    from aegis.dataset import contrib
+    monkeypatch.setenv("AEGIS_DATASET_SALT", "s" * 16)
+    path = tmp_path / "audit.jsonl"
+    log = AuditLog(path, max_bytes=1500)                                       # rotates every few rows
+    cur = tmp_path / ".contrib.cursor"
+    def chains(n, start):
+        for i in range(start, start + n):
+            log.append(EvidenceChain(alert_id=f"R{i}", investigated_by="t", verdict="benign", confidence=0.5))
+    chains(3, 0)
+    b1, c1 = contrib.build_bundle(path, installation_id="inst-1", cursor=contrib.read_cursor_state(cur))
+    contrib.write_cursor(cur, c1)
+    chains(12, 3)                                                              # several rotations happen here
+    assert len(log.rotated_files()) >= 1
+    b2, c2 = contrib.build_bundle(path, installation_id="inst-1", cursor=contrib.read_cursor_state(cur))
+    assert b1["counts"]["records"] == 3 and b2["counts"]["records"] == 12       # nothing lost across the rotation
+    contrib.write_cursor(cur, c2)
+    b3, _ = contrib.build_bundle(path, installation_id="inst-1", cursor=contrib.read_cursor_state(cur))
+    assert b3["counts"]["records"] == 0                                        # and nothing re-sent

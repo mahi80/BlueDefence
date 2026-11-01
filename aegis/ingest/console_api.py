@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,14 @@ MAX_SCAN_BYTES = 64 * 1024 * 1024          # read at most the last 64 MB of the 
 DEFAULT_LIMIT = 200
 _ID_RX = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _VERDICTS = ("benign", "suspicious", "malicious", "uncertain")
+
+
+def _num(v: Any) -> float:
+    try:
+        f = float(v or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if f == f else 0.0
 
 
 def _iso(ts: Any) -> str:
@@ -85,7 +94,7 @@ def _summary(c: dict) -> dict:
         "alert_id": str(c.get("alert_id") or ""),
         "source": _source(c),
         "verdict": verdict if verdict in _VERDICTS else "uncertain",
-        "confidence": float(c.get("confidence") or 0.0),
+        "confidence": _num(c.get("confidence")),
         "specialists": list(c.get("specialist_invocations") or [])[:20],
         "action_types": [str(a.get("action_type", "")) for a in actions if isinstance(a, dict)],
         "evidence_count": len(c.get("evidence") or []),
@@ -155,21 +164,54 @@ class ConsoleAPI:
         self.hitl_dir = Path(hitl_dir) if hitl_dir else None
 
     # ---------- chains ----------
+    # The audit file is parsed once and then only the appended delta: a console polling every few seconds
+    # must not re-parse 64 MB per request. Keyed on (inode, size); a rotation or truncation reparses.
+    _lock = threading.Lock()
+
     def _chains(self) -> list[dict]:
         if self.audit_path is None:
             return []
-        out: list[dict] = []
-        for line in _tail_lines(self.audit_path):
-            if not line.strip():
-                continue
+        with self._lock:
             try:
-                c = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(c, dict) and c.get("alert_id") is not None and "verdict" in c:
-                out.append(c)
-        out.reverse()                          # newest first
-        return out
+                st = self.audit_path.stat()
+            except OSError:
+                self._cache = None
+                return []
+            cache = getattr(self, "_cache", None)
+            if cache and cache["ino"] == st.st_ino and cache["size"] == st.st_size:
+                return cache["rows"]
+            if cache and cache["ino"] == st.st_ino and st.st_size > cache["size"]:
+                start, rows, by_id = cache["offset"], list(cache["rows"]), dict(cache["by_id"])
+            else:
+                start, rows, by_id = 0, [], {}
+                if st.st_size > MAX_SCAN_BYTES:
+                    start = st.st_size - MAX_SCAN_BYTES
+            with self.audit_path.open("rb") as fh:
+                fh.seek(start)
+                if start and not rows:
+                    fh.readline()                       # discard the cut line
+                    start = fh.tell()
+                raw = fh.read()
+            cut = raw.rfind(b"\n")
+            offset = start + (cut + 1 if cut >= 0 else 0)
+            if cut >= 0:
+                for line in raw[:cut].decode("utf-8", "replace").split("\n"):
+                    if not line.strip():
+                        continue
+                    try:
+                        c = json.loads(line)
+                    except (json.JSONDecodeError, RecursionError):
+                        continue
+                    if isinstance(c, dict) and c.get("alert_id") is not None and "verdict" in c:
+                        rows.insert(0, c)                # newest first
+                        by_id[_chain_id(c)] = c
+            self._cache = {"ino": st.st_ino, "size": st.st_size, "offset": offset, "rows": rows, "by_id": by_id}
+            return rows
+
+    def _by_id(self, chain_id: str) -> Optional[dict]:
+        self._chains()
+        cache = getattr(self, "_cache", None)
+        return (cache or {}).get("by_id", {}).get(chain_id)
 
     def chains(self, limit: int = DEFAULT_LIMIT) -> dict:
         rows = [_summary(c) for c in self._chains()[: max(1, min(int(limit), 1000))]]
@@ -178,10 +220,13 @@ class ConsoleAPI:
     def chain(self, chain_id: str) -> Optional[dict]:
         if not _ID_RX.match(chain_id):
             return None
-        for c in self._chains():
-            if _chain_id(c) == chain_id or str(c.get("alert_id")) == chain_id:
-                return _full(c)
-        return None
+        c = self._by_id(chain_id)
+        if c is None:
+            for row in self._chains():
+                if str(row.get("alert_id")) == chain_id:
+                    c = row
+                    break
+        return _full(c) if c is not None else None
 
     # ---------- approvals ----------
     def _decisions(self) -> dict[str, dict]:
@@ -191,7 +236,7 @@ class ConsoleAPI:
         for line in _tail_lines(self.hitl_dir / "decisions.jsonl"):
             try:
                 d = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
             if isinstance(d, dict) and d.get("approval_id"):
                 out[str(d["approval_id"])] = d
@@ -201,20 +246,31 @@ class ConsoleAPI:
         if self.hitl_dir is None:
             return {"approvals": []}
         decisions = self._decisions()
-        rows: list[dict] = []
+        settled: dict[str, dict] = {}
+        cards: list[dict] = []
         for line in _tail_lines(self.hitl_dir / "cards.jsonl"):
             try:
                 card = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
-            if not isinstance(card, dict) or card.get("kind") != "approval":
+            if not isinstance(card, dict):
                 continue
+            if card.get("kind") == "settled" and card.get("approval_id"):
+                settled[str(card["approval_id"])] = card      # expired / timed out / decided by the service itself
+            elif card.get("kind") == "approval":
+                cards.append(card)
+        rows: list[dict] = []
+        for card in cards:
             args = card.get("args") or {}
-            d = decisions.get(str(card.get("id")))
+            cid = str(card.get("id"))
+            d = decisions.get(cid)
+            st = settled.get(cid)
+            if st and not d:
+                d = {"status": st.get("status"), "decided_by": st.get("decided_by") or "aegis", "reason": st.get("reason"), "ts": st.get("ts")}
             status = str(d.get("status", "")).lower() if d else "pending"
             rows.append({
-                "id": str(card.get("id")),
-                "status": status if status in ("approved", "rejected") else "pending",
+                "id": cid,
+                "status": status if status in ("approved", "rejected", "expired") else "pending",
                 "created_at": _iso(card.get("ts")),
                 "action_type": str(args.get("action_type") or str(card.get("action", "")).split(" -> ")[0]),
                 "target": str(args.get("target") or ""),
@@ -229,19 +285,26 @@ class ConsoleAPI:
         rows.reverse()
         return {"approvals": rows}
 
+    _decide_lock = threading.Lock()
+
     def decide(self, approval_id: str, status: str, *, decided_by: str, reason: str = "",
                corrected_verdict: str = "") -> tuple[int, dict]:
+        with self._decide_lock:
+            return self._decide(approval_id, status, decided_by=decided_by, reason=reason, corrected_verdict=corrected_verdict)
+
+    def _decide(self, approval_id: str, status: str, *, decided_by: str, reason: str,
+                corrected_verdict: str) -> tuple[int, dict]:
         if self.hitl_dir is None:
             return 503, {"error": "no HITL directory on this host"}
         if not _ID_RX.match(approval_id):
             return 400, {"error": "bad approval id"}
         if status not in ("approved", "rejected"):
             return 400, {"error": "status must be approved or rejected"}
-        known = {str(json.loads(l).get("id")) for l in _tail_lines(self.hitl_dir / "cards.jsonl") if l.strip() and '"approval"' in l}
-        if approval_id not in known:
+        state = {a["id"]: a["status"] for a in self.approvals()["approvals"]}
+        if approval_id not in state:
             return 404, {"error": "unknown approval"}
-        if approval_id in self._decisions():
-            return 409, {"error": "already decided"}
+        if state[approval_id] != "pending":
+            return 409, {"error": f"already {state[approval_id]}"}
         row = {"approval_id": approval_id, "status": status, "decided_by": decided_by[:120] or "console",
                "reason": reason[:500], "ts": time.time(), "via": "console"}
         if corrected_verdict in _VERDICTS:
@@ -260,7 +323,7 @@ class ConsoleAPI:
         for line in _tail_lines(self.hitl_dir / "proposal-decisions.jsonl"):
             try:
                 d = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
             if isinstance(d, dict) and d.get("proposal_id"):
                 decided[str(d["proposal_id"])] = d
@@ -268,7 +331,7 @@ class ConsoleAPI:
         for line in _tail_lines(self.hitl_dir / "proposals.jsonl"):
             try:
                 p = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
             if not isinstance(p, dict) or not p.get("id"):
                 continue

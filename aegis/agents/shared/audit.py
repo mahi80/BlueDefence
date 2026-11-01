@@ -49,10 +49,13 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 class AuditLog:
-    def __init__(self, path: Path, sink=None, *, max_bytes: int | None = None, fsync: bool | None = None):
+    def __init__(self, path: Path, sink=None, *, max_bytes: int | None = None, fsync: bool | None = None,
+                 repair: bool = True):
         """``sink``: optional ``aegis.persist.DashboardSink`` — every appended
         chain is also shipped to the dashboard (roadmap 0.3). The JSONL file
-        stays the local source of truth; the sink never blocks or raises."""
+        stays the local source of truth; the sink never blocks or raises.
+        ``repair=False`` for read-only tools (``--status``, ``verify``, reports) run beside a live
+        service: they must never truncate a row the service is in the middle of writing."""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_bytes = int(max_bytes if max_bytes is not None else float(os.environ.get("AEGIS_AUDIT_MAX_MB", "512") or 512) * 1024 * 1024)
@@ -60,37 +63,48 @@ class AuditLog:
         self._sink = sink
         self.write_failures = 0
         self.last_error: str = ""
-        self._repair_torn_tail()
+        if repair:
+            self._repair_torn_tail()
         self._tail_hash = self._compute_tail_hash()
 
     # ------------------------------------------------------------ recovery --
     def _repair_torn_tail(self) -> None:
-        """A crash between write and fsync can leave a partial last line. Keep everything before it, move the
-        fragment aside for forensics, and carry on — otherwise one torn byte stops the SOC from starting."""
+        """A crash between write and fsync can leave a partial LAST line. Keep everything before it, move the
+        fragment aside for forensics, and carry on — otherwise one torn byte stops the SOC from starting.
+        Only the trailing fragment is touched: a bad line in the middle of the file is corruption, not a torn
+        write, and is left for ``verify`` to report (``broken_at``) rather than silently discarding every
+        intact row after it."""
         if not self.path.exists() or self.path.stat().st_size == 0:
             return
-        good_end = 0
-        torn = b""
+        size = self.path.stat().st_size
         with self.path.open("rb") as fh:
-            while True:
-                pos = fh.tell()
-                line = fh.readline()
-                if not line:
-                    break
-                ok = line.endswith(b"\n")
-                if ok:
-                    try:
-                        json.loads(line)
-                    except ValueError:
-                        ok = False
-                if ok:
-                    good_end = pos + len(line)
-                else:
-                    torn = line + fh.read()
-                    break
-        if not torn:
-            return
-        aside = self.path.with_name(f"{self.path.name}.torn-{int(time.time())}")
+            fh.seek(max(0, size - 1024 * 1024))
+            tail = fh.read()
+        base = size - len(tail)
+        if tail.endswith(b"\n"):
+            # last line complete; it may still be garbage if the crash hit mid-write of a longer row — check it
+            body = tail.rstrip(b"\n")
+            nl = body.rfind(b"\n")
+            last = body[nl + 1:]
+            try:
+                json.loads(last)
+                return
+            except ValueError:
+                if nl < 0 and base > 0:
+                    return                       # the row is longer than the window; leave it to verify
+                good_end = base + nl + 1 if nl >= 0 else 0
+                torn = tail[nl + 1:] if nl >= 0 else tail
+        else:
+            nl = tail.rfind(b"\n")
+            if nl < 0 and base > 0:
+                return
+            good_end = base + nl + 1 if nl >= 0 else 0
+            torn = tail[nl + 1:] if nl >= 0 else tail
+        aside = self.path.with_name(f"{self.path.name}.torn-{int(time.time() * 1000)}")
+        n = 0
+        while aside.exists():
+            n += 1
+            aside = self.path.with_name(f"{self.path.name}.torn-{int(time.time() * 1000)}-{n}")
         aside.write_bytes(torn)
         with self.path.open("r+b") as fh:
             fh.truncate(good_end)
@@ -100,14 +114,24 @@ class AuditLog:
                        self.path, len(torn), aside.name)
 
     def _compute_tail_hash(self) -> str:
-        last: Optional[dict] = None
         for f in (self.path, *self.rotated_files()[::-1]):
             if not f.exists():
                 continue
-            with f.open("r", encoding="utf-8") as fh:
+            last: Optional[dict] = None
+            bad = 0
+            with f.open("r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    if line.strip():
-                        last = json.loads(line)
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        bad += 1
+                        continue
+                    if isinstance(row, dict) and row.get("integrity_hash"):
+                        last = row
+            if bad:
+                logger.warning("[audit] %s: %d unparseable line(s) skipped while locating the chain tail — run `python -m aegis.audit verify --all`", f.name, bad)
             if last:
                 return str(last["integrity_hash"])
         return GENESIS
@@ -125,15 +149,24 @@ class AuditLog:
             h = hashlib.sha256((self._tail_hash + serialized).encode("utf-8")).hexdigest()
             chain.integrity_hash = h
             row = (json.dumps(chain.model_dump(mode="json")) + "\n").encode("utf-8")
+            start = -1
             try:
                 self._rotate_if_needed(len(row))
                 with self.path.open("ab") as fh:
+                    start = fh.tell()
                     fh.write(row)
                     fh.flush()
                     if self.fsync:
                         os.fsync(fh.fileno())
             except OSError as e:
-                # nothing is chained until the row is durable: the next append retries against the same tail
+                # nothing is chained until the row is durable: the next append retries against the same tail.
+                # If the bytes did land before fsync failed, take them back so the file matches _tail_hash.
+                if start >= 0:
+                    try:
+                        with self.path.open("r+b") as fh:
+                            fh.truncate(start)
+                    except OSError as e2:
+                        logger.critical("[audit] could not roll back a half-durable row in %s (%s); chain may need verify", self.path, e2.strerror or e2)
                 chain.integrity_hash = ""
                 self.write_failures += 1
                 self.last_error = f"{e.strerror or e} ({self.path})"
@@ -179,10 +212,16 @@ class AuditLog:
         for f in files:
             if not f.exists():
                 continue
-            with f.open("r", encoding="utf-8") as fh:
+            with f.open("r", encoding="utf-8", errors="replace") as fh:
                 for n, line in enumerate(fh, 1):
-                    if line.strip():
+                    if not line.strip():
+                        continue
+                    if f == self.path and not line.endswith("\n"):
+                        break                       # the row the live service is writing right now: not part of the chain yet
+                    try:
                         yield f, n, json.loads(line)
+                    except ValueError as e:
+                        raise ValueError(f"{f.name}:{n}: {str(e)[:60]}") from e
 
     def verify(self, *, all_files: bool = False) -> bool:
         return self.verify_report(all_files=all_files)["ok"]
