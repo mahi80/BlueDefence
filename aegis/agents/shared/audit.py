@@ -50,7 +50,7 @@ def _env_flag(name: str, default: bool) -> bool:
 
 class AuditLog:
     def __init__(self, path: Path, sink=None, *, max_bytes: int | None = None, fsync: bool | None = None,
-                 repair: bool = True):
+                 repair: bool = True, index=None):
         """``sink``: optional ``aegis.persist.DashboardSink`` — every appended
         chain is also shipped to the dashboard (roadmap 0.3). The JSONL file
         stays the local source of truth; the sink never blocks or raises.
@@ -61,6 +61,7 @@ class AuditLog:
         self.max_bytes = int(max_bytes if max_bytes is not None else float(os.environ.get("AEGIS_AUDIT_MAX_MB", "512") or 512) * 1024 * 1024)
         self.fsync = _env_flag("AEGIS_AUDIT_FSYNC", True) if fsync is None else fsync
         self._sink = sink
+        self._index = index                      # aegis.store.IndexStore: derived, queryable copy; never raises
         self.write_failures = 0
         self.last_error: str = ""
         if repair:
@@ -180,6 +181,15 @@ class AuditLog:
                 logger.info("[audit] %s writable again after %d failure(s)", self.path, self.write_failures)
                 self.write_failures = 0
                 self.last_error = ""
+            if self._index is not None:
+                try:
+                    seg = str(self.path.stat().st_ino)
+                except OSError:
+                    seg = self.path.name
+                try:
+                    self._index.index_chain(chain.model_dump(mode="json"), prev_hash=prev, segment=seg, offset=start)
+                except Exception as exc:  # noqa: BLE001 — the store already swallows; belt and braces
+                    logger.warning("[audit] index insert failed: %s", str(exc)[:120])
         if self._sink is not None:
             try:
                 self._sink.ship_chain(chain, prev_hash=prev)

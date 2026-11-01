@@ -159,9 +159,10 @@ def _full(c: dict) -> dict:
 
 
 class ConsoleAPI:
-    def __init__(self, audit_path: Optional[Path], hitl_dir: Optional[Path]):
+    def __init__(self, audit_path: Optional[Path], hitl_dir: Optional[Path], index: Any = None):
         self.audit_path = Path(audit_path) if audit_path else None
         self.hitl_dir = Path(hitl_dir) if hitl_dir else None
+        self.index = index                      # aegis.store.IndexStore when configured: SQL instead of a file scan
 
     # ---------- chains ----------
     # The audit file is parsed once and then only the appended delta: a console polling every few seconds
@@ -214,12 +215,20 @@ class ConsoleAPI:
         return (cache or {}).get("by_id", {}).get(chain_id)
 
     def chains(self, limit: int = DEFAULT_LIMIT) -> dict:
+        if self.index is not None and not self.index.stale:
+            rows = self.index.recent(limit)
+            if rows:
+                return {"chains": rows, "count": len(rows), "from": "index"}
         rows = [_summary(c) for c in self._chains()[: max(1, min(int(limit), 1000))]]
         return {"chains": rows, "count": len(rows)}
 
     def chain(self, chain_id: str) -> Optional[dict]:
         if not _ID_RX.match(chain_id):
             return None
+        if self.index is not None and not self.index.stale:
+            c = self.index.get(chain_id)
+            if c is not None:
+                return _full(c)
         c = self._by_id(chain_id)
         if c is None:
             for row in self._chains():
@@ -313,6 +322,12 @@ class ConsoleAPI:
         with (self.hitl_dir / "decisions.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         logger.info("[console] %s %s by %s", status, approval_id, row["decided_by"])
+        if self.index is not None:
+            card = next((a for a in self.approvals()["approvals"] if a["id"] == approval_id), {})
+            self.index.record_decision(approval_id=approval_id, alert_id=str(card.get("alert_id") or ""),
+                                       action_type=str(card.get("action_type") or ""), target=str(card.get("target") or ""),
+                                       status=status, decided_by=row["decided_by"], rationale=reason[:500], via="console",
+                                       decided_at=row["ts"])
         return 200, {"ok": True, "approval_id": approval_id, "status": status}
 
     # ---------- proposals (model loop) ----------
@@ -363,9 +378,9 @@ class ConsoleAPI:
         return 200, {"ok": True, "proposal_id": proposal_id, "decision": decision}
 
 
-def console_api_from_env(audit_path: Optional[Path]) -> ConsoleAPI:
+def console_api_from_env(audit_path: Optional[Path], index: Any = None) -> ConsoleAPI:
     hitl = os.environ.get("AEGIS_HITL_DIR", "").strip()
-    return ConsoleAPI(audit_path, Path(hitl) if hitl else None)
+    return ConsoleAPI(audit_path, Path(hitl) if hitl else None, index=index)
 
 
 __all__ = ["ConsoleAPI", "console_api_from_env"]

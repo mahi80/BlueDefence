@@ -77,6 +77,7 @@ What the first boot does on the host (log: `/var/log/bluedefence-bootstrap.log`)
 | Step | Detail |
 |---|---|
 | `install.sh --community --non-interactive` | signs up a Community licence for `community_org`, writes `/etc/aegis/aegis.env` with `AEGIS_ENFORCEMENT_MODE=shadow`, `AEGIS_SOURCES=stream`, the ingest token, starts `aegis-soc` (systemd `Type=notify`, watchdog, rollback — see the on-prem guide) |
+| index | `AEGIS_INDEX_URL=duckdb:////var/lib/aegis/index.duckdb` — the console's `/api/soc/*` answer from SQL, not a file scan; `python -m aegis.store stats` on the host |
 | WAF puller | `aegis-cwlogs.timer` runs `/usr/local/bin/aegis-cwlogs-pull` every 30 s: `FilterLogEvents` on the WAF log group (instance role, read-only) → gzip NDJSON → `POST /ingest/waf?source=aws-waf` on loopback; checkpoint in `/var/lib/aegis/cwlogs-checkpoint.json` |
 | console | `soc-console` built from the same checkout, `AEGIS_AUTH_MODE=local`, one `admin` account (password: `terraform output -raw console_admin_password`); reads live incidents from the host's own `/api/soc/*` (`AEGIS_CONSOLE_TOKEN`), approvals land in `/var/lib/aegis/hitl/decisions.jsonl` |
 | nginx | `:80` immediately; `:443` + redirect the moment the domain resolves here (a 5-minute timer retries certbot until it succeeds) |

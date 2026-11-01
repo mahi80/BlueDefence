@@ -351,6 +351,28 @@ journalctl -u aegis-soc -f        # the banner prints the edition and model back
 > `/var/lib/aegis` on durable storage and back it up — it is the authoritative record,
 > especially in `external`.
 
+### 4e½. The index: where the console's queries run
+
+`audit.jsonl` is the record (hash-chained, append-only, fsynced, verifiable offline). It is not a database, and
+the console should not be scanning it. Every chain is therefore also inserted — after its JSONL append is
+durable — into a **derived index** through one SQLAlchemy ORM (`aegis/store/`). Pick the database by URL;
+the models, queries and the console do not change:
+
+| `AEGIS_INDEX_URL` | When |
+|---|---|
+| `duckdb:////var/lib/aegis/index.duckdb` (default, `install.sh` writes it) | single host, zero setup, fast analytics for the shadow report |
+| `sqlite:////var/lib/aegis/index.sqlite` | single host, the most conservative embedded choice |
+| `postgresql+psycopg2://aegis:…@db.bank.internal/aegis` (`pip install bluedefence[postgres]`) | the bank's own PostgreSQL; several SOC hosts, one console |
+| `mssql+pyodbc://aegis:…@sql.bank.internal/aegis?driver=ODBC+Driver+18+for+SQL+Server` (`pip install bluedefence[mssql]`) | the bank standardises on SQL Server |
+
+Rules the index keeps: it is **derived** (the JSONL set is the backup; `python -m aegis.store reindex`
+rebuilds it, `stats` reports it), **idempotent** (`integrity_hash` is UNIQUE, so replay and retries are
+harmless), **never load-bearing** (an insert failure marks it `stale` — visible on `/healthz` with the read
+token — and the console falls back to scanning the file until a reindex), and **append-only** (the code has
+no update or delete for chains or decisions; on PostgreSQL / SQL Server give the service a role with INSERT
+and SELECT only — retention is by dropping whole audit segments together with their rows). Schema: integer
+keys with explicit sequences, VARCHAR/TEXT, DATETIME, FLOAT — nothing dialect-specific.
+
 ### 4f. Analyst console (`soc` / `full` only)
 
 The console is `soc-console/` (Next.js), served on the SOC host itself — no second product. It reads

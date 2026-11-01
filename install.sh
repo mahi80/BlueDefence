@@ -124,7 +124,7 @@ else
 fi
 [[ -d "$PREFIX/venv" ]] || "$PY" -m venv "$PREFIX/venv"
 "$PREFIX/venv/bin/pip" install -q --upgrade pip >/dev/null
-"$PREFIX/venv/bin/pip" install -q -e "$PREFIX/app" >/dev/null
+"$PREFIX/venv/bin/pip" install -q -e "$PREFIX/app[index]" >/dev/null     # + the DuckDB index (AEGIS_INDEX_URL switches to Postgres/MSSQL)
 VERSION_SHA=$(git -C "$PREFIX/app" rev-parse --short HEAD)
 ok "BlueDefence $BRANCH@$VERSION_SHA installed into $PREFIX/venv"
 AEGIS="$PREFIX/venv/bin/python -m"
@@ -225,6 +225,8 @@ HOST_IP=$( { hostname -I 2>/dev/null || echo 127.0.0.1; } | awk '{print $1}')
   echo "AEGIS_CONSOLE_TOKEN=$CONSOLE_TOKEN"
   echo "# keys the pseudonyms; never change it after go-live"
   echo "AEGIS_DATASET_SALT=$SALT"
+  echo "# derived, rebuildable index of the audit chain for the console (python -m aegis.store reindex); duckdb | sqlite | postgresql | mssql"
+  echo "AEGIS_INDEX_URL=duckdb:///$VAR/index.duckdb"
   echo "AEGIS_MODEL_DIR=$VAR/models"
   echo "AEGIS_MODEL_POINTER=$VAR/models/current.json"
   case $LLM in
@@ -307,7 +309,7 @@ if [[ $HAVE_SYSTEMD -eq 1 ]]; then
     journalctl -u aegis-soc -n 30 --no-pager
     if [[ -n "$PREV_SHA" ]]; then
       warn "new release $VERSION_SHA failed its health check — rolling back to ${PREV_SHA:0:7}"
-      git -C "$PREFIX/app" checkout -q "$PREV_SHA" && "$PREFIX/venv/bin/pip" install -q -e "$PREFIX/app" >/dev/null
+      git -C "$PREFIX/app" checkout -q "$PREV_SHA" && "$PREFIX/venv/bin/pip" install -q -e "$PREFIX/app[index]" >/dev/null     # + the DuckDB index (AEGIS_INDEX_URL switches to Postgres/MSSQL)
       chown -R root:aegis "$PREFIX/app" && chmod -R g-w,o-rwx "$PREFIX/app"
       systemctl restart aegis-soc; sleep 6
       if systemctl is-active -q aegis-soc; then die "rolled back to ${PREV_SHA:0:7} and running; the failed release is $VERSION_SHA — see the log above"; fi
