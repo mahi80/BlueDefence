@@ -4,7 +4,7 @@
 #   var.region (Sydney)      aegis-host: one EC2 (Ubuntu 24.04 arm64) running install.sh in shadow mode with a
 #                            Community licence, the analyst console (local sign-in), nginx + Let's Encrypt on :443
 #   us-east-1 (CloudFront)   decoy-waf: S3 static decoy → CloudFront → AWS WAF (managed rule groups + rate rule)
-#                            → Kinesis Data Firehose HTTP endpoint → https://<domain>/ingest/firehose
+#                            → CloudWatch Logs; the host pulls new events every 30 s into /ingest/waf
 #
 # Nothing here is live-enforcing: AEGIS_ENFORCEMENT_MODE=shadow, and the WAF's own verdicts are the baseline the
 # shadow report is compared against (docs/pilot/aws-shadow-pilot.md).
@@ -22,24 +22,18 @@ provider "aws" {
   default_tags { tags = local.tags }
 }
 
-# CloudFront-scoped WAF, its logging Firehose and the decoy bucket all have to live in us-east-1
+# CloudFront-scoped WAF and its log group have to live in us-east-1
 provider "aws" {
   alias  = "us_east_1"
   region = "us-east-1"
   default_tags { tags = local.tags }
 }
 
-# Firehose without default tags: some organisation SCPs deny firehose:TagDeliveryStream even where CreateDeliveryStream is allowed
-provider "aws" {
-  alias  = "us_east_1_untagged"
-  region = "us-east-1"
-}
-
 locals {
   tags = { project = "bluedefence-pilot", mode = "shadow", managed_by = "terraform" }
 }
 
-# one ingest token for the host and the Firehose delivery; never printed
+# one ingest token for the host's push receiver (the puller uses it locally); never printed
 resource "random_password" "ingest_token" {
   length  = 48
   special = false
@@ -65,15 +59,15 @@ module "aegis_host" {
   ingest_token           = coalesce(var.aegis_ingest_token, random_password.ingest_token.result)
   console_admin_password = random_password.console_admin.result
   aegis_branch           = var.aegis_branch
+  waf_log_group_arn      = module.decoy_waf.log_group_arn
+  waf_log_group_name     = module.decoy_waf.log_group_name
 }
 
 module "decoy_waf" {
   source = "./modules/decoy-waf"
-  providers = { aws = aws.us_east_1, aws.home = aws, aws.untagged = aws.us_east_1_untagged }
+  providers = { aws = aws.us_east_1, aws.home = aws }
 
-  name          = var.name
-  aegis_url     = "https://${var.domain}"
-  ingest_token  = coalesce(var.aegis_ingest_token, random_password.ingest_token.result)
-  rate_limit    = var.waf_rate_limit
-  decoy_title   = var.decoy_title
+  name        = var.name
+  rate_limit  = var.waf_rate_limit
+  decoy_title = var.decoy_title
 }

@@ -1,5 +1,5 @@
 variable "name" {
-  description = "Short name used for AWS resources (bucket, WAF, Firehose)."
+  description = "Short name used for AWS resources (bucket, WAF, log group)."
   type        = string
   default     = "bluedefence-pilot"
 }
@@ -11,7 +11,7 @@ variable "region" {
 }
 
 variable "domain" {
-  description = "FQDN the host answers on, e.g. pilot.bluedefence.click. Firehose only delivers to a public HTTPS endpoint with a trusted certificate, so this must resolve to the host's Elastic IP."
+  description = "FQDN the host answers on, e.g. pilot.vajra.ink; must resolve to the host's Elastic IP for the certificate and the console."
   type        = string
 }
 
@@ -51,7 +51,7 @@ variable "community_org" {
 }
 
 variable "community_email" {
-  description = "Work e-mail for the Community licence (also the Let's Encrypt contact unless letsencrypt_email is set)."
+  description = "E-mail for the Community licence — must be on your organisation's domain (freemail such as gmail is refused by the licence service). Also the Let's Encrypt contact unless letsencrypt_email is set."
   type        = string
 }
 
@@ -62,7 +62,7 @@ variable "letsencrypt_email" {
 }
 
 variable "aegis_ingest_token" {
-  description = "Push token shared by the host and the Firehose delivery. Leave null to generate one (recommended)."
+  description = "Push token for the host's /ingest/* receiver. Leave null to generate one (recommended)."
   type        = string
   default     = null
   sensitive   = true

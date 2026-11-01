@@ -125,6 +125,49 @@ systemctl daemon-reload
 systemctl enable --now aegis-tls.timer
 /usr/local/bin/aegis-tls || true
 
+echo "▸ WAF log puller (CloudWatch Logs → /ingest/waf every 30 s)"
+/opt/aegis/venv/bin/pip install -q boto3
+cat > /usr/local/bin/aegis-cwlogs-pull <<'PYEOF'
+${cwlogs_pull_py}
+PYEOF
+chmod 755 /usr/local/bin/aegis-cwlogs-pull
+cat > /etc/aegis/cwlogs.env <<EOF
+AEGIS_CWLOGS_GROUP=${waf_log_group}
+AEGIS_CWLOGS_REGION=us-east-1
+AEGIS_INGEST_URL=http://127.0.0.1:8787
+AEGIS_INGEST_TOKEN=$(cat /root/.aegis-ingest-token)
+AEGIS_CWLOGS_CHECKPOINT=/var/lib/aegis/cwlogs-checkpoint.json
+EOF
+chown root:aegis /etc/aegis/cwlogs.env; chmod 640 /etc/aegis/cwlogs.env
+cat > /etc/systemd/system/aegis-cwlogs.service <<'EOF'
+[Unit]
+Description=BlueDefence: pull AWS WAF events from CloudWatch Logs
+After=aegis-soc.service
+[Service]
+Type=oneshot
+User=aegis
+Group=aegis
+EnvironmentFile=/etc/aegis/cwlogs.env
+ExecStart=/usr/local/bin/aegis-cwlogs-pull
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/aegis
+EOF
+cat > /etc/systemd/system/aegis-cwlogs.timer <<'EOF'
+[Unit]
+Description=Pull WAF events every 30 s
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=30s
+AccuracySec=5s
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now aegis-cwlogs.timer
+
 echo "▸ daily backup (audit chain, licence, state) → /var/backups/aegis"
 cat > /etc/cron.daily/aegis-backup <<'EOF'
 #!/usr/bin/env bash

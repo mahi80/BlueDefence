@@ -1,23 +1,18 @@
 #
-# Decoy target behind AWS WAF, every evaluated request streamed to AEGIS via Firehose.
-# Provider `aws` must be us-east-1 (CloudFront-scoped WAF + its logging stream live there); `aws.home` is the
-# host's region and holds the two S3 buckets — organisation SCPs often deny S3 outside the approved regions,
-# and CloudFront / Firehose are happy with a bucket anywhere.
+# Decoy target behind AWS WAF, every evaluated request logged for the AEGIS host to pull.
+# Provider `aws` must be us-east-1 (CloudFront-scoped WAF + its log group live there); `aws.home` is the
+# host's region and holds the decoy bucket — organisation SCPs often deny S3 outside the approved regions,
+# and CloudFront is happy with an origin bucket anywhere.
 #
 terraform {
   required_providers {
-    aws = { source = "hashicorp/aws", configuration_aliases = [aws.home, aws.untagged] }
+    aws = { source = "hashicorp/aws", configuration_aliases = [aws.home] }
   }
 }
 
 variable "name" { type = string }
-variable "aegis_url" { type = string }
 variable "rate_limit" { type = number }
 variable "decoy_title" { type = string }
-variable "ingest_token" {
-  type      = string
-  sensitive = true
-}
 
 data "aws_caller_identity" "me" {}
 
@@ -179,111 +174,18 @@ resource "aws_cloudfront_distribution" "decoy" {
   }
 }
 
-# ---------- Firehose HTTP endpoint → AEGIS /ingest/firehose ----------
-resource "aws_s3_bucket" "firehose_backup" {
-  provider      = aws.home
-  bucket        = "${var.name}-waf-undelivered-${data.aws_caller_identity.me.account_id}"
-  force_destroy = true
-}
-
-resource "aws_s3_bucket_public_access_block" "firehose_backup" {
-  provider                = aws.home
-  bucket                  = aws_s3_bucket.firehose_backup.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_lifecycle_configuration" "firehose_backup" {
-  provider = aws.home
-  bucket = aws_s3_bucket.firehose_backup.id
-  rule {
-    id     = "expire-undelivered"
-    status = "Enabled"
-    filter {}
-    expiration {
-      days = 14
-    }
-  }
-}
-
-resource "aws_iam_role" "firehose" {
-  name = "${var.name}-waf-firehose"
-  assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
-    Statement = [{ Effect = "Allow", Principal = { Service = "firehose.amazonaws.com" }, Action = "sts:AssumeRole" }]
-  })
-}
-
-resource "aws_iam_role_policy" "firehose" {
-  role = aws_iam_role.firehose.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["s3:AbortMultipartUpload", "s3:GetBucketLocation", "s3:GetObject", "s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:PutObject"]
-        Resource = [aws_s3_bucket.firehose_backup.arn, "${aws_s3_bucket.firehose_backup.arn}/*"]
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["logs:PutLogEvents"]
-        Resource = "${aws_cloudwatch_log_group.firehose.arn}:*"
-      }
-    ]
-  })
-}
-
-resource "aws_cloudwatch_log_group" "firehose" {
-  name              = "/aws/kinesisfirehose/${var.name}-waf"
+# ---------- WAF logging → CloudWatch Logs (the AEGIS host pulls from here) ----------
+# Firehose would deliver straight to /ingest/firehose, but organisation SCPs often deny Firehose in us-east-1
+# — and a CloudFront-scoped web ACL can only log to us-east-1. CloudWatch Logs is allowed wherever the
+# web ACL is; the host polls it every 30 s with FilterLogEvents (see aegis-host/cwlogs-pull.py).
+resource "aws_cloudwatch_log_group" "waf" {
+  name              = "aws-waf-logs-${var.name}" # WAF insists on this prefix
   retention_in_days = 14
-}
-
-resource "aws_cloudwatch_log_stream" "firehose" {
-  name           = "HttpEndpointDelivery"
-  log_group_name = aws_cloudwatch_log_group.firehose.name
-}
-
-# WAF only logs to streams whose name starts with aws-waf-logs-
-resource "aws_kinesis_firehose_delivery_stream" "waf" {
-  provider    = aws.untagged
-  name        = "aws-waf-logs-${var.name}"
-  destination = "http_endpoint"
-
-  http_endpoint_configuration {
-    url                = "${var.aegis_url}/ingest/firehose"
-    name               = "BlueDefence AEGIS"
-    access_key         = var.ingest_token # sent as X-Amz-Firehose-Access-Key; the receiver compares it in constant time
-    buffering_size     = 1  # MB
-    buffering_interval = 60 # seconds — the shadow report does not need sub-minute delivery
-    role_arn           = aws_iam_role.firehose.arn
-    s3_backup_mode     = "FailedDataOnly"
-    retry_duration     = 300
-
-    request_configuration {
-      content_encoding = "GZIP"
-    }
-
-    s3_configuration {
-      role_arn           = aws_iam_role.firehose.arn
-      bucket_arn         = aws_s3_bucket.firehose_backup.arn
-      buffering_size     = 5
-      buffering_interval = 300
-      compression_format = "GZIP"
-    }
-
-    cloudwatch_logging_options {
-      enabled         = true
-      log_group_name  = aws_cloudwatch_log_group.firehose.name
-      log_stream_name = aws_cloudwatch_log_stream.firehose.name
-    }
-  }
 }
 
 resource "aws_wafv2_web_acl_logging_configuration" "decoy" {
   resource_arn            = aws_wafv2_web_acl.decoy.arn
-  log_destination_configs = [aws_kinesis_firehose_delivery_stream.waf.arn]
+  log_destination_configs = [aws_cloudwatch_log_group.waf.arn]
 
   redacted_fields {
     single_header {
@@ -298,5 +200,6 @@ resource "aws_wafv2_web_acl_logging_configuration" "decoy" {
 }
 
 output "decoy_url" { value = "https://${aws_cloudfront_distribution.decoy.domain_name}/" }
-output "firehose_name" { value = aws_kinesis_firehose_delivery_stream.waf.name }
+output "log_group_name" { value = aws_cloudwatch_log_group.waf.name }
+output "log_group_arn" { value = aws_cloudwatch_log_group.waf.arn }
 output "web_acl_arn" { value = aws_wafv2_web_acl.decoy.arn }

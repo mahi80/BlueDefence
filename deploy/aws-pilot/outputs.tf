@@ -17,12 +17,13 @@ output "healthz_url" {
 }
 
 output "decoy_url" {
-  description = "The CloudFront URL attackers (and your own scanners) hit; every request is WAF-evaluated and streamed to AEGIS."
+  description = "The CloudFront URL attackers (and your own scanners) hit; every request is WAF-evaluated and pulled into AEGIS."
   value       = module.decoy_waf.decoy_url
 }
 
-output "firehose_stream" {
-  value = module.decoy_waf.firehose_name
+output "waf_log_group" {
+  description = "CloudWatch log group (us-east-1) the WAF writes to and the host pulls from."
+  value       = module.decoy_waf.log_group_name
 }
 
 output "console_admin_password" {

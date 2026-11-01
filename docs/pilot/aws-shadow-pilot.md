@@ -10,10 +10,11 @@ before a pilot: *"what would AEGIS have said about traffic my WAF already judged
    scanners        │          (managed rules,                       │ aegis-host  t4g.large         │
    bots            │           rate rule)                           │  nginx :443 (Let's Encrypt)   │
    you             │                                                │   ├ /ingest/*  → AEGIS :8787  │
-                   └── every evaluated request ──► Firehose ──────► │   ├ /healthz                  │
-                       (gzip JSON, X-Amz-Firehose-Access-Key)       │   └ /          → console :3000│
-                                                                    │  aegis-soc.service  (shadow)  │
-                                                                    │  aegis-console.service        │
+                   └── every evaluated request ──► CloudWatch Logs  │   ├ /healthz                  │
+                                                   (aws-waf-logs-…) │   └ /          → console :3000│
+                                                        ▲           │  aegis-soc.service  (shadow)  │
+                                                        └── pull ── │  aegis-cwlogs.timer (30 s)    │
+                                                     FilterLogEvents│  aegis-console.service        │
                                                                     └──────────────────────────────┘
 ```
 
@@ -30,7 +31,7 @@ compares against (`python -m aegis.service --status`, and the per-connector shad
 | 50 GB gp3 root volume | ~$4 |
 | AWS WAF: 1 web ACL + 5 rules + requests | ~$11 |
 | CloudFront + S3 decoy (a few GB) | < $2 |
-| Firehose (HTTP endpoint delivery) | < $1 |
+| CloudWatch Logs (WAF records, 14-day retention) + the host's FilterLogEvents calls | < $2 |
 | Route 53 hosted zone (if used) | $0.50 |
 | Elastic IP (attached) | $0 |
 | **Total** | **≈ $65–75** |
@@ -49,12 +50,14 @@ instance.
    organisation often carry a service control policy that denies some regions — `terraform plan` shows
    `explicit deny in a service control policy` if so. Sydney (`ap-southeast-2`) is the default; set
    `region = "ap-south-1"` only if the plan goes through there.
-2. **A domain** that will point at the host. Firehose only delivers to a public HTTPS endpoint with a
-   certificate a public CA issued, so `https://<ip>` is not an option.
+2. **A domain** that will point at the host — one subdomain at whatever registrar already holds a domain of
+   yours (e.g. `pilot.vajra.ink` at GoDaddy) is the cheapest option: an A record, nothing to buy.
    - Route 53: `aws route53domains register-domain --region us-east-1 …` (registration creates the
      hosted zone; its id goes into `route53_zone_id` and the A record is managed for you), or
    - any registrar: leave `route53_zone_id` empty and create the A record yourself after the first apply.
-3. **Session Manager plugin** for `.\pilot.ps1 shell`
+3. **A work e-mail** for the Community licence (`community_email`): the licence service refuses gmail/yahoo/…
+   by design; any address on your own domain works (it is not verified by mail).
+4. **Session Manager plugin** for `.\pilot.ps1 shell`
    (https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html).
    No SSH port is opened unless you set `admin_cidr`.
 
@@ -71,6 +74,7 @@ What the first boot does on the host (log: `/var/log/bluedefence-bootstrap.log`)
 | Step | Detail |
 |---|---|
 | `install.sh --community --non-interactive` | signs up a Community licence for `community_org`, writes `/etc/aegis/aegis.env` with `AEGIS_ENFORCEMENT_MODE=shadow`, `AEGIS_SOURCES=stream`, the ingest token, starts `aegis-soc` (systemd `Type=notify`, watchdog, rollback — see the on-prem guide) |
+| WAF puller | `aegis-cwlogs.timer` runs `/usr/local/bin/aegis-cwlogs-pull` every 30 s: `FilterLogEvents` on the WAF log group (instance role, read-only) → gzip NDJSON → `POST /ingest/waf?source=aws-waf` on loopback; checkpoint in `/var/lib/aegis/cwlogs-checkpoint.json` |
 | console | `soc-console` built from the same checkout, `AEGIS_AUTH_MODE=local`, one `admin` account (password: `terraform output -raw console_admin_password`) |
 | nginx | `:80` immediately; `:443` + redirect the moment the domain resolves here (a 5-minute timer retries certbot until it succeeds) |
 | backup | `/etc/cron.daily/aegis-backup` → `/var/backups/aegis`, 14 days kept |
@@ -78,11 +82,12 @@ What the first boot does on the host (log: `/var/log/bluedefence-bootstrap.log`)
 Then:
 
 ```powershell
-.\pilot.ps1 status          # outputs, /healthz, Firehose destination
+.\pilot.ps1 status          # outputs, /healthz, last WAF event seen
 ```
 
 If `route53_zone_id` was empty: create `A  <domain>  → aegis_host_ip` at your registrar now. TLS is issued
 within 5 minutes of the record propagating; `status` shows `/healthz` answering over https once it has.
+WAF events flow regardless of DNS — the puller works over the instance role, not the domain.
 
 ## Verify the chain end to end
 
@@ -96,18 +101,23 @@ Invoke-WebRequest -UseBasicParsing "$($decoy)login.html?user=admin'%20OR%201=1--
 1..400 | % { Invoke-WebRequest -UseBasicParsing "$($decoy)robots.txt" -SkipHttpErrorCheck | Out-Null }
 ```
 
-Within ~60 s (Firehose buffering) the host shows them:
+Within ~45 s (CloudWatch ingestion + the 30 s timer) the host shows them:
 
 ```powershell
 .\pilot.ps1 shell
-sudo journalctl -u aegis-soc -n 30 --no-pager            # cycles with firehose: N
+sudo journalctl -u aegis-cwlogs -n 5 --no-pager          # "pushed N WAF events"
+sudo journalctl -u aegis-soc -n 30 --no-pager            # cycles with aws-waf: N
 sudo -u aegis /opt/aegis/venv/bin/python -m aegis.service --status
 sudo -u aegis /opt/aegis/venv/bin/python -m aegis.audit verify --all
 ```
 
-Firehose's own view (deliveries, HTTP codes from the host) is in CloudWatch
-`/aws/kinesisfirehose/<name>-waf`; anything AEGIS refused (503 during a storm, 401 on a token mismatch)
-lands in the `-waf-undelivered-` bucket for 14 days.
+The raw WAF records stay in the `aws-waf-logs-<name>` log group (us-east-1) for 14 days, so anything the
+host missed while down is re-pulled from its checkpoint; if the puller itself fails (`journalctl -u
+aegis-cwlogs`) the checkpoint does not advance.
+
+Why not Firehose straight into `/ingest/firehose`? Banks will use it (the receiver supports it), but a
+CloudFront web ACL can only log to us-east-1, and organisation SCPs on new AWS accounts frequently deny
+Firehose and S3 there — this pilot hit exactly that. CloudWatch Logs is allowed wherever the web ACL is.
 
 ## What the pilot proves — and what it does not
 
@@ -124,6 +134,6 @@ lands in the `-waf-undelivered-` bucket for 14 days.
 .\pilot.ps1 down
 ```
 
-Everything is destroyed, buckets included (`force_destroy`). The Community licence row stays on the
+Everything is destroyed, bucket and log group included (`force_destroy`). The Community licence row stays on the
 licence service and is reusable; the Route 53 hosted zone and the domain registration are outside this
 stack and remain.

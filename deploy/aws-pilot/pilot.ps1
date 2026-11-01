@@ -1,6 +1,6 @@
 # BlueDefence all-AWS shadow pilot — Windows wrapper around terraform
 #   .\pilot.ps1 up        plan + apply (asks for confirmation)
-#   .\pilot.ps1 status    outputs + host health + Firehose delivery state
+#   .\pilot.ps1 status    outputs + host health + WAF log group state
 #   .\pilot.ps1 shell     SSM session onto the host (needs the Session Manager plugin)
 #   .\pilot.ps1 down      destroy everything (the Community licence record stays on the licence service)
 param([Parameter(Position = 0)][ValidateSet("up", "status", "shell", "down", "plan")][string]$cmd = "status")
@@ -22,7 +22,7 @@ switch ($cmd) {
     terraform output
     $domain = terraform output -raw console_url
     Write-Host "`nhost health:"; try { (Invoke-WebRequest -UseBasicParsing "$($domain)healthz" -TimeoutSec 10).Content } catch { Write-Host "  not answering yet: $($_.Exception.Message)" }
-    Write-Host "`nFirehose:"; aws firehose describe-delivery-stream --region us-east-1 --delivery-stream-name (terraform output -raw firehose_stream) --query 'DeliveryStreamDescription.[DeliveryStreamStatus,Destinations[0].HttpEndpointDestinationDescription.EndpointConfiguration.Url]' --output text
+    Write-Host "`nWAF log group, last event (epoch ms):"; aws logs describe-log-streams --region us-east-1 --log-group-name (terraform output -raw waf_log_group) --order-by LastEventTime --descending --max-items 1 --query 'logStreams[0].lastEventTimestamp' --output text
     Write-Host "`nconsole admin password: terraform output -raw console_admin_password"
   }
   "shell"  { aws ssm start-session --region $region --target (terraform output -raw aegis_instance_id) }

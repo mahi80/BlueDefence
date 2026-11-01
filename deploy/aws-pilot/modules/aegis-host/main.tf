@@ -14,6 +14,8 @@ variable "community_org" { type = string }
 variable "community_email" { type = string }
 variable "letsencrypt_email" { type = string }
 variable "aegis_branch" { type = string }
+variable "waf_log_group_arn" { type = string }
+variable "waf_log_group_name" { type = string }
 variable "ingest_token" {
   type      = string
   sensitive = true
@@ -90,6 +92,20 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# read-only on the WAF log group: the puller's only AWS permission
+resource "aws_iam_role_policy" "cwlogs" {
+  name = "waf-log-pull"
+  role = aws_iam_role.host.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
+      Resource = [var.waf_log_group_arn, "${var.waf_log_group_arn}:*"]
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "host" {
   name = "bluedefence-aegis-host"
   role = aws_iam_role.host.name
@@ -103,7 +119,7 @@ resource "aws_instance" "host" {
   iam_instance_profile        = aws_iam_instance_profile.host.name
   key_name                    = var.admin_cidr == "" ? null : var.key_name
   associate_public_ip_address = true
-  user_data_replace_on_change = false
+  user_data_replace_on_change = true # the bootstrap only runs on first boot; a changed bootstrap means a new host
 
   metadata_options {
     http_tokens = "required" # IMDSv2 only
@@ -125,6 +141,8 @@ resource "aws_instance" "host" {
     ingest_token           = var.ingest_token
     console_admin_password = var.console_admin_password
     aegis_branch           = var.aegis_branch
+    waf_log_group          = var.waf_log_group_name
+    cwlogs_pull_py         = file("${path.module}/cwlogs-pull.py")
   })
 
   tags = { Name = "bluedefence-aegis-host" }
