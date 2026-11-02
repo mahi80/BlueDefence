@@ -269,33 +269,71 @@ class StreamConsumer(BaseConsumer):
         return alerts or CONSUMED
 
 
+# Content sniffing looks at a record's STRUCTURE (its top-level JSON keys, or a syslog line's own header),
+# never at arbitrary substrings: a WAF event's Referer / URI / payload is attacker-controlled, and a
+# "%SYS-5-CONFIG_I:" or '"id.orig_h"' planted there used to send the record to the netops / NDR parser,
+# which dropped it — switching WAF detection off for that attacker's requests.
+_WAF_SOURCES = ("waf", "cloudflare", "imperva", "f5", "akamai", "aws-waf", "awswaf", "azure-waf", "fortiweb", "edge")
+_SYSLOG_HEAD = re.compile(r"^(?:<\d{1,3}>)?[^{]{0,160}?%[A-Z0-9_]+-[0-7]-[A-Z0-9_]+:")
+
+
+def _top_keys(item: StreamItem) -> set[str] | None:
+    """Top-level keys of a JSON-object line (None for a non-JSON line). Cached on the item."""
+    cached = getattr(item, "_top_keys", False)
+    if cached is not False:
+        return cached
+    keys: set[str] | None = None
+    line = item.line.lstrip()
+    if line.startswith("{"):
+        try:
+            obj = json.loads(line)
+            keys = set(obj) if isinstance(obj, dict) else None
+            if keys is not None:
+                keys |= {f"{k}={v}" for k, v in obj.items() if k == "event_type" and isinstance(v, str)}
+        except (ValueError, RecursionError):
+            keys = None
+    try:
+        object.__setattr__(item, "_top_keys", keys)
+    except (AttributeError, TypeError):
+        pass
+    return keys
+
+
+def _named_waf(item: StreamItem) -> bool:
+    return item.source.lower().startswith(_WAF_SOURCES)
+
+
 def _is_netops(item: StreamItem) -> bool:
-    if item.passthrough:
+    if item.passthrough or _named_waf(item):
         return False
     if item.source.startswith(("netops", "syslog", "snmp", "netflow", "telemetry")):
         return True
-    head = item.line[:300]
-    # a Cisco system message (%FACILITY-SEV-MNEMONIC:), an SNMP trap, or an LLDP/CDP neighbour row
-    return bool(re.search(r"%[A-Z0-9_]+-[0-7]-[A-Z0-9_]+:", head)) or '"snmpTrapOID"' in head or '"trapName"' in head \
-        or ('"neighbor"' in head and '"local_iface"' in head)
+    keys = _top_keys(item)
+    if keys is not None:
+        return bool(keys & {"snmpTrapOID", "trapName"}) or {"neighbor", "local_iface"} <= keys
+    line = item.line[:400]
+    # a Cisco system message in the syslog header itself — not anywhere in a CEF / LEEF extension
+    return not line.lstrip().startswith(("CEF:", "LEEF:")) and "CEF:" not in line[:120] and bool(_SYSLOG_HEAD.search(line))
 
 
 def _is_ndr(item: StreamItem) -> bool:
-    if item.passthrough:
+    if item.passthrough or _named_waf(item):
         return False
     if item.source.startswith("ndr"):
         return True
-    head = item.line[:300]
-    return '"id.orig_h"' in head or ('"event_type"' in head and ('"tls"' in head or '"flow"' in head) and '"src_ip"' in head)
+    keys = _top_keys(item)
+    if keys is None:
+        return False
+    return "id.orig_h" in keys or (("event_type=tls" in keys or "event_type=flow" in keys) and "src_ip" in keys)
 
 
 def _is_apigw(item: StreamItem) -> bool:
-    if item.passthrough:
+    if item.passthrough or _named_waf(item):
         return False
     if item.source.startswith("apigw"):
         return True
-    head = item.line[:400]
-    return '"GatewayLogs"' in head or '"ApimSubscriptionId"' in head or '"apimSubscriptionId"' in head
+    keys = _top_keys(item)
+    return bool(keys) and bool(keys & {"GatewayLogs", "ApimSubscriptionId", "apimSubscriptionId"})
 
 
 MAX_INFLATE = 64 * 1024 * 1024      # decompressed bytes one body may expand to (AEGIS_INGEST_MAX_INFLATE_MB)

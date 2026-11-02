@@ -54,7 +54,16 @@ _DANGEROUS_ROLES = {
     "Owner", "Contributor", "User Access Administrator",
     # GCP
     "roles/owner", "roles/iam.securityAdmin",
+    # Azure built-in role definition ids — what a real roleAssignments/write event carries, not the name
+    "8e3af657-a8ff-443c-a75c-2fe8c4bcb635",   # Owner
+    "b24988ac-6180-42a0-ab88-20f7382dd24c",   # Contributor
+    "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9",   # User Access Administrator
+    "f58310d9-a9f6-439a-9e8d-f62e7b41a168",   # Role Based Access Control Administrator
 }
+# CloudTrail names the service in eventSource and the call in eventName WITHOUT a prefix
+# ("AttachUserPolicy", eventSource "iam.amazonaws.com"); the check used to need "iam" in the eventName.
+_SERVICE_PREFIX = {"iam.amazonaws.com": "iam:", "sts.amazonaws.com": "sts:"}
+_WILDCARD_RX = re.compile(r'"(?:Action|NotAction|Resource|actions)"\s*:\s*(?:"\*"|\[[^\]]*"\*"[^\]]*\])', re.IGNORECASE)
 
 
 def iam_change_check(event: dict | None) -> ToolResult:
@@ -66,10 +75,13 @@ def iam_change_check(event: dict | None) -> ToolResult:
         return ToolResult(name="iam_change", data={"verdict": "no_event"}, weight="low")
 
     # OpenStack Keystone events use `event_type` instead of eventName.
-    action = (event.get("eventName")
-              or event.get("operationName")
-              or event.get("event_type")
-              or "")
+    action = str(event.get("eventName")
+                 or event.get("operationName")
+                 or event.get("event_type")
+                 or "")
+    prefix = _SERVICE_PREFIX.get(str(event.get("eventSource") or "").lower())
+    if prefix and ":" not in action:
+        action = prefix + action
     is_iam_action = (
         action in _HIGH_RISK_IAM_ACTIONS
         or "iam" in action.lower()
@@ -83,9 +95,13 @@ def iam_change_check(event: dict | None) -> ToolResult:
 
     params = event.get("requestParameters") or event.get("properties") or {}
     # Wildcard scan in policy document
-    policy_text = str(params.get("policyDocument") or params.get("roleDefinition") or "")
-    has_wildcard = '"Action": "*"' in policy_text or '"Resource": "*"' in policy_text or '"actions": ["*"]' in policy_text
-    has_dangerous_role = any(role in policy_text for role in _DANGEROUS_ROLES)
+    from urllib.parse import unquote
+    doc = params.get("policyDocument") or params.get("roleDefinition") or ""
+    policy_text = unquote(doc if isinstance(doc, str) else __import__("json").dumps(doc))
+    # the policy ARN (AttachUserPolicy / AttachRolePolicy) and the Azure role definition id name the grant
+    grant_text = " ".join(str(params.get(k) or "") for k in ("policyArn", "roleDefinitionId", "role", "roleName"))
+    has_wildcard = bool(_WILDCARD_RX.search(policy_text))
+    has_dangerous_role = any(role.lower() in (policy_text + " " + grant_text).lower() for role in _DANGEROUS_ROLES)
     # Was a long-lived access key created for a service principal?
     user_type = (event.get("userIdentity") or {}).get("type", "")
     is_service_principal = user_type in ("AssumedRole", "ServicePrincipal", "Application")

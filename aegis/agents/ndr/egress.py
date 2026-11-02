@@ -324,8 +324,10 @@ class EgressDetector:
         srcs = self._lru_get(self._prev, key, set, self.max_keys)
         if len(srcs) < 64:
             srcs.add(src)
-        if self._allowed_domain(sni):
-            return []
+        # The SNI is chosen by the client, so the allow-list only quiets the *heuristics* (beacon, shadow-AI)
+        # for a domain the bank trusts. A threat-intel hit on the destination IP, JA3S or certificate is still
+        # reported: "SNI c2.windowsupdate.com" on a known-bad IP used to return before the intel match.
+        allowed = self._allowed_domain(sni)
         p = self._pair(src, key, ts)
         p.sni, p.sensor = sni, str(ev.get("sensor") or "")
         p.dport = int(ev.get("dport") or 0)
@@ -342,9 +344,11 @@ class EgressDetector:
                                ja3s=str(ev.get("ja3s") or ""), ja4=str(ev.get("ja4") or ""), ja3=str(ev.get("ja3") or ""))
         if hit is None:
             hit = self._store_hit(sni, dst)
-        if hit is not None:
+        if hit is not None and not (allowed and hit.kind == "domain"):
             p.intel = hit.to_dict()
             out.append(self._emit("tls_known_bad", p, ts, 1, indicator=f"{hit.kind}:{hit.value}"))
+        if allowed:
+            return out
         svc = ai_service(sni)
         if svc is not None:
             status, system = self.ai.status(src, svc.endpoint)
@@ -381,6 +385,9 @@ class EgressDetector:
         known = handshake_seen or key is not None          # this connection's handshake was already counted
         sni = str(ev.get("sni") or "").strip().lower().strip(".")
         key = key or sni or dst
+        # Known limit: the SNI is client-chosen, so a forged allow-listed SNI on a clean IP also skips the
+        # volume (exfil) heuristic here. Closing it needs certificate-to-SNI verification; intel hits on the
+        # IP / JA3S / certificate are still caught at the handshake.
         if self._allowed_domain(sni) or self._allowed_domain(key):
             return []
         p = self._pair(src, key, ts)

@@ -201,7 +201,9 @@ class ObjectWalkDetector:
         nf = sum(1 for e in evs if e.status in (403, 404))
         gaps = [b.ts - a.ts for a, b in zip(evs, evs[1:]) if b.ts >= a.ts]
         med = statistics.median(gaps) if gaps else None
-        nums = sorted(int(o[1]) for o in not_own if o[1].isdigit())
+        # ids are attacker-chosen: a 5,000-digit id raised ValueError (int-string limit) on every later event
+        # for the client, blinding the detector — cap the length before converting
+        nums = sorted(int(o[1]) for o in not_own if o[1].isdigit() and len(o[1]) <= 18)
         diffs = [b - a for a, b in zip(nums, nums[1:])]
         sequential = len(nums) >= 4 and sum(1 for d in diffs if 0 < d <= 3) >= 0.6 * len(diffs)
         stats = {"requests": len(evs), "distinct_objects": len(distinct), "own_objects": len(own),

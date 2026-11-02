@@ -79,6 +79,15 @@ def _scan_obfuscation(content: str) -> tuple[list[str], int]:
     return findings, total
 
 
+_TAG_RX = re.compile(r"<\s*/?\s*analyzed_data\b[^>]*>?", re.IGNORECASE)
+_JSON_ESC_RX = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _decode_json_escapes(text: str) -> str:
+    """\\uXXXX escapes (what json.dumps produces for non-ASCII) back to the characters themselves."""
+    return _JSON_ESC_RX.sub(lambda m: chr(int(m.group(1), 16)), text) if "\\u" in text else text
+
+
 @dataclass
 class WrappedInput:
     wrapped: str
@@ -96,9 +105,18 @@ def wrap_untrusted(label: str, content: str) -> WrappedInput:
     verbatim (the agent sees it as-is, encoded inside <analyzed_data>),
     but downstream consumers can read the flags off the WrappedInput.
     """
-    matches = _INJECTION_RX.findall(content)
+    # Callers pass json.dumps(alert), which turns U+3000 / U+202E / zero-width characters into \uXXXX
+    # before we see them — so scan the decoded text too, or the obfuscation detector never fires.
+    decoded = _decode_json_escapes(content)
+    matches = _INJECTION_RX.findall(content) + (_INJECTION_RX.findall(decoded) if decoded != content else [])
     matched = [m if isinstance(m, str) else " ".join(filter(None, m)) for m in matches]
-    obf_findings, obf_count = _scan_obfuscation(content)
+    obf_findings, obf_count = _scan_obfuscation(decoded)
+    # The data block must not be closable from inside: an alert containing "</analyzed_data>" used to end
+    # the untrusted block and append text that read as trusted instructions. Neutralise any tag of ours.
+    breakout = _TAG_RX.findall(content)
+    if breakout:
+        matched.append("analyzed_data tag inside untrusted content")
+        content = _TAG_RX.sub(lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), content)
     safe_label = re.sub(r"[^a-zA-Z0-9_\-]", "_", label)[:64]
     wrapped = (
         f"<analyzed_data label=\"{safe_label}\" trust=\"untrusted\">\n"
@@ -107,7 +125,7 @@ def wrap_untrusted(label: str, content: str) -> WrappedInput:
     )
     return WrappedInput(
         wrapped=wrapped,
-        injection_detected=bool(matches),
+        injection_detected=bool(matches) or bool(breakout),
         matched_patterns=matched,
         obfuscation_findings=obf_findings,
         obfuscation_char_count=obf_count,
