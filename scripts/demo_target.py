@@ -794,6 +794,14 @@ def _forward_alert(aegis_url: str | None, token: str | None, alert: dict[str, An
     if not aegis_url:
         return
     payload = {k: v for k, v in alert.items() if not k.startswith("_")}
+    # Telemetry carries the raw request so the SOC can see attack strings — but never a customer's
+    # password, cookie or bearer token: those are redacted here, before anything leaves the edge
+    # (attack-shaped values such as `password=' OR 1=1--` are kept; they are the evidence).
+    try:
+        from aegis.agents.shared.redact import redact
+        payload = redact(payload)
+    except ImportError:  # running the demo target outside the repo: drop the credential-bearing fields outright
+        payload = {k: v for k, v in payload.items() if k not in ("request_headers", "body", "body_params")}
     data = (json.dumps(payload) + "\n").encode()
     headers = {"Content-Type": "application/x-ndjson"}
     if token:
