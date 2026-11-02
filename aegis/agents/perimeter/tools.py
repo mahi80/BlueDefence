@@ -533,6 +533,146 @@ def id_enumeration(source_ip: str, alert: dict, raw_payload: str = "", *,
     return ToolResult(name="id_enumeration", data=data, weight="low")
 
 
+# ---- Tool: secret-file request signature (credential-disclosure attempt) ----
+
+#: Paths with no benign reason to be fetched from a bank's web tier — a dev-left secret, a VCS
+#: directory, a framework config, a key or a backup. A request for one is a credential-disclosure
+#: attempt (the CVE_DOTENV_DISCLOSURE / CVE_LARAVEL_LOG_DISCLOSURE / edge-/export/-alias classes);
+#: whether it SUCCEEDED is decided by the response (see secret_exfil_probe). Matched case-insensitively
+#: against the decoded URL path, so ``/..%2f.env`` and ``/public/../.env`` both land here.
+_SECRET_PATH_SIGNS = (
+    ".env", ".env.local", ".env.prod", ".env.production", ".env.dev", ".env.bak",
+    ".git/config", ".git/head", ".gitconfig", ".svn/", ".hg/",
+    "wp-config.php", "config.php", "configuration.php", "settings.py", "local_settings.py",
+    "application.properties", "application.yml", "appsettings.json", "web.config",
+    "/storage/logs/", "laravel.log", "debug.log",
+    "id_rsa", ".pem", ".ppk", ".p12", ".pfx", ".keystore", ".jks",
+    ".aws/credentials", "/.aws/", ".npmrc", ".dockercfg", ".docker/config.json",
+    ".kube/config", ".htpasswd", ".netrc", ".pgpass", "secrets.yml", "secrets.yaml", "credentials.json",
+    "/export/", "/backup/", "/backups/",
+)
+#: Backup / editor-swap suffixes that turn an otherwise-servable file into a source/secret leak
+#: (``index.php.bak``, ``config.php~``, ``database.sql``, ``.env.swp``).
+_SECRET_SUFFIXES = (".bak", ".old", ".save", ".orig", ".swp", ".swo", ".tmp", "~",
+                    ".sql", ".sql.gz", ".dump", ".tar.gz", ".tgz", ".zip.old")
+#: Served-content tells: a 200 with one of these content types on a secret path means the file came
+#: back, not a redirect to /login. Octet-stream / plain text on a config path is the disclosure.
+_DISCLOSURE_CONTENT_TYPES = ("application/octet-stream", "text/plain", "application/x-yaml",
+                             "text/x-php", "application/json")
+
+
+def _decoded_path(alert: dict) -> str:
+    raw = str(alert.get("url") or alert.get("uri") or alert.get("path") or "")
+    path = urllib.parse.urlsplit(raw).path or raw
+    # double-decode so %2e%2e%2f and %2f obfuscation of the same target collapse to one string
+    for _ in range(2):
+        dec = urllib.parse.unquote(path)
+        if dec == path:
+            break
+        path = dec
+    return path.lower()
+
+
+def _status_of(alert: dict) -> Optional[int]:
+    for k in ("status", "status_code", "response_code", "responseCode"):
+        v = alert.get(k)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def secret_file_probe(alert: dict) -> ToolResult:
+    """Credential-disclosure attempt: a request for a path that only exists to leak a secret — a
+    dev-left ``.env``, a ``.git`` dir, a framework config, a private key, or a source/DB backup. These
+    are the classes a scanning agent uses to harvest the ``id``/``password`` an app was shipped with.
+    The signature is the attempt; the response decides success — a 200 that actually served the file
+    (``_status``/content-type tell) is HIGH, a blocked/absent one (401/403/404) stays MEDIUM so a
+    refused probe is noted without crying breach."""
+    path = _decoded_path(alert)
+    if not path:
+        return ToolResult(name="secret_file_probe", data={"applicable": False}, weight="low")
+    hit = next((s for s in _SECRET_PATH_SIGNS if s in path), "")
+    if not hit:
+        hit = next((f"*{suf}" for suf in _SECRET_SUFFIXES if path.endswith(suf)), "")
+    if not hit:
+        return ToolResult(name="secret_file_probe", data={"path": path[:120]}, weight="low")
+    status = _status_of(alert)
+    rh = alert.get("response_headers") if isinstance(alert.get("response_headers"), dict) else {}
+    ctype = str(rh.get("content-type") or rh.get("Content-Type") or "").split(";")[0].strip().lower()
+    served = (status == 200) and (not ctype or any(ctype == c for c in _DISCLOSURE_CONTENT_TYPES)
+                                  or ctype.startswith("text/"))
+    data = {"path": path[:120], "signature": hit, "status": status, "content_type": ctype or None,
+            "served": served}
+    if status is None:
+        # we saw the attempt but not the outcome — a real secret-file request is still high-signal
+        return ToolResult(name="secret_file_probe", data=data, weight="high")
+    if served:
+        data["disclosure"] = True
+        return ToolResult(name="secret_file_probe", data=data, weight="high")
+    if status in (401, 403, 404, 400):
+        data["blocked"] = True
+        return ToolResult(name="secret_file_probe", data=data, weight="medium")
+    return ToolResult(name="secret_file_probe", data=data, weight="high")
+
+
+# ---- Tool: secret exfiltration in the response body --------------------
+
+#: What a leaked secret looks like in a response body, independent of the path that served it — so a
+#: novel disclosure vector (LFI, a misrouted download, an error page dumping config) is caught by the
+#: SHAPE of what left the building, not by a path list. This is the response-side half of the claim
+#: "even if the agent reads the file, the credentials don't leave": the brain can refuse on this.
+_SECRET_BODY_PATTERNS = (
+    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
+    ("aws_access_key_id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("aws_secret", re.compile(r"aws_secret_access_key\s*[=:]", re.I)),
+    ("gcp_sa_key", re.compile(r'"type"\s*:\s*"service_account"')),
+    ("slack_token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}")),
+    ("github_pat", re.compile(r"\bghp_[0-9A-Za-z]{30,}\b")),
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
+    ("bearer_token", re.compile(r"authorization\s*:\s*bearer\s+[0-9A-Za-z._\-]{16,}", re.I)),
+    ("db_dsn", re.compile(r"\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:@/]+:[^\s:@/]+@", re.I)),
+    ("env_secret_assign", re.compile(
+        r"(?im)^\s*(?:DB_PASSWORD|DB_USERNAME|DATABASE_URL|APP_KEY|SECRET_KEY|JWT_SECRET|"
+        r"API_KEY|API_SECRET|PRIVATE_KEY|ENCRYPTION_KEY|STRIPE_SECRET|TWILIO_AUTH_TOKEN)\s*=\s*\S+")),
+)
+
+
+def _response_body_of(alert: dict) -> str:
+    for k in ("response_body", "resp_body", "body_response", "response_text"):
+        v = alert.get(k)
+        if isinstance(v, str) and v:
+            return v
+    resp = alert.get("response")
+    if isinstance(resp, dict):
+        b = resp.get("body")
+        if isinstance(b, str):
+            return b
+    return ""
+
+
+def secret_exfil_probe(alert: dict) -> ToolResult:
+    """Secret leaving in the RESPONSE: scan the body (when the sensor forwards it — the shim and the
+    api-gateway path do) for the shape of a credential — a private key, an AWS/Slack/GitHub key, a
+    DSN with an inline password, or ``DB_PASSWORD=``-style env assignments. Path-independent, so it
+    catches disclosure vectors no path signature lists. HIGH on any match: a bank's web response has
+    no benign reason to carry a private key or a database password."""
+    body = _response_body_of(alert)
+    if not body:
+        return ToolResult(name="secret_exfil_probe", data={"applicable": False}, weight="low")
+    sample = body[:200_000]  # cap the scan; a leak shows in the first page
+    found = [name for name, rx in _SECRET_BODY_PATTERNS if rx.search(sample)]
+    if not found:
+        return ToolResult(name="secret_exfil_probe", data={"scanned_bytes": len(sample)}, weight="low")
+    status = _status_of(alert)
+    return ToolResult(name="secret_exfil_probe",
+                      data={"secret_kinds": found[:8], "count": len(found), "status": status,
+                            "bytes": len(body)}, weight="high")
+
+
 # ---- Helpers -----------------------------------------------------------
 
 def run_all_tools(raw_payload: str, source_ip: str, user_id: Optional[str],
@@ -551,4 +691,6 @@ def run_all_tools(raw_payload: str, source_ip: str, user_id: Optional[str],
         scanner_signature(alert),
         recon_sweep(source_ip, alert),
         id_enumeration(source_ip, alert, raw_payload),
+        secret_file_probe(alert),
+        secret_exfil_probe(alert),
     ]

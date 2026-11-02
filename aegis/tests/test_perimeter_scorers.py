@@ -148,7 +148,7 @@ def test_run_all_tools_includes_new_scorers():
 def test_run_all_tools_backward_compatible_without_alert():
     # old 3-arg call site must still work (alert defaults to {})
     results = tools.run_all_tools("x=1", "1.2.3.4", "u_42891")
-    assert len(results) == 12
+    assert len(results) == 14
 
 
 def test_newline_payload_does_not_crash():

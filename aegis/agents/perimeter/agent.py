@@ -220,4 +220,8 @@ def _summarize_result(r: tools.ToolResult) -> str:
         return f"distinct_paths={r.data.get('distinct_paths', 0)} in {r.data.get('window_sec', 0)}s"
     if r.name == "id_enumeration":
         return f"distinct_ids={r.data.get('distinct_ids', 0)} on {r.data.get('param', '-')}@{r.data.get('path', '-')}"
+    if r.name == "secret_file_probe":
+        return f"secret_path={r.data.get('signature', 'none')}, served={r.data.get('served', False)}"
+    if r.name == "secret_exfil_probe":
+        return f"secret_exfil={r.data.get('secret_kinds', [])}"
     return "tool_result"
