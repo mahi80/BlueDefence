@@ -6,6 +6,10 @@ https://github.com/user-attachments/assets/9b6db3dd-427d-48ac-a590-9e3192f9af3b
 
 **How it works (4:52)** — an alarm storm becomes one governed, evidenced decision: correlation, the agent swarm, the console, approval, audit. Full-resolution copy: [`docs/media/BlueDefence-how-it-works.mp4`](docs/media/BlueDefence-how-it-works.mp4).
 
+**Full walkthrough with live demo (7:24, narrated)** — the intro above, then the architecture, then an AI agent robbing a bank on the weakbank range and being contained: valid-login break-in → 25-record harvest → 100,000-agent swarm correlated to 40 incidents → Agent Q's minimum cut → analyst approval → denied at the edge. [`docs/media/walkthrough/BlueDefence-AEGIS-walkthrough.mp4`](docs/media/walkthrough/BlueDefence-AEGIS-walkthrough.mp4) · [timings and narration script](docs/media/walkthrough/README.md)
+
+[![AEGIS architecture — edge shim → deterministic detection → Agent Q triage → governed containment → learning loop](docs/media/walkthrough/architecture.png)](docs/media/walkthrough/BlueDefence-AEGIS-walkthrough.mp4)
+
 **AEGIS** — an autonomous SOC and network-operations brain for banks. It reads the bank's
 security *and* network telemetry, reaches a verdict deterministically where it can and with a
 fine-tuned open-weights model where it must, walks the blast radius, proposes the minimum
