@@ -74,6 +74,30 @@ asset IPs / hostnames and also load-balancer names / DNS names and Ingress hosts
 pointing at an ALB credits the instances behind it. All exporters are read-only (GET, plus Imperva's
 POST *list* endpoint); field names follow the public API docs, so a tenant may need a field renamed.
 
+## In the VAPT loop and the console
+
+Add a `type: exposure` scan to `posture.yaml` (sample: `samples/posture_exposure.yaml`) and the runner
+tracks exposures like every other finding: the tier becomes the severity (ACT_NOW → critical, ACT → high,
+SCHEDULE → medium, MONITOR → low), so the remediation SLA, new / resolved tracking and the waiver register
+apply. The finding id is the CVE and the component is `asset:port`, so when a finding changes tier (a WAF
+goes to blocking mode, a CVE lands in KEV) it keeps its first-seen date instead of looking new. Each run's
+report carries the funnel, and the SOC console's **Exposures** tab shows it with every exposure's four
+answers colour-coded and the reason behind each.
+
+```yaml
+  - name: exposure-prod
+    type: exposure
+    vulns: [exports/tenable.json, exports/trivy]          # files or directories
+    aws_bundles: [exports/aws-prod.json]
+    azure_bundles: [exports/azure-prod.json]
+    k8s_exports: [eks-payments=exports/eks-payments.json]
+    inventory: exports/onprem-assets.csv
+    kev: feeds/known_exploited_vulnerabilities.json
+    epss: feeds/epss_scores.csv
+    waf_coverage: [exports/imperva.json, exports/edge.json]
+    settings: exposure.yaml
+```
+
 ## Inventory CSV
 
 `asset,name,ips,hostname,zone,role,public,internet_ports,lateral_ports,waf,edr` — ports as `443;8443`,
@@ -86,5 +110,5 @@ collector inferred (role, WAF / EDR coverage). AWS instances can carry the same 
 Reachability is reasoned from network configuration, not proven by packets. No application-level
 reachability (whether the vulnerable code path is called). Not yet modelled: Azure Application Gateway /
 Front Door, AWS classic ELB and CloudFront, Kubernetes NetworkPolicy rule evaluation, NACLs; Cloudflare
-managed-rule CVE coverage beyond "managed ruleset deployed". The console view and the HITL loop come in the
-next PRs (see the scope doc).
+managed-rule CVE coverage beyond "managed ruleset deployed". Proposing the compensating control through
+the HITL queue and re-testing closure is the next PR (see the scope doc).

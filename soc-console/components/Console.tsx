@@ -152,6 +152,7 @@ export default function Console({
         <nav className="tabs" aria-label="Views">
           <a href="/" aria-current="page">Incidents</a>
           <a href="/posture">Posture</a>
+          <a href="/exposure">Exposures</a>
         </nav>
         <div className="live">
           <span className="pulse-dot" aria-hidden style={backendError ? { background: "var(--v-malicious)" } : undefined} />{" "}

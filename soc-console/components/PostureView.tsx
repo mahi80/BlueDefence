@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import type { PostureFinding, PostureResult, PostureRun, Severity } from "../lib/posture";
 
 const SEVS: Severity[] = ["critical", "high", "medium", "low", "info"];
-const SCAN_LABEL: Record<string, string> = { iam: "IAM", cspm: "AWS", azure: "Azure", k8s: "K8s", iac: "IaC" };
+const SCAN_LABEL: Record<string, string> = { iam: "IAM", cspm: "AWS", azure: "Azure", k8s: "K8s", iac: "IaC", exposure: "Exposure" };
 
 // One explicit locale + zone so the server render and the browser agree (no hydration mismatch). Banks
 // read SOC timestamps in their own zone; override with NEXT_PUBLIC_AEGIS_TZ.
@@ -14,7 +14,7 @@ const FMT = new Intl.DateTimeFormat("en-IN", {
   day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short",
 });
 
-function when(iso: string): string {
+export function when(iso: string): string {
   return FMT.format(new Date(iso));
 }
 
@@ -24,7 +24,7 @@ function dueLabel(f: PostureFinding): string {
   return days <= 0 ? "due today" : `due in ${days}d`;
 }
 
-export function TopNav({ active, session, children }: { active: "incidents" | "posture"; session: { user: string; role: string }; children?: React.ReactNode }) {
+export function TopNav({ active, session, children }: { active: "incidents" | "posture" | "exposure"; session: { user: string; role: string }; children?: React.ReactNode }) {
   async function logout() {
     try {
       await fetch("/api/auth/logout", { method: "POST" });
@@ -41,6 +41,7 @@ export function TopNav({ active, session, children }: { active: "incidents" | "p
       <nav className="tabs" aria-label="Views">
         <a href="/" aria-current={active === "incidents" ? "page" : undefined}>Incidents</a>
         <a href="/posture" aria-current={active === "posture" ? "page" : undefined}>Posture</a>
+        <a href="/exposure" aria-current={active === "exposure" ? "page" : undefined}>Exposures</a>
       </nav>
       {children}
       <div className="whoami">

@@ -475,3 +475,57 @@ button.pt-row[data-sev="critical"][data-overdue] { background: color-mix(in srgb
   .pt-row > :nth-child(3), .pt-row > :nth-child(4) { display: none; }
 }
 .topbar .tabs + .whoami { margin-left: auto; }
+
+/* ---- exposures view ---- */
+.ex-main { min-height: 0; overflow: auto; padding: 18px 22px 40px; display: flex; flex-direction: column; gap: 16px; max-width: 1280px; width: 100%; margin: 0 auto; }
+.ex-funnel { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 16px 18px; box-shadow: var(--shadow); }
+.ex-funnel-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.ex-funnel-head h2 { font-size: 14px; font-weight: 600; }
+.ex-funnel-head .sub { color: var(--ink-muted); font-size: 12.5px; }
+.ex-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; }
+.ex-step { min-width: 0; }
+.ex-bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.ex-bar i { display: block; height: 100%; background: color-mix(in srgb, var(--swarm) 55%, transparent); border-radius: 4px; }
+.ex-step.last .ex-bar i { background: var(--v-malicious); }
+.ex-n { font-size: 26px; font-weight: 600; margin-top: 8px; line-height: 1.1; }
+.ex-step.last .ex-n { color: var(--v-malicious); }
+.ex-label { font-size: 12.5px; font-weight: 600; margin-top: 2px; }
+.ex-hint { font-size: 11.5px; color: var(--ink-faint); }
+.ex-monitor { margin-top: 12px; font-size: 12.5px; color: var(--ink-muted); border-left: 3px solid var(--v-suspicious); padding: 6px 10px; background: color-mix(in srgb, var(--v-suspicious) 6%, transparent); }
+.ex-monitor b { color: var(--v-suspicious); }
+
+.ex-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.ex-tabs button { padding: 6px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink-muted); font-size: 12.5px; cursor: pointer; display: inline-flex; gap: 6px; align-items: center; }
+.ex-tabs button .mono { color: var(--ink-faint); }
+.ex-tabs button[aria-selected="true"] { color: var(--ink); border-color: var(--ink-faint); box-shadow: inset 0 -2px 0 var(--swarm); }
+.ex-tabs button.t-ACT_NOW[aria-selected="true"] { box-shadow: inset 0 -2px 0 var(--v-malicious); }
+.ex-tabs button:focus-visible { outline: 2px solid var(--swarm); outline-offset: 1px; }
+
+.ex-list { display: flex; flex-direction: column; gap: 10px; }
+.ex-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 12px 14px; }
+.ex-card[data-tier="ACT_NOW"] { border-left: 4px solid var(--v-malicious); }
+.ex-card[data-tier="ACT"] { border-left: 4px solid var(--v-suspicious); }
+.ex-card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ex-tier { font-size: 10.5px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; padding: 2px 7px; border-radius: 4px; background: var(--surface-2); color: var(--ink-muted); }
+.ex-tier.t-ACT_NOW { background: var(--v-malicious); color: #fff; }
+.ex-tier.t-ACT { background: color-mix(in srgb, var(--v-suspicious) 16%, transparent); color: var(--v-suspicious); }
+.ex-cve { font-size: 12px; font-weight: 600; }
+.ex-title { font-size: 13px; font-weight: 500; }
+.ex-sla { margin-left: auto; font-size: 11.5px; color: var(--ink-muted); }
+.ex-sla.overdue { color: var(--v-malicious); font-weight: 600; }
+.ex-asset { margin-top: 4px; font-size: 13px; font-weight: 500; }
+.ex-asset .sub { color: var(--ink-faint); font-weight: 400; font-size: 11.5px; }
+.ex-answers { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.ex-answer { border: 1px solid var(--line-soft); border-radius: var(--radius-sm); padding: 7px 9px; min-width: 0; border-top: 3px solid var(--line); }
+.ex-answer.lv-bad { border-top-color: var(--v-malicious); }
+.ex-answer.lv-warn { border-top-color: var(--v-suspicious); }
+.ex-answer.lv-ok { border-top-color: var(--v-benign); }
+.ex-q { display: block; font-size: 10.5px; color: var(--ink-faint); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+.ex-a { display: block; font-size: 12.5px; font-weight: 600; margin-top: 2px; }
+.ex-why { display: block; font-size: 11.5px; color: var(--ink-muted); margin-top: 3px; overflow-wrap: anywhere; }
+.ex-fix { margin-top: 10px; font-size: 12.5px; color: var(--ink); }
+
+@media (max-width: 900px) {
+  .ex-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ex-answers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

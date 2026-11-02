@@ -27,17 +27,40 @@ export interface PostureFinding {
   overdue: boolean;
   new: boolean;
   stale: boolean;
+  extra?: ExposureExtra | null;
+}
+
+// scanner === "exposure": the engine's verdict behind the severity
+export interface ExposureExtra {
+  tier: "ACT_NOW" | "ACT" | "SCHEDULE" | "MONITOR";
+  reach: "internet" | "one_hop" | "local" | "isolated";
+  defended: "full" | "partial" | "none";
+  exploitable: boolean;
+  crown_distance: number | null;
+  port: number | null;
+  title: string;
+  reasons: string[];
+  source?: string;
+}
+
+export interface ExposureMeta {
+  funnel: { raw: number; scored: number; exploitable: number; reachable: number; undefended: number; act_now: number };
+  tiers: Record<string, number>;
+  assets: number;
+  protections: number;
+  monitor_only: number;
 }
 
 export interface PostureScan {
   name: string;
-  type: "iam" | "cspm" | "azure" | "k8s" | "iac";
+  type: "iam" | "cspm" | "azure" | "k8s" | "iac" | "exposure";
   status: "ok" | "error";
   live: boolean;
   seconds: number;
   error?: string;
   notes?: string[];
   summary?: Record<Severity, number>;
+  meta?: ExposureMeta;
 }
 
 export interface PostureRun {

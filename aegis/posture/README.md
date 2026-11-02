@@ -9,6 +9,7 @@ bucket, cluster and template as it stands, so a misconfiguration that predates A
 | CSPM (AWS) | ✅ | `python -m aegis.posture export-aws --out bundle.json` (run by the bank) | boto3, `SecurityAudit` policy |
 | CSPM (Azure) | ✅ | `python -m aegis.posture export-azure --out azure.json` (run by the bank, `az login`) | read-only `az` (Reader + Security Reader) |
 | Kubernetes posture | ✅ | `kubectl get <kinds> -A -o json` (no secrets) | read-only `kubectl get` |
+| Exposure prioritisation | ✅ | scanner exports + KEV / EPSS + asset model + WAF coverage (`type: exposure`, see `aegis/exposure/README.md`) | per source |
 | Policy-as-code (IaC) | ✅ | `terraform show -json plan.out` + Kubernetes YAML | — (pre-deploy gate) |
 
 **Offline is the default and the recommended pilot mode.** The bank runs the export with its own

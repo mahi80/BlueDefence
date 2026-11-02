@@ -1,0 +1,91 @@
+"""The exposure engine as a VAPT-loop scan (``type: exposure`` in ``posture.yaml``).
+
+Each exposure becomes a ``PostureFinding`` so the runner's tracking applies unchanged — new / still open /
+resolved, the remediation SLA, the waiver register and the dated report. The tier maps to severity
+(ACT_NOW → critical, ACT → high, SCHEDULE → medium, MONITOR → low); the finding id is the CVE and the
+component is ``asset:port``, so a finding that changes tier (a WAF goes in front, a CVE lands in KEV)
+keeps its history instead of looking new.
+
+    - name: exposure-prod
+      type: exposure
+      vulns: [exports/tenable.json, exports/trivy]        # files or directories of JSON / CSV
+      aws_bundles: [exports/aws-prod-aps1.json]
+      azure_bundles: [exports/azure-prod.json]
+      k8s_exports: [eks-payments=exports/eks-payments.json]
+      inventory: exports/onprem-assets.csv
+      kev: feeds/known_exploited_vulnerabilities.json
+      epss: feeds/epss_scores.csv
+      waf_coverage: [exports/imperva.json, exports/edge.json]
+      settings: exposure.yaml
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from ..posture.base import PostureFinding
+from ..posture.sources import PostureSourceError, load_json
+from . import loaders
+from .azure_reach import assets_from_azure
+from .engine import ANY_PORT, Exposure, assess, funnel, summarize
+from .k8s_reach import assets_from_k8s
+
+SEVERITY = {"ACT_NOW": "critical", "ACT": "high", "SCHEDULE": "medium", "MONITOR": "low"}
+
+
+def _files(paths: list[Any]) -> list[Path]:
+    out: list[Path] = []
+    for p in map(Path, paths):
+        out += sorted(x for x in p.iterdir() if x.suffix.lower() in (".json", ".jsonl", ".csv")) if p.is_dir() else [p]
+    return out
+
+
+def _fix(e: Exposure) -> str:
+    target = f"{e.cve or e.title} on {e.asset_name}"
+    if e.tier in ("ACT_NOW", "ACT"):
+        stopgap = []
+        if e.defended != "full" and e.cve:
+            stopgap.append(f"a blocking WAF virtual patch for {e.cve}")
+        if e.reach == "internet" and e.port and e.port > 0:
+            stopgap.append(f"closing port {e.port} to the internet")
+        elif e.reach == "one_hop" and e.port and e.port > 0:
+            stopgap.append(f"restricting port {e.port} to the hosts that need it")
+        return f"Patch {target}" + (f"; until it is patched, cut the path: {' or '.join(stopgap)}" if stopgap else "")
+    if e.tier == "SCHEDULE":
+        return f"Patch {target} in the next maintenance window; keep the compensating control in place"
+    return f"Track {target}; re-assess if it is exploited in the wild or its exposure changes"
+
+
+def to_finding(e: Exposure) -> PostureFinding:
+    comp = e.asset_name + (f":{e.port}" if e.port and e.port > 0 else " (image)" if e.port == ANY_PORT else "")
+    return PostureFinding(
+        id=e.cve or f"VULN {e.title[:40]}", severity=SEVERITY[e.tier], confidence=0.9, category="exposure",
+        affected_component=comp, resource=e.asset, scanner="exposure", control=f"Exposure tier {e.tier}",
+        evidence=" · ".join(e.reasons), recommended_remediation=_fix(e), risk_score=e.risk_score,
+        extra={"tier": e.tier, "reach": e.reach, "defended": e.defended, "exploitable": e.exploitable,
+               "crown_distance": e.crown_distance, "port": e.port, "title": e.title, "reasons": e.reasons,
+               "source": e.vuln_source})
+
+
+def run_scan(o: dict) -> tuple[list[PostureFinding], list[str], dict]:
+    if not o.get("vulns"):
+        raise PostureSourceError("exposure scan needs vulns (scanner exports)")
+    vulns = [v for f in _files(o["vulns"]) for v in loaders.load_vulns(f)]
+    notes = loaders.apply_intel(vulns, kev=o.get("kev"), epss=o.get("epss"))
+    groups = [loaders.assets_from_aws(load_json(b)) for b in o.get("aws_bundles") or []]
+    groups += [assets_from_azure(load_json(b)) for b in o.get("azure_bundles") or []]
+    for spec in o.get("k8s_exports") or []:
+        name, _, path = str(spec).rpartition("=") if "=" in str(spec) else ("", "", str(spec))
+        groups.append(assets_from_k8s(load_json(path), cluster=name or "k8s", public_nodes=bool(o.get("public_nodes"))))
+    if o.get("inventory"):
+        groups.append(loaders.assets_from_inventory(o["inventory"]))
+    if not groups:
+        raise PostureSourceError("exposure scan needs an asset model: aws_bundles / azure_bundles / k8s_exports / inventory")
+    assets = loaders.merge_assets(*groups)
+    settings = loaders.with_coverage(loaders.load_settings(o.get("settings")), o.get("waf_coverage") or [])
+    exposures, more = assess(vulns, assets, settings)
+    meta = {"funnel": funnel(exposures, len(vulns)), "tiers": summarize(exposures), "assets": len(assets),
+            "protections": len(settings.coverage),
+            "monitor_only": sum(p.mode == "monitor" for p in settings.coverage)}
+    return [to_finding(e) for e in exposures], notes + more, meta

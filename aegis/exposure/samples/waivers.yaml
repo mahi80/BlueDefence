@@ -1,0 +1,6 @@
+waivers:
+  - id: CVE-2011-2523
+    resource: dmz-ftp
+    reason: "Partner FTP decommissioning 2026-11-30; port 21 restricted to partner IPs at the edge firewall (CR-3107)"
+    approved_by: ciso
+    expires: 2026-11-30
