@@ -289,3 +289,60 @@ def test_shim_relays_redirect_without_following_and_emits_one_true_event():
         # exactly one telemetry event, and it carries the real 302 (not a followed 200)
         assert _wait(lambda: any(a.get("response_status") == 302 for a in ag.alerts))
         assert len([a for a in ag.alerts if a.get("source_ip") == "203.0.113.7"]) == 1
+
+
+# --------------------------------------------- response-side secret redaction (exfil) -- #
+
+class _SecretUpstream(BaseHTTPRequestHandler):
+    """An app that leaks a credential in its response body — a dev-left .env served back."""
+    def log_message(self, *a):  # noqa: ANN002
+        pass
+
+    def _handle(self):
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        self.rfile.read(n)
+        out = b"APP_ENV=production\nDB_PASSWORD=S3cr3t_prod_pw\nAPP_KEY=base64:zzz\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    do_GET = do_POST = _handle
+
+
+def test_live_mode_withholds_a_response_that_leaks_a_secret():
+    with _serve(_SecretUpstream) as (_up, upbase), \
+         _serve(_Aegis, alerts=[], blocklist_payload={"ips": [], "fingerprints": []}) as (ag, agbase), \
+         _edge(upbase, aegis_base=agbase, mode="live") as (base, _s, _bl):
+        code, body, _ = _req(base, "/.env", src="203.0.113.9")
+        assert code == 403                                   # the client never receives the secret
+        assert "S3cr3t_prod_pw" not in body
+        assert _wait(lambda: any(a.get("op") == "secret_exfil" for a in ag.alerts))
+        ev = next(a for a in ag.alerts if a.get("op") == "secret_exfil")
+        assert ev["action"] == "blocked" and "env_secret_assign" in ev["secret_kinds"]
+        assert "S3cr3t_prod_pw" not in json.dumps(ev)         # the secret itself is never in telemetry
+
+
+def test_shadow_mode_relays_the_secret_but_flags_would_block():
+    with _serve(_SecretUpstream) as (_up, upbase), \
+         _serve(_Aegis, alerts=[], blocklist_payload={"ips": [], "fingerprints": []}) as (ag, agbase), \
+         _edge(upbase, aegis_base=agbase, mode="shadow") as (base, _s, _bl):
+        code, body, _ = _req(base, "/.env", src="203.0.113.9")
+        assert code == 200 and "S3cr3t_prod_pw" in body       # shadow forwards, nothing breaks
+        assert _wait(lambda: any(a.get("op") == "secret_exfil" for a in ag.alerts))
+        ev = next(a for a in ag.alerts if a.get("op") == "secret_exfil")
+        assert ev["action"] == "would_block"
+
+
+def test_redaction_can_be_disabled_in_live_mode():
+    with _serve(_SecretUpstream) as (_up, upbase), _edge(upbase, mode="live") as (base, _s, _bl):
+        _s.redact_secrets = False
+        code, body, _ = _req(base, "/.env", src="203.0.113.9")
+        assert code == 200 and "S3cr3t_prod_pw" in body       # opt-out: observed, not withheld
+
+
+def test_benign_response_passes_through_untouched():
+    with _serve(_Upstream, hits=[]) as (_up, upbase), _edge(upbase, mode="live") as (base, _s, _bl):
+        code, body, _ = _req(base, "/accounts", src="203.0.113.9")
+        assert code == 200 and json.loads(body)["echo"] == "/accounts"   # no false positive, no 403
