@@ -1,0 +1,217 @@
+{
+ "format_version": "1.2",
+ "terraform_version": "1.9.5",
+ "resource_changes": [
+  {
+   "address": "aws_security_group.core_db",
+   "type": "aws_security_group",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "name": "core-db",
+     "ingress": [
+      {
+       "protocol": "tcp",
+       "from_port": 5432,
+       "to_port": 5432,
+       "cidr_blocks": [
+        "0.0.0.0/0"
+       ],
+       "ipv6_cidr_blocks": []
+      }
+     ]
+    }
+   }
+  },
+  {
+   "address": "aws_security_group_rule.bastion_ssh",
+   "type": "aws_security_group_rule",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "type": "ingress",
+     "protocol": "tcp",
+     "from_port": 22,
+     "to_port": 22,
+     "cidr_blocks": [
+      "0.0.0.0/0"
+     ]
+    }
+   }
+  },
+  {
+   "address": "aws_vpc_security_group_ingress_rule.web_https",
+   "type": "aws_vpc_security_group_ingress_rule",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "ip_protocol": "tcp",
+     "from_port": 443,
+     "to_port": 443,
+     "cidr_ipv4": "0.0.0.0/0"
+    }
+   }
+  },
+  {
+   "address": "aws_db_instance.ledger",
+   "type": "aws_db_instance",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "engine": "postgres",
+     "publicly_accessible": true,
+     "storage_encrypted": false,
+     "backup_retention_period": 7,
+     "deletion_protection": true
+    }
+   }
+  },
+  {
+   "address": "aws_instance.netbanking_web",
+   "type": "aws_instance",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "associate_public_ip_address": true,
+     "metadata_options": [
+      {
+       "http_tokens": "optional"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "address": "aws_launch_template.batch",
+   "type": "aws_launch_template",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "metadata_options": [
+      {
+       "http_tokens": "required"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "address": "aws_s3_bucket_public_access_block.kyc",
+   "type": "aws_s3_bucket_public_access_block",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "block_public_acls": true,
+     "ignore_public_acls": true,
+     "block_public_policy": false,
+     "restrict_public_buckets": false
+    }
+   }
+  },
+  {
+   "address": "aws_s3_bucket_policy.kyc",
+   "type": "aws_s3_bucket_policy",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "policy": "{\"Statement\": [{\"Effect\": \"Allow\", \"Principal\": \"*\", \"Action\": \"s3:GetObject\", \"Resource\": \"arn:aws:s3:::wb-kyc/*\"}]}"
+    }
+   }
+  },
+  {
+   "address": "aws_iam_policy.deploy_all",
+   "type": "aws_iam_policy",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "policy": "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Action\": \"*\", \"Resource\": \"*\"}]}"
+    }
+   }
+  },
+  {
+   "address": "aws_iam_role.vendor",
+   "type": "aws_iam_role",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "assume_role_policy": "{\"Statement\": [{\"Effect\": \"Allow\", \"Principal\": {\"AWS\": \"*\"}, \"Action\": \"sts:AssumeRole\"}]}"
+    }
+   }
+  },
+  {
+   "address": "aws_kms_key.ledger",
+   "type": "aws_kms_key",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "enable_key_rotation": false
+    }
+   }
+  },
+  {
+   "address": "aws_eks_cluster.payments",
+   "type": "aws_eks_cluster",
+   "change": {
+    "actions": [
+     "create"
+    ],
+    "after": {
+     "vpc_config": [
+      {
+       "endpoint_public_access": true,
+       "public_access_cidrs": [
+        "0.0.0.0/0"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "address": "aws_db_instance.old_reports",
+   "type": "aws_db_instance",
+   "change": {
+    "actions": [
+     "delete"
+    ],
+    "after": {
+     "publicly_accessible": true
+    }
+   }
+  },
+  {
+   "address": "aws_kms_key.cards",
+   "type": "aws_kms_key",
+   "change": {
+    "actions": [
+     "no-op"
+    ],
+    "after": {
+     "enable_key_rotation": true
+    }
+   }
+  }
+ ]
+}

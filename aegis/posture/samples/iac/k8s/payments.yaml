@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: payments-api, namespace: payments}
+spec:
+  template:
+    spec:
+      serviceAccountName: payments-api
+      automountServiceAccountToken: false
+      containers:
+        - name: api
+          image: registry.bank/payments-api@sha256:abc
+          resources: {limits: {cpu: 500m, memory: 512Mi}}
+          securityContext: {allowPrivilegeEscalation: false, runAsNonRoot: true, readOnlyRootFilesystem: true}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: log-shipper, namespace: logging}
+spec:
+  template:
+    spec:
+      containers:
+        - name: shipper
+          image: vendor/shipper:latest
+          securityContext: {privileged: true}
+          env:
+            - {name: SPLUNK_TOKEN, value: "hec-0000-1111"}
+      volumes:
+        - {name: root, hostPath: {path: /}}

@@ -1,0 +1,55 @@
+# BlueDefence policy-as-code gate — copy into an infrastructure repo as .github/workflows/iac-gate.yml
+#
+# Blocks a pull request when the Terraform plan or the Kubernetes manifests introduce a high or
+# critical misconfiguration, using the same rule IDs AEGIS uses on the running estate. Approved
+# exceptions live in security/waivers.yaml (reason + approver + expiry, reviewed like code).
+name: iac-gate
+on:
+  pull_request:
+    paths: ["terraform/**", "k8s/**", "security/waivers.yaml"]
+
+permissions:
+  contents: read
+  id-token: write   # OIDC to a read-only plan role; no long-lived keys in the repo
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_wrapper: false }
+
+      - name: Configure AWS (read-only plan role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TF_PLAN_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Terraform plan → JSON
+        working-directory: terraform
+        run: |
+          terraform init -input=false
+          terraform plan -input=false -lock=false -out=plan.out
+          terraform show -json plan.out > "$RUNNER_TEMP/plan.json"
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Install BlueDefence
+        run: pip install "bluedefence @ git+https://x-access-token:${{ secrets.BLUEDEFENCE_READ_TOKEN }}@github.com/mahi80/BlueDefence.git@main"
+
+      - name: Policy-as-code gate
+        run: |
+          set -o pipefail
+          python -m aegis.posture iac \
+            --plan "$RUNNER_TEMP/plan.json" --changed-only \
+            --k8s k8s/ \
+            --waivers security/waivers.yaml \
+            --fail-on high | tee "$RUNNER_TEMP/iac-gate.txt"
+
+      - name: Gate report
+        if: always()
+        run: |
+          { echo '```'; cat "$RUNNER_TEMP/iac-gate.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
