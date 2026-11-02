@@ -121,10 +121,12 @@ def execute(scan: ScanConfig) -> tuple[list[PostureFinding], list[str]] | tuple[
     if scan.type == "cspm":
         bundle = sources.collect_aws_cspm(o.get("region")) if o.get("live") else sources.load_json(_need(o, "bundle", scan))
         gaps = cspm.coverage_gaps(bundle)
-        return cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(gaps)}"] if gaps else []
+        meta = {"unchecked_sections": cspm.unchecked_sections(bundle)}
+        return cspm.scan(bundle), ([f"not in bundle, not checked: {', '.join(gaps)}"] if gaps else []), meta
     if scan.type == "azure":
         bundle = sources.collect_azure(o.get("subscription")) if o.get("live") else sources.load_json(_need(o, "bundle", scan))
-        return azure_cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(azure_cspm.coverage_gaps(bundle))}"]
+        return (azure_cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(azure_cspm.coverage_gaps(bundle))}"],
+                {"unchecked_sections": azure_cspm.unchecked_sections(bundle)})
     if scan.type == "k8s":
         export = sources.collect_k8s(o.get("context")) if o.get("live") else sources.load_json(_need(o, "export", scan))
         inc = bool(o.get("include_system"))
@@ -208,12 +210,17 @@ def run_once(cfg: RunnerConfig, *, now: datetime | None = None, hitl: Any = _FRO
 
     scans_out, current = [], []  # current: (scan_name, finding)
     failed: set[str] = set()
+    partial: dict[str, tuple[set[str], Any]] = {}   # scan -> (bundle sections not collected, section_of)
     for sc in cfg.scans:
         t0 = time.monotonic()
         try:
             res = execute(sc)
             findings, notes = res[0], res[1]
             meta = res[2] if len(res) > 2 else {}
+            if meta.get("unchecked_sections"):
+                mod = cspm if sc.type == "cspm" else azure_cspm
+                partial[sc.name] = (set(meta["unchecked_sections"]), mod.section_of)
+                meta = {k: v for k, v in meta.items() if k != "unchecked_sections"}
             current += [(sc.name, f) for f in findings]
             scans_out.append({"name": sc.name, "type": sc.type, "status": "ok", "notes": notes, **({"meta": meta} if meta else {}),
                               "summary": summarize(findings), "seconds": round(time.monotonic() - t0, 2),
@@ -264,9 +271,16 @@ def run_once(cfg: RunnerConfig, *, now: datetime | None = None, hitl: Any = _FRO
                           "new": fp not in prev_open and fp not in {w["fingerprint"] for w in prev.get("waived", [])},
                           "stale": False})
 
-    # carry forward the previous findings of scans that failed this run — unknown is not fixed
+    # carry forward the previous findings of scans that failed this run — unknown is not fixed — and of
+    # bundle sections the collector could not read this run (an SCP deny on one API is not a fix either)
+    def _unread(o: dict) -> bool:
+        if o.get("scan") in failed:
+            return True
+        part = partial.get(o.get("scan"))
+        return bool(part) and part[1](o.get("id", "")) in part[0]
+
     for fp, o in prev_open.items():
-        if o.get("scan") in failed and fp not in seen_now:
+        if _unread(o) and fp not in seen_now:
             due = _parse(o["sla_due"])
             open_rows.append({**o, "stale": True, "new": False, "overdue": now > due,
                               "age_days": (now - _parse(o["first_seen"])).days})
@@ -295,7 +309,8 @@ def run_once(cfg: RunnerConfig, *, now: datetime | None = None, hitl: Any = _FRO
     if any(sc.type == "exposure" for sc in cfg.scans) and rem_cfg.get("enabled", True):
         from ..exposure import remediation
         tiers = tuple(str(t).upper() for t in rem_cfg.get("tiers") or ["ACT_NOW"])
-        section = remediation.reconcile(store, record, hitl=_remediation_hitl(hitl), now=now, tiers=tiers)
+        section = remediation.reconcile(store, record, hitl=_remediation_hitl(hitl), now=now, tiers=tiers,
+                                        review_days=int(rem_cfg.get("review_days", 30)))
         record["remediation"] = section
         record["notes"] = record["notes"] + section["notes"]
         remediation.save(store, section)

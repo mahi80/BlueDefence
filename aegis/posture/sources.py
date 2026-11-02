@@ -126,9 +126,15 @@ def collect_aws_cspm(region: str | None = None, *, require_flag: bool = True) ->
             b[key] = fn()
         except Exception as e:
             err = getattr(e, "response", None)
-            if not isinstance(err, dict) or "Error" not in err:
-                raise
-            errors[key] = f"{err['Error'].get('Code', 'Error')}: {str(err['Error'].get('Message', ''))[:200]}"
+            if isinstance(err, dict) and "Error" in err:
+                errors[key] = f"{err['Error'].get('Code', 'Error')}: {str(err['Error'].get('Message', ''))[:200]}"
+                return
+            # an endpoint that cannot be reached (a VPC endpoint policy, an s3-control host that does not
+            # resolve, a timeout) is the same story: that section was not checked. It used to crash the export.
+            if type(e).__module__.startswith(("botocore", "urllib3")):
+                errors[key] = f"{type(e).__name__}: {str(e)[:200]}"
+                return
+            raise
 
     def buckets() -> list:
         out = []

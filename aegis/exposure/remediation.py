@@ -109,11 +109,17 @@ def build_options(row: dict) -> list[dict]:
         opened = path.get("opened_by") or []
         cmds: list[str] = []
         steps: list[str] = []
+        # behind a load balancer the internet reaches the LISTENER port on the LB's security group, not the
+        # target port — revoking the target port there changed nothing (found by the Floci CI run)
+        sg_port = path.get("entry_port") or port
         if src == "aws" and opened:
             for g in opened:
-                cmds += [f"aws ec2 revoke-security-group-ingress --group-id {g} --protocol tcp --port {port} --cidr 0.0.0.0/0",
+                cmds += [f"aws ec2 revoke-security-group-ingress --group-id {g} --protocol tcp --port {sg_port} --cidr 0.0.0.0/0",
                          (f"aws ec2 revoke-security-group-ingress --group-id {g} --ip-permissions "
-                          f"'IpProtocol=tcp,FromPort={port},ToPort={port},Ipv6Ranges=[{{CidrIpv6=::/0}}]'")]
+                          f"'IpProtocol=tcp,FromPort={sg_port},ToPort={sg_port},Ipv6Ranges=[{{CidrIpv6=::/0}}]'")]
+            if sg_port != port:
+                steps.append(f"This closes listener port {sg_port} on the load balancer for everyone. If the listener must stay "
+                             f"public, put a WAF in front or remove the listener's forwarding to port {port} instead.")
             rng = path.get("range") or [port, port]
             if rng[0] != rng[1]:
                 steps.append(f"The open rule covers ports {rng[0]}-{rng[1]}: revoke that range rule and re-add only the "
@@ -203,7 +209,7 @@ def _event(p: dict, now: datetime, status: str, note: str = "") -> None:
 
 
 def reconcile(store: Path, record: dict, *, hitl: Any = None, now: datetime | None = None,
-              tiers: tuple[str, ...] = ("ACT_NOW",)) -> dict:
+              tiers: tuple[str, ...] = ("ACT_NOW",), review_days: int = 30) -> dict:
     """Bring every proposal up to date with this run, file new ones, pull decisions, verify closure.
 
     ``record`` is the runner's run record (open / resolved / waived rows). Returns the remediation section
@@ -222,14 +228,22 @@ def reconcile(store: Path, record: dict, *, hitl: Any = None, now: datetime | No
         p = props.get(fp)
         if p and p.get("status") in OPEN_STATES:
             continue
-        if p and p.get("status") in ("rejected", "expired") and row["extra"].get("tier") in tiers:
-            # a rejected proposal is not re-filed every run; a new decision needs a new proposal id
-            continue
+        if p and p.get("status") == "rejected":
+            # a rejection holds until its review date — then the still-open ACT NOW finding is proposed again,
+            # so "rejected once" can never silence it for good
+            decided = p.get("decided_at") or p.get("updated_at")
+            if decided and (now - _parse(decided)).days < review_days:
+                continue
+        # an expired card is not a decision: nobody looked at it, so it is filed again on the next run
+        previous = {k: p.get(k) for k in ("status", "approval_id", "decided_by", "decided_at", "created_at")} if p else None
         options = build_options(row)
         props[fp] = p = {"fingerprint": fp, "id": row.get("id"), "asset": row.get("resource"),
                          "component": row.get("affected_component"), "scan": row.get("scan"),
                          "title": (row.get("extra") or {}).get("title"), "created_at": _iso(now),
-                         "options": options, "approval_id": None, "transport": None, "history": []}
+                         "options": options, "approval_id": None, "transport": None,
+                         "history": [{"at": _iso(now), "status": "refiled", "note": f"previous proposal {previous['status']}"}]
+                                    if previous else [],
+                         **({"previous": previous} if previous else {})}
         _event(p, now, "proposed")
 
     # 2) file proposals that have no card yet

@@ -168,7 +168,8 @@ def test_bad_inputs(tmp_path):
         loaders.load_vulns(tmp_path / "missing.json")
     bad = tmp_path / "bad.csv"
     bad.write_text("nope\n1\n")
-    assert loaders.load_vulns(bad) == []
+    with pytest.raises(PostureSourceError, match="no 'asset' column"):    # used to read as zero findings
+        loaders.load_vulns(bad)
     with pytest.raises(PostureSourceError, match="KEV"):
         loaders.apply_intel([], kev=tmp_path / "missing.json")
 

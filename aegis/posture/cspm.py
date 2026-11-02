@@ -58,9 +58,20 @@ def _open_ranges(perm: dict) -> list[str]:
     return v4 + v6
 
 
+# protocols whose rules carry port numbers; ICMP / ICMPv6 / GRE / ESP rules open no TCP or UDP port
+_PORT_PROTOCOLS = {"-1", "tcp", "udp", "6", "17", "all"}
+
+
+def carries_ports(perm: dict) -> bool:
+    """True when the rule can open a TCP/UDP port. An ICMP rule's FromPort/ToPort are the ICMP type and
+    code (-1 = all types), not ports — reading them as "all ports" turned an open ping into a critical
+    any-any finding and made every TCP port on the host look internet-facing."""
+    return str(perm.get("IpProtocol", "-1")).lower() in _PORT_PROTOCOLS
+
+
 def _ports(perm: dict) -> tuple[int, int] | None:
-    """(from, to); None means all traffic."""
-    if str(perm.get("IpProtocol")) == "-1":
+    """(from, to) for a port-bearing rule; None means every port. Call ``carries_ports`` first."""
+    if str(perm.get("IpProtocol")).lower() in ("-1", "all"):
         return None
     lo, hi = perm.get("FromPort"), perm.get("ToPort")
     if lo is None or hi is None or (lo, hi) in ((-1, -1), (0, 65535)):
@@ -126,7 +137,7 @@ def scan(bundle: dict) -> list[PostureFinding]:
                               recommended_remediation="Remove all rules from default security groups; use purpose-built groups"))
         for perm in sg.get("IpPermissions", []):
             srcs = _open_ranges(perm)
-            if not srcs:
+            if not srcs or not carries_ports(perm):
                 continue
             pr = _ports(perm)
             src = ", ".join(srcs)
@@ -263,6 +274,23 @@ def scan(bundle: dict) -> list[PostureFinding]:
                               recommended_remediation="Prevent reuse of the last 24 passwords"))
 
     return sort_findings(out)
+
+
+_SECTION_OF = (("CSPM-SG-", "security_groups"), ("CSPM-EC2-", "instances"), ("CSPM-EBS-DEFAULT", "ebs_encryption_by_default"),
+               ("CSPM-EBS-", "volumes"), ("CSPM-S3-ACCOUNT", "account_public_access_block"), ("CSPM-S3-", "buckets"),
+               ("CSPM-RDS-", "db_instances"), ("CSPM-CLOUDTRAIL-", "trails"), ("CSPM-GUARDDUTY-", "guardduty_detectors"),
+               ("CSPM-CONFIG-", "config_recorders"), ("CSPM-KMS-", "kms_keys"), ("CSPM-PASSWORD-", "password_policy"),
+               ("CSPM-NO-PASSWORD", "password_policy"), ("CSPM-VPC-", "vpcs"))
+
+
+def section_of(finding_id: str) -> str | None:
+    """The bundle section a finding comes from — so a section that was not collected this run carries its
+    findings forward instead of resolving them."""
+    return next((sec for pre, sec in _SECTION_OF if str(finding_id).startswith(pre)), None)
+
+
+def unchecked_sections(bundle: dict) -> list[str]:
+    return [k for k in BUNDLE_KEYS if k not in bundle]
 
 
 def coverage_gaps(bundle: dict) -> list[str]:

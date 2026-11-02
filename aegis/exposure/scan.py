@@ -72,7 +72,17 @@ def to_finding(e: Exposure) -> PostureFinding:
 def run_scan(o: dict) -> tuple[list[PostureFinding], list[str], dict]:
     if not o.get("vulns"):
         raise PostureSourceError("exposure scan needs vulns (scanner exports)")
-    vulns = [v for f in _files(o["vulns"]) for v in loaders.load_vulns(f)]
+    files = _files(o["vulns"])
+    if not files:
+        raise PostureSourceError(f"exposure scan: no vulnerability export found in {o['vulns']}")
+    vulns = [v for f in files for v in loaders.load_vulns(f)]
+    if not vulns and not o.get("allow_empty"):
+        # An export with no findings at all is far more often a broken export (an expired API key writing
+        # "[]", a filter that matched nothing) than a clean estate — and treating it as clean resolves every
+        # open exposure and marks approved remediations verified. Fail the scan instead (the runner carries
+        # the previous findings forward as stale); set allow_empty: true for an estate that is truly clean.
+        raise PostureSourceError(f"exposure scan: the vulnerability export(s) {', '.join(str(f) for f in files)} "
+                                 "contain no findings — refusing to treat that as a clean estate (allow_empty: true to accept)")
     notes = loaders.apply_intel(vulns, kev=o.get("kev"), epss=o.get("epss"))
     groups = [loaders.assets_from_aws(load_json(b)) for b in o.get("aws_bundles") or []]
     groups += [assets_from_azure(load_json(b)) for b in o.get("azure_bundles") or []]
