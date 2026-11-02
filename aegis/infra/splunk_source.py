@@ -152,6 +152,7 @@ class SplunkConsumer:
 
     def _stream_with_retry(self, url: str, body: bytes) -> Iterable[str]:
         attempt = 0
+        reauths = 0
         backoff = self._cfg.initial_backoff_s
         while True:
             try:
@@ -159,7 +160,14 @@ class SplunkConsumer:
                 return
             except urllib.error.HTTPError as exc:
                 if exc.code == 401 and not self._cfg.token:
-                    # Session expired — re-auth once
+                    # Session expired — re-auth ONCE. A 401 straight after a fresh login means the account
+                    # cannot search (role lacks the capability, session invalidated): looping on it hammered
+                    # Splunk and hung the service cycle forever.
+                    if reauths >= 1:
+                        _log.error("splunk: still 401 after re-authenticating as %s — check the account's search "
+                                   "capability; giving up this cycle", self._cfg.username)
+                        raise
+                    reauths += 1
                     _log.warning("splunk: 401 — re-authenticating")
                     self._state.session_key = None
                     self._login()

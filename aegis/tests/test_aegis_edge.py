@@ -18,6 +18,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 import aegis_edge as E  # noqa: E402
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _demo_sources(monkeypatch):
+    # these tests drive the shim like the scripted demo does (spoofed sources via X-Demo-Src)
+    monkeypatch.setenv("AEGIS_EDGE_TRUST_DEMO_SRC", "1")
 
 
 # ----------------------------------------------------------------- stubs -- #
@@ -346,3 +353,16 @@ def test_benign_response_passes_through_untouched():
     with _serve(_Upstream, hits=[]) as (_up, upbase), _edge(upbase, mode="live") as (base, _s, _bl):
         code, body, _ = _req(base, "/accounts", src="203.0.113.9")
         assert code == 200 and json.loads(body)["echo"] == "/accounts"   # no false positive, no 403
+
+
+def test_x_demo_src_is_ignored_unless_the_demo_flag_is_set(monkeypatch):
+    """In front of a real app a client could set X-Demo-Src to step around the blocklist."""
+    monkeypatch.delenv("AEGIS_EDGE_TRUST_DEMO_SRC", raising=False)
+
+    class H:
+        def __init__(self):
+            self.headers = {"X-Demo-Src": "198.51.100.7"}
+            self.client_address = ("203.0.113.66", 5555)
+    assert E.Handler._client_ip(H()) == "203.0.113.66"
+    monkeypatch.setenv("AEGIS_EDGE_TRUST_DEMO_SRC", "1")
+    assert E.Handler._client_ip(H()) == "198.51.100.7"

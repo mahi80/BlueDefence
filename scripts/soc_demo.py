@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -289,6 +290,9 @@ class _Handler(BaseHTTPRequestHandler):
         # /api/approvals/{id}/approve|reject
         parts = path.strip("/").split("/")
         if len(parts) >= 4 and parts[:2] == ["api", "approvals"] and parts[3] in ("approve", "reject"):
+            if self.headers.get("Origin"):        # the console decides server-side; a browser page here is CSRF
+                self._send(403, {"error": "cross-site decision refused"})
+                return
             ok = d.decide(parts[2], "approve" if parts[3] == "approve" else "reject",
                           rationale=str(body.get("rationale") or body.get("reason") or ""))
             if ok and parts[3] == "approve" and parts[2] == "appr_01":
@@ -325,7 +329,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if a.all or (not a.step and a.pace <= 0):
         d.goto_end()
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", a.port), _Handler)
+    # loopback by default: the demo has no authentication (AEGIS_DEMO_BIND=0.0.0.0 to show it on a LAN)
+    httpd = ThreadingHTTPServer((os.environ.get("AEGIS_DEMO_BIND", "127.0.0.1"), a.port), _Handler)
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, name="soc-demo", daemon=True).start()
     _banner(a.port)

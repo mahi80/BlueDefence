@@ -470,3 +470,21 @@ def test_representative_alert_picks_the_worst_severity():
           edge_blocked=True, deep=[], behavioral=[])
     rep = c.representative_alert()
     assert rep is not None and rep["severity"] == "critical"
+
+
+def test_decisions_need_the_token_and_refuse_cross_site_pages():
+    """An approve can push real enforcement; any web page the presenter opened used to be able to POST it."""
+    httpd, base = _serve(token="t0k")
+    try:
+        url = f"{base}/api/approvals/appr_x_iso/approve"
+        assert _post(url, "{}") == 403                          # no token
+        req = urllib.request.Request(url, data=b"{}", method="POST",
+                                     headers={"Authorization": "Bearer t0k", "Origin": "https://evil.example"})
+        try:
+            code = urllib.request.urlopen(req, timeout=5).status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        assert code == 403                                       # browser cross-site request, even with a token
+        assert _post(url, "{}", token="t0k") == 404             # authorised, unknown id
+    finally:
+        httpd.shutdown()
