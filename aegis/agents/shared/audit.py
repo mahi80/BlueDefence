@@ -236,6 +236,25 @@ class AuditLog:
                     except ValueError as e:
                         raise ValueError(f"{f.name}:{n}: {str(e)[:60]}") from e
 
+    def _live_segment_seed(self) -> str:
+        """The hash the live segment's first row chains from: the last row of the newest rotated segment
+        (GENESIS when the log has never rotated). Verifying the live file from GENESIS reported an intact log
+        as "chain BROKEN at (audit.jsonl, 1)" after the first rotation, and the compliance report failed."""
+        rotated = self.rotated_files()
+        if not rotated:
+            return GENESIS
+        last = ""
+        try:
+            with rotated[-1].open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - 1_048_576))       # the last row of a segment is well under 1 MiB
+                tail = fh.read().decode("utf-8", "replace").rstrip("\n").rsplit("\n", 1)[-1]
+            last = str(json.loads(tail).get("integrity_hash") or "")
+        except (OSError, ValueError):
+            last = ""
+        return last or GENESIS
+
     def verify(self, *, all_files: bool = False) -> bool:
         return self.verify_report(all_files=all_files)["ok"]
 
@@ -243,7 +262,7 @@ class AuditLog:
         """Walk the chain; ``{"ok", "entries", "files", "broken_at": (file, line) | None}``. With ``all_files``
         the rotated segments are verified in order as one chain (the first entry of each segment chains from the
         previous segment's tail)."""
-        prev = GENESIS
+        prev = GENESIS if all_files else self._live_segment_seed()
         entries, files = 0, set()
         try:
             for f, n, entry in self._iter_entries(all_files):

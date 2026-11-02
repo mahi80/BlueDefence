@@ -30,8 +30,14 @@ class DeferredQueue:
         cur = self._cursor_path()
         try:
             self._read_pos = int(cur.read_text().strip())
-            if self.path.exists() and self._read_pos > self.path.stat().st_size:
+            # A cursor with no spill file (a crash between ack()'s two unlinks, an operator deleting the file)
+            # or past its end is stale: honouring it hid every newly parked alert until the file outgrew it.
+            if not self.path.exists() or self._read_pos > self.path.stat().st_size:
+                if self._read_pos:
+                    logger.warning("[deferred] stale cursor %d for %s (file %s) — starting from the beginning",
+                                   self._read_pos, self.path, "missing" if not self.path.exists() else "shorter")
                 self._read_pos = 0
+                cur.unlink(missing_ok=True)
         except (OSError, ValueError):
             self._read_pos = 0
         self._inflight_pos = self._read_pos
@@ -132,8 +138,8 @@ class DeferredQueue:
             tmp.write_text(str(self._read_pos))
             os.replace(tmp, cur)
             if self.path.exists() and self._read_pos >= self.path.stat().st_size:   # fully drained: start the file over
+                cur.unlink(missing_ok=True)          # cursor first: a crash in between leaves a file and no cursor (safe)
                 self.path.unlink(missing_ok=True)
-                cur.unlink(missing_ok=True)
                 self._read_pos = self._inflight_pos = 0
         except OSError as e:
             logger.warning("[deferred] cursor not persisted: %s — the batch may be re-delivered after a restart", e)

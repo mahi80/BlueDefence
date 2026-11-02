@@ -131,6 +131,7 @@ class Blocklist:
         self._url = url
         self._token = token
         self._poll_s = max(0.5, poll_s)
+        self._poll_failures = 0
         self._lock = threading.Lock()
         self._nets: list[tuple[Any, float | None]] = []    # (ip_network, expires_at|None) from the SOC poll
         self._pushed: dict[str, float | None] = {}         # target -> expires_at|None from /control/enforce
@@ -145,8 +146,15 @@ class Blocklist:
         while True:
             try:
                 self._poll_once()
-            except Exception:  # noqa: BLE001 — a transient SOC outage must never take the edge down
-                pass
+                if self._poll_failures:
+                    print(f"[aegis-edge] blocklist poll recovered after {self._poll_failures} failure(s)", file=sys.stderr)
+                self._poll_failures = 0
+            except Exception as e:  # noqa: BLE001 — a transient SOC outage must never take the edge down
+                # ...but it must be visible: new containment does not reach the edge while this fails
+                self._poll_failures += 1
+                if self._poll_failures in (1, 10) or self._poll_failures % 100 == 0:
+                    print(f"[aegis-edge] blocklist poll failed ({self._poll_failures}x, keeping the last good list): "
+                          f"{type(e).__name__}: {str(e)[:160]}", file=sys.stderr)
             time.sleep(self._poll_s)
 
     def _poll_once(self) -> None:
@@ -240,9 +248,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_a: Any) -> None:
         pass
 
-    # -- identity: the real peer IP, or X-Demo-Src for a scripted demo (demo convenience only) --
+    # -- identity: the real peer IP. X-Demo-Src (a scripted demo's spoofed source) is honoured ONLY when the
+    # shim is started with AEGIS_EDGE_TRUST_DEMO_SRC=1: in front of a real app any client could set it to
+    # step around the blocklist or pin its attack on an innocent IP.
     def _client_ip(self) -> str:
-        return self.headers.get("X-Demo-Src") or self.client_address[0]
+        if os.environ.get("AEGIS_EDGE_TRUST_DEMO_SRC", "").strip() == "1":
+            return self.headers.get("X-Demo-Src") or self.client_address[0]
+        return self.client_address[0]
 
     def _headers_lc(self) -> dict[str, str]:
         return {k.lower(): v for k, v in self.headers.items()}

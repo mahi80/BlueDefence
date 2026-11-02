@@ -806,6 +806,12 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             body = {}
         if len(parts) >= 4 and parts[:2] == ["api", "approvals"] and parts[3] in ("approve", "reject"):
+            # A decision can push real enforcement (--target-control-url). The console calls this server-side
+            # with the bearer token and no Origin; a browser page (CSRF) always sends an Origin. Refuse both a
+            # missing token and any cross-site browser request.
+            if self.headers.get("Origin") or not self._ingest_authorized():
+                self._send(403, {"error": "decisions need the console's bearer token and no browser Origin"})
+                return
             ok = s.decide(parts[2], "approve" if parts[3] == "approve" else "reject",
                           rationale=str(body.get("rationale") or body.get("reason") or ""))
             if ok and parts[3] == "approve" and parts[2].endswith("_iso") and not s._enforce_url:
