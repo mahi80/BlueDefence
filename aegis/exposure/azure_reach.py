@@ -201,5 +201,6 @@ def assets_from_azure(bundle: dict) -> list[Asset]:
                 if rng not in a.internet_ports:
                     a.internet_ports.append(rng)
                 a.internet_via.setdefault(rng, f"load balancer {name} (frontend :{fport} → port {bport})")
+                a.fronted_by.add(name)
                 a.public = True
     return out

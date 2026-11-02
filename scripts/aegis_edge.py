@@ -319,6 +319,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route == "/__edge/health":
             self._json(200, {"ok": True, "mode": self.state.mode, "upstream": self.state.upstream,
+                             "inline_waf": self.state.inline_waf, "asset": self.state.asset,
                              "denied": self.state.denied, "forwarded": self.state.forwarded,
                              "blocklist": self.state.blocklist.snapshot()})
             return

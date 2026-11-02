@@ -28,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--inventory", help="asset inventory CSV (on-prem assets, zones, roles, WAF / EDR coverage)")
     ap.add_argument("--kev", help="CISA KEV catalogue JSON (known_exploited_vulnerabilities.json)")
     ap.add_argument("--epss", help="FIRST EPSS scores CSV (epss_scores-YYYY-MM-DD.csv)")
+    ap.add_argument("--waf-coverage", action="append", default=[],
+                    help="WAF / virtual-patch coverage from `python -m aegis.exposure.coverage`; repeatable")
     ap.add_argument("--settings", help="exposure.yaml: epss_threshold, virtual_patches {CVE: [asset, ...]}")
     ap.add_argument("--top", type=int, default=15, help="exposures to print (text mode)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -48,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
             raise PostureSourceError("pass at least one --aws-bundle / --azure-bundle / --k8s-export / --inventory: "
                                      "reachability needs an asset model")
         assets = loaders.merge_assets(*groups)
-        exposures, more = assess(vulns, assets, loaders.load_settings(args.settings))
+        exposures, more = assess(vulns, assets, loaders.with_coverage(loaders.load_settings(args.settings), args.waf_coverage))
         notes += more
     except PostureSourceError as e:
         print(f"error: {e}", file=sys.stderr)
