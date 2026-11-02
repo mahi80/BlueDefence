@@ -59,8 +59,8 @@ def load_credential_report(path: str | Path) -> list[dict[str, str]]:
 
 # ---- live (opt-in) --------------------------------------------------------------------------------
 
-def _boto3_client(service: str, **kw: Any) -> Any:
-    if not live_enabled():
+def _boto3_client(service: str, *, require_flag: bool = True, **kw: Any) -> Any:
+    if require_flag and not live_enabled():
         raise PostureSourceError("live posture collection is off; set AEGIS_POSTURE_LIVE=1 or pass an export file")
     try:
         import boto3
@@ -88,3 +88,83 @@ def live_aws_iam(wait_s: float = 30.0) -> tuple[dict, list[dict[str, str]]]:
         time.sleep(2)
     content = iam.get_credential_report()["Content"]
     return details, parse_credential_report(content)
+
+
+def _safe(fn: Any, *a: Any, missing: tuple[str, ...] = (), default: Any = None, **kw: Any) -> Any:
+    """Call a read-only AWS API; return ``default`` when the resource simply has no such config
+    (e.g. NoSuchBucketPolicy). Any other error propagates so a permissions gap is not read as clean."""
+    try:
+        return fn(*a, **kw)
+    except Exception as e:  # botocore ClientError; botocore is only importable in live mode
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in missing:
+            return default
+        raise
+
+
+def collect_aws_cspm(region: str | None = None, *, require_flag: bool = True) -> dict:
+    """Build the ``cspm.scan`` bundle for one region (plus S3 / IAM, which are global) with
+    read-only Describe/Get/List calls. The AWS-managed ``SecurityAudit`` policy is sufficient.
+
+    ``require_flag=False`` is used by ``export-aws``: the bank runs the export itself and hands AEGIS
+    the file, so AEGIS's own live-mode switch does not apply.
+    """
+    c = lambda svc: _boto3_client(svc, require_flag=require_flag, **({"region_name": region} if region else {}))
+    sts, s3, s3c, ec2, rds, ct, kms, gd, cfg, iam = (c(s) for s in
+        ("sts", "s3", "s3control", "ec2", "rds", "cloudtrail", "kms", "guardduty", "config", "iam"))
+    acct = sts.get_caller_identity()["Account"]
+    b: dict[str, Any] = {"account_id": acct, "region": ec2.meta.region_name}
+
+    b["account_public_access_block"] = _safe(s3c.get_public_access_block, AccountId=acct,
+                                             missing=("NoSuchPublicAccessBlockConfiguration",), default={}).get("PublicAccessBlockConfiguration")
+    buckets = []
+    for bk in s3.list_buckets().get("Buckets", []):
+        n = bk["Name"]
+        nf = ("NoSuchPublicAccessBlockConfiguration", "NoSuchBucketPolicy", "ServerSideEncryptionConfigurationNotFoundError")
+        buckets.append({
+            "Name": n,
+            "PublicAccessBlock": (_safe(s3.get_public_access_block, Bucket=n, missing=nf, default={}) or {}).get("PublicAccessBlockConfiguration"),
+            "PolicyStatus": (_safe(s3.get_bucket_policy_status, Bucket=n, missing=nf, default={}) or {}).get("PolicyStatus"),
+            "Acl": {"Grants": s3.get_bucket_acl(Bucket=n).get("Grants", [])},
+            "Encryption": (_safe(s3.get_bucket_encryption, Bucket=n, missing=nf, default={}) or {}).get("ServerSideEncryptionConfiguration"),
+            "Versioning": {"Status": s3.get_bucket_versioning(Bucket=n).get("Status")},
+            "Logging": s3.get_bucket_logging(Bucket=n).get("LoggingEnabled"),
+        })
+    b["buckets"] = buckets
+
+    page = lambda cl, op, key, **kw: [x for p in cl.get_paginator(op).paginate(**kw) for x in p.get(key, [])]
+    b["security_groups"] = page(ec2, "describe_security_groups", "SecurityGroups")
+    b["instances"] = [i for r in page(ec2, "describe_instances", "Reservations") for i in r.get("Instances", [])]
+    b["volumes"] = page(ec2, "describe_volumes", "Volumes")
+    b["ebs_encryption_by_default"] = ec2.get_ebs_encryption_by_default().get("EbsEncryptionByDefault")
+    flows = {f.get("ResourceId") for f in page(ec2, "describe_flow_logs", "FlowLogs")}
+    b["vpcs"] = [{"VpcId": v["VpcId"], "IsDefault": v.get("IsDefault"), "FlowLogs": [v["VpcId"]] if v["VpcId"] in flows else []}
+                 for v in page(ec2, "describe_vpcs", "Vpcs")]
+    b["db_instances"] = page(rds, "describe_db_instances", "DBInstances")
+
+    # Include shadow trails: a multi-region trail homed in another region still covers this one.
+    # Its status has to be read from its home region.
+    trails, home_clients = [], {ec2.meta.region_name: ct}
+    for t in ct.describe_trails(includeShadowTrails=True).get("trailList", []):
+        home = t.get("HomeRegion") or ec2.meta.region_name
+        if home not in home_clients:
+            home_clients[home] = _boto3_client("cloudtrail", require_flag=require_flag, region_name=home)
+        st = home_clients[home].get_trail_status(Name=t["TrailARN"])
+        trails.append({**t, "IsLogging": st.get("IsLogging"), "KmsKeyId": t.get("KmsKeyId")})
+    b["trails"] = trails
+
+    keys = []
+    for k in page(kms, "list_keys", "Keys"):
+        meta = kms.describe_key(KeyId=k["KeyId"])["KeyMetadata"]
+        if meta.get("KeyManager") == "CUSTOMER" and meta.get("KeyState") == "Enabled":
+            rot = _safe(kms.get_key_rotation_status, KeyId=k["KeyId"], missing=("UnsupportedOperationException",), default={})
+            meta["KeyRotationEnabled"] = (rot or {}).get("KeyRotationEnabled")
+        keys.append({x: meta.get(x) for x in ("KeyId", "Arn", "KeyManager", "KeyState", "KeySpec", "KeyRotationEnabled")})
+    b["kms_keys"] = keys
+
+    b["guardduty_detectors"] = [{"DetectorId": d, "Status": gd.get_detector(DetectorId=d).get("Status")}
+                                for d in gd.list_detectors().get("DetectorIds", [])]
+    statuses = {s["name"]: s.get("recording") for s in cfg.describe_configuration_recorder_status().get("ConfigurationRecordersStatus", [])}
+    b["config_recorders"] = [{"name": n, "recording": r} for n, r in statuses.items()]
+    b["password_policy"] = (_safe(iam.get_account_password_policy, missing=("NoSuchEntity",), default={}) or {}).get("PasswordPolicy")
+    return b
