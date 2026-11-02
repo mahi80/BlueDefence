@@ -4,6 +4,7 @@
     python -m aegis.posture cspm --bundle F [--live --region R] [--json] [--fail-on SEV]
     python -m aegis.posture k8s  --export F [--live --context C] [--include-system] [--json] [--fail-on SEV]
     python -m aegis.posture iac  [--plan F] [--k8s PATH ...] [--waivers F] [--changed-only] [--json] [--fail-on SEV]
+    python -m aegis.posture run  --config posture.yaml [--store DIR] [--loop] [--fail-on SEV] [--fail-on-overdue]
     python -m aegis.posture export-aws --out F [--region R]     # run by the bank, with its own read-only creds
 
 Exit codes: 0 ok, 1 a finding at or above ``--fail-on``, 2 bad or missing input. The same command
@@ -14,10 +15,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
-from . import cspm, iac_policy, iam_review, k8s_posture, sources
+from . import cspm, iac_policy, iam_review, k8s_posture, runner, sources
 from .base import SEVERITY_ORDER, sort_findings, summarize
 
 
@@ -131,12 +133,35 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--json", action="store_true", help="machine-readable output")
         p.add_argument("--fail-on", choices=SEVERITY_ORDER, help="exit 1 if any finding is this severe or worse")
 
+    rn = sub.add_parser("run", help="the VAPT loop: every scan in posture.yaml, tracked over time, with a report")
+    rn.add_argument("--config", required=True, help="posture.yaml (scans, waivers, SLA days, store, interval)")
+    rn.add_argument("--store", help="override the store directory (latest.json, runs/, state.json)")
+    rn.add_argument("--loop", action="store_true", help="keep running every interval_minutes")
+    rn.add_argument("--fail-on", choices=SEVERITY_ORDER, help="exit 1 if any open finding is this severe or worse")
+    rn.add_argument("--fail-on-overdue", action="store_true", help="exit 1 if any open finding is past its SLA")
+
     ex = sub.add_parser("export-aws", help="write a CSPM bundle using the caller's own read-only AWS credentials")
     ex.add_argument("--out", required=True, help="output JSON file")
     ex.add_argument("--region", help="region to export (default: the SDK's configured region)")
 
     args = ap.parse_args(argv)
     try:
+        if args.scan == "run":
+            cfg = runner.load_config(args.config, store=args.store)
+            if args.loop:
+                logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+                runner.loop(cfg)
+                return 0
+            r = runner.run_once(cfg)
+            c = r["counts"]
+            for sc in r["scans"]:
+                print(f"{sc['status'].upper():5} {sc['name']:28} {sc['type']:5} " + (sc.get("error") or ", ".join(f"{k} {v}" for k, v in sc["summary"].items() if v) or "clean"))
+            print(f"run {r['run_id']}: {c['open']} open ({', '.join(f'{k} {v}' for k, v in r['summary'].items() if v) or 'none'}), "
+                  f"{c['new']} new, {c['resolved']} resolved, {c['overdue']} past SLA, {c['waived']} waived, {c['stale']} stale")
+            print(f"report: {cfg.store / 'runs' / (r['run_id'] + '.md')}")
+            limit = SEVERITY_ORDER.index(args.fail_on) if args.fail_on else -1
+            failing = any(SEVERITY_ORDER.index(o["severity"]) <= limit for o in r["open"]) or (args.fail_on_overdue and c["overdue"])
+            return 1 if failing else 0
         if args.scan == "export-aws":
             bundle = sources.collect_aws_cspm(args.region, require_flag=False)
             Path(args.out).write_text(json.dumps(bundle, indent=1, default=str), encoding="utf-8")

@@ -1,0 +1,27 @@
+# /etc/aegis/posture.yaml — the bank's posture scans. Paths may be absolute or relative to this file.
+store: /var/lib/aegis/posture           # set the console's AEGIS_POSTURE_DIR to this
+interval_minutes: 1440                  # only used with --loop; the systemd timer is preferred
+keep_runs: 365                          # one year of dated assessment records
+waivers: /etc/aegis/waivers.yaml        # the exception register (reason, approver, expiry)
+sla_days: {critical: 7, high: 30, medium: 90, low: 180}
+
+scans:
+  - name: aws-prod-iam
+    type: iam
+    auth_details: /var/lib/aegis/exports/aws-prod/auth.json
+    credential_report: /var/lib/aegis/exports/aws-prod/credential-report.json
+    trusted_accounts: ["222222222222"]   # approved vendor / org accounts
+  - name: aws-prod-ap-south-1
+    type: cspm
+    bundle: /var/lib/aegis/exports/aws-prod/cspm-ap-south-1.json
+  - name: aws-dr-ap-south-2
+    type: cspm
+    live: true                          # AEGIS_POSTURE_LIVE=1 + read-only role; omit for export mode
+    region: ap-south-2
+  - name: eks-payments
+    type: k8s
+    export: /var/lib/aegis/exports/eks-payments.json
+  - name: infra-repo-main
+    type: iac
+    plan: /var/lib/aegis/exports/infra-repo/plan.json
+    k8s: [/var/lib/aegis/exports/infra-repo/k8s]
