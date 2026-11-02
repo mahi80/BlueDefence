@@ -81,9 +81,11 @@ const STATUS_LEVEL: Record<ProposalStatus, Level | "info"> = {
   proposed: "info", awaiting_approval: "warn", approved: "info", approved_still_open: "bad", verified_closed: "ok",
   closed_before_decision: "ok", rejected: "info", expired: "info", accepted_risk: "info",
 };
+// transports whose decisions this console can record itself: the ACP dashboard, and the standalone host's
+// own queue (the console's approve route → the host's /api/approvals → decisions.jsonl)
+const DECIDE_HERE = new Set(["dashboard", "file"]);
 const DECIDE_ELSEWHERE: Record<string, string> = {
   servicenow: "Decide on the ServiceNow approval record",
-  file: "Decide by appending to decisions.jsonl in the HITL directory",
 };
 
 function CopyCmd({ cmd }: { cmd: string }) {
@@ -140,7 +142,7 @@ function Remediation({ p, canDecide, fixture }: { p: RemediationProposal; canDec
   }
 
   const lvl = STATUS_LEVEL[status];
-  const canAct = status === "awaiting_approval" && !local && p.approval_id && (p.transport === "dashboard" || fixture);
+  const canAct = status === "awaiting_approval" && !local && p.approval_id && (DECIDE_HERE.has(p.transport ?? "") || fixture);
   return (
     <section className={`rm rm-${lvl}`} aria-label="Remediation proposal">
       <header className="rm-head">

@@ -118,20 +118,30 @@ vulnerable target, Logic App playbooks — is `deploy/sandbox/azure/` (Terraform
 
 ## Editions
 
-`AEGIS_EDITION` separates the external SOC from the internal agent governance. A company that
-only wants the detection agent runs **external**: nothing of ours in their code, no ACP
-dashboard, no `acp-sdk` import.
+`AEGIS_EDITION` separates the standalone SOC from the ACP integration. **BlueDefence is standalone
+by default (`external`)**: its own Next.js console (`soc-console/`) talks to this host's API — chains
+from the local audit log, approvals through the local queue — with no ACP dashboard and no `acp-sdk`.
+A host that sets `ACP_DASHBOARD_URL` without naming an edition keeps `full`, so integrated installs are
+unchanged.
 
-| | `external` | `soc` | `full` (default) |
+| | `external` (default) | `soc` | `full` |
 |---|---|---|---|
 | Alert feeds, triage model, swarm, blast radius, plan, twin | ✅ | ✅ | ✅ |
 | WAF / SOAR connectors, shadow mode, receipts | ✅ | ✅ | ✅ |
 | Local hash-chained audit | ✅ authoritative | ✅ | ✅ |
-| Approvals | ServiceNow or file queue (+ Slack notify) | dashboard, ServiceNow or file | dashboard, ServiceNow or file |
-| ACP console: cards, chains, shadow report, dataset, model promotion queue | — | ✅ | ✅ |
+| Approvals | **BlueDefence console** (local queue), ServiceNow, or file (+ Slack notify) | dashboard, ServiceNow or file | dashboard, ServiceNow or file |
+| Console: incidents, approvals, posture, exposures, model loop | ✅ BlueDefence console → this host | ✅ | ✅ |
+| Model promotion (`retrain propose` / `sync`) | local queue, decided in the console | ACP dashboard (`--dashboard`) | ACP dashboard (`--dashboard`) |
+| ACP dashboard: shadow report upload, receipts/chains shipped, rule feed | — | ✅ | ✅ |
 | SOC brain governed under ACPGuard | — | — | ✅ |
 | ACP SDK in the customer's own agents, Q37, Q rogue detectors | — | — | ✅ |
 | Q ↔ AEGIS bridge | — | — | ✅ |
+
+**Standalone in three settings:** on the host, `AEGIS_CONSOLE_TOKEN=<secret>` (the push receiver then
+serves `/api/soc/*` + `/api/approvals` + `/api/soc/proposals` from its own files); in the console,
+`AEGIS_API_ORIGIN=http://<host>:8787` and `AEGIS_API_KEY=<same secret>`. Analysts sign in to the
+console; only deciding roles see Approve / Reject, and the decision lands in `decisions.jsonl` where the
+service executes it on its next cycle.
 
 `aegis/edition.py::apply_edition()` runs first in `build_pipeline`: it fills the edition's
 defaults and **refuses** contradictory configuration with the variable named

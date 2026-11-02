@@ -6,7 +6,11 @@
     AEGIS_EDITION=soc        external + the ACP dashboard in SOC mode (cards, chains, receipts, shadow report,
                              retrain loop). Still no SDK in the customer's agents.
     AEGIS_EDITION=full       everything: the SOC brain is itself a governed ACP agent, Q ↔ AEGIS bridge on,
-                             live intel published to the agent threat-impact scan.   (default)
+                             live intel published to the agent threat-impact scan.
+
+Default: ``external`` (standalone — the SOC console talks to this host's own API: chains from the local
+audit log, approvals through the local queue). A host with ``ACP_DASHBOARD_URL`` set and no
+``AEGIS_EDITION`` keeps ``full``, so existing integrated installs are unchanged.
 
 ``apply_edition()`` runs first in ``build_pipeline``: it fills in the edition's defaults for anything
 unset, and **refuses** configuration that contradicts the edition — an "external" deployment that
@@ -70,9 +74,16 @@ class EditionError(ValueError):
     """Configuration contradicts the chosen edition (named variable, named reason)."""
 
 
+def default_edition(env: Mapping[str, str]) -> str:
+    """BlueDefence is standalone by default: its own console + this host's API, no ACP dashboard
+    (``external``). A host that already points at an ACP dashboard (``ACP_DASHBOARD_URL`` set) and names no
+    edition keeps the integrated ``full`` behaviour it was installed with."""
+    return "full" if str(env.get("ACP_DASHBOARD_URL", "")).strip() else "external"
+
+
 def current(env: Mapping[str, str] | None = None) -> Edition:
     env = os.environ if env is None else env
-    name = str(env.get("AEGIS_EDITION", "full")).strip().lower() or "full"
+    name = str(env.get("AEGIS_EDITION", "")).strip().lower() or default_edition(env)
     if name not in _BY_NAME:
         raise EditionError(f"AEGIS_EDITION={name!r} is not one of {EDITIONS}")
     return _BY_NAME[name]
