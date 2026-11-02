@@ -242,11 +242,42 @@ def test_collected_bundle_scans_and_uses_only_read_calls(monkeypatch, fake_aws):
     assert all(op.startswith(("get_", "list_", "describe_")) for op in ops), ops
 
 
-def test_unexpected_api_error_is_not_swallowed(monkeypatch, fake_aws):
+def test_scp_deny_drops_one_section_not_the_scan(monkeypatch, fake_aws):
+    """Seen on a real AWS Organizations account: an SCP explicitly denies guardduty:ListDetectors.
+    The rest of the account must still be scanned, and GuardDuty reported as not checked, not clean."""
+    monkeypatch.setenv("AEGIS_POSTURE_LIVE", "1")
+    deny = _Err("AccessDeniedException")
+    deny.response["Error"]["Message"] = "... with an explicit deny in a service control policy"
+    monkeypatch.setattr(FakeAWS, "_guardduty_list_detectors", lambda self: (_ for _ in ()).throw(deny))
+    b = sources.collect_aws_cspm()
+    assert "guardduty_detectors" not in b and "service control policy" in b["collection_errors"]["guardduty_detectors"]
+    ids = {f.id for f in cspm.scan(b)}
+    assert "CSPM-GUARDDUTY-OFF" not in ids                       # unknown is not "off"
+    assert {"CSPM-S3-PUBLIC-BUCKET", "CSPM-SG-DB-PORT-OPEN"} <= ids  # everything else still scanned
+    (gap,) = cspm.coverage_gaps(b)
+    assert gap.startswith("guardduty_detectors (access denied") and "AccessDeniedException" in gap
+
+
+def test_denied_bucket_call_drops_the_s3_section(monkeypatch, fake_aws):
     monkeypatch.setenv("AEGIS_POSTURE_LIVE", "1")
     monkeypatch.setattr(FakeAWS, "_s3_get_bucket_policy_status", lambda self, **_: (_ for _ in ()).throw(_Err("AccessDenied")))
-    with pytest.raises(_Err):
+    b = sources.collect_aws_cspm()
+    assert "buckets" not in b and "buckets" in b["collection_errors"]
+    assert "CSPM-S3-PUBLIC-BUCKET" not in {f.id for f in cspm.scan(b)}
+
+
+def test_non_aws_errors_still_stop_the_collection(monkeypatch, fake_aws):
+    monkeypatch.setenv("AEGIS_POSTURE_LIVE", "1")
+    monkeypatch.setattr(FakeAWS, "_kms_describe_key", lambda self, **_: (_ for _ in ()).throw(KeyError("bug")))
+    with pytest.raises(KeyError):
         sources.collect_aws_cspm()
+
+
+def test_cli_reports_why_a_section_was_skipped(tmp_path, capsys):
+    p = tmp_path / "b.json"
+    p.write_text(json.dumps({"account_id": "1", "collection_errors": {"guardduty_detectors": "AccessDeniedException: SCP"}}))
+    assert cli(["cspm", "--bundle", str(p)]) == 0
+    assert "guardduty_detectors (access denied or failed: AccessDeniedException: SCP)" in capsys.readouterr().out
 
 
 def test_export_runs_without_the_flag_and_cli_scans_it(monkeypatch, fake_aws, tmp_path, capsys):

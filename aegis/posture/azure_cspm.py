@@ -289,5 +289,6 @@ def scan(bundle: dict) -> list[PostureFinding]:
 
 
 def coverage_gaps(bundle: dict) -> list[str]:
-    gaps = [k for k in BUNDLE_KEYS if k not in bundle]
+    errs = bundle.get("collection_errors") or {}
+    gaps = [f"{k} (access denied or failed: {errs[k]})" if k in errs else k for k in BUNDLE_KEYS if k not in bundle]
     return gaps + ["entra_id (MFA, guests, conditional access — needs Microsoft Graph, not collected)"]
