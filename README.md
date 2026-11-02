@@ -42,6 +42,7 @@ cadence. Full technical detail: [`aegis/README.md`](aegis/README.md).
 | **Kubernetes posture** | `kubectl get … -o json` export (never secrets), or live read-only `kubectl` | privileged / host-mounting workloads, pods holding cluster-admin tokens, plaintext secrets in manifests, anonymous and wildcard RBAC, namespaces with no NetworkPolicy — CIS Kubernetes v1.9 + Pod Security Standards |
 | **DevSecOps / policy-as-code** | Terraform plans and Kubernetes YAML in CI | the same rules and IDs as runtime block the pull request; exceptions only through a waiver register with reason, approver and expiry |
 | **Continuous VAPT tracking** | all of the above, on a schedule | new / still open / resolved per run, remediation SLA by severity, a dated assessment report per run, and a **Posture** tab in the SOC console |
+| **Exposure prioritisation** | Tenable / scanner exports, CISA KEV + FIRST EPSS, posture bundles, asset inventory | exploitable × reachable × undefended × crown-jewel distance → ACT NOW / ACT / SCHEDULE / MONITOR with the reason chain for each; the funnel from raw findings to the few that need action now |
 | **Network operations** | Cisco IOS / NX-OS syslog, SNMP traps, NetFlow / IPFIX, gNMI telemetry, RANCID / Oxidized configs, LLDP / CDP | topology-aware root cause, alarm suppression (53 → 1 on a fibre cut), flaps, congestion, device silence, **bad config push** detection with rollback |
 | AI governance | ACP governance events (optional) | the SOC brain itself runs as a governed agent under ACP |
 

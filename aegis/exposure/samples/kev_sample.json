@@ -1,0 +1,21 @@
+{
+ "title": "CISA KEV \u2014 sample subset for tests",
+ "catalogVersion": "sample",
+ "vulnerabilities": [
+  {
+   "cveID": "CVE-2021-44228"
+  },
+  {
+   "cveID": "CVE-2023-44487"
+  },
+  {
+   "cveID": "CVE-2022-22965"
+  },
+  {
+   "cveID": "CVE-2017-5638"
+  },
+  {
+   "cveID": "CVE-2023-34362"
+  }
+ ]
+}
