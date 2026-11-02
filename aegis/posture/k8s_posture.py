@@ -27,7 +27,8 @@ CIS = "CIS Kubernetes v1.9"
 PSS = "Pod Security Standards"
 
 EXPORT_KINDS = ("namespaces", "pods", "deployments", "daemonsets", "statefulsets", "replicasets", "jobs", "cronjobs",
-                "serviceaccounts", "roles", "clusterroles", "rolebindings", "clusterrolebindings", "networkpolicies")
+                "serviceaccounts", "roles", "clusterroles", "rolebindings", "clusterrolebindings", "networkpolicies",
+                "services", "ingresses")
 EXPORT_COMMAND = "kubectl get " + ",".join(EXPORT_KINDS) + " -A -o json"
 
 SYSTEM_NAMESPACES = frozenset({"kube-system", "kube-public", "kube-node-lease"})

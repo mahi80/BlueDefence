@@ -1,0 +1,6 @@
+asset,cve,title,port,cvss,epss,kev,poc
+vm-web,CVE-2023-44487,HTTP/2 Rapid Reset,443,7.5,0.82,yes,yes
+vm-web,CVE-2019-0708,BlueKeep RDP RCE,3389,9.8,0.97,yes,yes
+vm-api,CVE-2022-22965,Spring4Shell,8080,9.8,0.97,yes,yes
+vm-api,CVE-2021-44228,Log4Shell,8443,10.0,0.94,yes,yes
+vm-db,CVE-2020-0618,SQL Server Reporting Services RCE,1433,8.8,0.97,yes,yes

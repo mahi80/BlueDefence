@@ -11,13 +11,20 @@ import sys
 
 from ..posture.sources import PostureSourceError, load_json
 from . import loaders
+from .azure_reach import assets_from_azure
 from .engine import assess, funnel, summarize
+from .k8s_reach import assets_from_k8s
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m aegis.exposure", description="Exploitable × reachable × undefended prioritisation")
-    ap.add_argument("--vulns", required=True, action="append", help="Tenable vulns export (JSON / JSONL) or CSV; repeatable")
+    ap.add_argument("--vulns", required=True, action="append",
+                    help="Tenable vulns export (JSON / JSONL), Trivy image report (JSON) or CSV; repeatable")
     ap.add_argument("--aws-bundle", action="append", default=[], help="posture bundle from `python -m aegis.posture export-aws`; repeatable")
+    ap.add_argument("--azure-bundle", action="append", default=[], help="posture bundle from `python -m aegis.posture export-azure`; repeatable")
+    ap.add_argument("--k8s-export", action="append", default=[], metavar="[NAME=]FILE",
+                    help="kubectl export (see `python -m aegis.posture k8s --help`), optionally named; repeatable")
+    ap.add_argument("--public-nodes", action="store_true", help="Kubernetes nodes have public IPs (NodePort Services are internet-facing)")
     ap.add_argument("--inventory", help="asset inventory CSV (on-prem assets, zones, roles, WAF / EDR coverage)")
     ap.add_argument("--kev", help="CISA KEV catalogue JSON (known_exploited_vulnerabilities.json)")
     ap.add_argument("--epss", help="FIRST EPSS scores CSV (epss_scores-YYYY-MM-DD.csv)")
@@ -31,10 +38,15 @@ def main(argv: list[str] | None = None) -> int:
         vulns = [v for p in args.vulns for v in loaders.load_vulns(p)]
         notes = loaders.apply_intel(vulns, kev=args.kev, epss=args.epss)
         groups = [loaders.assets_from_aws(load_json(b)) for b in args.aws_bundle]
+        groups += [assets_from_azure(load_json(b)) for b in args.azure_bundle]
+        for spec in args.k8s_export:
+            name, _, path = spec.rpartition("=") if "=" in spec else ("", "", spec)
+            groups.append(assets_from_k8s(load_json(path), cluster=name or "k8s", public_nodes=args.public_nodes))
         if args.inventory:
             groups.append(loaders.assets_from_inventory(args.inventory))
         if not groups:
-            raise PostureSourceError("pass at least one --aws-bundle or --inventory: reachability needs an asset model")
+            raise PostureSourceError("pass at least one --aws-bundle / --azure-bundle / --k8s-export / --inventory: "
+                                     "reachability needs an asset model")
         assets = loaders.merge_assets(*groups)
         exposures, more = assess(vulns, assets, loaders.load_settings(args.settings))
         notes += more
@@ -51,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{fn['undefended']} undefended → {fn['act_now']} ACT NOW   ({len(assets)} assets)")
         print("tiers: " + ", ".join(f"{k} {v}" for k, v in summarize(exposures).items()))
         for e in exposures[: args.top]:
-            port = f":{e.port}" if e.port else ""
+            port = f":{e.port}" if e.port and e.port > 0 else " (image)" if e.port == -1 else ""
             print(f"\n{e.tier:9} {e.cve or '-':16} {e.asset_name}{port}  [{e.reach}, defended={e.defended}, risk {e.risk_score}]\n"
                   f"          {e.title}")
             for r in e.reasons:

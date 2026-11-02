@@ -1,0 +1,227 @@
+{
+ "subscription": {
+  "id": "s",
+  "name": "bank-prod"
+ },
+ "network_security_groups": [
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networksecuritygroups/nsg-web-subnet",
+   "name": "nsg-web-subnet",
+   "securityRules": [
+    {
+     "name": "https",
+     "priority": 100,
+     "direction": "Inbound",
+     "access": "Allow",
+     "sourceAddressPrefix": "Internet",
+     "destinationPortRange": "443"
+    },
+    {
+     "name": "alt-http",
+     "priority": 110,
+     "direction": "Inbound",
+     "access": "Allow",
+     "sourceAddressPrefix": "Internet",
+     "destinationPortRange": "8080"
+    }
+   ]
+  },
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networksecuritygroups/nsg-web-nic",
+   "name": "nsg-web-nic",
+   "securityRules": [
+    {
+     "name": "https",
+     "priority": 100,
+     "direction": "Inbound",
+     "access": "Allow",
+     "sourceAddressPrefix": "Internet",
+     "destinationPortRange": "443"
+    },
+    {
+     "name": "rdp-temp",
+     "priority": 120,
+     "direction": "Inbound",
+     "access": "Allow",
+     "sourceAddressPrefix": "Internet",
+     "destinationPortRange": "3389"
+    }
+   ]
+  },
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networksecuritygroups/nsg-data",
+   "name": "nsg-data",
+   "securityRules": [
+    {
+     "name": "sql-from-web",
+     "priority": 100,
+     "direction": "Inbound",
+     "access": "Allow",
+     "sourceAddressPrefix": "10.1.1.0/24",
+     "destinationPortRange": "1433"
+    },
+    {
+     "name": "deny-vnet",
+     "priority": 200,
+     "direction": "Inbound",
+     "access": "Deny",
+     "sourceAddressPrefix": "VirtualNetwork",
+     "destinationPortRange": "*"
+    }
+   ]
+  }
+ ],
+ "virtual_networks": [
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/virtualnetworks/vnet-bank",
+   "name": "vnet-bank",
+   "subnets": [
+    {
+     "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/virtualnetworks/vnet-bank/subnets/snet-web",
+     "networkSecurityGroup": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networksecuritygroups/nsg-web-subnet"
+     }
+    },
+    {
+     "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/virtualnetworks/vnet-bank/subnets/snet-data",
+     "networkSecurityGroup": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networksecuritygroups/nsg-data"
+     }
+    }
+   ]
+  }
+ ],
+ "network_interfaces": [
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-web",
+   "name": "nic-web",
+   "ipConfigurations": [
+    {
+     "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-web/ipconfigurations/ipconfig1",
+     "subnet": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/virtualnetworks/vnet-bank/subnets/snet-web"
+     }
+    }
+   ],
+   "networkSecurityGroup": {
+    "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networksecuritygroups/nsg-web-nic"
+   }
+  },
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-api",
+   "name": "nic-api",
+   "ipConfigurations": [
+    {
+     "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-api/ipconfigurations/ipconfig1",
+     "subnet": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/virtualnetworks/vnet-bank/subnets/snet-web"
+     }
+    }
+   ]
+  },
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-db",
+   "name": "nic-db",
+   "ipConfigurations": [
+    {
+     "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-db/ipconfigurations/ipconfig1",
+     "subnet": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/virtualnetworks/vnet-bank/subnets/snet-data"
+     }
+    }
+   ]
+  }
+ ],
+ "virtual_machines": [
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm-web",
+   "name": "vm-web",
+   "publicIps": "20.0.0.10",
+   "privateIps": "10.1.1.10",
+   "networkProfile": {
+    "networkInterfaces": [
+     {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-web"
+     }
+    ]
+   },
+   "tags": {}
+  },
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm-api",
+   "name": "vm-api",
+   "publicIps": "",
+   "privateIps": "10.1.1.20",
+   "networkProfile": {
+    "networkInterfaces": [
+     {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-api"
+     }
+    ]
+   },
+   "tags": {}
+  },
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.compute/virtualmachines/vm-db",
+   "name": "vm-db",
+   "publicIps": "",
+   "privateIps": "10.1.2.10",
+   "networkProfile": {
+    "networkInterfaces": [
+     {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-db"
+     }
+    ]
+   },
+   "tags": {
+    "aegis-role": "core_banking_db"
+   }
+  }
+ ],
+ "load_balancers": [
+  {
+   "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/loadbalancers/lb-api",
+   "name": "lb-api",
+   "frontendIPConfigurations": [
+    {
+     "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/loadbalancers/lb-api/frontendipconfigurations/fe",
+     "publicIPAddress": {
+      "id": "pip-api"
+     }
+    }
+   ],
+   "backendAddressPools": [
+    {
+     "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/loadbalancers/lb-api/backendaddresspools/pool",
+     "backendIPConfigurations": [
+      {
+       "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/networkinterfaces/nic-api/ipconfigurations/ipconfig1"
+      }
+     ]
+    }
+   ],
+   "loadBalancingRules": [
+    {
+     "frontendIPConfiguration": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/loadbalancers/lb-api/frontendipconfigurations/fe"
+     },
+     "backendAddressPool": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/loadbalancers/lb-api/backendaddresspools/pool"
+     },
+     "frontendPort": 80,
+     "backendPort": 8080
+    },
+    {
+     "frontendIPConfiguration": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/loadbalancers/lb-api/frontendipconfigurations/fe"
+     },
+     "backendAddressPool": {
+      "id": "/subscriptions/s/resourcegroups/rg/providers/microsoft.network/loadbalancers/lb-api/backendaddresspools/pool"
+     },
+     "frontendPort": 443,
+     "backendPort": 8443
+    }
+   ]
+  }
+ ]
+}

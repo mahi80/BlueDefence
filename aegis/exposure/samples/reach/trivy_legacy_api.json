@@ -1,0 +1,37 @@
+{
+ "SchemaVersion": 2,
+ "ArtifactName": "registry.bank/legacy-api:1.0",
+ "ArtifactType": "container_image",
+ "Results": [
+  {
+   "Target": "registry.bank/legacy-api:1.0 (debian 12)",
+   "Class": "os-pkgs",
+   "Vulnerabilities": [
+    {
+     "VulnerabilityID": "CVE-2021-44228",
+     "PkgName": "log4j-core",
+     "InstalledVersion": "2.14.1",
+     "Severity": "CRITICAL",
+     "Title": "Log4Shell",
+     "CVSS": {
+      "nvd": {
+       "V3Score": 10.0
+      }
+     }
+    },
+    {
+     "VulnerabilityID": "CVE-2023-0001",
+     "PkgName": "zlib",
+     "InstalledVersion": "1.2.11",
+     "Severity": "LOW",
+     "Title": "low noise",
+     "CVSS": {
+      "nvd": {
+       "V3Score": 3.1
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

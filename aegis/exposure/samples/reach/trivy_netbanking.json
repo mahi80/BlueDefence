@@ -1,0 +1,25 @@
+{
+ "SchemaVersion": 2,
+ "ArtifactName": "registry.bank/netbanking:4.2",
+ "ArtifactType": "container_image",
+ "Results": [
+  {
+   "Target": "registry.bank/netbanking:4.2 (debian 12)",
+   "Class": "os-pkgs",
+   "Vulnerabilities": [
+    {
+     "VulnerabilityID": "CVE-2022-22965",
+     "PkgName": "spring-beans",
+     "InstalledVersion": "5.3.17",
+     "Severity": "CRITICAL",
+     "Title": "Spring4Shell",
+     "CVSS": {
+      "nvd": {
+       "V3Score": 9.8
+      }
+     }
+    }
+   ]
+  }
+ ]
+}
