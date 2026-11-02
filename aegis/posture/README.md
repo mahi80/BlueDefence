@@ -6,7 +6,8 @@ bucket, cluster and template as it stands, so a misconfiguration that predates A
 | Scanner | Status | Input (offline) | Live mode |
 |---|---|---|---|
 | IAM review | ✅ | `aws iam get-account-authorization-details` + `aws iam get-credential-report` | boto3, `SecurityAudit` policy |
-| CSPM | ✅ | `python -m aegis.posture export-aws --out bundle.json` (run by the bank) | boto3, `SecurityAudit` policy |
+| CSPM (AWS) | ✅ | `python -m aegis.posture export-aws --out bundle.json` (run by the bank) | boto3, `SecurityAudit` policy |
+| CSPM (Azure) | ✅ | `python -m aegis.posture export-azure --out azure.json` (run by the bank, `az login`) | read-only `az` (Reader + Security Reader) |
 | Kubernetes posture | ✅ | `kubectl get <kinds> -A -o json` (no secrets) | read-only `kubectl get` |
 | Policy-as-code (IaC) | ✅ | `terraform show -json plan.out` + Kubernetes YAML | — (pre-deploy gate) |
 
@@ -79,6 +80,37 @@ checked. Multi-region trails homed in another region are counted (their status i
 | Logging | GuardDuty off, AWS Config not recording | medium | — |
 | Keys | Customer-managed symmetric KMS key without rotation | medium | — |
 | Identity | No password policy / length < 14 / reuse < 24 | medium / low / low | 1.8 / 1.9 |
+
+## Azure posture
+
+```bash
+# at the bank, signed in with `az login` as Reader + Security Reader on the subscription:
+python -m aegis.posture export-azure --subscription bank-prod-centralindia --out azure.json
+# in AEGIS:
+python -m aegis.posture azure --bundle azure.json --fail-on critical
+# or live (AEGIS_POSTURE_LIVE=1, az on PATH and signed in):
+python -m aegis.posture azure --live --subscription bank-prod-centralindia
+```
+
+The collector only runs `az … list` / `az … show`; a permission error stops the export instead of
+reading as clean. **Entra ID (MFA, guests, conditional access) needs Microsoft Graph and is not
+collected** — every report lists it as not checked. In `posture.yaml` use `type: azure` with `bundle:` or
+`live: true` + `subscription:`. `azurerm_*` Terraform resources go through the same rules in the
+policy-as-code gate (storage accounts, NSGs and rules, SQL / PostgreSQL / MySQL firewall rules, Key Vault,
+AKS, custom role definitions, user role assignments, Defender pricing).
+
+| Area | Check | Severity |
+|---|---|---|
+| Network | NSG inbound from Internet/`*`: all ports / data-store port / RDP-SSH | critical / critical / high |
+| Databases | SQL / PostgreSQL / MySQL public with a firewall rule covering the internet | critical |
+| Databases | 'Allow Azure services' rule; TLS < 1.2; SQL auditing off | medium |
+| Storage | anonymous blob access; HTTPS-only off | high |
+| Storage | TLS < 1.2; firewall default Allow; shared-key auth allowed | medium / medium / low |
+| Key Vault | no purge protection; reachable from any network; legacy access policies | medium / medium / low |
+| AKS | RBAC off; public API with no authorized ranges; local accounts; no network policy | critical / high / medium / medium |
+| Identity | user with standing Owner / Contributor / UAA on the subscription (use PIM); custom role with `*` at subscription scope | high |
+| Logging | subscription Activity Log not exported | high |
+| Detection | Defender for Cloud plans on Free | medium |
 
 ## Kubernetes posture
 

@@ -32,13 +32,13 @@ from typing import Any
 
 import yaml
 
-from . import cspm, iac_policy, iam_review, k8s_posture, sources
+from . import azure_cspm, cspm, iac_policy, iam_review, k8s_posture, sources
 from .base import SEVERITY_ORDER, PostureFinding, summarize
 
 logger = logging.getLogger("aegis.posture.runner")
 
 DEFAULT_SLA_DAYS = {"critical": 7, "high": 30, "medium": 90, "low": 180, "info": 365}
-SCAN_TYPES = ("iam", "cspm", "k8s", "iac")
+SCAN_TYPES = ("iam", "cspm", "azure", "k8s", "iac")
 
 
 @dataclass
@@ -110,6 +110,9 @@ def execute(scan: ScanConfig) -> tuple[list[PostureFinding], list[str]]:
         bundle = sources.collect_aws_cspm(o.get("region")) if o.get("live") else sources.load_json(_need(o, "bundle", scan))
         gaps = cspm.coverage_gaps(bundle)
         return cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(gaps)}"] if gaps else []
+    if scan.type == "azure":
+        bundle = sources.collect_azure(o.get("subscription")) if o.get("live") else sources.load_json(_need(o, "bundle", scan))
+        return azure_cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(azure_cspm.coverage_gaps(bundle))}"]
     if scan.type == "k8s":
         export = sources.collect_k8s(o.get("context")) if o.get("live") else sources.load_json(_need(o, "export", scan))
         inc = bool(o.get("include_system"))

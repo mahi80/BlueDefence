@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import type { PostureFinding, PostureResult, PostureRun, Severity } from "../lib/posture";
 
 const SEVS: Severity[] = ["critical", "high", "medium", "low", "info"];
-const SCAN_LABEL: Record<string, string> = { iam: "IAM", cspm: "Cloud", k8s: "K8s", iac: "IaC" };
+const SCAN_LABEL: Record<string, string> = { iam: "IAM", cspm: "AWS", azure: "Azure", k8s: "K8s", iac: "IaC" };
 
 // One explicit locale + zone so the server render and the browser agree (no hydration mismatch). Banks
 // read SOC timestamps in their own zone; override with NEXT_PUBLIC_AEGIS_TZ.

@@ -18,6 +18,13 @@ scans:
     type: cspm
     live: true                          # AEGIS_POSTURE_LIVE=1 + read-only role; omit for export mode
     region: ap-south-2
+  - name: azure-prod-centralindia
+    type: azure
+    bundle: /var/lib/aegis/exports/azure-prod/azure.json   # python -m aegis.posture export-azure --out …
+  - name: azure-dr-southindia
+    type: azure
+    live: true                          # AEGIS_POSTURE_LIVE=1 + az login as Reader + Security Reader
+    subscription: bank-dr-southindia
   - name: eks-payments
     type: k8s
     export: /var/lib/aegis/exports/eks-payments.json

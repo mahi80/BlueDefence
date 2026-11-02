@@ -2,6 +2,8 @@
 
     python -m aegis.posture iam  --auth-details F [--credential-report F] [--live] [--json] [--fail-on SEV]
     python -m aegis.posture cspm --bundle F [--live --region R] [--json] [--fail-on SEV]
+    python -m aegis.posture azure --bundle F [--live --subscription S] [--json] [--fail-on SEV]
+    python -m aegis.posture export-azure --out F [--subscription S]        # run by the bank, with its own `az login`
     python -m aegis.posture k8s  --export F [--live --context C] [--include-system] [--json] [--fail-on SEV]
     python -m aegis.posture iac  [--plan F] [--k8s PATH ...] [--waivers F] [--changed-only] [--json] [--fail-on SEV]
     python -m aegis.posture run  --config posture.yaml [--store DIR] [--loop] [--fail-on SEV] [--fail-on-overdue]
@@ -19,7 +21,7 @@ import logging
 import sys
 from pathlib import Path
 
-from . import cspm, iac_policy, iam_review, k8s_posture, runner, sources
+from . import azure_cspm, cspm, iac_policy, iam_review, k8s_posture, runner, sources
 from .base import SEVERITY_ORDER, sort_findings, summarize
 
 
@@ -47,6 +49,18 @@ def _cspm(args: argparse.Namespace) -> tuple[list, list[str]]:
         raise sources.PostureSourceError("bundle must be a JSON object")
     gaps = cspm.coverage_gaps(bundle)
     return cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(gaps)}"] if gaps else []
+
+
+def _azure(args: argparse.Namespace) -> tuple[list, list[str]]:
+    if args.live:
+        bundle = sources.collect_azure(args.subscription)
+    elif args.bundle:
+        bundle = sources.load_json(args.bundle)
+    else:
+        raise sources.PostureSourceError("pass --bundle FILE (from `python -m aegis.posture export-azure`) or --live")
+    if not isinstance(bundle, dict):
+        raise sources.PostureSourceError("bundle must be a JSON object")
+    return azure_cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(azure_cspm.coverage_gaps(bundle))}"]
 
 
 def _k8s(args: argparse.Namespace) -> tuple[list, list[str]]:
@@ -80,7 +94,7 @@ def _iac(args: argparse.Namespace) -> tuple[list, list[str]]:
     return findings, notes
 
 
-SCANS = {"iam": _iam, "cspm": _cspm, "k8s": _k8s, "iac": _iac}
+SCANS = {"iam": _iam, "cspm": _cspm, "azure": _azure, "k8s": _k8s, "iac": _iac}
 
 
 def _report(scan: str, findings: list, notes: list[str], as_json: bool, waived: list | None = None) -> None:
@@ -114,6 +128,10 @@ def main(argv: list[str] | None = None) -> int:
     cs.add_argument("--bundle", help="JSON bundle from `python -m aegis.posture export-aws`")
     cs.add_argument("--region", help="region for --live (default: the SDK's configured region)")
 
+    az = sub.add_parser("azure", help="Azure posture (storage, NSGs, databases, Key Vault, AKS, Defender, logging, RBAC)")
+    az.add_argument("--bundle", help="JSON bundle from `python -m aegis.posture export-azure`")
+    az.add_argument("--subscription", help="subscription id or name for --live (default: az's current one)")
+
     k8 = sub.add_parser("k8s", help="Kubernetes posture (workloads, RBAC, network policy)",
                         epilog=f"offline export: {k8s_posture.EXPORT_COMMAND} > FILE   (never export secrets)")
     k8.add_argument("--export", help="kubectl JSON List (see epilog for the command)")
@@ -128,10 +146,14 @@ def main(argv: list[str] | None = None) -> int:
     ia.add_argument("--json", action="store_true", help="machine-readable output")
     ia.add_argument("--fail-on", choices=SEVERITY_ORDER, help="exit 1 if any unwaived finding is this severe or worse")
 
-    for p in (iam, cs, k8):
+    for p in (iam, cs, az, k8):
         p.add_argument("--live", action="store_true", help="collect via read-only APIs (needs AEGIS_POSTURE_LIVE=1)")
         p.add_argument("--json", action="store_true", help="machine-readable output")
         p.add_argument("--fail-on", choices=SEVERITY_ORDER, help="exit 1 if any finding is this severe or worse")
+
+    exz = sub.add_parser("export-azure", help="write an Azure bundle using the caller's own `az login` (Reader + Security Reader)")
+    exz.add_argument("--out", required=True, help="output JSON file")
+    exz.add_argument("--subscription", help="subscription id or name (default: az's current one)")
 
     rn = sub.add_parser("run", help="the VAPT loop: every scan in posture.yaml, tracked over time, with a report")
     rn.add_argument("--config", required=True, help="posture.yaml (scans, waivers, SLA days, store, interval)")
@@ -162,6 +184,13 @@ def main(argv: list[str] | None = None) -> int:
             limit = SEVERITY_ORDER.index(args.fail_on) if args.fail_on else -1
             failing = any(SEVERITY_ORDER.index(o["severity"]) <= limit for o in r["open"]) or (args.fail_on_overdue and c["overdue"])
             return 1 if failing else 0
+        if args.scan == "export-azure":
+            bundle = sources.collect_azure(args.subscription, require_flag=False)
+            Path(args.out).write_text(json.dumps(bundle, indent=1, default=str), encoding="utf-8")
+            sub = bundle.get("subscription") or {}
+            print(f"wrote {args.out}: subscription {sub.get('name')} ({sub.get('id')}), "
+                  f"{len(bundle.get('storage_accounts', []))} storage accounts, {len(bundle.get('network_security_groups', []))} NSGs")
+            return 0
         if args.scan == "export-aws":
             bundle = sources.collect_aws_cspm(args.region, require_flag=False)
             Path(args.out).write_text(json.dumps(bundle, indent=1, default=str), encoding="utf-8")

@@ -196,3 +196,66 @@ def collect_k8s(context: str | None = None, *, kubectl: str = "kubectl", timeout
         return json.loads(r.stdout)
     except json.JSONDecodeError as e:
         raise PostureSourceError("kubectl did not return JSON") from e
+
+
+def _az_runner(az: str, subscription: str | None, timeout_s: float) -> Any:
+    import shutil
+    import subprocess
+
+    if shutil.which(az) is None:
+        raise PostureSourceError(f"Azure collection needs the {az} CLI on PATH (and `az login` as a Reader + Security Reader)")
+
+    def run(*args: str) -> Any:
+        cmd = [az, *args, "--only-show-errors", "-o", "json"]
+        if subscription:
+            cmd += ["--subscription", subscription]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)
+        except subprocess.TimeoutExpired as e:
+            raise PostureSourceError(f"az {' '.join(args[:3])} timed out") from e
+        if r.returncode != 0:
+            raise PostureSourceError(f"az {' '.join(args[:3])} failed: {r.stderr.strip()[:300]}")
+        try:
+            out = json.loads(r.stdout or "null")
+        except json.JSONDecodeError as e:
+            raise PostureSourceError(f"az {' '.join(args[:3])} did not return JSON") from e
+        return out.get("value", out) if isinstance(out, dict) and "value" in out else out
+
+    return run
+
+
+def collect_azure(subscription: str | None = None, *, require_flag: bool = True, az: str = "az",
+                  timeout_s: float = 120.0) -> dict:
+    """Build the ``azure_cspm.scan`` bundle for one subscription with read-only ``az`` calls
+    (list / show only). ``require_flag=False`` is used by ``export-azure``, which the bank runs itself."""
+    if require_flag and not live_enabled():
+        raise PostureSourceError("live posture collection is off; set AEGIS_POSTURE_LIVE=1 or pass --bundle FILE")
+    run = _az_runner(az, subscription, timeout_s)
+
+    acct = run("account", "show")
+    b: dict[str, Any] = {"subscription": {"id": acct.get("id"), "name": acct.get("name"), "tenant": acct.get("tenantId")}}
+    b["storage_accounts"] = run("storage", "account", "list")
+    b["network_security_groups"] = run("network", "nsg", "list")
+
+    sql = run("sql", "server", "list")
+    for s in sql:
+        rg, nm = s.get("resourceGroup"), s.get("name")
+        s["firewall_rules"] = run("sql", "server", "firewall-rule", "list", "--resource-group", rg, "--server", nm)
+        s["audit_state"] = (run("sql", "server", "audit-policy", "show", "--resource-group", rg, "--name", nm) or {}).get("state")
+    b["sql_servers"] = sql
+
+    for key, svc in (("postgres_servers", "postgres"), ("mysql_servers", "mysql")):
+        servers = run(svc, "flexible-server", "list")
+        for s in servers:
+            s["firewall_rules"] = run(svc, "flexible-server", "firewall-rule", "list",
+                                      "--resource-group", s.get("resourceGroup"), "--name", s.get("name"))
+        b[key] = servers
+
+    b["key_vaults"] = [run("keyvault", "show", "--name", v.get("name"), "--resource-group", v.get("resourceGroup"))
+                       for v in run("keyvault", "list")]
+    b["aks_clusters"] = run("aks", "list")
+    b["defender_plans"] = run("security", "pricing", "list")
+    b["activity_log_diagnostics"] = run("monitor", "diagnostic-settings", "subscription", "list")
+    b["role_assignments"] = run("role", "assignment", "list", "--all")
+    b["custom_roles"] = run("role", "definition", "list", "--custom-role-only", "true")
+    return b
