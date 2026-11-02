@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 from ..agents.orchestrator.walkers.graph import CRITICAL, SENSITIVITY
 from ..agents.vuln_discovery.tools import compute_risk_score
@@ -67,6 +68,7 @@ class Asset:
     public: bool = False
     internet_ports: PortRanges = field(default_factory=list)   # port ranges open to the internet
     internet_via: dict[tuple[int, int], str] = field(default_factory=dict)  # range -> "via load balancer X" etc.
+    fronted_by: set[str] = field(default_factory=set)   # LB names / DNS names / ingress hosts in front of it
     # (lo, hi, sources) reachable from inside the zone; sources = security-group ids allowed in, or "*" (any
     # host in the zone — a private CIDR rule, or the inventory's lateral_ports)
     lateral: list[tuple[int, int, frozenset[str]]] = field(default_factory=lambda: [(0, 65535, frozenset({"*"}))])
@@ -112,6 +114,8 @@ class Settings:
     epss_threshold: float = 0.1
     # CVE -> asset ids / names / "*" that carry a virtual-patch or IPS rule for it
     virtual_patches: dict[str, list[str]] = field(default_factory=dict)
+    # WAF / virtual-patch coverage exported from the vendors (coverage.Protection)
+    coverage: list[Any] = field(default_factory=list)
 
 
 def _exploitable(v: Vuln, s: Settings) -> tuple[bool, str]:
@@ -172,6 +176,17 @@ def _reach(v: Vuln, a: Asset, internet_assets_by_zone: dict[str, list[Asset]]) -
 
 
 def _defended(v: Vuln, a: Asset, s: Settings) -> tuple[str, str]:
+    keys = a.keys | {a.id, a.name} | a.fronted_by
+    prots = [p for p in s.coverage if p.covers(keys, v.port)]
+    blocking = [p for p in prots if p.mode == "block"]
+    monitor = [p for p in prots if p.mode == "monitor"]
+    note = ""
+    if monitor:
+        note = (f"; {', '.join(f'{p.vendor} {p.name}' for p in monitor[:2])} in front but in MONITOR mode: "
+                "it logs the attack and lets it through")
+    for p in blocking:
+        if v.cve and v.cve.upper() in p.virtual_patches:
+            return "full", f"virtual-patch rule for {v.cve} on {p.vendor} {p.name} (blocking mode)"
     targets = s.virtual_patches.get(v.cve or "", [])
     if v.cve and ("*" in targets or a.id in targets or a.name in targets or a.keys & set(targets)):
         return "full", f"virtual-patch / IPS rule for {v.cve} in front of this asset"
@@ -179,11 +194,12 @@ def _defended(v: Vuln, a: Asset, s: Settings) -> tuple[str, str]:
     # but does not block the exploit itself, so it is reported, never used to lower the tier.
     edr = "; EDR on the host will see post-exploitation activity (detection, not prevention)" if a.edr else ""
     web = v.port in WEB_PORTS or (v.port == ANY_PORT and any(lo <= p <= hi for lo, hi in a.internet_ports for p in WEB_PORTS))
-    if a.waf and web:
-        return "partial", "WAF in front of the web port (generic rules, no CVE-specific virtual patch)" + edr
+    if web and (a.waf or blocking):
+        who = f"{blocking[0].vendor} {blocking[0].name} in blocking mode" if blocking else "WAF in front of the web port"
+        return "partial", f"{who} (generic rules, no CVE-specific virtual patch)" + note + edr
     if v.port is None:
-        return "none", "no network control applies to a local vulnerability; patching is the fix" + edr
-    return "none", "no blocking control in front: no WAF or virtual patch for this port" + edr
+        return "none", "no network control applies to a local vulnerability; patching is the fix" + note + edr
+    return "none", "no blocking control in front: no WAF or virtual patch for this port" + note + edr
 
 
 def _tier(exploitable: bool, reach: str, defended: str, crown: int | None, cvss: float | None) -> str:

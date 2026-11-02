@@ -47,6 +47,33 @@ the exposed path. The collectors export what this needs: `export-aws` now includ
 listeners, targets and WAF associations; `export-azure` includes VMs, NICs, VNets and load balancers; the
 kubectl export command includes Services and Ingresses.
 
+## WAF / virtual-patch coverage
+
+"We have a WAF" is the most common false comfort in a SOC — many sit in **monitor mode** for months.
+Coverage comes from the vendors, not from tags:
+
+```bash
+python -m aegis.exposure.coverage --vendor imperva    --out imperva.json   # AEGIS_WAF_API_ID / AEGIS_WAF_API_KEY
+python -m aegis.exposure.coverage --vendor f5         --out f5.json        # AEGIS_WAF_URL / _USER / _PASS (or _TOKEN)
+python -m aegis.exposure.coverage --vendor cloudflare --zone ZONE --out cf.json   # CLOUDFLARE_API_TOKEN
+python -m aegis.exposure.coverage --vendor edge --edge-url http://edge-01:9000 --out edge.json
+python -m aegis.exposure ... --waf-coverage imperva.json --waf-coverage f5.json
+```
+
+| Vendor | Fronts | Blocking when | Virtual patches |
+|---|---|---|---|
+| Imperva Cloud WAF | site origin IPs + domain | core WAF rules set to block | custom rules that block and name a CVE |
+| F5 BIG-IP Advanced WAF | ASM policy → virtual server VIP + pool members | policy enforcement mode `blocking` | user-defined signatures naming a CVE (blocking policies only) |
+| Cloudflare | proxied DNS records (origin + hostname) | a managed ruleset is deployed | enabled custom `block` rules naming a CVE |
+| BlueDefence edge shim | its upstream host:port | `--mode live` with `--inline-waf` | — |
+
+A **monitor-mode** protection never counts as a defence; the reason chain names it ("imperva
+reports.bank.example in front but in MONITOR mode: it logs the attack and lets it through"). A blocking
+protection is a WAF on web ports (`partial`); a matching virtual patch makes that CVE `full`. Fronts match
+asset IPs / hostnames and also load-balancer names / DNS names and Ingress hosts, so a Cloudflare record
+pointing at an ALB credits the instances behind it. All exporters are read-only (GET, plus Imperva's
+POST *list* endpoint); field names follow the public API docs, so a tenant may need a field renamed.
+
 ## Inventory CSV
 
 `asset,name,ips,hostname,zone,role,public,internet_ports,lateral_ports,waf,edr` — ports as `443;8443`,
@@ -58,6 +85,6 @@ collector inferred (role, WAF / EDR coverage). AWS instances can carry the same 
 
 Reachability is reasoned from network configuration, not proven by packets. No application-level
 reachability (whether the vulnerable code path is called). Not yet modelled: Azure Application Gateway /
-Front Door, AWS classic ELB and CloudFront, Kubernetes NetworkPolicy rule evaluation, NACLs. WAF coverage
-from the Imperva / F5 connectors and the edge shim, the console view and the HITL loop come in the next PRs
-(see the scope doc).
+Front Door, AWS classic ELB and CloudFront, Kubernetes NetworkPolicy rule evaluation, NACLs; Cloudflare
+managed-rule CVE coverage beyond "managed ruleset deployed". The console view and the HITL loop come in the
+next PRs (see the scope doc).

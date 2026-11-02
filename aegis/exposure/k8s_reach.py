@@ -97,9 +97,10 @@ def assets_from_k8s(export: dict | list, *, cluster: str = "k8s", public_nodes: 
                   zone=zone, role=role if role in SENSITIVITY else "server", public=False,
                   lateral=[] if ns in policed else [(0, 65535, frozenset({"*"}))], source="k8s")
 
-        def expose(port: int | None, via: str, *, waf: bool = False, a: Asset = a) -> None:
+        def expose(port: int | None, via: str, *, waf: bool = False, fronts: tuple[str, ...] = (), a: Asset = a) -> None:
             if port is None:
                 return
+            a.fronted_by |= {f for f in fronts if f and f != "*"}
             r = (port, port)
             if r not in a.internet_ports:
                 a.internet_ports.append(r)
@@ -142,6 +143,6 @@ def assets_from_k8s(export: dict | list, *, cluster: str = "k8s", public_nodes: 
                     if (num is not None and num != sp.get("port")) or (pname is not None and pname != sp.get("name")):
                         continue
                     expose(_target_port(sp, pod), f"Ingress {ns}/{im.get('name')} ({host}) → Service {bs.get('name')}",
-                           waf=_waf_ingress(ing))
+                           waf=_waf_ingress(ing), fronts=(host,))
         out.append(a)
     return out

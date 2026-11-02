@@ -264,6 +264,7 @@ def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> N
                 if r not in a.internet_ports:
                     a.internet_ports.append(r)
                 a.internet_via.setdefault(r, f"load balancer {name} (listener {lp} → port {tp})")
+                a.fronted_by |= {x for x in (name, lb.get("DNSName")) if x}
                 a.public = True
                 if lb.get("web_acl"):
                     a.waf = True
@@ -331,3 +332,11 @@ def load_settings(path: str | Path | None) -> Settings:
         raise PostureSourceError(f"cannot read exposure settings {path}: {e}") from e
     vp = {str(k): [str(x) for x in (v if isinstance(v, list) else [v])] for k, v in (raw.get("virtual_patches") or {}).items()}
     return Settings(epss_threshold=float(raw.get("epss_threshold", 0.1)), virtual_patches=vp)
+
+
+def with_coverage(settings: Settings, paths: list[str | Path]) -> Settings:
+    from .coverage import load_coverage
+
+    for p in paths:
+        settings.coverage += load_coverage(p)
+    return settings

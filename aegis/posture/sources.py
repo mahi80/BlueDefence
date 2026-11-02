@@ -209,7 +209,8 @@ def collect_aws_cspm(region: str | None = None, *, require_flag: bool = True) ->
                     acl = ((waf.get_web_acl_for_resource(ResourceArn=arn) or {}).get("WebACL") or {}).get("Name")
                 except Exception as e:  # noqa: BLE001 - unknown WAF state reads as "no WAF": more findings, never fewer
                     errors.setdefault("load_balancer_waf", str(getattr(e, "response", {}).get("Error", {}).get("Code", e))[:200])
-            out.append({"LoadBalancerName": lb.get("LoadBalancerName"), "LoadBalancerArn": arn, "Scheme": lb.get("Scheme"),
+            out.append({"LoadBalancerName": lb.get("LoadBalancerName"), "LoadBalancerArn": arn, "DNSName": lb.get("DNSName"),
+                        "Scheme": lb.get("Scheme"),
                         "Type": lb.get("Type"), "SecurityGroups": lb.get("SecurityGroups") or [],
                         "listeners": listeners, "targets": targets, "web_acl": acl})
         return out
