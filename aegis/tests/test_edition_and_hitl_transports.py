@@ -41,7 +41,8 @@ def test_edition_defaults_and_contradictions():
     env = {"AEGIS_EDITION": "soc"}
     assert validate(env) == [] and warnings(env) and "stdout card" in warnings(env)[0]   # allowed, degraded, logged
     assert apply_edition(env, strict=False).name == "soc"
-    assert current({}).name == "full"
+    assert current({}).name == "external"                                   # standalone by default
+    assert current({"ACP_DASHBOARD_URL": "https://d"}).name == "full"     # an integrated install keeps full
     rows = feature_matrix()
     assert [r["edition"] for r in rows] == ["external", "soc", "full"] and not rows[0]["sdk_in_customer_agents"] and rows[2]["bridge_q_to_aegis"]
     assert all(r["local_audit_jsonl"] and r["connectors_waf_soar"] for r in rows)

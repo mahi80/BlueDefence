@@ -31,12 +31,14 @@ import logging
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 logger = logging.getLogger("aegis.retrain")
 
@@ -242,6 +244,52 @@ def promotion_proposal(run: str, info: dict) -> dict:
     }
 
 
+def _hitl_dir(a: Any = None) -> Path:
+    raw = getattr(a, "hitl_dir", None) or os.environ.get("AEGIS_HITL_DIR") or str(Path.cwd() / ".aegis-hitl")
+    return Path(raw).expanduser()
+
+
+def _ship_local(proposal: dict, dry_run: bool, hitl_dir: Path) -> dict | None:
+    """Standalone: append the proposal to ``<hitl>/proposals.jsonl`` — the SOC console's Model loop lists it
+    (``/api/soc/proposals``) and an analyst accepts or rejects it there (``proposal-decisions.jsonl``)."""
+    if dry_run:
+        print("  (dry run) would queue locally:", json.dumps(proposal)[:300]); return {"status": "dry_run"}
+    row = {"id": proposal["proposal_id"], "change_type": proposal["change_type"], "summary": proposal["title"],
+           "rationale": proposal["rationale"], "change": proposal["change"], "status": "pending_hitl",
+           "validation_passed": True, "ts": time.time()}
+    hitl_dir.mkdir(parents=True, exist_ok=True)
+    with (hitl_dir / "proposals.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+    return {"status": "pending_hitl", "queue": str(hitl_dir / "proposals.jsonl")}
+
+
+def _accepted_local(dry_run: bool, hitl_dir: Path) -> list[dict]:
+    """Standalone: model_promotion proposals an analyst accepted in the SOC console."""
+    if dry_run:
+        return []
+    def rows(name: str) -> list[dict]:
+        f = hitl_dir / name
+        if not f.exists():
+            return []
+        out = []
+        for line in f.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict):
+                out.append(r)
+        return out
+    decided = {str(d.get("proposal_id")): d for d in rows("proposal-decisions.jsonl")}
+    out = []
+    for p in rows("proposals.jsonl"):
+        d = decided.get(str(p.get("id")))
+        if p.get("change_type") == "model_promotion" and d and d.get("decision") == "accept":
+            out.append({"change_type": "model_promotion", "change": p.get("change") or {}, "proposal_id": p.get("id"),
+                        "decided_by": d.get("decided_by"), "decision_rationale": d.get("rationale")})
+    return out
+
+
 def _ship(proposal: dict, dry_run: bool) -> dict | None:
     if dry_run:
         print("  (dry run) would ship:", json.dumps(proposal)[:300]); return {"status": "dry_run"}
@@ -319,7 +367,9 @@ def cmd_shadow(a, *, candidate_loader=_adapter_triage, current_loader=_adapter_t
     return 0 if rep["verdict"] == "ready" else 1
 
 
-def cmd_propose(a, *, ship=_ship) -> int:
+def cmd_propose(a, *, ship=None) -> int:
+    if ship is None:
+        ship = _ship if getattr(a, "dashboard", False) else (lambda p, d: _ship_local(p, d, _hitl_dir(a)))
     runs = Path(a.runs).expanduser(); st = State.load(runs)
     run = a.run or _latest(st, "shadowed")
     if not run or run not in st.runs:
@@ -330,17 +380,30 @@ def cmd_propose(a, *, ship=_ship) -> int:
     p = promotion_proposal(run, info)
     res = ship(p, a.dry_run)
     st.log(run, "proposed", proposal_id=p["proposal_id"], result=res); st.save()
-    print(f"  proposed {p['proposal_id']} → dashboard approvals queue ({(res or {}).get('status')})")
+    where = "dashboard approvals queue" if getattr(a, "dashboard", False) else "SOC console model loop (local queue)"
+    print(f"  proposed {p['proposal_id']} → {where} ({(res or {}).get('status')})")
     return 0
 
 
-def cmd_sync(a, *, accepted=_accepted_model_rules) -> int:
+def cmd_sync(a, *, accepted=None) -> int:
     """Accepted `model_promotion` proposals → current pointer. The only path that changes `current`
     besides the offline `promote` (which records who approved it)."""
+    if accepted is None:
+        accepted = _accepted_model_rules if getattr(a, "dashboard", False) else (lambda d: _accepted_local(d, _hitl_dir(a)))
     runs = Path(a.runs).expanduser(); st = State.load(runs)
     for rule in accepted(a.dry_run):
-        run = (rule.get("change") or {}).get("run")
+        change = rule.get("change") or {}
+        run = change.get("run")
         if not run or run not in st.runs or st.runs[run].get("stage") == "promoted":
+            continue
+        info = st.runs[run]
+        # an accepted proposal can only promote a run that passed its gate and shadow, and only the adapter
+        # that was proposed: a rule naming a failed run (or one whose adapter changed since) is refused
+        if info.get("stage") not in ("shadowed", "proposed"):
+            print(f"  refused {run}: stage {info.get('stage')!r} — only a gated + shadowed run can be promoted")
+            continue
+        if change.get("sha256") and info.get("sha256") and change["sha256"] != info["sha256"]:
+            print(f"  refused {run}: adapter digest changed since it was proposed")
             continue
         if st.current and st.current.get("run") == run:
             continue
@@ -394,7 +457,9 @@ def main(argv: list[str] | None = None) -> int:
     def common(p):
         p.add_argument("--runs", default=str(Path.home() / "aegis-runs"))
         p.add_argument("--run", default=None)
-        p.add_argument("--dashboard", action="store_true", help="pull from ACP_DASHBOARD_URL / ACP_API_KEY")
+        p.add_argument("--dashboard", action="store_true", help="use the ACP dashboard (ACP_DASHBOARD_URL / ACP_API_KEY) "
+                       "instead of this host's local queue")
+        p.add_argument("--hitl-dir", default=None, help="local approvals queue (default AEGIS_HITL_DIR or ./.aegis-hitl)")
         p.add_argument("--dry-run", action="store_true")
     r = sub.add_parser("run", help="export → build → train → gate"); common(r)
     r.add_argument("--base-data", default=None, help="realistic base set (a build-public directory)")
