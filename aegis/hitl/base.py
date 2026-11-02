@@ -33,6 +33,8 @@ from typing import Any, Optional
 logger = logging.getLogger("aegis.hitl")
 
 _ARGS_TEXT_CAP = 2000
+# chain metadata the HITL timeout policy decides on — kept in the journal so a restart does not change the answer
+_JOURNALED_METADATA = ("vote_concur", "vote_tally", "swarm_vote_concur", "verdict_raised_by_swarm")
 
 
 @dataclass
@@ -78,6 +80,19 @@ def card_args(action: Any, chain: Any) -> dict:
         "integrity_hash": str(getattr(chain, "integrity_hash", "") or ""),
         "governance_block": (getattr(chain, "metadata", {}) or {}).get("governance_block"),
     }
+
+
+def execution_outcome(executed: Any) -> tuple[bool, str]:
+    """(ran, why-not) for whatever ``response_agent.approve`` returned.
+
+    An ``ExecutedAction`` ran only when its status is ``executed``; a dict ran unless it carries an
+    ``error``; anything else (a test stub, a commitment recorder) counts as ran."""
+    status = getattr(executed, "status", None)
+    if status is not None:
+        return (status == "executed"), str(getattr(executed, "note", "") or status)[:300]
+    if isinstance(executed, dict) and executed.get("error"):
+        return False, str(executed["error"])[:300]
+    return True, ""
 
 
 def _state_path(explicit: Optional[str | Path], transport_dir: Optional[Path]) -> Optional[Path]:
@@ -164,6 +179,7 @@ class BaseHITL:
         chain = EvidenceChain(alert_id=str(c.get("alert_id") or row.get("alert_id") or ""),
                               investigated_by=str(c.get("investigated_by") or "restored"),
                               verdict=c.get("verdict") or "uncertain", confidence=float(c.get("confidence") or 0.0))
+        chain.metadata.update({k: v for k, v in (c.get("metadata") or {}).items() if k in _JOURNALED_METADATA})
         chain.metadata["restored_from_journal"] = True
         return PendingApproval(approval_id=str(row["approval_id"]), alert_id=str(row.get("alert_id") or chain.alert_id),
                                action=action, chain=chain, requested_at=float(row.get("requested_at") or time.time()),
@@ -200,7 +216,11 @@ class BaseHITL:
                 "external_id": p.external_id, "requested_at": p.requested_at, "action": _action_dict(p.action),
                 "chain": {"alert_id": str(getattr(p.chain, "alert_id", p.alert_id)), "verdict": str(getattr(p.chain, "verdict", "")),
                           "confidence": float(getattr(p.chain, "confidence", 0.0) or 0.0),
-                          "investigated_by": str(getattr(p.chain, "investigated_by", ""))}}
+                          "investigated_by": str(getattr(p.chain, "investigated_by", "")),
+                          # the timeout policy reads these; without them a restored card looked like a concurring vote
+                          "metadata": {k: (getattr(p.chain, "metadata", None) or {}).get(k)
+                                       for k in _JOURNALED_METADATA
+                                       if k in (getattr(p.chain, "metadata", None) or {})}}}
 
     # ---- contract
     @property
@@ -267,17 +287,17 @@ class BaseHITL:
                 if key not in self._poll_failed:
                     self._poll_failed.add(key)
                     logger.warning("[hitl:%s] poll failed for %s: %s", self.name, approval_id, str(e)[:160])
-                res = None
+                # We could not read the human's decision, so we do not know there isn't one: the analyst may
+                # have rejected it. Never fall through to the timeout auto-execute on an unreadable channel.
+                continue
             if res:
                 status, decided_by, reason = res
                 if status == "approved":
                     try:
                         executed = response_agent.approve(p.action, approver=decided_by or self.name, source_alert_id=p.alert_id)
                     except Exception as e:  # noqa: BLE001 — one connector failure must not stall every other pending decision
-                        logger.error("[hitl:%s] approved %s on alert %s but execution failed: %s", self.name,
-                                     p.action.action_type, p.alert_id, str(e)[:200])
                         executed = {"error": str(e)[:200]}
-                    made.append(self._settle(p, "approved", decided_by or self.name, "", executed=executed)); continue
+                    made.append(self._settle_approved(p, decided_by or self.name, "", executed)); continue
                 if status == "rejected":
                     made.append(self._settle(p, "rejected", decided_by or self.name, reason)); continue
             # 2) no human decision — timeout auto-execute policy (opt-in)
@@ -287,12 +307,10 @@ class BaseHITL:
                     try:
                         executed = response_agent.approve(p.action, approver="aegis:hitl-timeout", source_alert_id=p.alert_id)
                     except Exception as e:  # noqa: BLE001
-                        logger.error("[hitl:%s] timeout auto-execute of %s on alert %s failed: %s", self.name,
-                                     p.action.action_type, p.alert_id, str(e)[:200])
                         executed = {"error": str(e)[:200]}
                     logger.warning("[hitl:%s] timeout auto-execute: %s on alert %s — %s",
                                    self.name, p.action.action_type, p.alert_id, why)
-                    made.append(self._settle(p, "approved", "aegis:hitl-timeout", why, executed=executed)); continue
+                    made.append(self._settle_approved(p, "aegis:hitl-timeout", why, executed)); continue
                 if decision == "shadow" and approval_id not in self._timeout_noted:
                     self._timeout_noted.add(approval_id)
                     logger.info("[hitl:%s] timeout-shadow: would auto-execute %s on alert %s — %s",
@@ -336,6 +354,18 @@ class BaseHITL:
         return False
 
     # ---- helpers
+    def _settle_approved(self, p: PendingApproval, decided_by: str, reason: str, executed: Any) -> Decision:
+        """Settle an approval by what actually happened. ``approved`` only when the action ran; a skipped
+        action (rate cap, ACP block, never-block guard), a connector failure, or a two-person rule still
+        waiting for its second approver settles as ``failed`` — loudly — so nothing downstream (the
+        containment loop, the console, the receipts) treats it as done."""
+        ok, why = execution_outcome(executed)
+        if ok:
+            return self._settle(p, "approved", decided_by, reason, executed=executed)
+        logger.error("[hitl:%s] %s -> %s on alert %s was approved by %s but NOT executed: %s", self.name,
+                     p.action.action_type, p.action.target, p.alert_id, decided_by, why)
+        return self._settle(p, "failed", decided_by, f"approved but not executed: {why}"[:500], executed=executed)
+
     def _settle(self, p: PendingApproval, status: str, decided_by: str, reason: str, executed: Any = None) -> Decision:
         self._pending.pop(p.approval_id, None)
         self._by_key.pop((p.alert_id, str(p.action.action_type), str(p.action.target)), None)

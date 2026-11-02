@@ -136,7 +136,14 @@ class ContainmentLoop:
             if getattr(d, "status", "") != "approved":
                 continue
             ex = getattr(d, "executed", None)
-            if ex is not None and getattr(ex, "status", "") not in ("executed", "approved", ""):
+            # only an action that actually ran changes the world: a connector failure ({"error": ...}),
+            # a skipped / still-queued action, or a shadow-mode dry run must not be reported as containment
+            if isinstance(ex, dict) and ex.get("error"):
+                continue
+            if ex is not None and not isinstance(ex, dict) and getattr(ex, "status", "") not in ("executed", "approved", ""):
+                continue
+            receipt = getattr(ex, "receipt", None)
+            if receipt is not None and getattr(receipt, "dry_run", False):
                 continue
             e = self.after_action(getattr(d, "alert_id", ""), getattr(d, "action_type", ""), getattr(d, "target", ""))
             if e is not None:

@@ -39,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from ..shared.audit import AuditWriteError
 from ..shared.evidence_chain import EvidenceChain, EvidenceItem, ReasoningStep, RecommendedAction
 from ..shared.injection_defense import wrap_untrusted
 from .voting import vote_best
@@ -379,16 +380,23 @@ class SwarmOrchestrator:
                 f.cancel()
                 results.append(WorkerResult(futures[f], error=f"timed out after {self.max_seconds:.0f}s"))
         self._merge(chain, results, started)
-        # Re-seal: the enriched chain (new evidence, re-vote, metadata.swarm) is
-        # what the ResponseAgent acts on, so it gets its own audit entry and its
-        # own persisted row — the pre-swarm entry stays as the first-pass record.
+        self._reseal(alert, chain)
+        return chain
+
+    def _reseal(self, alert: dict, chain: EvidenceChain) -> None:
+        """Re-seal: the enriched chain (new evidence, re-vote, metadata.swarm) is what the ResponseAgent
+        acts on, so it gets its own audit entry and its own persisted row — the pre-swarm entry stays as
+        the first-pass record."""
         record = getattr(self._orch, "record", None)
         if callable(record):
             try:
                 record(alert, chain)
-            except Exception as e:  # noqa: BLE001 — never lose a verdict over bookkeeping
+            except AuditWriteError:
+                # the enriched chain is what the ResponseAgent acts on: no audit row, no action —
+                # propagate so the service defers the alert exactly like a failed first seal
+                raise
+            except Exception as e:  # noqa: BLE001 — persistence (dashboard row) is bookkeeping, not the audit
                 logger.warning("[swarm] re-seal of %s failed: %s", chain.alert_id, str(e)[:120])
-        return chain
 
     # ------------------------------------------------------------ internals --
 
@@ -437,8 +445,11 @@ class SwarmOrchestrator:
             # "malicious" on the live-model eval, 2026-10-21).
             confirmed = any(ev.weight == "high" and ev.source in _CONFIRMING_SOURCES
                             for r in results for ev in r.evidence)
+            raised = False
             if confirmed and _VERDICT_RANK.get(chain.verdict, 0) < _VERDICT_RANK["malicious"]:
                 chain.verdict = "malicious" if chain.verdict == "suspicious" else "suspicious"
+                raised = True
+                chain.metadata["verdict_raised_by_swarm"] = True
             chain.specialist_invocations.extend(f"swarm.{r.worker}" for r in results if r.ok)
             # independent re-vote on the enriched chain
             vote_note = ""
@@ -454,6 +465,12 @@ class SwarmOrchestrator:
                     chain.metadata["swarm_vote_unanimous"] = v.unanimous
                 except Exception as e:  # noqa: BLE001
                     vote_note = f"re-vote failed: {str(e)[:100]}"
+            if raised:
+                # The first-pass concur was for the old verdict. Autonomy and the HITL timeout read
+                # ``vote_concur``: after a raise it is the re-vote's answer, and no re-vote = no concur.
+                chain.metadata["vote_concur"] = chain.metadata.get("swarm_vote_concur") is True
+                if "swarm_vote_tally" in chain.metadata:
+                    chain.metadata["vote_tally"] = chain.metadata["swarm_vote_tally"]
             chain.reasoning.append(ReasoningStep(
                 step=len(chain.reasoning) + 1, action="swarm_fan_out",
                 observation=f"{len([r for r in results if r.ok])}/{len(results)} workers returned, {added} evidence items; "
