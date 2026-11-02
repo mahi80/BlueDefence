@@ -15,6 +15,8 @@ the HITL gate are independent layers.
 from __future__ import annotations
 
 import sys
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -136,10 +138,20 @@ class ResponseAgent:
         # irreversible actions and split votes hold for a human. AEGIS_HITL_TIMEOUT=off → off.
         self._hitl_timeout = hitl_timeout if hitl_timeout is not None else HitlTimeoutPolicy.from_env()
         self._env_policies = (autonomy is None, breaker is None, hitl_timeout is None)
-        # Per-minute rate limit for high-impact actions; bounds blast radius
-        # if the agent is itself compromised. Counters reset by external scheduler in prod.
-        self._high_impact_counter = 0
-        self._high_impact_max = 10
+        # Rolling-window rate limit for high-impact actions; bounds blast radius if the agent is itself
+        # compromised. It used to be a counter nothing ever reset — a lifetime cap of 10 approvals that
+        # then silently skipped every later one. AEGIS_HIGH_IMPACT_MAX per AEGIS_HIGH_IMPACT_WINDOW_SEC.
+        self._high_impact_max = int(os.environ.get("AEGIS_HIGH_IMPACT_MAX", "10"))
+        self._high_impact_window = float(os.environ.get("AEGIS_HIGH_IMPACT_WINDOW_SEC", "60"))
+        self._high_impact_times: deque[float] = deque()
+
+    @property
+    def _high_impact_counter(self) -> int:
+        """High-impact actions executed inside the current window (old entries drop out)."""
+        cutoff = time.monotonic() - self._high_impact_window
+        while self._high_impact_times and self._high_impact_times[0] < cutoff:
+            self._high_impact_times.popleft()
+        return len(self._high_impact_times)
 
     def execute(self, chain: EvidenceChain) -> ResponseSummary:
         from ..shared import observability as obs
@@ -209,8 +221,11 @@ class ResponseAgent:
                 self._connectors.preview(action, alert_id=chain.alert_id, approver="aegis:auto-shadow",
                                          ttl_sec=self._autonomy.ttl_sec, note="auto-block shadow")
             elif ok:
-                receipt = self._connectors.apply(action, alert_id=chain.alert_id, approver="aegis:auto",
+                receipt = self._apply_unattended(action, alert_id=chain.alert_id, approver="aegis:auto",
                                                  ttl_sec=self._autonomy.ttl_sec)
+                if receipt is None:
+                    return ExecutedAction(action=action, status="queued_for_hitl",
+                                          note="auto-block refused by governance; routed to a human")
                 if receipt.active:
                     self._autonomy.take()
                 done = self._from_receipt(action, receipt, prefix="auto-block")
@@ -223,9 +238,9 @@ class ResponseAgent:
                 self._connectors.preview(action, alert_id=chain.alert_id, approver="aegis:breaker-shadow",
                                          ttl_sec=self._breaker.ttl_sec, note="outflow breaker shadow")
             elif ok:
-                receipt = self._connectors.apply(action, alert_id=chain.alert_id, approver="aegis:breaker",
+                receipt = self._apply_unattended(action, alert_id=chain.alert_id, approver="aegis:breaker",
                                                  ttl_sec=self._breaker.ttl_sec)
-                if receipt.active:
+                if receipt is not None and receipt.active:
                     self._breaker.take()
                     done = self._from_receipt(action, receipt, prefix="outflow-breaker")
                     done.note = f"{done.note} ({why})"
@@ -245,6 +260,12 @@ class ResponseAgent:
         # Unknown action class → safe-by-default
         return ExecutedAction(action=action, status="queued_for_hitl",
                               note=f"Unknown action class {action.action_type}; routing to HITL")
+
+    def _apply_unattended(self, action: RecommendedAction, *, alert_id: str, approver: str,
+                          ttl_sec: int) -> Receipt | None:
+        """The live auto-block / outflow-breaker apply — no human in the loop, so it is one of the
+        places ACP governance guards (``governance._guard_response``). ``None`` = refused upstream."""
+        return self._connectors.apply(action, alert_id=alert_id, approver=approver, ttl_sec=ttl_sec)
 
     def _execute_auto(self, action: RecommendedAction, *, alert_id: str = "") -> ExecutedAction:
         """Auto-safe actions run through the connector registry (Phase 1.1).
@@ -325,13 +346,16 @@ class ResponseAgent:
                     note=f"{action.action_type} on protected target {action.target} needs a second "
                          f"approver (first: {approver})",
                 )
-        self._high_impact_counter += 1
+        self._high_impact_times.append(time.monotonic())
         # Route to the right back-end
         if action.action_type == "trigger_self_heal" and self._self_healing:
             self._self_healing.handle_compromise(action.target, source_alert=source_alert_id)
             return ExecutedAction(action=action, status="executed",
                                   note=f"Self-heal triggered (approved by {approver})")
-        if action.action_type == "isolate" and self._self_healing:
+        # isolate goes to the EDR when one is configured; the self-healing pipeline (workload snapshot +
+        # sever) only takes it when no connector can. Before, an approved isolate always went to the
+        # pipeline and was reported "Host isolated" while the EDR was never called.
+        if action.action_type == "isolate" and self._self_healing and self._connectors.route_action(action) is self._connectors.fallback:
             # Treat isolate as a precursor to heal: snapshot+sever, hold respawn for human
             self._self_healing.snapshot_and_sever(action.target, source_alert=source_alert_id)
             return ExecutedAction(action=action, status="executed",

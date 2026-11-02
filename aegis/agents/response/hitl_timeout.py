@@ -85,10 +85,12 @@ class HitlTimeoutPolicy:
             return HOLD, f"{atype or 'action'} is irreversible / high-blast — holds for a human even on timeout"
 
         md = getattr(chain, "metadata", {}) or {}
-        if md.get("vote_concur") is False:
-            # tie or majority dissent on an irreversible call -> a human, not a timer
+        if md.get("vote_concur") is not True:
+            # tie, majority dissent, or no recorded vote at all (a card restored from an old journal, a verdict
+            # the swarm raised without a fresh concur) -> a human, not a timer
             tally = md.get("vote_tally")
-            return HOLD, f"reviewer panel did not reach a majority concur{f' ({tally})' if tally else ''} — escalate, don't auto-act"
+            why = "no concurring vote on record" if md.get("vote_concur") is None else "reviewer panel did not reach a majority concur"
+            return HOLD, f"{why}{f' ({tally})' if tally else ''} — escalate, don't auto-act"
 
         conf = float(getattr(chain, "confidence", 0.0) or 0.0)
         if conf < self.min_confidence:

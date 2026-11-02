@@ -286,8 +286,28 @@ def _guard_response(response: Any, guard: Any) -> None:
         guard.post_tool_call(tool, result={"status": getattr(executed, "status", "")}, success=True)
         return executed
 
+    orig_unattended = getattr(response, "_apply_unattended", None)
+
+    def _apply_unattended(action, *a, **kw):
+        # live auto-block / outflow breaker: the action runs with no human, so a governance block
+        # (incl. the pause-gate) must stop it — before, these paths called the connectors directly
+        tool = f"response.{getattr(action, 'action_type', 'unknown')}"
+        try:
+            guard.pre_tool_call(tool, {**_args(action), "approver": str(kw.get("approver", ""))[:64]})
+        except acp_violation:
+            return None
+        try:
+            receipt = orig_unattended(action, *a, **kw)
+        except Exception as e:
+            guard.post_tool_call(tool, success=False, error=str(e)[:200], exception=e)
+            raise
+        guard.post_tool_call(tool, result={"status": getattr(receipt, "status", "")}, success=True)
+        return receipt
+
     response._execute_auto = _execute_auto
     response.approve = approve
+    if orig_unattended is not None:
+        response._apply_unattended = _apply_unattended
     response._acp_wrapped = True
 
 
