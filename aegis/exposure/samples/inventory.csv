@@ -1,0 +1,5 @@
+asset,name,ips,hostname,zone,role,public,internet_ports,lateral_ports,waf,edr
+cbs-db01,Core banking DB (Oracle),10.50.1.10,cbs-db01.dc.bank,dc-core,core_banking_db,no,,1521,no,yes
+swift-gw01,SWIFT Alliance gateway,10.50.2.10,swift-gw01.dc.bank,dc-core,swift_gateway,no,,443;48002,no,yes
+ib-portal,Internet banking portal (on-prem DMZ),172.20.1.10,ib.bank.example,dc-dmz,payment_api,yes,443,all,yes,yes
+dmz-ftp,Partner file exchange,172.20.1.20,ftp.bank.example,dc-dmz,file_server,yes,21;22,all,no,no

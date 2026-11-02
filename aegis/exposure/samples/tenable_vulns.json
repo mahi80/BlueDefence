@@ -1,0 +1,388 @@
+[
+ {
+  "asset": {
+   "hostname": "legacy-reports",
+   "ipv4": [
+    "10.0.1.30"
+   ],
+   "uuid": "uuid-legacy-reports",
+   "aws_ec2_instance_id": "i-0legacy"
+  },
+  "plugin": {
+   "id": 155999,
+   "name": "Apache Log4j 2 RCE (Log4Shell)",
+   "cve": [
+    "CVE-2021-44228"
+   ],
+   "cvss3_base_score": 10.0,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 8080,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "netbanking-web",
+   "ipv4": [
+    "10.0.1.10"
+   ],
+   "uuid": "uuid-netbanking-web",
+   "aws_ec2_instance_id": "i-0web"
+  },
+  "plugin": {
+   "id": 182508,
+   "name": "HTTP/2 Rapid Reset DoS",
+   "cve": [
+    "CVE-2023-44487"
+   ],
+   "cvss3_base_score": 7.5,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 443,
+   "protocol": "TCP"
+  },
+  "severity": "high",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "netbanking-web",
+   "ipv4": [
+    "10.0.1.10"
+   ],
+   "uuid": "uuid-netbanking-web"
+  },
+  "plugin": {
+   "id": 190001,
+   "name": "Critical library flaw, no known exploitation",
+   "cve": [
+    "CVE-2024-99001"
+   ],
+   "cvss3_base_score": 9.8,
+   "exploit_available": false
+  },
+  "port": {
+   "port": 443,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "netbanking-web",
+   "ipv4": [
+    "10.0.1.10"
+   ],
+   "uuid": "uuid-netbanking-web"
+  },
+  "plugin": {
+   "id": 190002,
+   "name": "Information disclosure in HTTP header handling",
+   "cve": [
+    "CVE-2024-99002"
+   ],
+   "cvss3_base_score": 5.3,
+   "exploit_available": false
+  },
+  "port": {
+   "port": 443,
+   "protocol": "TCP"
+  },
+  "severity": "medium",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "ops-bastion",
+   "ipv4": [
+    "10.0.1.40"
+   ],
+   "uuid": "uuid-ops-bastion",
+   "aws_ec2_instance_id": "i-0bastion"
+  },
+  "plugin": {
+   "id": 201194,
+   "name": "OpenSSH regreSSHion RCE",
+   "cve": [
+    "CVE-2024-6387"
+   ],
+   "cvss3_base_score": 8.1,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 22,
+   "protocol": "TCP"
+  },
+  "severity": "high",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "nightly-batch",
+   "ipv4": [
+    "10.8.0.5"
+   ],
+   "uuid": "uuid-nightly-batch"
+  },
+  "plugin": {
+   "id": 201194,
+   "name": "OpenSSH regreSSHion RCE",
+   "cve": [
+    "CVE-2024-6387"
+   ],
+   "cvss3_base_score": 8.1,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 22,
+   "protocol": "TCP"
+  },
+  "severity": "high",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "payments-api",
+   "ipv4": [
+    "10.0.2.20"
+   ],
+   "uuid": "uuid-payments-api",
+   "aws_ec2_instance_id": "i-0api"
+  },
+  "plugin": {
+   "id": 159374,
+   "name": "Spring Framework RCE (Spring4Shell)",
+   "cve": [
+    "CVE-2022-22965"
+   ],
+   "cvss3_base_score": 9.8,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 8443,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "payments-api",
+   "ipv4": [
+    "10.0.2.20"
+   ],
+   "uuid": "uuid-payments-api"
+  },
+  "plugin": {
+   "id": 182873,
+   "name": "curl SOCKS5 heap overflow",
+   "cve": [
+    "CVE-2023-38545"
+   ],
+   "cvss3_base_score": 9.8,
+   "exploit_available": false
+  },
+  "port": {
+   "port": 0,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "cbs-db01",
+   "ipv4": [
+    "10.50.1.10"
+   ],
+   "uuid": "uuid-cbs-db01"
+  },
+  "plugin": {
+   "id": 69552,
+   "name": "Oracle TNS Listener poison",
+   "cve": [
+    "CVE-2012-1675"
+   ],
+   "cvss3_base_score": 7.5,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 1521,
+   "protocol": "TCP"
+  },
+  "severity": "high",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "swift-gw01",
+   "ipv4": [
+    "10.50.2.10"
+   ],
+   "uuid": "uuid-swift-gw01"
+  },
+  "plugin": {
+   "id": 158974,
+   "name": "OpenSSL BN_mod_sqrt infinite loop",
+   "cve": [
+    "CVE-2022-0778"
+   ],
+   "cvss3_base_score": 7.5,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 443,
+   "protocol": "TCP"
+  },
+  "severity": "high",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "ib-portal",
+   "ipv4": [
+    "172.20.1.10"
+   ],
+   "uuid": "uuid-ib-portal"
+  },
+  "plugin": {
+   "id": 97610,
+   "name": "Apache Struts 2 Jakarta RCE",
+   "cve": [
+    "CVE-2017-5638"
+   ],
+   "cvss3_base_score": 10.0,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 443,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "dmz-ftp",
+   "ipv4": [
+    "172.20.1.20"
+   ],
+   "uuid": "uuid-dmz-ftp"
+  },
+  "plugin": {
+   "id": 177082,
+   "name": "MOVEit Transfer SQL injection",
+   "cve": [
+    "CVE-2023-34362"
+   ],
+   "cvss3_base_score": 9.8,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 443,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "dmz-ftp",
+   "ipv4": [
+    "172.20.1.20"
+   ],
+   "uuid": "uuid-dmz-ftp"
+  },
+  "plugin": {
+   "id": 52704,
+   "name": "vsftpd 2.3.4 backdoor",
+   "cve": [
+    "CVE-2011-2523"
+   ],
+   "cvss3_base_score": 9.8,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 21,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "unknown-host",
+   "ipv4": [
+    "10.9.9.9"
+   ],
+   "uuid": "uuid-unknown-host"
+  },
+  "plugin": {
+   "id": 10001,
+   "name": "Finding on an asset not in the inventory",
+   "cve": [
+    "CVE-2021-44228"
+   ],
+   "cvss3_base_score": 10.0,
+   "exploit_available": true
+  },
+  "port": {
+   "port": 8080,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "OPEN"
+ },
+ {
+  "asset": {
+   "hostname": "netbanking-web",
+   "ipv4": [
+    "10.0.1.10"
+   ],
+   "uuid": "uuid-netbanking-web"
+  },
+  "plugin": {
+   "id": 10002,
+   "name": "Already fixed",
+   "cve": [
+    "CVE-2021-44228"
+   ],
+   "cvss3_base_score": 10.0,
+   "exploit_available": false
+  },
+  "port": {
+   "port": 443,
+   "protocol": "TCP"
+  },
+  "severity": "critical",
+  "state": "FIXED"
+ },
+ {
+  "asset": {
+   "hostname": "netbanking-web",
+   "ipv4": [
+    "10.0.1.10"
+   ],
+   "uuid": "uuid-netbanking-web"
+  },
+  "plugin": {
+   "id": 10003,
+   "name": "Informational banner",
+   "cve": [],
+   "cvss3_base_score": 0.0,
+   "exploit_available": false
+  },
+  "port": {
+   "port": 443,
+   "protocol": "TCP"
+  },
+  "severity": "info",
+  "state": "OPEN"
+ }
+]

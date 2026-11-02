@@ -1,0 +1,4 @@
+# Compensating controls the bank already has, by CVE. "*" = in front of every asset.
+epss_threshold: 0.1
+virtual_patches:
+  CVE-2017-5638: [ib-portal]        # Imperva virtual patch for Struts Jakarta on the IB portal

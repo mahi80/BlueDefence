@@ -1,0 +1,244 @@
+{
+ "account_id": "111111111111",
+ "region": "ap-south-1",
+ "security_groups": [
+  {
+   "GroupId": "sg-web",
+   "GroupName": "sg-web",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 443,
+     "ToPort": 443,
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ],
+     "Ipv6Ranges": []
+    },
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 22,
+     "ToPort": 22,
+     "IpRanges": [
+      {
+       "CidrIp": "10.0.0.0/8"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ]
+  },
+  {
+   "GroupId": "sg-api",
+   "GroupName": "sg-api",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 8443,
+     "ToPort": 8443,
+     "IpRanges": [],
+     "Ipv6Ranges": [],
+     "UserIdGroupPairs": [
+      {
+       "GroupId": "sg-web"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "GroupId": "sg-legacy",
+   "GroupName": "sg-legacy",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 8080,
+     "ToPort": 8080,
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ]
+  },
+  {
+   "GroupId": "sg-bastion",
+   "GroupName": "sg-bastion",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 22,
+     "ToPort": 22,
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ]
+  },
+  {
+   "GroupId": "sg-batch",
+   "GroupName": "sg-batch",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 22,
+     "ToPort": 22,
+     "IpRanges": [
+      {
+       "CidrIp": "10.0.0.0/8"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ]
+  }
+ ],
+ "instances": [
+  {
+   "InstanceId": "i-0web",
+   "State": {
+    "Name": "running"
+   },
+   "VpcId": "vpc-0prod",
+   "PrivateIpAddress": "10.0.1.10",
+   "PublicIpAddress": "13.0.0.10",
+   "SecurityGroups": [
+    {
+     "GroupId": "sg-web"
+    }
+   ],
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "netbanking-web"
+    },
+    {
+     "Key": "aegis:waf",
+     "Value": "true"
+    },
+    {
+     "Key": "aegis:edr",
+     "Value": "true"
+    }
+   ],
+   "MetadataOptions": {
+    "HttpTokens": "required"
+   }
+  },
+  {
+   "InstanceId": "i-0api",
+   "State": {
+    "Name": "running"
+   },
+   "VpcId": "vpc-0prod",
+   "PrivateIpAddress": "10.0.2.20",
+   "PublicIpAddress": null,
+   "SecurityGroups": [
+    {
+     "GroupId": "sg-api"
+    }
+   ],
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "payments-api"
+    },
+    {
+     "Key": "aegis:role",
+     "Value": "payment_api"
+    },
+    {
+     "Key": "aegis:edr",
+     "Value": "true"
+    }
+   ],
+   "MetadataOptions": {
+    "HttpTokens": "required"
+   }
+  },
+  {
+   "InstanceId": "i-0legacy",
+   "State": {
+    "Name": "running"
+   },
+   "VpcId": "vpc-0prod",
+   "PrivateIpAddress": "10.0.1.30",
+   "PublicIpAddress": "13.0.0.30",
+   "SecurityGroups": [
+    {
+     "GroupId": "sg-legacy"
+    }
+   ],
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "legacy-reports"
+    }
+   ],
+   "MetadataOptions": {
+    "HttpTokens": "required"
+   }
+  },
+  {
+   "InstanceId": "i-0bastion",
+   "State": {
+    "Name": "running"
+   },
+   "VpcId": "vpc-0prod",
+   "PrivateIpAddress": "10.0.1.40",
+   "PublicIpAddress": "13.0.0.40",
+   "SecurityGroups": [
+    {
+     "GroupId": "sg-bastion"
+    }
+   ],
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "ops-bastion"
+    },
+    {
+     "Key": "aegis:role",
+     "Value": "jump_host"
+    },
+    {
+     "Key": "aegis:edr",
+     "Value": "true"
+    }
+   ],
+   "MetadataOptions": {
+    "HttpTokens": "required"
+   }
+  },
+  {
+   "InstanceId": "i-0batch",
+   "State": {
+    "Name": "running"
+   },
+   "VpcId": "vpc-0batch",
+   "PrivateIpAddress": "10.8.0.5",
+   "PublicIpAddress": null,
+   "SecurityGroups": [
+    {
+     "GroupId": "sg-batch"
+    }
+   ],
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "nightly-batch"
+    }
+   ],
+   "MetadataOptions": {
+    "HttpTokens": "required"
+   }
+  }
+ ]
+}
