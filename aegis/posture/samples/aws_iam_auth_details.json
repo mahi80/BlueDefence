@@ -1,0 +1,151 @@
+{
+ "UserDetailList": [
+  {
+   "UserName": "ops-admin",
+   "Arn": "arn:aws:iam::111111111111:user/ops-admin",
+   "GroupList": [
+    "Admins"
+   ],
+   "AttachedManagedPolicies": [],
+   "UserPolicyList": []
+  },
+  {
+   "UserName": "ci-deployer",
+   "Arn": "arn:aws:iam::111111111111:user/ci-deployer",
+   "GroupList": [],
+   "AttachedManagedPolicies": [
+    {
+     "PolicyName": "DeployAll",
+     "PolicyArn": "arn:aws:iam::111111111111:policy/DeployAll"
+    }
+   ],
+   "UserPolicyList": []
+  },
+  {
+   "UserName": "analyst",
+   "Arn": "arn:aws:iam::111111111111:user/analyst",
+   "GroupList": [
+    "ReadOnly"
+   ],
+   "AttachedManagedPolicies": [],
+   "UserPolicyList": []
+  }
+ ],
+ "GroupDetailList": [
+  {
+   "GroupName": "Admins",
+   "AttachedManagedPolicies": [
+    {
+     "PolicyName": "AdministratorAccess",
+     "PolicyArn": "arn:aws:iam::aws:policy/AdministratorAccess"
+    }
+   ],
+   "GroupPolicyList": []
+  },
+  {
+   "GroupName": "ReadOnly",
+   "AttachedManagedPolicies": [
+    {
+     "PolicyName": "ReadOnlyAccess",
+     "PolicyArn": "arn:aws:iam::aws:policy/ReadOnlyAccess"
+    }
+   ],
+   "GroupPolicyList": []
+  }
+ ],
+ "RoleDetailList": [
+  {
+   "RoleName": "vendor-audit",
+   "Arn": "arn:aws:iam::111111111111:role/vendor-audit",
+   "Path": "/",
+   "AssumeRolePolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [
+     {
+      "Effect": "Allow",
+      "Principal": {
+       "AWS": "arn:aws:iam::999999999999:root"
+      },
+      "Action": "sts:AssumeRole"
+     }
+    ]
+   },
+   "RolePolicyList": []
+  },
+  {
+   "RoleName": "legacy-open",
+   "Arn": "arn:aws:iam::111111111111:role/legacy-open",
+   "Path": "/",
+   "AssumeRolePolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [
+     {
+      "Effect": "Allow",
+      "Principal": {
+       "AWS": "*"
+      },
+      "Action": "sts:AssumeRole"
+     }
+    ]
+   },
+   "RolePolicyList": [
+    {
+     "PolicyName": "all",
+     "PolicyDocument": {
+      "Version": "2012-10-17",
+      "Statement": [
+       {
+        "Effect": "Allow",
+        "Action": "*",
+        "Resource": "*"
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "RoleName": "lambda-exec",
+   "Arn": "arn:aws:iam::111111111111:role/lambda-exec",
+   "Path": "/",
+   "AssumeRolePolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [
+     {
+      "Effect": "Allow",
+      "Principal": {
+       "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+     }
+    ]
+   },
+   "RolePolicyList": []
+  }
+ ],
+ "Policies": [
+  {
+   "PolicyName": "DeployAll",
+   "Arn": "arn:aws:iam::111111111111:policy/DeployAll",
+   "AttachmentCount": 1,
+   "PolicyVersionList": [
+    {
+     "IsDefaultVersion": true,
+     "Document": {
+      "Version": "2012-10-17",
+      "Statement": [
+       {
+        "Effect": "Allow",
+        "Action": [
+         "iam:PassRole",
+         "lambda:*"
+        ],
+        "Resource": "*"
+       }
+      ]
+     }
+    }
+   ]
+  }
+ ]
+}
