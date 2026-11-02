@@ -168,3 +168,31 @@ def collect_aws_cspm(region: str | None = None, *, require_flag: bool = True) ->
     b["config_recorders"] = [{"name": n, "recording": r} for n, r in statuses.items()]
     b["password_policy"] = (_safe(iam.get_account_password_policy, missing=("NoSuchEntity",), default={}) or {}).get("PasswordPolicy")
     return b
+
+
+def collect_k8s(context: str | None = None, *, kubectl: str = "kubectl", timeout_s: float = 120.0) -> dict:
+    """Read the cluster with the same read-only ``kubectl get`` the bank would run for an offline
+    export. Secrets are never requested. Uses the caller's kubeconfig; a read-only ClusterRole
+    (get/list on the kinds in ``k8s_posture.EXPORT_KINDS``) is sufficient."""
+    import shutil
+    import subprocess
+
+    from .k8s_posture import EXPORT_KINDS
+
+    if not live_enabled():
+        raise PostureSourceError("live posture collection is off; set AEGIS_POSTURE_LIVE=1 or pass --export FILE")
+    if shutil.which(kubectl) is None:
+        raise PostureSourceError(f"live Kubernetes collection needs {kubectl} on PATH")
+    cmd = [kubectl, "get", ",".join(EXPORT_KINDS), "--all-namespaces", "-o", "json"]
+    if context:
+        cmd += ["--context", context]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)
+    except subprocess.TimeoutExpired as e:
+        raise PostureSourceError(f"kubectl timed out after {timeout_s:.0f}s") from e
+    if r.returncode != 0:
+        raise PostureSourceError(f"kubectl failed: {r.stderr.strip()[:300]}")
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        raise PostureSourceError("kubectl did not return JSON") from e

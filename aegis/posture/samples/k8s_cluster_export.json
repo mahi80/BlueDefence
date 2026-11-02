@@ -1,0 +1,382 @@
+{
+ "apiVersion": "v1",
+ "kind": "List",
+ "items": [
+  {
+   "kind": "Namespace",
+   "metadata": {
+    "name": "payments",
+    "labels": {
+     "pod-security.kubernetes.io/enforce": "restricted"
+    }
+   }
+  },
+  {
+   "kind": "Namespace",
+   "metadata": {
+    "name": "batch"
+   }
+  },
+  {
+   "kind": "Namespace",
+   "metadata": {
+    "name": "default"
+   }
+  },
+  {
+   "kind": "Namespace",
+   "metadata": {
+    "name": "kube-system"
+   }
+  },
+  {
+   "kind": "Deployment",
+   "apiVersion": "apps/v1",
+   "metadata": {
+    "name": "payments-api",
+    "namespace": "payments"
+   },
+   "spec": {
+    "template": {
+     "spec": {
+      "serviceAccountName": "payments-api",
+      "automountServiceAccountToken": false,
+      "containers": [
+       {
+        "name": "api",
+        "image": "registry.bank/payments-api@sha256:abc",
+        "securityContext": {
+         "allowPrivilegeEscalation": false,
+         "runAsNonRoot": true,
+         "runAsUser": 10001,
+         "readOnlyRootFilesystem": true,
+         "capabilities": {
+          "drop": [
+           "ALL"
+          ]
+         }
+        },
+        "resources": {
+         "limits": {
+          "cpu": "500m",
+          "memory": "512Mi"
+         }
+        }
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "kind": "NetworkPolicy",
+   "metadata": {
+    "name": "default-deny",
+    "namespace": "payments"
+   },
+   "spec": {
+    "podSelector": {}
+   }
+  },
+  {
+   "kind": "DaemonSet",
+   "apiVersion": "apps/v1",
+   "metadata": {
+    "name": "node-agent",
+    "namespace": "batch"
+   },
+   "spec": {
+    "template": {
+     "spec": {
+      "hostPID": true,
+      "hostNetwork": true,
+      "volumes": [
+       {
+        "name": "sock",
+        "hostPath": {
+         "path": "/var/run/docker.sock"
+        }
+       }
+      ],
+      "containers": [
+       {
+        "name": "agent",
+        "image": "vendor/agent:latest",
+        "securityContext": {
+         "privileged": true
+        }
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "kind": "Deployment",
+   "apiVersion": "apps/v1",
+   "metadata": {
+    "name": "report-gen",
+    "namespace": "batch"
+   },
+   "spec": {
+    "template": {
+     "spec": {
+      "serviceAccountName": "ci-deployer",
+      "containers": [
+       {
+        "name": "gen",
+        "image": "registry.bank/report:1.4",
+        "securityContext": {
+         "runAsUser": 0,
+         "capabilities": {
+          "add": [
+           "SYS_ADMIN"
+          ]
+         }
+        },
+        "env": [
+         {
+          "name": "DB_PASSWORD",
+          "value": "Sup3rS3cret"
+         },
+         {
+          "name": "LOG_LEVEL",
+          "value": "info"
+         }
+        ],
+        "ports": [
+         {
+          "containerPort": 8080,
+          "hostPort": 8080
+         }
+        ],
+        "resources": {
+         "limits": {
+          "cpu": "1",
+          "memory": "1Gi"
+         }
+        }
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "kind": "Pod",
+   "metadata": {
+    "name": "debug-shell",
+    "namespace": "default"
+   },
+   "spec": {
+    "containers": [
+     {
+      "name": "sh",
+      "image": "busybox",
+      "resources": {}
+     }
+    ]
+   }
+  },
+  {
+   "kind": "Pod",
+   "metadata": {
+    "name": "payments-api-7d9-abc",
+    "namespace": "payments",
+    "ownerReferences": [
+     {
+      "kind": "ReplicaSet",
+      "name": "payments-api-7d9"
+     }
+    ]
+   },
+   "spec": {
+    "containers": [
+     {
+      "name": "api",
+      "image": "x",
+      "securityContext": {
+       "privileged": true
+      }
+     }
+    ]
+   }
+  },
+  {
+   "kind": "DaemonSet",
+   "apiVersion": "apps/v1",
+   "metadata": {
+    "name": "kube-proxy",
+    "namespace": "kube-system"
+   },
+   "spec": {
+    "template": {
+     "spec": {
+      "hostNetwork": true,
+      "containers": [
+       {
+        "name": "kp",
+        "image": "k8s/kube-proxy:v1.30.1",
+        "securityContext": {
+         "privileged": true
+        }
+       }
+      ]
+     }
+    }
+   }
+  },
+  {
+   "kind": "ClusterRoleBinding",
+   "metadata": {
+    "name": "ci-admin"
+   },
+   "roleRef": {
+    "kind": "ClusterRole",
+    "name": "cluster-admin"
+   },
+   "subjects": [
+    {
+     "kind": "ServiceAccount",
+     "name": "ci-deployer",
+     "namespace": "batch"
+    }
+   ]
+  },
+  {
+   "kind": "ClusterRoleBinding",
+   "metadata": {
+    "name": "cluster-admin"
+   },
+   "roleRef": {
+    "kind": "ClusterRole",
+    "name": "cluster-admin"
+   },
+   "subjects": [
+    {
+     "kind": "Group",
+     "name": "system:masters"
+    }
+   ]
+  },
+  {
+   "kind": "ClusterRoleBinding",
+   "metadata": {
+    "name": "oops-public-view"
+   },
+   "roleRef": {
+    "kind": "ClusterRole",
+    "name": "view"
+   },
+   "subjects": [
+    {
+     "kind": "Group",
+     "name": "system:authenticated"
+    }
+   ]
+  },
+  {
+   "kind": "ClusterRole",
+   "metadata": {
+    "name": "ops-everything"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "*"
+     ],
+     "resources": [
+      "*"
+     ],
+     "verbs": [
+      "*"
+     ]
+    }
+   ]
+  },
+  {
+   "kind": "ClusterRoleBinding",
+   "metadata": {
+    "name": "ops-team"
+   },
+   "roleRef": {
+    "kind": "ClusterRole",
+    "name": "ops-everything"
+   },
+   "subjects": [
+    {
+     "kind": "Group",
+     "name": "ops"
+    }
+   ]
+  },
+  {
+   "kind": "Role",
+   "metadata": {
+    "name": "support-debug",
+    "namespace": "payments"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resources": [
+      "secrets"
+     ],
+     "verbs": [
+      "get",
+      "list"
+     ]
+    },
+    {
+     "apiGroups": [
+      ""
+     ],
+     "resources": [
+      "pods/exec"
+     ],
+     "verbs": [
+      "create"
+     ]
+    }
+   ]
+  },
+  {
+   "kind": "RoleBinding",
+   "metadata": {
+    "name": "support",
+    "namespace": "payments"
+   },
+   "roleRef": {
+    "kind": "Role",
+    "name": "support-debug"
+   },
+   "subjects": [
+    {
+     "kind": "Group",
+     "name": "l2-support"
+    }
+   ]
+  },
+  {
+   "kind": "ClusterRole",
+   "metadata": {
+    "name": "unused-wild"
+   },
+   "rules": [
+    {
+     "apiGroups": [
+      "*"
+     ],
+     "resources": [
+      "*"
+     ],
+     "verbs": [
+      "*"
+     ]
+    }
+   ]
+  }
+ ]
+}

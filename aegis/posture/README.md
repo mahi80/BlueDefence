@@ -7,7 +7,7 @@ bucket, cluster and template as it stands, so a misconfiguration that predates A
 |---|---|---|---|
 | IAM review | ✅ | `aws iam get-account-authorization-details` + `aws iam get-credential-report` | boto3, `SecurityAudit` policy |
 | CSPM | ✅ | `python -m aegis.posture export-aws --out bundle.json` (run by the bank) | boto3, `SecurityAudit` policy |
-| Kubernetes posture | planned | — | — |
+| Kubernetes posture | ✅ | `kubectl get <kinds> -A -o json` (no secrets) | read-only `kubectl get` |
 | Policy-as-code (IaC) | planned | — | — |
 
 **Offline is the default and the recommended pilot mode.** The bank runs the export with its own
@@ -79,5 +79,36 @@ checked. Multi-region trails homed in another region are counted (their status i
 | Logging | GuardDuty off, AWS Config not recording | medium | — |
 | Keys | Customer-managed symmetric KMS key without rotation | medium | — |
 | Identity | No password policy / length < 14 / reuse < 24 | medium / low / low | 1.8 / 1.9 |
+
+## Kubernetes posture
+
+```bash
+# at the bank (read-only ClusterRole with get/list on these kinds is enough; secrets are NOT exported):
+kubectl get namespaces,pods,deployments,daemonsets,statefulsets,replicasets,jobs,cronjobs,serviceaccounts,roles,clusterroles,rolebindings,clusterrolebindings,networkpolicies -A -o json > cluster.json
+# in AEGIS:
+python -m aegis.posture k8s --export cluster.json --fail-on critical
+# or live (AEGIS_POSTURE_LIVE=1, kubectl on PATH):
+python -m aegis.posture k8s --live --context prod-ap-south-1
+```
+
+Workloads are judged once, at their controller (a Deployment, not each of its pods). `kube-system`
+is skipped by default (CNI / kube-proxy are privileged by design) — `--include-system` scans it.
+Secret objects are never requested; if an export contains them they are ignored and the report says so.
+
+| Area | Check | Severity | CIS K8s v1.9 / PSS |
+|---|---|---|---|
+| Workload | Privileged container | critical | 5.2.1 / baseline |
+| Workload | hostPath to `/`, `/etc`, `/proc`, the container runtime socket, kubelet dir … | critical | baseline |
+| Workload | Mounts the token of a service account bound to cluster-admin | critical | 5.1.1 |
+| Workload | hostNetwork / hostPID / hostIPC; other hostPath; dangerous capabilities (SYS_ADMIN, NET_ADMIN, ALL …) | high | 5.2.2–5.2.4, 5.2.8–9 |
+| Workload | Explicit UID 0; plaintext secret-like env var in the manifest | high | 5.2.7; 5.4.1 |
+| Workload | allowPrivilegeEscalation not false; root not prevented; hostPort | medium | 5.2.6; 5.2.7; baseline |
+| Workload | Writable root FS; no CPU/memory limits; unpinned / `latest` image; default SA token mounted | low | 5.1.5–6 |
+| RBAC | Any role granted to `system:anonymous` / `system:unauthenticated` / `system:authenticated` | critical | 5.1.1 |
+| RBAC | cluster-admin bound to anything other than `system:masters` | high | 5.1.1 |
+| RBAC | Bound custom role with `*`/`*`, or `escalate` / `bind` / `impersonate` | high | 5.1.3, 5.1.8 |
+| RBAC | Bound custom role can read Secrets / exec into pods | medium | 5.1.2 |
+| Network | Namespace with workloads and no NetworkPolicy | medium | 5.3.2 |
+| Namespace | No Pod Security Admission enforce label; workloads in `default` | low | PSS; 5.7.4 |
 
 Exit codes: `0` ok, `1` a finding at or above `--fail-on`, `2` bad or missing input.
