@@ -176,7 +176,7 @@ def test_cli_json_and_fail_on(capsys):
     assert cli(args) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["summary"]["critical"] == 1  # only the Principal "*" trust; root checks need the report
-    assert out["note"] and out["findings"][0]["severity"] in ("critical", "high")
+    assert out["notes"] and out["findings"][0]["severity"] in ("critical", "high")
     assert cli(args + ["--fail-on", "high"]) == 1
     assert cli(args + ["--fail-on", "critical"]) == 1  # Principal "*" trust is critical without any report
 

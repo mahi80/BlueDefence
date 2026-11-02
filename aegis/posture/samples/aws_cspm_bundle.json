@@ -1,0 +1,345 @@
+{
+ "account_id": "111111111111",
+ "region": "ap-south-1",
+ "account_public_access_block": {
+  "BlockPublicAcls": true,
+  "IgnorePublicAcls": true,
+  "BlockPublicPolicy": false,
+  "RestrictPublicBuckets": true
+ },
+ "buckets": [
+  {
+   "Name": "wb-kyc-scans",
+   "PublicAccessBlock": null,
+   "PolicyStatus": {
+    "IsPublic": true
+   },
+   "Acl": {
+    "Grants": []
+   },
+   "Encryption": {
+    "Rules": [
+     {
+      "ApplyServerSideEncryptionByDefault": {
+       "SSEAlgorithm": "aws:kms"
+      }
+     }
+    ]
+   },
+   "Versioning": {
+    "Status": "Enabled"
+   },
+   "Logging": {
+    "TargetBucket": "wb-logs"
+   }
+  },
+  {
+   "Name": "wb-marketing-site",
+   "PublicAccessBlock": null,
+   "PolicyStatus": {
+    "IsPublic": false
+   },
+   "Acl": {
+    "Grants": [
+     {
+      "Grantee": {
+       "Type": "Group",
+       "URI": "http://acs.amazonaws.com/groups/global/AllUsers"
+      },
+      "Permission": "READ"
+     }
+    ]
+   },
+   "Encryption": null,
+   "Versioning": {
+    "Status": null
+   },
+   "Logging": null
+  },
+  {
+   "Name": "wb-ledger-backups",
+   "PublicAccessBlock": {
+    "BlockPublicAcls": true,
+    "IgnorePublicAcls": true,
+    "BlockPublicPolicy": true,
+    "RestrictPublicBuckets": true
+   },
+   "PolicyStatus": {
+    "IsPublic": true
+   },
+   "Acl": {
+    "Grants": []
+   },
+   "Encryption": {
+    "Rules": [
+     {
+      "ApplyServerSideEncryptionByDefault": {
+       "SSEAlgorithm": "aws:kms"
+      }
+     }
+    ]
+   },
+   "Versioning": {
+    "Status": "Enabled"
+   },
+   "Logging": {
+    "TargetBucket": "wb-logs"
+   }
+  }
+ ],
+ "security_groups": [
+  {
+   "GroupId": "sg-0db",
+   "GroupName": "core-db",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 5432,
+     "ToPort": 5432,
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ],
+   "IpPermissionsEgress": []
+  },
+  {
+   "GroupId": "sg-0jump",
+   "GroupName": "jumpbox",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 22,
+     "ToPort": 22,
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ],
+     "Ipv6Ranges": [
+      {
+       "CidrIpv6": "::/0"
+      }
+     ]
+    }
+   ],
+   "IpPermissionsEgress": []
+  },
+  {
+   "GroupId": "sg-0web",
+   "GroupName": "web",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 443,
+     "ToPort": 443,
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ],
+     "Ipv6Ranges": []
+    },
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 8080,
+     "ToPort": 8080,
+     "IpRanges": [
+      {
+       "CidrIp": "10.0.0.0/8"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ],
+   "IpPermissionsEgress": []
+  },
+  {
+   "GroupId": "sg-0legacy",
+   "GroupName": "legacy-any",
+   "IpPermissions": [
+    {
+     "IpProtocol": "-1",
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ],
+   "IpPermissionsEgress": []
+  },
+  {
+   "GroupId": "sg-0def",
+   "GroupName": "default",
+   "IpPermissions": [
+    {
+     "IpProtocol": "-1",
+     "UserIdGroupPairs": [
+      {
+       "GroupId": "sg-0def"
+      }
+     ],
+     "IpRanges": [],
+     "Ipv6Ranges": []
+    }
+   ],
+   "IpPermissionsEgress": [
+    {
+     "IpProtocol": "-1",
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "instances": [
+  {
+   "InstanceId": "i-0weba",
+   "State": {
+    "Name": "running"
+   },
+   "PublicIpAddress": "13.0.0.10",
+   "MetadataOptions": {
+    "HttpTokens": "optional"
+   },
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "netbanking-web-1"
+    }
+   ]
+  },
+  {
+   "InstanceId": "i-0batch",
+   "State": {
+    "Name": "running"
+   },
+   "MetadataOptions": {
+    "HttpTokens": "optional"
+   }
+  },
+  {
+   "InstanceId": "i-0good",
+   "State": {
+    "Name": "running"
+   },
+   "PublicIpAddress": "13.0.0.11",
+   "MetadataOptions": {
+    "HttpTokens": "required"
+   }
+  },
+  {
+   "InstanceId": "i-0gone",
+   "State": {
+    "Name": "terminated"
+   },
+   "MetadataOptions": {
+    "HttpTokens": "optional"
+   }
+  }
+ ],
+ "volumes": [
+  {
+   "VolumeId": "vol-0a",
+   "Encrypted": false,
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "batch-scratch"
+    }
+   ]
+  },
+  {
+   "VolumeId": "vol-0b",
+   "Encrypted": true
+  }
+ ],
+ "ebs_encryption_by_default": false,
+ "db_instances": [
+  {
+   "DBInstanceIdentifier": "core-ledger",
+   "DBInstanceArn": "arn:aws:rds:ap-south-1:111111111111:db:core-ledger",
+   "Engine": "postgres",
+   "PubliclyAccessible": true,
+   "StorageEncrypted": false,
+   "BackupRetentionPeriod": 0,
+   "DeletionProtection": false
+  },
+  {
+   "DBInstanceIdentifier": "cards",
+   "DBInstanceArn": "arn:aws:rds:ap-south-1:111111111111:db:cards",
+   "Engine": "mysql",
+   "PubliclyAccessible": false,
+   "StorageEncrypted": true,
+   "BackupRetentionPeriod": 14,
+   "DeletionProtection": true
+  }
+ ],
+ "trails": [
+  {
+   "Name": "region-only",
+   "TrailARN": "arn:aws:cloudtrail:ap-south-1:111111111111:trail/region-only",
+   "IsMultiRegionTrail": false,
+   "IsLogging": true,
+   "LogFileValidationEnabled": false,
+   "KmsKeyId": null
+  }
+ ],
+ "kms_keys": [
+  {
+   "KeyId": "k-cust",
+   "Arn": "arn:aws:kms:ap-south-1:111111111111:key/k-cust",
+   "KeyManager": "CUSTOMER",
+   "KeyState": "Enabled",
+   "KeySpec": "SYMMETRIC_DEFAULT",
+   "KeyRotationEnabled": false
+  },
+  {
+   "KeyId": "k-aws",
+   "KeyManager": "AWS",
+   "KeyState": "Enabled",
+   "KeySpec": "SYMMETRIC_DEFAULT",
+   "KeyRotationEnabled": null
+  },
+  {
+   "KeyId": "k-rsa",
+   "KeyManager": "CUSTOMER",
+   "KeyState": "Enabled",
+   "KeySpec": "RSA_2048",
+   "KeyRotationEnabled": null
+  }
+ ],
+ "vpcs": [
+  {
+   "VpcId": "vpc-0prod",
+   "IsDefault": false,
+   "FlowLogs": []
+  },
+  {
+   "VpcId": "vpc-0dmz",
+   "IsDefault": false,
+   "FlowLogs": [
+    "vpc-0dmz"
+   ]
+  }
+ ],
+ "guardduty_detectors": [],
+ "config_recorders": [
+  {
+   "name": "default",
+   "recording": true
+  }
+ ],
+ "password_policy": {
+  "MinimumPasswordLength": 8,
+  "PasswordReusePrevention": 24
+ }
+}
