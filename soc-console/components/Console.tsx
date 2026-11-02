@@ -113,8 +113,13 @@ export default function Console({
   const sorted = useMemo(
     () =>
       [...chains].sort((a, b) => {
+        // Triage order: worst verdict first, then by confidence (a 97% malicious outranks a 63% one),
+        // then most recent — so the row an analyst should touch first is always at the top.
         const r = (VERDICT_RANK[b.verdict] ?? 0) - (VERDICT_RANK[a.verdict] ?? 0);
-        return r !== 0 ? r : b.started_at.localeCompare(a.started_at);
+        if (r !== 0) return r;
+        const c = (b.confidence ?? 0) - (a.confidence ?? 0);
+        if (Math.abs(c) > 1e-9) return c;
+        return b.started_at.localeCompare(a.started_at);
       }),
     [chains],
   );
