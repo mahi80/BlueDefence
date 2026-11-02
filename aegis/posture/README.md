@@ -8,7 +8,7 @@ bucket, cluster and template as it stands, so a misconfiguration that predates A
 | IAM review | ✅ | `aws iam get-account-authorization-details` + `aws iam get-credential-report` | boto3, `SecurityAudit` policy |
 | CSPM | ✅ | `python -m aegis.posture export-aws --out bundle.json` (run by the bank) | boto3, `SecurityAudit` policy |
 | Kubernetes posture | ✅ | `kubectl get <kinds> -A -o json` (no secrets) | read-only `kubectl get` |
-| Policy-as-code (IaC) | planned | — | — |
+| Policy-as-code (IaC) | ✅ | `terraform show -json plan.out` + Kubernetes YAML | — (pre-deploy gate) |
 
 **Offline is the default and the recommended pilot mode.** The bank runs the export with its own
 credentials and hands AEGIS the files, so AEGIS never holds cloud credentials. **Live mode** is opt-in:
@@ -110,5 +110,41 @@ Secret objects are never requested; if an export contains them they are ignored 
 | RBAC | Bound custom role can read Secrets / exec into pods | medium | 5.1.2 |
 | Network | Namespace with workloads and no NetworkPolicy | medium | 5.3.2 |
 | Namespace | No Pod Security Admission enforce label; workloads in `default` | low | PSS; 5.7.4 |
+
+## Policy-as-code (pre-deploy gate)
+
+The same rules, run before deploy: **one rule, one ID, whether it fires in a pull request or on the
+live account.** Terraform resources are translated into the shapes the CSPM and IAM scanners judge;
+Kubernetes manifests go through the K8s workload and RBAC checks. Findings carry the Terraform address
+or `Kind/namespace/name`.
+
+```bash
+terraform show -json plan.out > plan.json
+python -m aegis.posture iac --plan plan.json --changed-only --k8s k8s/ --waivers security/waivers.yaml --fail-on high
+```
+
+Covered Terraform types: `aws_security_group`, `aws_security_group_rule`, `aws_vpc_security_group_ingress_rule`,
+`aws_db_instance`, `aws_instance`, `aws_launch_template`, `aws_ebs_volume`, `aws_ebs_encryption_by_default`,
+`aws_kms_key`, `aws_cloudtrail`, `aws_s3_bucket(_acl|_policy|_public_access_block)`, `aws_s3_account_public_access_block`,
+`aws_iam_policy`, `aws_iam_(role|user|group)_policy`, `aws_iam_(user|group)_policy_attachment`, `aws_iam_role`, `aws_eks_cluster`.
+Deleted resources are skipped; `--changed-only` also skips no-ops. Namespace-level K8s checks (NetworkPolicy, PSA)
+depend on the cluster, so they stay in the live `k8s` scan.
+
+**Waivers are the exception register.** Each needs `id` and `resource` (globs allowed), `reason`,
+`approved_by` and `expires`; a waiver missing any of them is rejected (exit 2). Expired waivers suppress
+nothing and are reported; waivers that match nothing are reported for clean-up; every applied waiver is
+listed with its reason and approver.
+
+```yaml
+waivers:
+  - id: CSPM-SG-ADMIN-PORT-OPEN
+    resource: aws_security_group_rule.bastion_ssh
+    reason: "Break-glass bastion behind Zscaler during VPN migration — CR-2291"
+    approved_by: ciso
+    expires: 2026-12-31
+```
+
+A ready-to-copy GitHub Actions workflow is in `deploy/ci/bluedefence-iac-gate.yml` (OIDC read-only plan
+role, gate on `high`, report in the job summary).
 
 Exit codes: `0` ok, `1` a finding at or above `--fail-on`, `2` bad or missing input.

@@ -1,0 +1,12 @@
+# Approved exceptions to the policy-as-code gate. Every entry needs a reason, an approver and an expiry.
+waivers:
+  - id: CSPM-SG-ADMIN-PORT-OPEN
+    resource: aws_security_group_rule.bastion_ssh
+    reason: "Break-glass bastion behind Zscaler during VPN migration — CR-2291"
+    approved_by: ciso
+    expires: 2026-12-31
+  - id: CSPM-KMS-NO-ROTATION
+    resource: aws_kms_key.ledger
+    reason: "HSM-backed key rotated manually each quarter"
+    approved_by: head-of-infra
+    expires: 2026-06-30
