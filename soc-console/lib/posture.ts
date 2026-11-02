@@ -43,6 +43,35 @@ export interface ExposureExtra {
   source?: string;
 }
 
+// ACT NOW → a remediation proposal filed through the approval queue; the next run verifies it (aegis/exposure/remediation.py)
+export type ProposalStatus =
+  | "proposed" | "awaiting_approval" | "approved" | "approved_still_open" | "verified_closed"
+  | "closed_before_decision" | "rejected" | "expired" | "accepted_risk";
+
+export interface RemediationOption {
+  kind: "virtual_patch" | "cut_path" | "patch";
+  title: string;
+  owner: string;
+  steps: string[];
+  commands: string[];
+  closes_when: string;
+}
+
+export interface RemediationProposal {
+  fingerprint: string;
+  id: string;
+  component: string;
+  status: ProposalStatus;
+  options: RemediationOption[];
+  approval_id: string | null;
+  transport: string | null;
+  decided_by?: string;
+  approved_at?: string;
+  closed_at?: string;
+  verification?: string | null;
+  history: { at: string; status: ProposalStatus; note?: string }[];
+}
+
 export interface ExposureMeta {
   funnel: { raw: number; scored: number; exploitable: number; reachable: number; undefended: number; act_now: number };
   tiers: Record<string, number>;
@@ -74,6 +103,7 @@ export interface PostureRun {
   resolved: { fingerprint: string; id: string; severity: Severity; scan: string; affected_component: string; first_seen?: string; resolved_at: string }[];
   waived: (PostureFinding & { waiver: { reason: string; approved_by: string; expires: string } })[];
   notes: string[];
+  remediation?: { proposals: RemediationProposal[]; counts: Partial<Record<ProposalStatus, number>>; channel: string | null };
 }
 
 export type PostureResult =

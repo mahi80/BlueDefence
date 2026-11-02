@@ -98,6 +98,36 @@ answers colour-coded and the reason behind each.
     settings: exposure.yaml
 ```
 
+## Remediation: proposed through the approval queue, verified by the next run
+
+Every ACT NOW finding gets a remediation proposal (`remediation.py`) with up to three options, built from
+the facts the engine recorded about the path:
+
+| Option | What it says | Counts as closed when |
+|---|---|---|
+| Virtual patch | a blocking rule for the CVE on the WAF that already fronts the asset, or switching a monitor-mode protection to block (web ports only — a WAF cannot stop an SSH or RDP exploit) | the next run sees the CVE virtual-patched in blocking mode |
+| Cut the path | the exact command: `aws ec2 revoke-security-group-ingress` on the security group that opens the port (or the load balancer's), `az network nsg rule create … --access Deny` on the exact NSG, the Kubernetes Service / Ingress to take off the internet, or a firewall change request for on-prem | the next run no longer finds the port reachable from the internet |
+| Patch | the fix | the scanner stops reporting it on that asset |
+
+The proposal is filed through the deployment's HITL transport (`AEGIS_HITL_TRANSPORT`: the dashboard, so
+the SOC console's Exposures card has Approve / Reject; ServiceNow; or the file queue). **Approval records a
+commitment, never a change** — BlueDefence has no connector that could apply a virtual patch or a
+security-group change, and the scanners stay read-only. The owning team makes the change through its own
+change process, and the next run checks it:
+
+`proposed → awaiting_approval → approved → verified_closed`, or **`approved_still_open`** when the path is
+still there after approval (the report and the console flag it with the days since approval). Also
+`rejected`, `expired`, `closed_before_decision` (the path closed before anyone decided) and
+`accepted_risk` (waived). A proposal is filed once and survives restarts (the HITL journal); a rejected
+proposal is not re-filed every run. State is in `<store>/proposals.json`; each run record carries a
+`remediation` section and the report a "Remediation proposals" table.
+
+```yaml
+remediation:              # optional, in posture.yaml
+  enabled: true           # default
+  tiers: [ACT_NOW]        # add ACT to propose for WAF-fronted exploitable exposures too
+```
+
 ## Inventory CSV
 
 `asset,name,ips,hostname,zone,role,public,internet_ports,lateral_ports,waf,edr` — ports as `443;8443`,

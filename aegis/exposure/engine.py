@@ -69,6 +69,7 @@ class Asset:
     internet_ports: PortRanges = field(default_factory=list)   # port ranges open to the internet
     internet_via: dict[tuple[int, int], str] = field(default_factory=dict)  # range -> "via load balancer X" etc.
     fronted_by: set[str] = field(default_factory=set)   # LB names / DNS names / ingress hosts in front of it
+    opened_by: dict[tuple[int, int], set[str]] = field(default_factory=dict)  # range -> SG / NSG ids that open it
     # (lo, hi, sources) reachable from inside the zone; sources = security-group ids allowed in, or "*" (any
     # host in the zone — a private CIDR rule, or the inventory's lateral_ports)
     lateral: list[tuple[int, int, frozenset[str]]] = field(default_factory=lambda: [(0, 65535, frozenset({"*"}))])
@@ -104,6 +105,7 @@ class Exposure:
     risk_score: float
     reasons: list[str]
     vuln_source: str = ""
+    path: dict = field(default_factory=dict)   # what opens / fronts the path — remediation builds its commands from it
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -202,6 +204,18 @@ def _defended(v: Vuln, a: Asset, s: Settings) -> tuple[str, str]:
     return "none", "no blocking control in front: no WAF or virtual patch for this port" + note + edr
 
 
+def _path(v: Vuln, a: Asset, s: Settings) -> dict:
+    """The facts a fix is built from: which rule opens the port, what fronts it, which WAF covers it."""
+    r = _internet_range(a, v.port) if v.port not in (None, ANY_PORT) else None
+    keys = a.keys | {a.id, a.name} | a.fronted_by
+    return {"source": a.source, "zone": a.zone, "range": list(r) if r else None,
+            "via": a.internet_via.get(r) if r else None,
+            "opened_by": sorted(a.opened_by.get(r, set())) if r else [],
+            "fronted_by": sorted(a.fronted_by),
+            "protections": [{"name": p.name, "vendor": p.vendor, "mode": p.mode}
+                            for p in s.coverage if p.covers(keys, v.port)]}
+
+
 def _tier(exploitable: bool, reach: str, defended: str, crown: int | None, cvss: float | None) -> str:
     if exploitable:
         if reach == "internet" and defended == "none":
@@ -253,7 +267,7 @@ def assess(vulns: list[Vuln], assets: list[Asset], settings: Settings | None = N
             tier=tier, cve=v.cve, title=v.title, asset=a.id, asset_name=a.name or a.id, port=v.port,
             exploitable=exploitable, reach=reach, defended=defended, crown_distance=crown,
             risk_score=compute_risk_score(cvss=v.cvss, epss=v.epss, kev=v.kev, poc_available=v.poc),
-            reasons=[why_x, why_r, why_d, why_c], vuln_source=v.source))
+            reasons=[why_x, why_r, why_d, why_c], vuln_source=v.source, path=_path(v, a, s)))
 
     rank = {t: i for i, t in enumerate(TIERS)}
     def crown_weight(e: Exposure) -> int:

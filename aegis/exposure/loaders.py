@@ -216,19 +216,21 @@ def assets_from_aws(bundle: dict) -> list[Asset]:
         internet: PortRanges = []
         lateral: list[tuple[int, int, frozenset[str]]] = []
         groups = frozenset(ref.get("GroupId") for ref in i.get("SecurityGroups") or [] if ref.get("GroupId"))
-        for gid in groups:
+        opened: dict[tuple[int, int], set[str]] = {}
+        for gid in sorted(groups):
             for perm in (sgs.get(gid) or {}).get("IpPermissions", []):
                 pr = _ports(perm)
                 lo, hi = (0, 65535) if pr is None else pr
                 if _open_ranges(perm):
                     internet.append((lo, hi))
+                    opened.setdefault((lo, hi), set()).add(gid)
                 if srcs := _lateral_sources(perm):
                     lateral.append((lo, hi, srcs))
         role = tags.get("aegis:role") or tags.get("Role") or tags.get("role") or "server"
         keys = {iid, *(x for x in (i.get("PrivateIpAddress"), i.get("PublicIpAddress"), i.get("PrivateDnsName"), tags.get("Name")) if x)}
         out.append(Asset(id=iid, name=tags.get("Name") or iid, keys=keys, zone=i.get("VpcId") or "",
                          role=role if role in SENSITIVITY else "server", public=bool(i.get("PublicIpAddress")),
-                         internet_ports=internet, lateral=lateral, groups=groups,
+                         internet_ports=internet, lateral=lateral, groups=groups, opened_by=opened,
                          waf=_b(tags.get("aegis:waf")), edr=_b(tags.get("aegis:edr")), source="aws"))
     _apply_aws_load_balancers(bundle, sgs, out)
     return out
@@ -246,11 +248,13 @@ def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> N
         name = lb.get("LoadBalancerName") or lb.get("LoadBalancerArn", "?")
         lb_sgs = lb.get("SecurityGroups") or []
         open_ranges: PortRanges = []
+        lb_open_by: dict[tuple[int, int], set[str]] = {}
         for gid in lb_sgs:
             for perm in (sgs.get(gid) or {}).get("IpPermissions", []):
                 if _open_ranges(perm):
                     pr = _ports(perm)
                     open_ranges.append((0, 65535) if pr is None else pr)
+                    lb_open_by.setdefault(open_ranges[-1], set()).add(gid)
         for lst in lb.get("listeners") or []:
             lp = lst.get("Port")
             if lp is None or (lb_sgs and not any(lo <= lp <= hi for lo, hi in open_ranges)):
@@ -264,6 +268,8 @@ def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> N
                 if r not in a.internet_ports:
                     a.internet_ports.append(r)
                 a.internet_via.setdefault(r, f"load balancer {name} (listener {lp} → port {tp})")
+                if r not in a.opened_by:   # the listener's own SG rule is what lets the internet in
+                    a.opened_by[r] = {g for (lo, hi), gs in lb_open_by.items() if lo <= lp <= hi for g in gs}
                 a.fronted_by |= {x for x in (name, lb.get("DNSName")) if x}
                 a.public = True
                 if lb.get("web_acl"):

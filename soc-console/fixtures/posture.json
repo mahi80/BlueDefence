@@ -79,14 +79,14 @@
      "raw": 14,
      "scored": 13,
      "exploitable": 10,
-     "reachable": 7,
-     "undefended": 5,
-     "act_now": 3
+     "reachable": 6,
+     "undefended": 4,
+     "act_now": 2
     },
     "tiers": {
-     "ACT_NOW": 3,
+     "ACT_NOW": 2,
      "ACT": 2,
-     "SCHEDULE": 6,
+     "SCHEDULE": 7,
      "MONITOR": 2
     },
     "assets": 9,
@@ -94,9 +94,9 @@
     "monitor_only": 1
    },
    "summary": {
-    "critical": 3,
+    "critical": 2,
     "high": 2,
-    "medium": 6,
+    "medium": 7,
     "low": 2,
     "info": 0
    },
@@ -105,9 +105,9 @@
   }
  ],
  "summary": {
-  "critical": 21,
+  "critical": 20,
   "high": 22,
-  "medium": 27,
+  "medium": 28,
   "low": 25,
   "info": 0
  },
@@ -441,54 +441,13 @@
    "stale": false
   },
   {
-   "id": "CVE-2021-44228",
-   "severity": "critical",
-   "confidence": 0.9,
-   "category": "exposure",
-   "affected_component": "legacy-reports:8080",
-   "evidence": "exploitable: listed in CISA KEV (exploited in the wild); EPSS 0.94 \u2265 0.10; public exploit available \u00b7 port 8080 is reachable from the internet on legacy-reports (aws) \u00b7 no blocking control in front: no WAF or virtual patch for this port; imperva reports.bank.example in front but in MONITOR mode: it logs the attack and lets it through \u00b7 shares zone vpc-0prod with a crown-jewel asset",
-   "recommended_remediation": "Patch CVE-2021-44228 on legacy-reports; until it is patched, cut the path: a blocking WAF virtual patch for CVE-2021-44228 or closing port 8080 to the internet",
-   "cvss_estimate": null,
-   "epss": null,
-   "kev": false,
-   "poc_available": false,
-   "risk_score": 1.0,
-   "control": "Exposure tier ACT_NOW",
-   "resource": "i-0legacy",
-   "scanner": "exposure",
-   "extra": {
-    "tier": "ACT_NOW",
-    "reach": "internet",
-    "defended": "none",
-    "exploitable": true,
-    "crown_distance": 1,
-    "port": 8080,
-    "title": "Apache Log4j 2 RCE (Log4Shell)",
-    "reasons": [
-     "exploitable: listed in CISA KEV (exploited in the wild); EPSS 0.94 \u2265 0.10; public exploit available",
-     "port 8080 is reachable from the internet on legacy-reports (aws)",
-     "no blocking control in front: no WAF or virtual patch for this port; imperva reports.bank.example in front but in MONITOR mode: it logs the attack and lets it through",
-     "shares zone vpc-0prod with a crown-jewel asset"
-    ],
-    "source": "tenable:155999"
-   },
-   "scan": "exposure-prod",
-   "fingerprint": "a7b317706c0f89ec",
-   "first_seen": "2026-10-25T03:30:00+00:00",
-   "age_days": 8,
-   "sla_due": "2026-11-01T03:30:00+00:00",
-   "overdue": true,
-   "new": false,
-   "stale": false
-  },
-  {
    "id": "CVE-2024-6387",
    "severity": "critical",
    "confidence": 0.9,
    "category": "exposure",
    "affected_component": "ops-bastion:22",
    "evidence": "exploitable: EPSS 0.42 \u2265 0.10; public exploit available \u00b7 port 22 is reachable from the internet on ops-bastion (aws) \u00b7 no blocking control in front: no WAF or virtual patch for this port; EDR on the host will see post-exploitation activity (detection, not prevention) \u00b7 the asset is a crown jewel",
-   "recommended_remediation": "Patch CVE-2024-6387 on ops-bastion; until it is patched, cut the path: a blocking WAF virtual patch for CVE-2024-6387 or closing port 22 to the internet",
+   "recommended_remediation": "Patch CVE-2024-6387 on ops-bastion; until it is patched, cut the path: closing port 22 to the internet",
    "cvss_estimate": null,
    "epss": null,
    "kev": false,
@@ -511,7 +470,21 @@
      "no blocking control in front: no WAF or virtual patch for this port; EDR on the host will see post-exploitation activity (detection, not prevention)",
      "the asset is a crown jewel"
     ],
-    "source": "tenable:201194"
+    "source": "tenable:201194",
+    "path": {
+     "source": "aws",
+     "zone": "vpc-0prod",
+     "range": [
+      22,
+      22
+     ],
+     "via": null,
+     "opened_by": [
+      "sg-bastion"
+     ],
+     "fronted_by": [],
+     "protections": []
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "6ddea5b4de326d2b",
@@ -1098,7 +1071,16 @@
      "no blocking control in front: no WAF or virtual patch for this port; EDR on the host will see post-exploitation activity (detection, not prevention)",
      "the asset is a crown jewel"
     ],
-    "source": "tenable:159374"
+    "source": "tenable:159374",
+    "path": {
+     "source": "aws",
+     "zone": "vpc-0prod",
+     "range": null,
+     "via": null,
+     "opened_by": [],
+     "fronted_by": [],
+     "protections": []
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "32d280cab413d356",
@@ -1139,7 +1121,16 @@
      "no blocking control in front: no WAF or virtual patch for this port",
      "shares zone dc-dmz with a crown-jewel asset"
     ],
-    "source": "tenable:177082"
+    "source": "tenable:177082",
+    "path": {
+     "source": "inventory",
+     "zone": "dc-dmz",
+     "range": null,
+     "via": null,
+     "opened_by": [],
+     "fronted_by": [],
+     "protections": []
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "5185096e65bdaf54",
@@ -1303,6 +1294,62 @@
    "age_days": 8,
    "sla_due": "2026-11-24T03:30:00+00:00",
    "overdue": false,
+   "new": false,
+   "stale": false
+  },
+  {
+   "id": "CVE-2021-44228",
+   "severity": "medium",
+   "confidence": 0.9,
+   "category": "exposure",
+   "affected_component": "legacy-reports:8080",
+   "evidence": "exploitable: listed in CISA KEV (exploited in the wild); EPSS 0.94 \u2265 0.10; public exploit available \u00b7 port 8080 is not exposed to the internet, and the internet-facing assets in zone vpc-0prod (netbanking-web, ops-bastion) are not allowed to reach it \u00b7 no blocking control in front: no WAF or virtual patch for this port; imperva reports.bank.example in front but in MONITOR mode: it logs the attack and lets it through \u00b7 shares zone vpc-0prod with a crown-jewel asset",
+   "recommended_remediation": "Patch CVE-2021-44228 on legacy-reports in the next maintenance window; keep the compensating control in place",
+   "cvss_estimate": null,
+   "epss": null,
+   "kev": false,
+   "poc_available": false,
+   "risk_score": 1.0,
+   "control": "Exposure tier SCHEDULE",
+   "resource": "i-0legacy",
+   "scanner": "exposure",
+   "extra": {
+    "tier": "SCHEDULE",
+    "reach": "isolated",
+    "defended": "none",
+    "exploitable": true,
+    "crown_distance": 1,
+    "port": 8080,
+    "title": "Apache Log4j 2 RCE (Log4Shell)",
+    "reasons": [
+     "exploitable: listed in CISA KEV (exploited in the wild); EPSS 0.94 \u2265 0.10; public exploit available",
+     "port 8080 is not exposed to the internet, and the internet-facing assets in zone vpc-0prod (netbanking-web, ops-bastion) are not allowed to reach it",
+     "no blocking control in front: no WAF or virtual patch for this port; imperva reports.bank.example in front but in MONITOR mode: it logs the attack and lets it through",
+     "shares zone vpc-0prod with a crown-jewel asset"
+    ],
+    "source": "tenable:155999",
+    "path": {
+     "source": "aws",
+     "zone": "vpc-0prod",
+     "range": null,
+     "via": null,
+     "opened_by": [],
+     "fronted_by": [],
+     "protections": [
+      {
+       "name": "reports.bank.example",
+       "vendor": "imperva",
+       "mode": "monitor"
+      }
+     ]
+    }
+   },
+   "scan": "exposure-prod",
+   "fingerprint": "a7b317706c0f89ec",
+   "first_seen": "2026-10-25T03:30:00+00:00",
+   "age_days": 8,
+   "sla_due": "2026-11-01T03:30:00+00:00",
+   "overdue": true,
    "new": false,
    "stale": false
   },
@@ -1830,7 +1877,16 @@
      "no blocking control in front: no WAF or virtual patch for this port; EDR on the host will see post-exploitation activity (detection, not prevention)",
      "the asset is a crown jewel"
     ],
-    "source": "tenable:69552"
+    "source": "tenable:69552",
+    "path": {
+     "source": "inventory",
+     "zone": "dc-core",
+     "range": null,
+     "via": null,
+     "opened_by": [],
+     "fronted_by": [],
+     "protections": []
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "1c8ab9188ca039bf",
@@ -1871,7 +1927,25 @@
      "virtual-patch / IPS rule for CVE-2017-5638 in front of this asset",
      "the asset is a crown jewel"
     ],
-    "source": "tenable:97610"
+    "source": "tenable:97610",
+    "path": {
+     "source": "inventory",
+     "zone": "dc-dmz",
+     "range": [
+      443,
+      443
+     ],
+     "via": null,
+     "opened_by": [],
+     "fronted_by": [],
+     "protections": [
+      {
+       "name": "edge shim ib-edge-01",
+       "vendor": "bluedefence-edge",
+       "mode": "block"
+      }
+     ]
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "e7a6ebf48809751a",
@@ -1912,7 +1986,16 @@
      "no blocking control in front: no WAF or virtual patch for this port; EDR on the host will see post-exploitation activity (detection, not prevention)",
      "the asset is a crown jewel"
     ],
-    "source": "tenable:158974"
+    "source": "tenable:158974",
+    "path": {
+     "source": "inventory",
+     "zone": "dc-core",
+     "range": null,
+     "via": null,
+     "opened_by": [],
+     "fronted_by": [],
+     "protections": []
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "dda445a19f8f0619",
@@ -1953,7 +2036,27 @@
      "virtual-patch rule for CVE-2023-44487 on imperva netbanking.bank.example (blocking mode)",
      "shares zone vpc-0prod with a crown-jewel asset"
     ],
-    "source": "tenable:182508"
+    "source": "tenable:182508",
+    "path": {
+     "source": "aws",
+     "zone": "vpc-0prod",
+     "range": [
+      443,
+      443
+     ],
+     "via": null,
+     "opened_by": [
+      "sg-web"
+     ],
+     "fronted_by": [],
+     "protections": [
+      {
+       "name": "netbanking.bank.example",
+       "vendor": "imperva",
+       "mode": "block"
+      }
+     ]
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "ce4122a322a70174",
@@ -1994,7 +2097,16 @@
      "no blocking control in front: no WAF or virtual patch for this port",
      "no crown jewel in its zone"
     ],
-    "source": "tenable:201194"
+    "source": "tenable:201194",
+    "path": {
+     "source": "aws",
+     "zone": "vpc-0batch",
+     "range": null,
+     "via": null,
+     "opened_by": [],
+     "fronted_by": [],
+     "protections": []
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "93013dd67a1731e0",
@@ -2035,7 +2147,27 @@
      "imperva netbanking.bank.example in blocking mode (generic rules, no CVE-specific virtual patch); EDR on the host will see post-exploitation activity (detection, not prevention)",
      "shares zone vpc-0prod with a crown-jewel asset"
     ],
-    "source": "tenable:190001"
+    "source": "tenable:190001",
+    "path": {
+     "source": "aws",
+     "zone": "vpc-0prod",
+     "range": [
+      443,
+      443
+     ],
+     "via": null,
+     "opened_by": [
+      "sg-web"
+     ],
+     "fronted_by": [],
+     "protections": [
+      {
+       "name": "netbanking.bank.example",
+       "vendor": "imperva",
+       "mode": "block"
+      }
+     ]
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "8be068b8fe4ab4c8",
@@ -2622,7 +2754,16 @@
      "no network control applies to a local vulnerability; patching is the fix; EDR on the host will see post-exploitation activity (detection, not prevention)",
      "the asset is a crown jewel"
     ],
-    "source": "tenable:182873"
+    "source": "tenable:182873",
+    "path": {
+     "source": "aws",
+     "zone": "vpc-0prod",
+     "range": null,
+     "via": null,
+     "opened_by": [],
+     "fronted_by": [],
+     "protections": []
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "42615b77696fbee4",
@@ -2663,7 +2804,27 @@
      "imperva netbanking.bank.example in blocking mode (generic rules, no CVE-specific virtual patch); EDR on the host will see post-exploitation activity (detection, not prevention)",
      "shares zone vpc-0prod with a crown-jewel asset"
     ],
-    "source": "tenable:190002"
+    "source": "tenable:190002",
+    "path": {
+     "source": "aws",
+     "zone": "vpc-0prod",
+     "range": [
+      443,
+      443
+     ],
+     "via": null,
+     "opened_by": [
+      "sg-web"
+     ],
+     "fronted_by": [],
+     "protections": [
+      {
+       "name": "netbanking.bank.example",
+       "vendor": "imperva",
+       "mode": "block"
+      }
+     ]
+    }
    },
    "scan": "exposure-prod",
    "fingerprint": "3c2e3f32da10a0ce",
@@ -2892,5 +3053,141 @@
  ],
  "notes": [
   "waiver for CSPM-KMS-NO-ROTATION on aws_kms_key.ledger expired 2026-06-30 (approved by head-of-infra); not applied"
- ]
+ ],
+ "remediation": {
+  "proposals": [
+   {
+    "fingerprint": "6ddea5b4de326d2b",
+    "id": "CVE-2024-6387",
+    "asset": "i-0bastion",
+    "component": "ops-bastion:22",
+    "scan": "exposure-prod",
+    "title": "OpenSSH regreSSHion RCE",
+    "created_at": "2026-10-30T03:30:00Z",
+    "options": [
+     {
+      "kind": "cut_path",
+      "title": "Close port 22 to the internet",
+      "owner": "network / cloud team",
+      "steps": [
+       "Remove the internet rule for port 22 on sg-bastion; allow only the partner / admin CIDRs that need it."
+      ],
+      "commands": [
+       "aws ec2 revoke-security-group-ingress --group-id sg-bastion --protocol tcp --port 22 --cidr 0.0.0.0/0",
+       "aws ec2 revoke-security-group-ingress --group-id sg-bastion --ip-permissions 'IpProtocol=tcp,FromPort=22,ToPort=22,Ipv6Ranges=[{CidrIpv6=::/0}]'"
+      ],
+      "closes_when": "the next run no longer finds port 22 on ops-bastion reachable from the internet"
+     },
+     {
+      "kind": "patch",
+      "title": "Patch CVE-2024-6387 on ops-bastion",
+      "owner": "asset owner",
+      "steps": [
+       "Patch or upgrade CVE-2024-6387 on ops-bastion, then let the scanner re-scan the host."
+      ],
+      "commands": [],
+      "closes_when": "the scanner stops reporting it on this asset"
+     }
+    ],
+    "approval_id": "aegis_exposure-6ddea5b4de326d2b_escalate_ad1313",
+    "transport": "dashboard",
+    "history": [
+     {
+      "at": "2026-10-30T03:30:00Z",
+      "status": "proposed"
+     },
+     {
+      "at": "2026-10-30T03:30:00Z",
+      "status": "awaiting_approval",
+      "note": "filed to dashboard as aegis_exposure-6ddea5b4de326d2b_escalate_ad1313"
+     }
+    ],
+    "status": "awaiting_approval",
+    "updated_at": "2026-10-30T03:30:00Z",
+    "verification": null
+   },
+   {
+    "fingerprint": "a7b317706c0f89ec",
+    "id": "CVE-2021-44228",
+    "asset": "i-0legacy",
+    "component": "legacy-reports:8080",
+    "scan": "exposure-prod",
+    "title": "Apache Log4j 2 RCE (Log4Shell)",
+    "created_at": "2026-10-30T03:30:00Z",
+    "options": [
+     {
+      "kind": "virtual_patch",
+      "title": "Virtual-patch CVE-2021-44228 at the WAF",
+      "owner": "WAF team (imperva)",
+      "steps": [
+       "Switch imperva reports.bank.example from monitor to block mode, or at least its rules for CVE-2021-44228.",
+       "Add a blocking rule for CVE-2021-44228 named with the CVE id.",
+       "Re-export WAF coverage (python -m aegis.exposure.coverage) before the next run."
+      ],
+      "commands": [],
+      "closes_when": "the next run shows CVE-2021-44228 virtual-patched in blocking mode"
+     },
+     {
+      "kind": "cut_path",
+      "title": "Close port 8080 to the internet",
+      "owner": "network / cloud team",
+      "steps": [
+       "Remove the internet rule for port 8080 on sg-legacy; allow only the partner / admin CIDRs that need it."
+      ],
+      "commands": [
+       "aws ec2 revoke-security-group-ingress --group-id sg-legacy --protocol tcp --port 8080 --cidr 0.0.0.0/0",
+       "aws ec2 revoke-security-group-ingress --group-id sg-legacy --ip-permissions 'IpProtocol=tcp,FromPort=8080,ToPort=8080,Ipv6Ranges=[{CidrIpv6=::/0}]'"
+      ],
+      "closes_when": "the next run no longer finds port 8080 on legacy-reports reachable from the internet"
+     },
+     {
+      "kind": "patch",
+      "title": "Patch CVE-2021-44228 on legacy-reports",
+      "owner": "asset owner",
+      "steps": [
+       "Patch or upgrade CVE-2021-44228 on legacy-reports, then let the scanner re-scan the host."
+      ],
+      "commands": [],
+      "closes_when": "the scanner stops reporting it on this asset"
+     }
+    ],
+    "approval_id": "aegis_exposure-a7b317706c0f89ec_escalate_e4f04a",
+    "transport": "dashboard",
+    "history": [
+     {
+      "at": "2026-10-30T03:30:00Z",
+      "status": "proposed"
+     },
+     {
+      "at": "2026-10-30T03:30:00Z",
+      "status": "awaiting_approval",
+      "note": "filed to dashboard as aegis_exposure-a7b317706c0f89ec_escalate_e4f04a"
+     },
+     {
+      "at": "2026-10-31T03:30:00Z",
+      "status": "approved",
+      "note": "approved by ciso:asha"
+     },
+     {
+      "at": "2026-11-02T03:30:00Z",
+      "status": "verified_closed",
+      "note": "Now in Schedule: port 8080 is not exposed to the internet, and the internet-facing assets in zone vpc-0prod (netbanking-web, ops-bastion) are not allowed to reach it"
+     }
+    ],
+    "status": "verified_closed",
+    "updated_at": "2026-11-02T03:30:00Z",
+    "verification": "Now in Schedule: port 8080 is not exposed to the internet, and the internet-facing assets in zone vpc-0prod (netbanking-web, ops-bastion) are not allowed to reach it",
+    "decided_by": "ciso:asha",
+    "decided_at": "2026-10-31T03:30:00Z",
+    "approved_at": "2026-10-31T03:30:00Z",
+    "closed_at": "2026-11-02T03:30:00Z"
+   }
+  ],
+  "counts": {
+   "awaiting_approval": 1,
+   "verified_closed": 1
+  },
+  "notes": [],
+  "channel": "dashboard"
+ }
 }

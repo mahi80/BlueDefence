@@ -2,7 +2,9 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { ExposureExtra, PostureFinding, PostureResult, PostureRun, PostureScan } from "../lib/posture";
+import type {
+  ExposureExtra, PostureFinding, PostureResult, PostureRun, PostureScan, ProposalStatus, RemediationProposal,
+} from "../lib/posture";
 import { TopNav, when } from "./PostureView";
 
 type Tier = ExposureExtra["tier"];
@@ -64,7 +66,129 @@ function Funnel({ scan, waivedNow }: { scan: PostureScan; waivedNow: number }) {
   );
 }
 
-function Card({ f, waived }: { f: PostureFinding & { waiver?: { reason: string; approved_by: string; expires: string } }; waived?: boolean }) {
+const STATUS_LABEL: Record<ProposalStatus, string> = {
+  proposed: "Proposed — no approval channel",
+  awaiting_approval: "Awaiting approval",
+  approved: "Approved — re-tested on the next run",
+  approved_still_open: "Approved, but the path is still open",
+  verified_closed: "Verified closed",
+  closed_before_decision: "Closed before a decision",
+  rejected: "Rejected",
+  expired: "Expired without a decision",
+  accepted_risk: "Accepted as risk",
+};
+const STATUS_LEVEL: Record<ProposalStatus, Level | "info"> = {
+  proposed: "info", awaiting_approval: "warn", approved: "info", approved_still_open: "bad", verified_closed: "ok",
+  closed_before_decision: "ok", rejected: "info", expired: "info", accepted_risk: "info",
+};
+const DECIDE_ELSEWHERE: Record<string, string> = {
+  servicenow: "Decide on the ServiceNow approval record",
+  file: "Decide by appending to decisions.jsonl in the HITL directory",
+};
+
+function CopyCmd({ cmd }: { cmd: string }) {
+  const [done, setDone] = useState(false);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(cmd);
+      setDone(true);
+      setTimeout(() => setDone(false), 1500);
+    } catch {
+      /* clipboard refused: the command stays selectable */
+    }
+  }
+  return (
+    <div className="rm-cmd">
+      <code>{cmd}</code>
+      <button type="button" onClick={copy} aria-label="Copy command">{done ? "Copied" : "Copy"}</button>
+    </div>
+  );
+}
+
+function Remediation({ p, canDecide, fixture }: { p: RemediationProposal; canDecide: boolean; fixture: boolean }) {
+  const [local, setLocal] = useState<{ status: ProposalStatus; note: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const status = local?.status ?? p.status;
+  const open = status === "awaiting_approval" || status === "proposed" || status === "approved_still_open";
+  const [expanded, setExpanded] = useState(open);
+
+  async function decide(d: "approve" | "reject") {
+    if (!p.approval_id) return;
+    setErr("");
+    if (fixture) {
+      setLocal({ status: d === "approve" ? "approved" : "rejected", note: "sample run — nothing was sent" });
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/approvals/${encodeURIComponent(p.approval_id)}/${d}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: d === "approve" ? "remediation approved from the Exposures view" : "rejected from the Exposures view" }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        setErr((j as { error?: string }).error || `the approval service answered ${r.status}`);
+      } else {
+        setLocal({ status: d === "approve" ? "approved" : "rejected", note: "recorded; the next run picks it up" });
+      }
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const lvl = STATUS_LEVEL[status];
+  const canAct = status === "awaiting_approval" && !local && p.approval_id && (p.transport === "dashboard" || fixture);
+  return (
+    <section className={`rm rm-${lvl}`} aria-label="Remediation proposal">
+      <header className="rm-head">
+        <span className={`rm-status lv-${lvl}`}>{STATUS_LABEL[status]}</span>
+        {p.decided_by && !local && <span className="sub">by {p.decided_by}</span>}
+        {local && <span className="sub">{local.note}</span>}
+        <button type="button" className="rm-toggle" aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}>
+          {expanded ? "Hide options" : `${p.options.length} option${p.options.length === 1 ? "" : "s"}`}
+        </button>
+      </header>
+      {p.verification && <p className="rm-verify">{p.verification}</p>}
+      {expanded && (
+        <ol className="rm-options">
+          {p.options.map((o) => (
+            <li key={o.kind} className="rm-option">
+              <div className="rm-option-head"><b>{o.title}</b> <span className="sub">{o.owner}</span></div>
+              <ul className="rm-steps">{o.steps.map((s) => <li key={s}>{s}</li>)}</ul>
+              {o.commands.map((c) => <CopyCmd key={c} cmd={c} />)}
+              <div className="rm-closes">Counts as closed when {o.closes_when}.</div>
+            </li>
+          ))}
+        </ol>
+      )}
+      {canAct && (
+        <div className="rm-actions">
+          <span className="sub">Approving commits the owning team to one of these options. BlueDefence changes nothing itself.</span>
+          {canDecide ? (
+            <>
+              <button type="button" className="btn btn-reject" disabled={busy} onClick={() => decide("reject")}>Reject</button>
+              <button type="button" className="btn btn-approve" disabled={busy} onClick={() => decide("approve")}>Approve</button>
+            </>
+          ) : (
+            <span className="sub">Your role can view but not decide.</span>
+          )}
+        </div>
+      )}
+      {status === "awaiting_approval" && !canAct && p.transport && DECIDE_ELSEWHERE[p.transport] && (
+        <div className="rm-actions"><span className="sub">{DECIDE_ELSEWHERE[p.transport]} (approval id <span className="mono">{p.approval_id}</span>).</span></div>
+      )}
+      {err && <p className="rm-err" role="alert">Not recorded: {err}</p>}
+    </section>
+  );
+}
+
+function Card({ f, waived, proposal, canDecide, fixture }: {
+  f: PostureFinding & { waiver?: { reason: string; approved_by: string; expires: string } };
+  waived?: boolean; proposal?: RemediationProposal; canDecide: boolean; fixture: boolean;
+}) {
   const x = f.extra!;
   const lv = levels(x);
   const answers = [
@@ -97,11 +221,35 @@ function Card({ f, waived }: { f: PostureFinding & { waiver?: { reason: string; 
       ) : (
         <p className="ex-fix"><b>Fix:</b> {f.recommended_remediation}</p>
       )}
+      {proposal && <Remediation p={proposal} canDecide={canDecide} fixture={fixture} />}
     </article>
   );
 }
 
-export default function ExposureView({ result, session }: { result: PostureResult; session: { user: string; role: string } }) {
+function RemediationSummary({ proposals }: { proposals: RemediationProposal[] }) {
+  const n = (st: ProposalStatus) => proposals.filter((p) => p.status === st).length;
+  const items: [string, number, Level | "info"][] = [
+    ["awaiting approval", n("awaiting_approval") + n("proposed"), "warn"],
+    ["approved, waiting for the re-test", n("approved"), "info"],
+    ["approved but still open", n("approved_still_open"), "bad"],
+    ["verified closed", n("verified_closed") + n("closed_before_decision"), "ok"],
+  ];
+  return (
+    <section className="rm-summary" aria-label="Remediation proposals">
+      <h2>Remediation</h2>
+      <ul>
+        {items.map(([label, count, lv]) => (
+          <li key={label} className={`lv-${lv}${count ? "" : " zero"}`}><span className="mono">{count}</span> {label}</li>
+        ))}
+      </ul>
+      <p className="sub">Each ACT NOW finding gets a proposal in the approval queue. The next run re-tests the path, so &ldquo;closed&rdquo; here means the scanners confirmed it.</p>
+    </section>
+  );
+}
+
+export default function ExposureView({ result, session, canDecide = false }: {
+  result: PostureResult; session: { user: string; role: string }; canDecide?: boolean;
+}) {
   const router = useRouter();
   const fixture = result.state === "ok" && result.source === "fixture";
   useEffect(() => {
@@ -115,6 +263,8 @@ export default function ExposureView({ result, session }: { result: PostureResul
   const open = useMemo(() => (run?.open ?? []).filter((f) => f.scanner === "exposure" && f.extra), [run]);
   const waived = useMemo(() => (run?.waived ?? []).filter((f) => f.scanner === "exposure" && f.extra), [run]);
   const counts = useMemo(() => Object.fromEntries(TIERS.map((t) => [t, open.filter((f) => f.extra!.tier === t).length])), [open]);
+  const proposals = useMemo(() => run?.remediation?.proposals ?? [], [run]);
+  const byFp = useMemo(() => Object.fromEntries(proposals.map((p) => [p.fingerprint, p])), [proposals]);
   const [tier, setTier] = useState<Tier | "WAIVED">("ACT_NOW");
   const shown = tier === "WAIVED" ? waived : open.filter((f) => f.extra!.tier === tier);
 
@@ -145,6 +295,7 @@ export default function ExposureView({ result, session }: { result: PostureResul
         {scans.map((s) => (
           <Funnel key={s.name} scan={s} waivedNow={waived.filter((w) => w.scan === s.name && w.extra!.tier === "ACT_NOW").length} />
         ))}
+        {proposals.length > 0 && <RemediationSummary proposals={proposals} />}
         <div className="ex-tabs" role="tablist" aria-label="Tier">
           {TIERS.map((t) => (
             <button key={t} role="tab" aria-selected={tier === t} className={`t-${t}`} onClick={() => setTier(t)}>
@@ -156,7 +307,9 @@ export default function ExposureView({ result, session }: { result: PostureResul
           </button>
         </div>
         <div className="ex-list">
-          {shown.length ? shown.map((f) => <Card key={f.fingerprint} f={f} waived={tier === "WAIVED"} />)
+          {shown.length ? shown.map((f) => (
+            <Card key={f.fingerprint} f={f} waived={tier === "WAIVED"} proposal={byFp[f.fingerprint]} canDecide={canDecide} fixture={fixture} />
+          ))
             : <div className="ev-empty">Nothing in this tier.</div>}
         </div>
       </main>

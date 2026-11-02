@@ -138,7 +138,8 @@ def assets_from_azure(bundle: dict) -> list[Asset]:
         for sn in _p(vnet).get("subnets") or []:
             sn = _p(sn)
             subnet_nsg[_id(sn)] = nsgs.get(_id(sn.get("networkSecurityGroup")))
-    nics = {_id(n): _p(n) for n in bundle.get("network_interfaces") or []}
+    nics = {_id(n): {**_p(n), "id": _id(n)} for n in bundle.get("network_interfaces") or []}
+    nic_nsg_ids: dict[str, list[str]] = {}
 
     def nic_reach(nic: dict) -> tuple[PortRanges, PortRanges, str]:
         nic_nsg = nsgs.get(_id(nic.get("networkSecurityGroup")))
@@ -146,6 +147,7 @@ def assets_from_azure(bundle: dict) -> list[Asset]:
         sid = _id((cfgs[0] if cfgs else {}).get("subnet"))
         sub = subnet_nsg.get(sid)
         zone = sid.split("/subnets/")[0] if "/subnets/" in sid else sid
+        nic_nsg_ids[_id(nic)] = [x for x in (_id(sub) if sub else "", _id(nic_nsg) if nic_nsg else "") if x]
         return _effective(sub, nic_nsg, "internet"), _effective(sub, nic_nsg, "vnet"), zone
 
     out: list[Asset] = []
@@ -169,7 +171,9 @@ def assets_from_azure(bundle: dict) -> list[Asset]:
         pub = [x.strip() for x in str(v.get("publicIps") or "").split(",") if x.strip()]
         priv = [x.strip() for x in str(v.get("privateIps") or "").split(",") if x.strip()]
         role = tags.get("aegis-role") or tags.get("aegis:role") or "server"
+        nsg_ids = {g for nid in nic_ids for g in nic_nsg_ids.get(nid, [])}
         a = Asset(id=_id(vm) or name, name=name, keys={name, *pub, *priv, _id(vm)} - {""}, zone=zone,
+                  opened_by={r: set(nsg_ids) for r in internet} if pub else {},
                   role=role if role in SENSITIVITY else "server", public=bool(pub),
                   internet_ports=internet if pub else [], lateral=[(lo, hi, frozenset({"*"})) for lo, hi in lateral],
                   waf=str(tags.get("aegis-waf", "")).lower() == "true", edr=str(tags.get("aegis-edr", "")).lower() == "true",

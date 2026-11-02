@@ -28,7 +28,7 @@ from ..posture.base import PostureFinding
 from ..posture.sources import PostureSourceError, load_json
 from . import loaders
 from .azure_reach import assets_from_azure
-from .engine import ANY_PORT, Exposure, assess, funnel, summarize
+from .engine import ANY_PORT, WEB_PORTS, Exposure, assess, funnel, summarize
 from .k8s_reach import assets_from_k8s
 
 SEVERITY = {"ACT_NOW": "critical", "ACT": "high", "SCHEDULE": "medium", "MONITOR": "low"}
@@ -45,7 +45,8 @@ def _fix(e: Exposure) -> str:
     target = f"{e.cve or e.title} on {e.asset_name}"
     if e.tier in ("ACT_NOW", "ACT"):
         stopgap = []
-        if e.defended != "full" and e.cve:
+        web = e.port in WEB_PORTS or bool((e.path or {}).get("protections"))   # a WAF only stops HTTP
+        if e.defended != "full" and e.cve and web:
             stopgap.append(f"a blocking WAF virtual patch for {e.cve}")
         if e.reach == "internet" and e.port and e.port > 0:
             stopgap.append(f"closing port {e.port} to the internet")
@@ -65,7 +66,7 @@ def to_finding(e: Exposure) -> PostureFinding:
         evidence=" · ".join(e.reasons), recommended_remediation=_fix(e), risk_score=e.risk_score,
         extra={"tier": e.tier, "reach": e.reach, "defended": e.defended, "exploitable": e.exploitable,
                "crown_distance": e.crown_distance, "port": e.port, "title": e.title, "reasons": e.reasons,
-               "source": e.vuln_source})
+               "source": e.vuln_source, "path": e.path})
 
 
 def run_scan(o: dict) -> tuple[list[PostureFinding], list[str], dict]:
