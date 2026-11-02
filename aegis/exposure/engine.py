@@ -70,6 +70,7 @@ class Asset:
     internet_via: dict[tuple[int, int], str] = field(default_factory=dict)  # range -> "via load balancer X" etc.
     fronted_by: set[str] = field(default_factory=set)   # LB names / DNS names / ingress hosts in front of it
     opened_by: dict[tuple[int, int], set[str]] = field(default_factory=dict)  # range -> SG / NSG ids that open it
+    entry_port: dict[tuple[int, int], int] = field(default_factory=dict)      # range -> the port the internet hits (LB listener)
     # (lo, hi, sources) reachable from inside the zone; sources = security-group ids allowed in, or "*" (any
     # host in the zone — a private CIDR rule, or the inventory's lateral_ports)
     lateral: list[tuple[int, int, frozenset[str]]] = field(default_factory=lambda: [(0, 65535, frozenset({"*"}))])
@@ -211,6 +212,7 @@ def _path(v: Vuln, a: Asset, s: Settings) -> dict:
     return {"source": a.source, "zone": a.zone, "range": list(r) if r else None,
             "via": a.internet_via.get(r) if r else None,
             "opened_by": sorted(a.opened_by.get(r, set())) if r else [],
+            "entry_port": a.entry_port.get(r) if r else None,
             "fronted_by": sorted(a.fronted_by),
             "protections": [{"name": p.name, "vendor": p.vendor, "mode": p.mode}
                             for p in s.coverage if p.covers(keys, v.port)]}
@@ -234,9 +236,15 @@ def assess(vulns: list[Vuln], assets: list[Asset], settings: Settings | None = N
     """Score every vulnerability against the asset it sits on. Returns (exposures, notes)."""
     s = settings or Settings()
     by_key: dict[str, Asset] = {}
+    ambiguous: set[str] = set()
     for a in assets:
         for k in {a.id, a.name, *a.keys} - {""}:
-            by_key.setdefault(k.lower(), a)
+            kl = k.lower()
+            if kl in by_key and by_key[kl] is not a:
+                ambiguous.add(kl)          # e.g. the same private IP in two VPCs: it identifies neither
+            by_key.setdefault(kl, a)
+    for kl in ambiguous:
+        by_key.pop(kl, None)
     internet_by_zone: dict[str, list[Asset]] = {}
     crown_zones: set[str] = set()
     for a in assets:

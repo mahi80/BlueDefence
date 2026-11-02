@@ -288,6 +288,20 @@ def scan(bundle: dict) -> list[PostureFinding]:
     return sort_findings(out)
 
 
+_SECTION_OF = (("AZ-NSG-", "network_security_groups"), ("AZ-STORAGE-", "storage_accounts"), ("AZ-KEYVAULT-", "key_vaults"),
+               ("AZ-SQL-", "sql_servers"), ("AZ-AKS-", "aks_clusters"), ("AZ-DEFENDER-", "defender_plans"),
+               ("AZ-ACTIVITY-LOG-", "activity_log_diagnostics"), ("AZ-RBAC-", "role_assignments"),
+               ("AZ-CUSTOM-", "custom_roles"))
+
+
+def section_of(finding_id: str) -> str | None:
+    return next((sec for pre, sec in _SECTION_OF if str(finding_id).startswith(pre)), None)
+
+
+def unchecked_sections(bundle: dict) -> list[str]:
+    return [k for k in BUNDLE_KEYS if k not in bundle]
+
+
 def coverage_gaps(bundle: dict) -> list[str]:
     errs = bundle.get("collection_errors") or {}
     gaps = [f"{k} (access denied or failed: {errs[k]})" if k in errs else k for k in BUNDLE_KEYS if k not in bundle]

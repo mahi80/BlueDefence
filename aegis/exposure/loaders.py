@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..agents.orchestrator.walkers.graph import SENSITIVITY
-from ..posture.cspm import _open_ranges, _ports
+from ..posture.cspm import _open_ranges, _ports, carries_ports
 from ..posture.sources import PostureSourceError
 from .engine import ALL_PORTS, ANY_PORT, Asset, PortRanges, Settings, Vuln
 
@@ -88,8 +88,10 @@ def _from_tenable(r: dict) -> list[Vuln]:
     asset, plugin, port = r.get("asset") or {}, r.get("plugin") or {}, r.get("port") or {}
     ips = asset.get("ipv4") or []
     ips = [ips] if isinstance(ips, str) else list(ips)
-    keys = [k for k in [asset.get("hostname"), *ips, asset.get("fqdn"), asset.get("uuid"),
-                        *(asset.get("aws_ec2_instance_id") and [asset["aws_ec2_instance_id"]] or [])] if k]
+    # most specific identifier first: an instance id or agent uuid names one machine; a private IP can be
+    # reused in another VPC, so it is tried last (and the engine refuses an IP that names two assets)
+    keys = [k for k in [*(asset.get("aws_ec2_instance_id") and [asset["aws_ec2_instance_id"]] or []),
+                        asset.get("azure_vm_id"), asset.get("uuid"), asset.get("fqdn"), asset.get("hostname"), *ips] if k]
     if not keys:
         return []
     cves = plugin.get("cve") or [None]
@@ -131,6 +133,13 @@ def load_vulns(path: str | Path) -> list[Vuln]:
     try:
         if p.suffix.lower() == ".csv":
             with p.open(newline="", encoding="utf-8") as fh:
+                header = next(csv.reader([fh.readline()]), [])
+                fh.seek(0)
+                if "asset" not in [h.strip() for h in header]:
+                    # a Qualys / custom export with other column names used to read as "zero findings" — and
+                    # an empty scan resolves every open exposure. Refuse it; the runner carries findings forward.
+                    raise PostureSourceError(f"{path}: CSV has no 'asset' column (columns: {', '.join(header[:8]) or 'none'}) "
+                                             "— map it to asset,cve,title,port,cvss,epss,kev,poc")
                 return [Vuln(asset=row["asset"].strip(), cve=(row.get("cve") or "").strip() or None,
                              title=(row.get("title") or row.get("cve") or "?").strip(), port=_port(row.get("port")),
                              cvss=_f(row.get("cvss")), epss=_f(row.get("epss")), kev=_b(row.get("kev")),
@@ -188,7 +197,9 @@ def _lateral_sources(perm: dict) -> frozenset[str]:
     """Who inside the network may use this rule: the referenced security groups, and "*" when a
     private CIDR is allowed (any host in the zone)."""
     srcs = {p.get("GroupId") for p in perm.get("UserIdGroupPairs") or [] if p.get("GroupId")}
-    if _private_cidr(perm):
+    # a rule open to the whole internet is open to every host in the VPC too — it used to count only as an
+    # internet rule, so a private host behind a world-open SG looked unreachable from its neighbours
+    if _private_cidr(perm) or _open_ranges(perm):
         srcs.add("*")
     return frozenset(srcs)
 
@@ -219,6 +230,8 @@ def assets_from_aws(bundle: dict) -> list[Asset]:
         opened: dict[tuple[int, int], set[str]] = {}
         for gid in sorted(groups):
             for perm in (sgs.get(gid) or {}).get("IpPermissions", []):
+                if not carries_ports(perm):
+                    continue
                 pr = _ports(perm)
                 lo, hi = (0, 65535) if pr is None else pr
                 if _open_ranges(perm):
@@ -227,9 +240,12 @@ def assets_from_aws(bundle: dict) -> list[Asset]:
                 if srcs := _lateral_sources(perm):
                     lateral.append((lo, hi, srcs))
         role = tags.get("aegis:role") or tags.get("Role") or tags.get("role") or "server"
-        keys = {iid, *(x for x in (i.get("PrivateIpAddress"), i.get("PublicIpAddress"), i.get("PrivateDnsName"), tags.get("Name")) if x)}
+        v6 = [a.get("Ipv6Address") for ni in i.get("NetworkInterfaces") or [] for a in ni.get("Ipv6Addresses") or []
+              if a.get("Ipv6Address")] + ([i["Ipv6Address"]] if i.get("Ipv6Address") else [])
+        keys = {iid, *v6, *(x for x in (i.get("PrivateIpAddress"), i.get("PublicIpAddress"), i.get("PrivateDnsName"), tags.get("Name")) if x)}
+        # AWS IPv6 addresses are globally routable: an IPv6-only instance with a ::/0 rule is internet-facing
         out.append(Asset(id=iid, name=tags.get("Name") or iid, keys=keys, zone=i.get("VpcId") or "",
-                         role=role if role in SENSITIVITY else "server", public=bool(i.get("PublicIpAddress")),
+                         role=role if role in SENSITIVITY else "server", public=bool(i.get("PublicIpAddress") or v6),
                          internet_ports=internet, lateral=lateral, groups=groups, opened_by=opened,
                          waf=_b(tags.get("aegis:waf")), edr=_b(tags.get("aegis:edr")), source="aws"))
     _apply_aws_load_balancers(bundle, sgs, out)
@@ -251,7 +267,7 @@ def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> N
         lb_open_by: dict[tuple[int, int], set[str]] = {}
         for gid in lb_sgs:
             for perm in (sgs.get(gid) or {}).get("IpPermissions", []):
-                if _open_ranges(perm):
+                if _open_ranges(perm) and carries_ports(perm):
                     pr = _ports(perm)
                     open_ranges.append((0, 65535) if pr is None else pr)
                     lb_open_by.setdefault(open_ranges[-1], set()).add(gid)
@@ -270,6 +286,7 @@ def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> N
                 a.internet_via.setdefault(r, f"load balancer {name} (listener {lp} → port {tp})")
                 if r not in a.opened_by:   # the listener's own SG rule is what lets the internet in
                     a.opened_by[r] = {g for (lo, hi), gs in lb_open_by.items() if lo <= lp <= hi for g in gs}
+                    a.entry_port[r] = int(lp)
                 a.fronted_by |= {x for x in (name, lb.get("DNSName")) if x}
                 a.public = True
                 if lb.get("web_acl"):
