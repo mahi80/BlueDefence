@@ -35,9 +35,16 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import logging
 import os
 import re
+import secrets
+from collections import OrderedDict
 from typing import Any, Iterable
+
+from ..agents.shared.redact import redact, redact_text
+
+logger = logging.getLogger("aegis.dataset.scrub")
 
 IDENTITY_KEYS: frozenset[str] = frozenset({
     "user_id", "userid", "user", "username", "user_name", "userprincipalname", "upn",
@@ -77,6 +84,11 @@ _ARN_ACCOUNT_RX = re.compile(r"(arn:aws[a-z-]*:[a-z0-9-]*:[a-z0-9-]*:)(\d{12})(?
 _PREFIXED_ID_RX = re.compile(r"^([A-Za-z]{1,4}[_\-])(\d{2,}|[0-9a-f]{6,})$")
 
 _MIN_LITERAL_LEN = 3
+_GENERIC_ACCOUNTS = frozenset({"root", "admin", "administrator", "user", "guest", "test", "system", "service",
+                               "default", "nobody", "anonymous", "operator", "support", "www-data", "ubuntu",
+                               "ec2-user", "postgres", "oracle", "sa", "dba", "backup", "ftp", "www", "web"})
+# identity values remembered for free-text replacement: bounded (an attacker can spray usernames), most recent kept
+_MAX_KNOWN_LITERALS = 5000
 
 
 def _luhn_ok(digits: str) -> bool:
@@ -104,12 +116,13 @@ class Scrubber:
     """Consistent, keyed pseudonymisation of a JSON-like object (dicts / lists / scalars)."""
 
     def __init__(self, salt: str | None = None, *, scrub_ips: bool = False,
-                 identity_keys: Iterable[str] = IDENTITY_KEYS):
+                 identity_keys: Iterable[str] = IDENTITY_KEYS, ephemeral_salt: bool = False):
         self._salt = (salt if salt is not None else "").encode("utf-8")
+        self._ephemeral = ephemeral_salt            # a random per-process salt: keyed, but not the operator's
         self.scrub_ips = scrub_ips
         self._identity_keys = frozenset(k.lower() for k in identity_keys)
         self._map: dict[tuple[str, str], str] = {}
-        self._known: set[str] = set()            # identity values seen so far (any call)
+        self._known: OrderedDict[str, None] = OrderedDict()   # identity values seen so far, bounded, newest last
         self._known_sorted: tuple[str, ...] = ()
         self.replacements = 0
 
@@ -122,16 +135,25 @@ class Scrubber:
         lifetime of the scrubber, so a user id first seen in an alert is also
         replaced where a later chain's evidence mentions it under some other key.
         """
+        obj = redact(obj)        # credentials go first, whatever the salt: they are removed, not pseudonymised
         self._remember(self._collect_identity_values(obj))
         return self._walk(obj, self._known_sorted, under_identity_key=False)
 
     def scrub_text(self, text: str) -> str:
-        return self._scrub_string(text, self._known_sorted)
+        return self._scrub_string(redact_text(text), self._known_sorted)
 
     def _remember(self, values: Iterable[str]) -> None:
-        new = set(values) - self._known
-        if new:
-            self._known |= new
+        changed = False
+        for v in values:
+            if v in self._known:
+                self._known.move_to_end(v)
+                continue
+            self._known[v] = None
+            changed = True
+        while len(self._known) > _MAX_KNOWN_LITERALS:
+            self._known.popitem(last=False)
+            changed = True
+        if changed:
             self._known_sorted = tuple(sorted(self._known, key=len, reverse=True))
 
     def token(self, kind: str, value: str) -> str:
@@ -152,7 +174,8 @@ class Scrubber:
 
     @property
     def salted(self) -> bool:
-        return bool(self._salt)
+        """Keyed by the operator's ``AEGIS_DATASET_SALT`` (stable across restarts and installs)."""
+        return bool(self._salt) and not self._ephemeral
 
     # ------------------------------------------------------------ internals --
 
@@ -167,8 +190,11 @@ class Scrubber:
                 for v in o:
                     walk(v, key)
             elif isinstance(o, str) and key is not None and key.lower() in self._identity_keys:
-                if len(o.strip()) >= _MIN_LITERAL_LEN:
-                    found.add(o.strip())
+                v = o.strip()
+                # generic account names are not personal data, and rewriting them in free text destroys the
+                # attack indicator ("/root/.ssh", "/wp-admin/") — the structured field is still pseudonymised
+                if len(v) >= _MIN_LITERAL_LEN and v.lower() not in _GENERIC_ACCOUNTS:
+                    found.add(v)
         walk(obj, None)
         return tuple(found)
 
@@ -232,9 +258,11 @@ class Scrubber:
         out = _ARN_ACCOUNT_RX.sub(self._sub_arn, out)
         if self.scrub_ips:
             out = _IPV4_RX.sub(self._sub_ip, out)
-        for lit in literals:
-            if lit in out:
-                out = out.replace(lit, self._pseudonym_for_literal(lit))
+        present = [lit for lit in literals if lit in out]      # cheap substring pre-filter, longest first
+        if present:
+            # replace only on word boundaries: "ravi" must not rewrite "ravikumar"
+            rx = re.compile(r"(?<![\w])(?:" + "|".join(re.escape(x) for x in present) + r")(?![\w])")
+            out = rx.sub(lambda m: self._pseudonym_for_literal(m.group(0)), out)
         return out
 
     def _pseudonym_for_literal(self, lit: str) -> str:
@@ -284,9 +312,24 @@ class Scrubber:
         return f"198.{18 + (tok >> 16) % 2}.{(tok >> 8) % 256}.{tok % 256}"
 
 
+_process_salt = secrets.token_hex(16)
+_warned_unsalted = False
+
+
 def scrubber_from_env(**overrides: Any) -> Scrubber:
     """``AEGIS_DATASET_SALT`` keys the pseudonyms; ``AEGIS_DATASET_SCRUB_IPS=1`` also pseudonymises public IPs."""
     salt = os.environ.get("AEGIS_DATASET_SALT", "")
+    if not salt and "salt" not in overrides:
+        # An unsalted pseudonym is sha256 of a public constant + the value — reversible by guessing user ids.
+        # Use a random per-process salt instead: pseudonyms stay consistent within this run but cannot be
+        # reversed; set AEGIS_DATASET_SALT for consistency across restarts and installs.
+        global _warned_unsalted
+        if not _warned_unsalted:
+            logger.warning("AEGIS_DATASET_SALT is not set: dataset pseudonyms use a random per-process salt "
+                           "(not reversible, not stable across restarts) — set it in production")
+            _warned_unsalted = True
+        salt = _process_salt
+        overrides = {"ephemeral_salt": True, **overrides}
     scrub_ips = os.environ.get("AEGIS_DATASET_SCRUB_IPS", "0").strip().lower() in {"1", "true", "yes", "on"}
     kw: dict[str, Any] = {"salt": salt, "scrub_ips": scrub_ips}
     kw.update(overrides)

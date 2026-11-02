@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from .evidence_chain import EvidenceChain
+from .redact import redact_chain
 
 logger = logging.getLogger("aegis.audit")
 
@@ -145,6 +146,8 @@ class AuditLog:
     def append(self, chain: EvidenceChain) -> EvidenceChain:
         with _LOCK:
             chain.finalize()
+            # credentials never enter the sealed record (audit file, index, dashboard row all come from here)
+            redact_chain(chain)
             payload = chain.model_dump(mode="json", exclude={"integrity_hash"})
             serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
             h = hashlib.sha256((self._tail_hash + serialized).encode("utf-8")).hexdigest()
