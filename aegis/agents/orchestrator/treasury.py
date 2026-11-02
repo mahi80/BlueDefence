@@ -89,7 +89,13 @@ def _beneficiary_known(alert: dict) -> bool | None:
         for r in tools.run_all_tools(alert):
             if r.name == "beneficiary_risk":
                 known = r.data.get("known")
-                return bool(known) if known is not None else None
+                if known is not None:
+                    return bool(known)
+                # the register only sets known=False for an account it has never seen; a registered payee comes
+                # back with its profile (first_seen_days …) and no "known" key — it used to read as "unknown → new"
+                if "first_seen_days" in r.data:
+                    return True
+                return None
     except Exception:  # noqa: BLE001 — a toolkit failure must not open the gate
         return None
     return None

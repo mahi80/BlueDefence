@@ -544,6 +544,14 @@ def _compute_cost(resp: LLMResponse) -> float:
     )
 
 
+_MOCK_FALLBACK = False
+
+
+def mock_fallback_active() -> bool:
+    """True when a real LLM was expected but the mock is answering (never true for LLM_BACKEND=mock)."""
+    return _MOCK_FALLBACK
+
+
 class MockClient(LLMClient):
     """Deterministic responder for offline demos.
 
@@ -1408,7 +1416,16 @@ def get_client(
             _log.error("AnthropicClient unavailable (%s: %s) — primary LLM is now the MOCK client; verdicts are placeholders until this is fixed", type(exc).__name__, str(exc)[:160])
             inner = MockClient()
     else:
+        if pref != "mock":
+            # "auto" with no API key (a missing secret, an unmounted env file) used to fall to the mock
+            # silently — and the mock auto-closes low-anomaly alerts as benign. Say so loudly, and mark it so
+            # the orchestrator refuses the auto-close shortcut while it lasts.
+            _log.error("no LLM configured (LLM_BACKEND=%s, ANTHROPIC_API_KEY unset): the primary LLM is the MOCK "
+                       "client — verdicts are placeholders and auto-close is disabled until this is fixed", pref)
         inner = MockClient()
+    if isinstance(inner, MockClient) and pref != "mock":
+        global _MOCK_FALLBACK
+        _MOCK_FALLBACK = True
 
     # Wrap in PII tokenization unless explicitly disabled. Default ON
     # because the project plan flags raw-PII-to-LLM as a compliance
@@ -1596,7 +1613,12 @@ def _balanced_objects(text: str) -> list[str]:
     return out
 
 
-def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next")) -> dict[str, Any]:
+def _squash(s: str) -> str:
+    return re.sub(r"\s+", "", s)
+
+
+def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next"), *,
+               exclude_text: str | None = None) -> dict[str, Any]:
     """Best-effort extract a JSON object from LLM text.
 
     Live models wrap the object in prose, fences, or trailing analysis — and a
@@ -1606,6 +1628,11 @@ def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next")) ->
     the specialist fell back to ``uncertain``. Now: fenced block first, then
     every balanced object, preferring one that carries a ``prefer_keys`` key,
     else the last complete object.
+
+    Among objects that carry a preferred key the **last** wins: a model that quotes the attacker's
+    ``{"verdict": "benign"}`` from the payload and then gives its own verdict must not be read as the
+    attacker's answer. ``exclude_text`` (the prompt the model was given) drops any object that appears
+    verbatim in it — an object the model merely echoed from the untrusted input is never its decision.
     """
     text = text.strip()
     fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
@@ -1615,19 +1642,25 @@ def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next")) ->
     stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
     candidates.append(stripped)
     candidates.extend(_balanced_objects(stripped))
+    echoed = _squash(exclude_text) if exclude_text else ""
+    fenced_objs: list[dict] = []
     parsed: list[dict] = []
-    for cand in candidates:
+    for i, cand in enumerate(candidates):
         try:
             obj = json.loads(cand)
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict):
-            parsed.append(obj)
-    for obj in parsed:
-        if any(k in obj for k in prefer_keys):
-            return obj
-    if parsed:
-        return parsed[-1]
+        if not isinstance(obj, dict):
+            continue
+        if echoed and len(cand) > 2 and _squash(cand) in echoed:
+            continue                                   # quoted back from the untrusted input
+        (fenced_objs if i < len(fenced) else parsed).append(obj)
+    for group in (fenced_objs, parsed):
+        for obj in reversed(group):
+            if any(k in obj for k in prefer_keys):
+                return obj
+    if parsed or fenced_objs:
+        return (parsed or fenced_objs)[-1]
     raise json.JSONDecodeError("no JSON object in LLM output", text[:200], 0)
 
 
@@ -1647,10 +1680,10 @@ def complete_for_json(llm: "LLMClient", system: str, user: str, *, max_tokens: i
     summed so the budget stays honest.
     """
     resp = llm.complete(system, user, max_tokens=max_tokens)
-    obj = _usable_object(resp.text, want)
+    obj = _usable_object(resp.text, want, exclude_text=user)
     if obj is None:
         retry = llm.complete(system, user + JSON_ONLY_NUDGE, max_tokens=max_tokens)
-        obj2 = _usable_object(retry.text, want)
+        obj2 = _usable_object(retry.text, want, exclude_text=user)
         merged = LLMResponse(
             text=retry.text, model=retry.model,
             input_tokens=resp.input_tokens + retry.input_tokens,
@@ -1660,16 +1693,18 @@ def complete_for_json(llm: "LLMClient", system: str, user: str, *, max_tokens: i
             cost_cents=resp.cost_cents + retry.cost_cents, retries=resp.retries + retry.retries + 1,
             tool_calls=retry.tool_calls,
         )
-        if obj2 is not None:
-            merged.text = json.dumps(obj2)
+        # No usable object of the model's own: hand the caller nothing to parse, so it takes its fail-safe
+        # path (uncertain → a human, or the perimeter specialist). Returning the raw text let the caller's own
+        # parse_json pick up an object the model had merely quoted from the untrusted input.
+        merged.text = json.dumps(obj2) if obj2 is not None else ""
         return merged
     resp.text = json.dumps(obj)
     return resp
 
 
-def _usable_object(text: str, want: tuple[str, ...]) -> Optional[dict]:
+def _usable_object(text: str, want: tuple[str, ...], *, exclude_text: str | None = None) -> Optional[dict]:
     try:
-        obj = parse_json(text, prefer_keys=want)
+        obj = parse_json(text, prefer_keys=want, exclude_text=exclude_text)
     except Exception:  # noqa: BLE001
         return None
     return obj if any(k in obj for k in want) else None

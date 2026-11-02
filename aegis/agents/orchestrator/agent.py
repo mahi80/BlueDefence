@@ -57,6 +57,27 @@ _VERDICT_LABELS = ("benign", "suspicious", "malicious", "uncertain")
 _NEXT_BY_VERDICT = {"auto_close": "benign", "respond": "malicious"}
 
 
+def guard_triage(triage: dict) -> dict:
+    """Refuse the triage shortcuts when the triage answer cannot be trusted.
+
+    ``auto_close`` (close with no specialist) and ``respond`` (act with no specialist / voter) skip every
+    later check, so they are refused when the alert carried prompt-injection text — the answer may be the
+    attacker's — and ``auto_close`` is refused while the mock LLM is standing in for a real one."""
+    from ..shared.llm_client import mock_fallback_active
+    md = dict(triage.get("_triage_metadata") or {})
+    nxt = triage.get("next")
+    why = ""
+    if nxt == "auto_close" and mock_fallback_active():
+        why = "no real LLM configured — the mock's auto-close is not trusted"
+    elif md.get("injection_detected") and nxt in ("auto_close", "respond"):
+        why = f"prompt-injection patterns in the alert ({', '.join(md.get('injection_patterns', [])[:3])})"
+    if not why:
+        return triage
+    md["overridden"] = f"{nxt} → dispatch_perimeter ({why})"
+    return {**triage, "next": "dispatch_perimeter", "reason": f"{why}; triage shortcut refused, investigating",
+            "_triage_metadata": md}
+
+
 def _normalise_triage(decision: dict) -> dict:
     """Make a live model's triage JSON safe to act on.
 
@@ -309,6 +330,7 @@ class SOCOrchestrator:
         else:
             # Triage with primary LLM.
             triage = self._triage(alert)
+            triage = guard_triage(triage)
 
         if triage["next"] == "auto_close":
             chain = self._build_auto_close_chain(alert, triage)
