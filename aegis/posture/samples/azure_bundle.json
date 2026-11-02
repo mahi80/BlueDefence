@@ -1,0 +1,333 @@
+{
+ "subscription": {
+  "id": "00000000-1111-2222-3333-444444444444",
+  "name": "bank-prod-centralindia",
+  "tenant": "tenant-0"
+ },
+ "storage_accounts": [
+  {
+   "name": "wbkycdocs",
+   "resourceGroup": "rg-kyc",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-kyc/providers/Microsoft.Storage/storageAccounts/wbkycdocs",
+   "allowBlobPublicAccess": true,
+   "enableHttpsTrafficOnly": true,
+   "minimumTlsVersion": "TLS1_2",
+   "publicNetworkAccess": "Enabled",
+   "networkRuleSet": {
+    "defaultAction": "Allow"
+   },
+   "allowSharedKeyAccess": true
+  },
+  {
+   "name": "wblegacyexports",
+   "resourceGroup": "rg-batch",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-batch/providers/Microsoft.Storage/storageAccounts/wblegacyexports",
+   "allowBlobPublicAccess": false,
+   "enableHttpsTrafficOnly": false,
+   "minimumTlsVersion": "TLS1_0",
+   "publicNetworkAccess": "Enabled",
+   "networkRuleSet": {
+    "defaultAction": "Deny"
+   },
+   "allowSharedKeyAccess": false
+  },
+  {
+   "name": "wbledgerbackup",
+   "resourceGroup": "rg-core",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-core/providers/Microsoft.Storage/storageAccounts/wbledgerbackup",
+   "allowBlobPublicAccess": false,
+   "enableHttpsTrafficOnly": true,
+   "minimumTlsVersion": "TLS1_2",
+   "publicNetworkAccess": "Disabled",
+   "networkRuleSet": {
+    "defaultAction": "Deny"
+   },
+   "allowSharedKeyAccess": false
+  }
+ ],
+ "network_security_groups": [
+  {
+   "name": "nsg-core-db",
+   "resourceGroup": "rg-core",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-core/providers/Microsoft.Network/networkSecurityGroups/nsg-core-db",
+   "securityRules": [
+    {
+     "name": "allow-sql",
+     "access": "Allow",
+     "direction": "Inbound",
+     "protocol": "Tcp",
+     "sourceAddressPrefix": "*",
+     "destinationPortRange": "1433",
+     "priority": 100
+    }
+   ]
+  },
+  {
+   "name": "nsg-jump",
+   "resourceGroup": "rg-ops",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-ops/providers/Microsoft.Network/networkSecurityGroups/nsg-jump",
+   "securityRules": [
+    {
+     "name": "rdp",
+     "access": "Allow",
+     "direction": "Inbound",
+     "protocol": "Tcp",
+     "sourceAddressPrefix": "Internet",
+     "destinationPortRanges": [
+      "3389",
+      "22"
+     ],
+     "priority": 110
+    }
+   ]
+  },
+  {
+   "name": "nsg-web",
+   "resourceGroup": "rg-web",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-web/providers/Microsoft.Network/networkSecurityGroups/nsg-web",
+   "securityRules": [
+    {
+     "name": "https",
+     "access": "Allow",
+     "direction": "Inbound",
+     "protocol": "Tcp",
+     "sourceAddressPrefix": "Internet",
+     "destinationPortRange": "443",
+     "priority": 100
+    },
+    {
+     "name": "mgmt-from-vpn",
+     "access": "Allow",
+     "direction": "Inbound",
+     "protocol": "Tcp",
+     "sourceAddressPrefix": "10.20.0.0/16",
+     "destinationPortRange": "22",
+     "priority": 120
+    },
+    {
+     "name": "deny-all",
+     "access": "Deny",
+     "direction": "Inbound",
+     "protocol": "*",
+     "sourceAddressPrefix": "*",
+     "destinationPortRange": "*",
+     "priority": 4000
+    }
+   ]
+  },
+  {
+   "name": "nsg-legacy",
+   "resourceGroup": "rg-batch",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-batch/providers/Microsoft.Network/networkSecurityGroups/nsg-legacy",
+   "securityRules": [
+    {
+     "name": "any",
+     "access": "Allow",
+     "direction": "Inbound",
+     "protocol": "*",
+     "sourceAddressPrefix": "0.0.0.0/0",
+     "destinationPortRange": "*",
+     "priority": 200
+    }
+   ]
+  }
+ ],
+ "sql_servers": [
+  {
+   "name": "sql-loans",
+   "resourceGroup": "rg-loans",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-loans/providers/Microsoft.Sql/servers/sql-loans",
+   "publicNetworkAccess": "Enabled",
+   "minimalTlsVersion": "1.0",
+   "audit_state": "Disabled",
+   "firewall_rules": [
+    {
+     "name": "AllowAllWindowsAzureIps",
+     "startIpAddress": "0.0.0.0",
+     "endIpAddress": "0.0.0.0"
+    },
+    {
+     "name": "temp-vendor",
+     "startIpAddress": "0.0.0.0",
+     "endIpAddress": "255.255.255.255"
+    }
+   ]
+  },
+  {
+   "name": "sql-cards",
+   "resourceGroup": "rg-cards",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-cards/providers/Microsoft.Sql/servers/sql-cards",
+   "publicNetworkAccess": "Disabled",
+   "minimalTlsVersion": "1.2",
+   "audit_state": "Enabled",
+   "firewall_rules": []
+  }
+ ],
+ "postgres_servers": [
+  {
+   "name": "pg-upi-switch",
+   "resourceGroup": "rg-upi",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-upi/providers/Microsoft.DBforPostgreSQL/flexibleServers/pg-upi-switch",
+   "network": {
+    "publicNetworkAccess": "Enabled"
+   },
+   "firewall_rules": [
+    {
+     "name": "AllowAll_2026-10-1",
+     "startIpAddress": "0.0.0.0",
+     "endIpAddress": "255.255.255.255"
+    }
+   ]
+  }
+ ],
+ "mysql_servers": [],
+ "key_vaults": [
+  {
+   "name": "kv-payments",
+   "resourceGroup": "rg-payments",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-payments/providers/Microsoft.KeyVault/vaults/kv-payments",
+   "properties": {
+    "enableSoftDelete": true,
+    "enablePurgeProtection": null,
+    "enableRbacAuthorization": false,
+    "publicNetworkAccess": "Enabled",
+    "networkAcls": {
+     "defaultAction": "Allow"
+    }
+   }
+  },
+  {
+   "name": "kv-core",
+   "resourceGroup": "rg-core",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-core/providers/Microsoft.KeyVault/vaults/kv-core",
+   "properties": {
+    "enableSoftDelete": true,
+    "enablePurgeProtection": true,
+    "enableRbacAuthorization": true,
+    "publicNetworkAccess": "Disabled",
+    "networkAcls": {
+     "defaultAction": "Deny"
+    }
+   }
+  }
+ ],
+ "aks_clusters": [
+  {
+   "name": "aks-netbanking",
+   "resourceGroup": "rg-web",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-web/providers/Microsoft.ContainerService/managedClusters/aks-netbanking",
+   "apiServerAccessProfile": null,
+   "enableRbac": true,
+   "disableLocalAccounts": false,
+   "networkProfile": {
+    "networkPlugin": "azure",
+    "networkPolicy": null
+   }
+  },
+  {
+   "name": "aks-core",
+   "resourceGroup": "rg-core",
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-core/providers/Microsoft.ContainerService/managedClusters/aks-core",
+   "apiServerAccessProfile": {
+    "enablePrivateCluster": true
+   },
+   "enableRbac": true,
+   "disableLocalAccounts": true,
+   "networkProfile": {
+    "networkPlugin": "azure",
+    "networkPolicy": "azure"
+   }
+  }
+ ],
+ "defender_plans": [
+  {
+   "name": "VirtualMachines",
+   "pricingTier": "Standard"
+  },
+  {
+   "name": "SqlServers",
+   "pricingTier": "Free"
+  },
+  {
+   "name": "StorageAccounts",
+   "pricingTier": "Free"
+  },
+  {
+   "name": "KeyVaults",
+   "pricingTier": "Standard"
+  },
+  {
+   "name": "Containers",
+   "pricingTier": "Free"
+  },
+  {
+   "name": "Arm",
+   "pricingTier": "Standard"
+  }
+ ],
+ "activity_log_diagnostics": [],
+ "role_assignments": [
+  {
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/providers/Microsoft.Authorization/roleAssignments/ra1",
+   "principalName": "ravi.ops@bank.example",
+   "principalType": "User",
+   "roleDefinitionName": "Owner",
+   "scope": "/subscriptions/00000000-1111-2222-3333-444444444444"
+  },
+  {
+   "id": "/subscriptions/00000000-1111-2222-3333-444444444444/providers/Microsoft.Authorization/roleAssignments/ra2",
+   "principalName": "sp-terraform",
+   "principalType": "ServicePrincipal",
+   "roleDefinitionName": "Contributor",
+   "scope": "/subscriptions/00000000-1111-2222-3333-444444444444"
+  },
+  {
+   "id": "ra3",
+   "principalName": "anita.dba@bank.example",
+   "principalType": "User",
+   "roleDefinitionName": "Contributor",
+   "scope": "/subscriptions/00000000-1111-2222-3333-444444444444/resourceGroups/rg-loans"
+  },
+  {
+   "id": "ra4",
+   "principalName": "auditors@bank.example",
+   "principalType": "Group",
+   "roleDefinitionName": "Reader",
+   "scope": "/subscriptions/00000000-1111-2222-3333-444444444444"
+  }
+ ],
+ "custom_roles": [
+  {
+   "id": "cr1",
+   "roleName": "Ops Super User",
+   "permissions": [
+    {
+     "actions": [
+      "*"
+     ],
+     "notActions": [
+      "Microsoft.Authorization/*/Delete"
+     ]
+    }
+   ],
+   "assignableScopes": [
+    "/subscriptions/00000000-1111-2222-3333-444444444444"
+   ]
+  },
+  {
+   "id": "cr2",
+   "roleName": "VM Operator",
+   "permissions": [
+    {
+     "actions": [
+      "Microsoft.Compute/virtualMachines/start/action",
+      "Microsoft.Compute/virtualMachines/restart/action"
+     ]
+    }
+   ],
+   "assignableScopes": [
+    "/subscriptions/00000000-1111-2222-3333-444444444444"
+   ]
+  }
+ ]
+}

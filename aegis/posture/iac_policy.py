@@ -26,7 +26,7 @@ from typing import Any
 
 import yaml
 
-from . import cspm, k8s_posture
+from . import azure_cspm, cspm, k8s_posture
 from .base import PostureFinding, sort_findings
 from .iam_review import ADMIN_POLICY_ARN, _as_list, _is_full_admin, _privesc_actions
 from .sources import PostureSourceError
@@ -173,10 +173,82 @@ def _terraform(address: str, rtype: str, a: dict) -> list[PostureFinding]:
     return []
 
 
+# ---- azurerm: translated into the Azure posture bundle shape, judged by azure_cspm ---------------
+
+def _first(v: Any) -> dict:
+    return v[0] if isinstance(v, list) and v and isinstance(v[0], dict) else v if isinstance(v, dict) else {}
+
+
+def _nsg_rule(r: dict) -> dict:
+    return {"name": r.get("name"), "access": r.get("access"), "direction": r.get("direction"),
+            "sourceAddressPrefix": r.get("source_address_prefix"), "sourceAddressPrefixes": r.get("source_address_prefixes") or [],
+            "destinationPortRange": r.get("destination_port_range"), "destinationPortRanges": r.get("destination_port_ranges") or []}
+
+
+def _azurerm(address: str, rtype: str, a: dict, *, separate_storage_rules: bool) -> list[PostureFinding]:
+    b: dict[str, Any] = {}
+    if rtype == "azurerm_storage_account":
+        nr = _first(a.get("network_rules"))
+        sa = {"name": address, "allowBlobPublicAccess": a.get("allow_nested_items_to_be_public"),
+              "enableHttpsTrafficOnly": a.get("https_traffic_only_enabled", a.get("enable_https_traffic_only")),
+              "minimumTlsVersion": a.get("min_tls_version") or "TLS1_2",
+              "publicNetworkAccess": "Disabled" if a.get("public_network_access_enabled") is False else "Enabled"}
+        if "shared_access_key_enabled" in a:
+            sa["allowSharedKeyAccess"] = a.get("shared_access_key_enabled")
+        # network rules may live in a separate azurerm_storage_account_network_rules resource; when the plan
+        # has one we cannot tie it to this account by reference, so the open-network check is left to runtime
+        sa["networkRuleSet"] = {"defaultAction": nr.get("default_action") or ("Deny" if separate_storage_rules else "Allow")}
+        b["storage_accounts"] = [sa]
+    elif rtype == "azurerm_network_security_group":
+        b["network_security_groups"] = [{"name": address, "securityRules": [_nsg_rule(r) for r in a.get("security_rule") or []]}]
+    elif rtype == "azurerm_network_security_rule":
+        b["network_security_groups"] = [{"name": address, "securityRules": [_nsg_rule(a)]}]
+    elif rtype in ("azurerm_mssql_server", "azurerm_sql_server"):
+        b["sql_servers"] = [{"name": address, "minimalTlsVersion": a.get("minimum_tls_version"),
+                             "publicNetworkAccess": "Disabled" if a.get("public_network_access_enabled") is False else "Enabled"}]
+    elif rtype in ("azurerm_mssql_firewall_rule", "azurerm_sql_firewall_rule"):
+        b["sql_servers"] = [{"name": address, "firewall_rules": [{"name": a.get("name"), "startIpAddress": a.get("start_ip_address"),
+                                                                  "endIpAddress": a.get("end_ip_address")}]}]
+    elif rtype in ("azurerm_postgresql_flexible_server_firewall_rule", "azurerm_mysql_flexible_server_firewall_rule"):
+        key = "postgres_servers" if "postgresql" in rtype else "mysql_servers"
+        b[key] = [{"name": address, "firewall_rules": [{"name": a.get("name"), "startIpAddress": a.get("start_ip_address"),
+                                                        "endIpAddress": a.get("end_ip_address")}]}]
+    elif rtype == "azurerm_key_vault":
+        acl = _first(a.get("network_acls"))
+        b["key_vaults"] = [{"name": address, "properties": {
+            "enableSoftDelete": True, "enablePurgeProtection": bool(a.get("purge_protection_enabled")),
+            "enableRbacAuthorization": a.get("rbac_authorization_enabled", a.get("enable_rbac_authorization")),
+            "publicNetworkAccess": "Disabled" if a.get("public_network_access_enabled") is False else "Enabled",
+            "networkAcls": {"defaultAction": acl.get("default_action") or "Allow"}}}]
+    elif rtype == "azurerm_kubernetes_cluster":
+        api = _first(a.get("api_server_access_profile"))
+        ranges = api.get("authorized_ip_ranges") or a.get("api_server_authorized_ip_ranges") or []
+        b["aks_clusters"] = [{"name": address, "apiServerAccessProfile": {"enablePrivateCluster": bool(a.get("private_cluster_enabled")),
+                                                                          "authorizedIpRanges": ranges},
+                              "enableRbac": a.get("role_based_access_control_enabled", True),
+                              "disableLocalAccounts": bool(a.get("local_account_disabled")),
+                              "networkProfile": {"networkPolicy": _first(a.get("network_profile")).get("network_policy")}}]
+    elif rtype == "azurerm_role_definition":
+        b["custom_roles"] = [{"roleName": a.get("name") or address,
+                              "permissions": [{"actions": p.get("actions") or []} for p in a.get("permissions") or []],
+                              "assignableScopes": a.get("assignable_scopes") or ([a["scope"]] if a.get("scope") else [])}]
+    elif rtype == "azurerm_role_assignment" and str(a.get("principal_type", "")).lower() == "user":
+        b["role_assignments"] = [{"principalName": a.get("principal_id"), "principalType": "User",
+                                  "roleDefinitionName": a.get("role_definition_name"), "scope": a.get("scope", "")}]
+    elif rtype == "azurerm_security_center_subscription_pricing" and str(a.get("tier", "")).lower() == "free":
+        b["defender_plans"] = [{"name": a.get("resource_type") or "VirtualMachines", "pricingTier": "Free"}]
+    return _rehome(azure_cspm.scan(b), address) if b else []
+
+
 def scan_plan(plan: dict, *, changed_only: bool = False) -> list[PostureFinding]:
     out: list[PostureFinding] = []
-    for address, rtype, after in plan_resources(plan, changed_only=changed_only):
-        out.extend(_terraform(address, rtype, after))
+    resources = plan_resources(plan, changed_only=changed_only)
+    separate_rules = any(t == "azurerm_storage_account_network_rules" for _, t, _ in resources)
+    for address, rtype, after in resources:
+        if rtype.startswith("azurerm_"):
+            out.extend(_azurerm(address, rtype, after, separate_storage_rules=separate_rules))
+        else:
+            out.extend(_terraform(address, rtype, after))
     return sort_findings(out)
 
 

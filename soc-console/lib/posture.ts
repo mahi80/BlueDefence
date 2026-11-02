@@ -31,7 +31,7 @@ export interface PostureFinding {
 
 export interface PostureScan {
   name: string;
-  type: "iam" | "cspm" | "k8s" | "iac";
+  type: "iam" | "cspm" | "azure" | "k8s" | "iac";
   status: "ok" | "error";
   live: boolean;
   seconds: number;
