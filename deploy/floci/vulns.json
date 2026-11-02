@@ -1,0 +1,38 @@
+[
+ {
+  "asset": {"hostname": "bank-web", "uuid": "uuid-bank-web"},
+  "plugin": {"id": 201352, "name": "OpenSSH regreSSHion signal-handler race (unauthenticated RCE)",
+             "cve": ["CVE-2024-6387"], "cvss3_base_score": 8.1, "exploit_available": false},
+  "port": {"port": 22, "protocol": "TCP"}, "severity": "high", "state": "OPEN"
+ },
+ {
+  "asset": {"hostname": "bank-mgmt", "uuid": "uuid-bank-mgmt"},
+  "plugin": {"id": 159374, "name": "Spring4Shell on the mgmt console (public host whose SG opens only ICMP)",
+             "cve": ["CVE-2022-22965"], "cvss3_base_score": 9.8, "exploit_available": true},
+  "port": {"port": 8443, "protocol": "TCP"}, "severity": "critical", "state": "OPEN"
+ },
+ {
+  "asset": {"hostname": "bank-app", "uuid": "uuid-bank-app"},
+  "plugin": {"id": 155999, "name": "Apache Log4j 2 RCE (Log4Shell) behind the internet-facing ALB",
+             "cve": ["CVE-2021-44228"], "cvss3_base_score": 10.0, "exploit_available": true},
+  "port": {"port": 8080, "protocol": "TCP"}, "severity": "critical", "state": "OPEN"
+ },
+ {
+  "asset": {"hostname": "bank-db", "uuid": "uuid-bank-db"},
+  "plugin": {"id": 211651, "name": "PostgreSQL PL/Perl environment variable change (code execution)",
+             "cve": ["CVE-2024-10979"], "cvss3_base_score": 8.8, "exploit_available": true},
+  "port": {"port": 5432, "protocol": "TCP"}, "severity": "high", "state": "OPEN"
+ },
+ {
+  "asset": {"hostname": "bank-db", "uuid": "uuid-bank-db"},
+  "plugin": {"id": 158779, "name": "Redis Lua sandbox escape (cache on the DB host, SG open to 0.0.0.0/0, no public IP)",
+             "cve": ["CVE-2022-0543"], "cvss3_base_score": 10.0, "exploit_available": true},
+  "port": {"port": 6379, "protocol": "TCP"}, "severity": "critical", "state": "OPEN"
+ },
+ {
+  "asset": {"hostname": "bank-ipv6", "uuid": "uuid-bank-ipv6"},
+  "plugin": {"id": 182508, "name": "HTTP/2 Rapid Reset DoS on an IPv6-only public API (SG open to ::/0)",
+             "cve": ["CVE-2023-44487"], "cvss3_base_score": 7.5, "exploit_available": true},
+  "port": {"port": 443, "protocol": "TCP"}, "severity": "high", "state": "OPEN"
+ }
+]

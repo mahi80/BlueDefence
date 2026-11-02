@@ -1,0 +1,94 @@
+name: Floci integration (AWS posture + exposure)
+
+# Spike: BlueDefence's AWS posture collector (export-aws) and exposure engine against Floci, a free
+# local AWS emulator. Reports which collector sections Floci supports, the exposure tiers before and
+# after executing a generated revoke command, and the known-bug checks. Fails only when BlueDefence
+# itself crashes; emulator gaps are reported in the job summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      floci_image:
+        description: Floci image
+        default: floci/floci:latest
+      ec2_mock:
+        description: "FLOCI_SERVICES_EC2_MOCK (true = no Docker containers per instance)"
+        default: "true"
+  pull_request:
+    paths:
+      - 'deploy/floci/**'
+      - 'aegis/posture/**'
+      - 'aegis/exposure/**'
+      - '.github/workflows/floci-integration.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  floci:
+    name: Floci — collector support matrix + exposure tiers
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FLOCI_IMAGE: ${{ inputs.floci_image || 'floci/floci:latest' }}
+      FLOCI_EC2_MOCK: ${{ inputs.ec2_mock || 'true' }}
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+      OUT: ${{ github.workspace }}/floci-out
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Floci
+        run: |
+          docker run -d --name floci -p 4566:4566 -u root \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -e FLOCI_SERVICES_EC2_MOCK="$FLOCI_EC2_MOCK" \
+            -e FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES=documentation \
+            "$FLOCI_IMAGE"
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:4566/_localstack/health >/dev/null || docker logs floci 2>&1 | grep -q 'Ready\.'; then
+              echo "Floci up after ${i}s"; break
+            fi
+            sleep 1
+          done
+          docker inspect --format '{{.Config.Image}} {{.Image}}' floci
+          curl -s http://localhost:4566/_localstack/health | head -c 2000 || true
+          echo
+          # s3control's endpoint rules prefix the host with the account id (000000000000.localhost).
+          echo "127.0.0.1 000000000000.localhost" | sudo tee -a /etc/hosts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install BlueDefence (posture-aws extra) + AWS CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[posture-aws]'
+          aws --version || pip install awscli
+          aws --version
+
+      - name: Run the spike (deploy/floci/run.sh)
+        run: bash deploy/floci/run.sh "$OUT" 2>&1 | tee floci-run.log; exit ${PIPESTATUS[0]}
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f "$OUT/summary.md" ]; then cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else echo "run.sh produced no summary — see floci-run.log" >> "$GITHUB_STEP_SUMMARY"; fi
+          docker logs floci > "$OUT/floci-container.log" 2>&1 || true
+          cp floci-run.log "$OUT/" 2>/dev/null || true
+
+      - name: Upload spike output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: floci-integration
+          path: floci-out/
+          if-no-files-found: warn
+          retention-days: 30
