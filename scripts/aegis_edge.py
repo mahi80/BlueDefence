@@ -53,7 +53,11 @@ import urllib.request
 # Reuse the demo bank's signature engine + AEGIS alert shape + forwarder, so the SOC sees
 # one consistent alert contract whether traffic hits the demo bank or a shimmed third app.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # repo root, so `aegis.*` is importable
 import demo_target as dt  # noqa: E402
+# Response-side secret guard reuses the perimeter detector's exfil logic, so the shim withholds exactly
+# what the SOC's secret_exfil_probe flags — one source of truth for "what is a leaked credential".
+from aegis.agents.perimeter.tools import secret_exfil_probe  # noqa: E402
 
 # Hop-by-hop headers never forwarded across a proxy (RFC 7230 §6.1) + ones we set ourselves.
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
@@ -203,13 +207,15 @@ class Blocklist:
 
 class EdgeState:
     def __init__(self, *, upstream: str, aegis_url: str | None, token: str | None, asset: str,
-                 mode: str, inline_waf: bool, blocklist: Blocklist) -> None:
+                 mode: str, inline_waf: bool, blocklist: Blocklist,
+                 redact_secrets: bool = True) -> None:
         self.upstream = upstream.rstrip("/")
         self.aegis_url = aegis_url
         self.token = token
         self.asset = asset
         self.mode = mode                      # "shadow" | "live"
         self.inline_waf = inline_waf
+        self.redact_secrets = redact_secrets  # live mode: withhold a response body carrying a secret
         self.blocklist = blocklist
         self.clients: dict[str, dt.ClientState] = {}
         self.denied = 0
@@ -367,6 +373,14 @@ class Handler(BaseHTTPRequestHandler):
                 "ja3": self.headers.get("X-Demo-JA3", ""), "asset": self.state.asset,
             }
         event.update(self._raw_fields(parts, ip, hl, body, resp))
+        kinds = getattr(self, "_exfil_kinds", None)
+        if kinds:
+            redacted = self.state.mode == "live" and self.state.redact_secrets
+            event["op"] = "secret_exfil"
+            event["severity"] = "high"
+            event["action"] = "blocked" if redacted else "would_block"
+            event["secret_kinds"] = kinds          # labels only — the secret is never forwarded
+            self._exfil_kinds = None
         if self.state.aegis_url:
             dt._forward_alert(self.state.aegis_url, self.state.token, event)
 
@@ -432,12 +446,12 @@ class Handler(BaseHTTPRequestHandler):
             # keeping its cookie/session and making every request exactly one hit + one event.
             with _OPENER.open(req, timeout=15.0) as r:
                 rhdrs = {k.lower(): v for k, v in r.headers.items()}
-                self._relay(r.status, r.read(), r.headers)
-                return r.status, rhdrs
+                code = self._guard_and_relay(r.status, r.read(), r.headers)
+                return code, rhdrs
         except urllib.error.HTTPError as e:                # upstream 4xx/5xx is a real response — relay it
             rhdrs = {k.lower(): v for k, v in e.headers.items()}
-            self._relay(e.code, e.read(), e.headers)
-            return e.code, rhdrs
+            code = self._guard_and_relay(e.code, e.read(), e.headers)
+            return code, rhdrs
         except (urllib.error.URLError, OSError) as e:
             self._json(502, {"error": "upstream unreachable", "upstream": self.state.upstream, "detail": str(e)[:200]})
             return None
@@ -447,6 +461,33 @@ class Handler(BaseHTTPRequestHandler):
         passthru = {k: v for k, v in headers.items()
                     if k.lower() not in _HOP_BY_HOP and k.lower() != "content-type"}
         self._reply(code, body, ctype, passthru)
+
+    def _guard_and_relay(self, code: int, body: bytes, headers: Any) -> int:
+        """Response-side secret guard. Scan the body the app returned, and in live mode WITHHOLD it
+        when it carries a credential — a private key, a cloud/API key, a DSN with an inline password,
+        or ``DB_PASSWORD=``-style env assignments. The guard reuses the SOC's ``secret_exfil_probe`` so
+        it stops exactly what the detector flags. Shadow mode relays the body unchanged and only records
+        'would redact', keeping the shim's observe-first default. Either way the SOC gets one event; the
+        secret itself is never put in telemetry, only the KIND labels. A guard must never turn a good
+        response into a 500, so any scan error falls through to a normal relay."""
+        kinds: list[str] = []
+        try:
+            text = body[:200_000].decode("utf-8", "replace")
+            probe = secret_exfil_probe({"response_body": text, "status": code})
+            if probe.weight == "high":
+                kinds = list(probe.data.get("secret_kinds", []))
+        except Exception:  # noqa: BLE001 — never let the guard break a legitimate response
+            kinds = []
+        if kinds:
+            self._exfil_kinds = kinds
+            if self.state.mode == "live" and self.state.redact_secrets:
+                self.state.denied += 1
+                self._reply(403, json.dumps(
+                    {"error": "response withheld by AEGIS: a credential was detected in the response body",
+                     "secret_kinds": kinds}).encode(), "application/json")
+                return 403
+        self._relay(code, body, headers)
+        return code
 
 
 def build_server(listen: str, state: EdgeState) -> ThreadingHTTPServer:
@@ -471,11 +512,14 @@ def main() -> None:
     ap.add_argument("--poll-interval", type=float, default=2.0, help="seconds between blocklist polls")
     ap.add_argument("--inline-waf", action="store_true",
                     help="also hard-block local signature hits at the edge (off by default; the SOC is the decider)")
+    ap.add_argument("--redact-secrets", action=argparse.BooleanOptionalAction, default=True,
+                    help="live mode: withhold a response whose body carries a credential (private key, "
+                         "cloud/API key, DB DSN, DB_PASSWORD=…). On by default; --no-redact-secrets to disable.")
     args = ap.parse_args()
 
     bl = Blocklist(_blocklist_url(args.aegis_url) if args.aegis_url else None, args.token, args.poll_interval).start()
     state = EdgeState(upstream=args.upstream, aegis_url=args.aegis_url, token=args.token, asset=args.asset,
-                      mode=args.mode, inline_waf=args.inline_waf, blocklist=bl)
+                      mode=args.mode, inline_waf=args.inline_waf, blocklist=bl, redact_secrets=args.redact_secrets)
     httpd = build_server(args.listen, state)
     print(f"AEGIS Edge Shim  →  http://{args.listen}   (mode: {args.mode})")
     print(f"  protecting   {args.upstream}")
