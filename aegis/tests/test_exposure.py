@@ -84,7 +84,7 @@ def test_fixed_and_info_records_skipped_and_unmatched_reported(sample):
 
 
 def _asset(**kw):
-    base = dict(id="a", name="a", keys={"a"}, zone="z", public=True, internet_ports=[(443, 443)])
+    base = {"id": "a", "name": "a", "keys": {"a"}, "zone": "z", "public": True, "internet_ports": [(443, 443)]}
     return Asset(**{**base, **kw})
 
 
