@@ -38,7 +38,7 @@ from .base import SEVERITY_ORDER, PostureFinding, summarize
 logger = logging.getLogger("aegis.posture.runner")
 
 DEFAULT_SLA_DAYS = {"critical": 7, "high": 30, "medium": 90, "low": 180, "info": 365}
-SCAN_TYPES = ("iam", "cspm", "azure", "k8s", "iac")
+SCAN_TYPES = ("iam", "cspm", "azure", "k8s", "iac", "exposure")
 
 
 @dataclass
@@ -77,9 +77,15 @@ def load_config(path: str | Path, *, store: str | Path | None = None) -> RunnerC
             raise sources.PostureSourceError(f"duplicate scan name {s['name']!r}")
         names.add(s["name"])
         opts = {k: v for k, v in s.items() if k not in ("name", "type")}
-        for k in ("auth_details", "credential_report", "bundle", "export", "plan"):
+        for k in ("auth_details", "credential_report", "bundle", "export", "plan", "inventory", "kev", "epss", "settings"):
             if opts.get(k):
                 opts[k] = rel(opts[k])
+        for k in ("vulns", "aws_bundles", "azure_bundles", "waf_coverage"):
+            if opts.get(k):
+                opts[k] = [rel(x) for x in (opts[k] if isinstance(opts[k], list) else [opts[k]])]
+        if opts.get("k8s_exports"):
+            opts["k8s_exports"] = [(f"{n}={rel(p)}" if "=" in str(x) else str(rel(x)))
+                                   for x in opts["k8s_exports"] for n, _, p in [str(x).rpartition("=")]]
         if opts.get("k8s"):
             opts["k8s"] = [rel(p) for p in (opts["k8s"] if isinstance(opts["k8s"], list) else [opts["k8s"]])]
         scans.append(ScanConfig(s["name"], s["type"], opts))
@@ -94,8 +100,13 @@ def load_config(path: str | Path, *, store: str | Path | None = None) -> RunnerC
 
 # ---- executing one scan ---------------------------------------------------------------------------
 
-def execute(scan: ScanConfig) -> tuple[list[PostureFinding], list[str]]:
+def execute(scan: ScanConfig) -> tuple[list[PostureFinding], list[str]] | tuple[list[PostureFinding], list[str], dict]:
     o = scan.opts
+    if scan.type == "exposure":
+        from ..exposure.scan import (
+            run_scan,
+        )
+        return run_scan(o)
     if scan.type == "iam":
         if o.get("live"):
             details, report = sources.live_aws_iam()
@@ -182,9 +193,11 @@ def run_once(cfg: RunnerConfig, *, now: datetime | None = None) -> dict:
     for sc in cfg.scans:
         t0 = time.monotonic()
         try:
-            findings, notes = execute(sc)
+            res = execute(sc)
+            findings, notes = res[0], res[1]
+            meta = res[2] if len(res) > 2 else {}
             current += [(sc.name, f) for f in findings]
-            scans_out.append({"name": sc.name, "type": sc.type, "status": "ok", "notes": notes,
+            scans_out.append({"name": sc.name, "type": sc.type, "status": "ok", "notes": notes, **({"meta": meta} if meta else {}),
                               "summary": summarize(findings), "seconds": round(time.monotonic() - t0, 2),
                               "live": bool(sc.opts.get("live"))})
         except Exception as e:  # noqa: BLE001 - one broken scan must not stop the others
@@ -293,6 +306,12 @@ def report_markdown(r: dict) -> str:
     for sc in r["scans"]:
         res = ", ".join(f"{k} {v}" for k, v in sc.get("summary", {}).items() if v) or ("—" if sc["status"] == "ok" else sc.get("error", ""))
         L.append(f"| {sc['name']} | {sc['type']} | {'live' if sc.get('live') else 'export'} | {sc['status']} | {res} |")
+    for sc in r["scans"]:
+        fn = (sc.get("meta") or {}).get("funnel")
+        if fn:
+            L += ["", f"Exposure funnel — {sc['name']}: {fn['raw']} findings → {fn['exploitable']} exploitable → "
+                      f"{fn['reachable']} reachable → {fn['undefended']} undefended → **{fn['act_now']} ACT NOW**"
+                      + (f" ({sc['meta']['monitor_only']} WAF protection(s) in monitor mode do not count)" if sc["meta"].get("monitor_only") else "")]
     gaps = [(sc["name"], n) for sc in r["scans"] for n in sc.get("notes", [])]
     if gaps:
         L += ["", "Coverage notes:", ""] + [f"- **{n}** — {t}" for n, t in gaps]

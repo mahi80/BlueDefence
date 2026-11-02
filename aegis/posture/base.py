@@ -19,7 +19,8 @@ _RISK_FOR_SEVERITY = {"critical": 0.95, "high": 0.8, "medium": 0.55, "low": 0.3,
 class PostureFinding(Finding):
     control: str | None = None   # benchmark control, e.g. "CIS AWS Foundations v2.0 1.4"
     resource: str | None = None  # ARN / object reference the finding is about
-    scanner: str = ""            # iam_review | cspm | k8s_posture | iac_policy
+    scanner: str = ""            # iam_review | cspm | k8s_posture | iac_policy | exposure
+    extra: dict | None = None    # scanner-specific detail (exposure: tier, reach, defended, reasons)
 
     def __post_init__(self) -> None:
         if self.severity not in _RISK_FOR_SEVERITY:
