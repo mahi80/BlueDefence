@@ -2,6 +2,7 @@
 
     python -m aegis.posture iam  --auth-details F [--credential-report F] [--live] [--json] [--fail-on SEV]
     python -m aegis.posture cspm --bundle F [--live --region R] [--json] [--fail-on SEV]
+    python -m aegis.posture k8s  --export F [--live --context C] [--include-system] [--json] [--fail-on SEV]
     python -m aegis.posture export-aws --out F [--region R]     # run by the bank, with its own read-only creds
 
 Exit codes: 0 ok, 1 a finding at or above ``--fail-on``, 2 bad or missing input. The same command
@@ -15,7 +16,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import cspm, iam_review, sources
+from . import cspm, iam_review, k8s_posture, sources
 from .base import SEVERITY_ORDER, summarize
 
 
@@ -45,7 +46,20 @@ def _cspm(args: argparse.Namespace) -> tuple[list, list[str]]:
     return cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(gaps)}"] if gaps else []
 
 
-SCANS = {"iam": _iam, "cspm": _cspm}
+def _k8s(args: argparse.Namespace) -> tuple[list, list[str]]:
+    if args.live:
+        export = sources.collect_k8s(args.context)
+    elif args.export:
+        export = sources.load_json(args.export)
+    else:
+        raise sources.PostureSourceError(f"pass --export FILE ({k8s_posture.EXPORT_COMMAND} > FILE) or --live")
+    if not isinstance(export, (dict, list)):
+        raise sources.PostureSourceError("export must be a kubectl JSON List")
+    return (k8s_posture.scan(export, include_system=args.include_system),
+            k8s_posture.notes(export, include_system=args.include_system))
+
+
+SCANS = {"iam": _iam, "cspm": _cspm, "k8s": _k8s}
 
 
 def _report(scan: str, findings: list, notes: list[str], as_json: bool) -> None:
@@ -74,7 +88,13 @@ def main(argv: list[str] | None = None) -> int:
     cs.add_argument("--bundle", help="JSON bundle from `python -m aegis.posture export-aws`")
     cs.add_argument("--region", help="region for --live (default: the SDK's configured region)")
 
-    for p in (iam, cs):
+    k8 = sub.add_parser("k8s", help="Kubernetes posture (workloads, RBAC, network policy)",
+                        epilog=f"offline export: {k8s_posture.EXPORT_COMMAND} > FILE   (never export secrets)")
+    k8.add_argument("--export", help="kubectl JSON List (see epilog for the command)")
+    k8.add_argument("--context", help="kubeconfig context for --live")
+    k8.add_argument("--include-system", action="store_true", help="also scan kube-system / kube-public / kube-node-lease workloads")
+
+    for p in (iam, cs, k8):
         p.add_argument("--live", action="store_true", help="collect via read-only APIs (needs AEGIS_POSTURE_LIVE=1)")
         p.add_argument("--json", action="store_true", help="machine-readable output")
         p.add_argument("--fail-on", choices=SEVERITY_ORDER, help="exit 1 if any finding is this severe or worse")
