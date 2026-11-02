@@ -128,6 +128,7 @@ def fake_az(bundle, calls, fail=None):
         ("monitor", "diagnostic-settings", "subscription"): {"value": []},
         ("role", "assignment", "list"): bundle["role_assignments"],
         ("role", "definition", "list"): bundle["custom_roles"],
+        ("vm", "list"): [], ("network", "nic", "list"): [], ("network", "vnet", "list"): [], ("network", "lb", "list"): [],
     }
 
     def run(cmd, **kw):

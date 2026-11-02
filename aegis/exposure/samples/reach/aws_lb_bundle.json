@@ -1,0 +1,194 @@
+{
+ "account_id": "111111111111",
+ "region": "ap-south-1",
+ "security_groups": [
+  {
+   "GroupId": "sg-alb",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 443,
+     "ToPort": 443,
+     "IpRanges": [
+      {
+       "CidrIp": "0.0.0.0/0"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ]
+  },
+  {
+   "GroupId": "sg-app",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 8080,
+     "ToPort": 8080,
+     "IpRanges": [
+      {
+       "CidrIp": "10.0.0.0/8"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ]
+  },
+  {
+   "GroupId": "sg-mq",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 5672,
+     "ToPort": 5672,
+     "IpRanges": [
+      {
+       "CidrIp": "10.0.0.0/8"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ]
+  },
+  {
+   "GroupId": "sg-admin",
+   "IpPermissions": [
+    {
+     "IpProtocol": "tcp",
+     "FromPort": 8443,
+     "ToPort": 8443,
+     "IpRanges": [
+      {
+       "CidrIp": "10.0.0.0/8"
+      }
+     ],
+     "Ipv6Ranges": []
+    }
+   ]
+  }
+ ],
+ "instances": [
+  {
+   "InstanceId": "i-app",
+   "State": {
+    "Name": "running"
+   },
+   "VpcId": "vpc-1",
+   "PrivateIpAddress": "10.0.1.10",
+   "SecurityGroups": [
+    {
+     "GroupId": "sg-app"
+    }
+   ],
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "netbanking-app"
+    }
+   ]
+  },
+  {
+   "InstanceId": "i-mq",
+   "State": {
+    "Name": "running"
+   },
+   "VpcId": "vpc-1",
+   "PrivateIpAddress": "10.0.1.20",
+   "SecurityGroups": [
+    {
+     "GroupId": "sg-mq"
+    }
+   ],
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "payments-mq"
+    }
+   ]
+  },
+  {
+   "InstanceId": "i-admin",
+   "State": {
+    "Name": "running"
+   },
+   "VpcId": "vpc-1",
+   "PrivateIpAddress": "10.0.1.30",
+   "SecurityGroups": [
+    {
+     "GroupId": "sg-admin"
+    }
+   ],
+   "Tags": [
+    {
+     "Key": "Name",
+     "Value": "ops-admin"
+    }
+   ]
+  }
+ ],
+ "load_balancers": [
+  {
+   "LoadBalancerName": "alb-netbanking",
+   "LoadBalancerArn": "arn:alb1",
+   "Scheme": "internet-facing",
+   "Type": "application",
+   "SecurityGroups": [
+    "sg-alb"
+   ],
+   "listeners": [
+    {
+     "Port": 443,
+     "Protocol": "HTTPS"
+    }
+   ],
+   "targets": [
+    {
+     "Id": "i-app",
+     "Port": 8080
+    }
+   ],
+   "web_acl": "netbanking-waf"
+  },
+  {
+   "LoadBalancerName": "nlb-mq",
+   "LoadBalancerArn": "arn:nlb1",
+   "Scheme": "internet-facing",
+   "Type": "network",
+   "SecurityGroups": [],
+   "listeners": [
+    {
+     "Port": 5672,
+     "Protocol": "TCP"
+    }
+   ],
+   "targets": [
+    {
+     "Id": "i-mq",
+     "Port": 5672
+    }
+   ],
+   "web_acl": null
+  },
+  {
+   "LoadBalancerName": "alb-internal",
+   "LoadBalancerArn": "arn:alb2",
+   "Scheme": "internal",
+   "Type": "application",
+   "SecurityGroups": [
+    "sg-alb"
+   ],
+   "listeners": [
+    {
+     "Port": 443
+    }
+   ],
+   "targets": [
+    {
+     "Id": "i-admin",
+     "Port": 8443
+    }
+   ],
+   "web_acl": null
+  }
+ ]
+}

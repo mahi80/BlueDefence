@@ -110,8 +110,8 @@ def collect_aws_cspm(region: str | None = None, *, require_flag: bool = True) ->
     the file, so AEGIS's own live-mode switch does not apply.
     """
     c = lambda svc: _boto3_client(svc, require_flag=require_flag, **({"region_name": region} if region else {}))
-    sts, s3, s3c, ec2, rds, ct, kms, gd, cfg, iam = (c(s) for s in
-        ("sts", "s3", "s3control", "ec2", "rds", "cloudtrail", "kms", "guardduty", "config", "iam"))
+    sts, s3, s3c, ec2, rds, ct, kms, gd, cfg, iam, elb, waf = (c(s) for s in
+        ("sts", "s3", "s3control", "ec2", "rds", "cloudtrail", "kms", "guardduty", "config", "iam", "elbv2", "wafv2"))
     acct = sts.get_caller_identity()["Account"]  # must succeed: no identity, no scan
     region = ec2.meta.region_name
     b: dict[str, Any] = {"account_id": acct, "region": region}
@@ -191,6 +191,30 @@ def collect_aws_cspm(region: str | None = None, *, require_flag: bool = True) ->
     section("guardduty_detectors", lambda: [{"DetectorId": d, "Status": gd.get_detector(DetectorId=d).get("Status")}
                                             for d in gd.list_detectors().get("DetectorIds", [])])
     section("config_recorders", recorders)
+    def load_balancers() -> list:
+        """ALB / NLB with listeners, targets and any AWS WAF web ACL — the exposure engine's internet paths."""
+        out = []
+        for lb in page(elb, "describe_load_balancers", "LoadBalancers"):
+            arn = lb["LoadBalancerArn"]
+            listeners = [{"Port": x.get("Port"), "Protocol": x.get("Protocol")}
+                         for x in page(elb, "describe_listeners", "Listeners", LoadBalancerArn=arn)]
+            targets = []
+            for tg in page(elb, "describe_target_groups", "TargetGroups", LoadBalancerArn=arn):
+                for th in elb.describe_target_health(TargetGroupArn=tg["TargetGroupArn"]).get("TargetHealthDescriptions", []):
+                    t = th.get("Target") or {}
+                    targets.append({"Id": t.get("Id"), "Port": t.get("Port") or tg.get("Port")})
+            acl = None
+            if lb.get("Type") == "application":
+                try:
+                    acl = ((waf.get_web_acl_for_resource(ResourceArn=arn) or {}).get("WebACL") or {}).get("Name")
+                except Exception as e:  # noqa: BLE001 - unknown WAF state reads as "no WAF": more findings, never fewer
+                    errors.setdefault("load_balancer_waf", str(getattr(e, "response", {}).get("Error", {}).get("Code", e))[:200])
+            out.append({"LoadBalancerName": lb.get("LoadBalancerName"), "LoadBalancerArn": arn, "Scheme": lb.get("Scheme"),
+                        "Type": lb.get("Type"), "SecurityGroups": lb.get("SecurityGroups") or [],
+                        "listeners": listeners, "targets": targets, "web_acl": acl})
+        return out
+
+    section("load_balancers", load_balancers)
     section("password_policy", lambda: (_safe(iam.get_account_password_policy, missing=("NoSuchEntity",), default={}) or {}).get("PasswordPolicy"))
     if errors:
         b["collection_errors"] = errors
@@ -298,6 +322,11 @@ def collect_azure(subscription: str | None = None, *, require_flag: bool = True,
     section("activity_log_diagnostics", lambda: run("monitor", "diagnostic-settings", "subscription", "list"))
     section("role_assignments", lambda: run("role", "assignment", "list", "--all"))
     section("custom_roles", lambda: run("role", "definition", "list", "--custom-role-only", "true"))
+    # reachability inputs for the exposure engine (not CSPM checks themselves)
+    section("virtual_machines", lambda: run("vm", "list", "--show-details"))
+    section("network_interfaces", lambda: run("network", "nic", "list"))
+    section("virtual_networks", lambda: run("network", "vnet", "list"))
+    section("load_balancers", lambda: run("network", "lb", "list"))
     if errors:
         b["collection_errors"] = errors
     return b

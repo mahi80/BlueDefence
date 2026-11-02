@@ -1,0 +1,25 @@
+{
+ "SchemaVersion": 2,
+ "ArtifactName": "registry.bank/ledger:7.1",
+ "ArtifactType": "container_image",
+ "Results": [
+  {
+   "Target": "registry.bank/ledger:7.1 (debian 12)",
+   "Class": "os-pkgs",
+   "Vulnerabilities": [
+    {
+     "VulnerabilityID": "CVE-2021-44228",
+     "PkgName": "log4j-core",
+     "InstalledVersion": "2.14.1",
+     "Severity": "CRITICAL",
+     "Title": "Log4Shell",
+     "CVSS": {
+      "nvd": {
+       "V3Score": 10.0
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

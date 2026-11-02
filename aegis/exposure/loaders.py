@@ -21,7 +21,7 @@ from typing import Any
 from ..agents.orchestrator.walkers.graph import SENSITIVITY
 from ..posture.cspm import _open_ranges, _ports
 from ..posture.sources import PostureSourceError
-from .engine import ALL_PORTS, Asset, PortRanges, Settings, Vuln
+from .engine import ALL_PORTS, ANY_PORT, Asset, PortRanges, Settings, Vuln
 
 _TRUE = {"1", "true", "yes", "y"}
 PRIVATE = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
@@ -101,6 +101,31 @@ def _from_tenable(r: dict) -> list[Vuln]:
                  poc=bool(plugin.get("exploit_available")), source=f"tenable:{plugin.get('id', '?')}") for c in cves]
 
 
+def _image_keys(ref: str) -> list[str]:
+    """``registry.bank/team/app:1.2`` also matches ``app:1.2`` (how many scanners print it)."""
+    ref = ref.split("@")[0]
+    short = ref.rsplit("/", 1)[-1]
+    return [ref] + ([short] if short != ref else [])
+
+
+def _from_trivy(doc: dict) -> list[Vuln]:
+    """Trivy image report (``trivy image -f json``): package CVEs, judged by what the workload exposes."""
+    image = doc.get("ArtifactName") or "?"
+    keys = _image_keys(image)
+    out = []
+    for res in doc.get("Results") or []:
+        for v in res.get("Vulnerabilities") or []:
+            if str(v.get("Severity", "")).upper() in ("UNKNOWN", "LOW"):
+                continue
+            cvss = None
+            for src in (v.get("CVSS") or {}).values():
+                cvss = max(cvss or 0.0, float(src.get("V3Score") or 0)) or cvss
+            out.append(Vuln(asset=keys[0], asset_alt=keys[1:], cve=v.get("VulnerabilityID"),
+                            title=f"{v.get('PkgName', '?')} {v.get('InstalledVersion', '')}: {v.get('Title') or v.get('VulnerabilityID')}".strip(),
+                            port=ANY_PORT, cvss=cvss, source=f"trivy:{res.get('Target', image)}"))
+    return out
+
+
 def load_vulns(path: str | Path) -> list[Vuln]:
     p = Path(path)
     try:
@@ -111,6 +136,9 @@ def load_vulns(path: str | Path) -> list[Vuln]:
                              cvss=_f(row.get("cvss")), epss=_f(row.get("epss")), kev=_b(row.get("kev")),
                              poc=_b(row.get("poc")), source="csv")
                         for row in csv.DictReader(fh) if (row.get("asset") or "").strip()]
+        text = p.read_text(encoding="utf-8").lstrip()
+        if text.startswith("{") and '"Results"' in text[:20000] and '"ArtifactName"' in text[:20000]:
+            return _from_trivy(json.loads(text))
         out: list[Vuln] = []
         for r in _read_records(p):
             out += _from_tenable(r) if "plugin" in r else [Vuln(
@@ -202,7 +230,43 @@ def assets_from_aws(bundle: dict) -> list[Asset]:
                          role=role if role in SENSITIVITY else "server", public=bool(i.get("PublicIpAddress")),
                          internet_ports=internet, lateral=lateral, groups=groups,
                          waf=_b(tags.get("aegis:waf")), edr=_b(tags.get("aegis:edr")), source="aws"))
+    _apply_aws_load_balancers(bundle, sgs, out)
     return out
+
+
+def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> None:
+    """An internet-facing ALB / NLB makes its targets reachable on the target port, even when the
+    instance itself has no public address. ALB listeners must also be open in the LB's security
+    groups; an NLB without security groups passes every listener. An AWS WAF web ACL on the ALB
+    counts as a WAF in front of its targets."""
+    by_key = {k: a for a in assets for k in a.keys | {a.id}}
+    for lb in bundle.get("load_balancers") or []:
+        if lb.get("Scheme") != "internet-facing":
+            continue
+        name = lb.get("LoadBalancerName") or lb.get("LoadBalancerArn", "?")
+        lb_sgs = lb.get("SecurityGroups") or []
+        open_ranges: PortRanges = []
+        for gid in lb_sgs:
+            for perm in (sgs.get(gid) or {}).get("IpPermissions", []):
+                if _open_ranges(perm):
+                    pr = _ports(perm)
+                    open_ranges.append((0, 65535) if pr is None else pr)
+        for lst in lb.get("listeners") or []:
+            lp = lst.get("Port")
+            if lp is None or (lb_sgs and not any(lo <= lp <= hi for lo, hi in open_ranges)):
+                continue
+            for t in lb.get("targets") or []:
+                a = by_key.get(t.get("Id"))
+                tp = t.get("Port") or lp
+                if a is None:
+                    continue
+                r = (tp, tp)
+                if r not in a.internet_ports:
+                    a.internet_ports.append(r)
+                a.internet_via.setdefault(r, f"load balancer {name} (listener {lp} → port {tp})")
+                a.public = True
+                if lb.get("web_acl"):
+                    a.waf = True
 
 
 def assets_from_inventory(path: str | Path) -> list[Asset]:

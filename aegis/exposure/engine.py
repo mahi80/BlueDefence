@@ -34,6 +34,8 @@ REACH_RANK = {"internet": 3, "one_hop": 2, "local": 1, "isolated": 0}
 
 PortRanges = list[tuple[int, int]]
 ALL_PORTS: PortRanges = [(0, 65535)]
+# Image / package findings (Trivy) have no port: the component may sit behind any port the workload exposes.
+ANY_PORT = -1
 
 
 def in_ranges(port: int, ranges: PortRanges) -> bool:
@@ -45,7 +47,7 @@ class Vuln:
     asset: str                 # asset key: hostname, IP or instance id — matched against Asset.keys
     cve: str | None
     title: str
-    port: int | None = None
+    port: int | None = None    # None = local only, ANY_PORT = package finding (behind whatever the workload exposes)
     protocol: str = "tcp"
     cvss: float | None = None
     epss: float | None = None
@@ -64,6 +66,7 @@ class Asset:
     role: str = "server"                             # a blast-graph SENSITIVITY key (core_banking_db, payment_api, …)
     public: bool = False
     internet_ports: PortRanges = field(default_factory=list)   # port ranges open to the internet
+    internet_via: dict[tuple[int, int], str] = field(default_factory=dict)  # range -> "via load balancer X" etc.
     # (lo, hi, sources) reachable from inside the zone; sources = security-group ids allowed in, or "*" (any
     # host in the zone — a private CIDR rule, or the inventory's lateral_ports)
     lateral: list[tuple[int, int, frozenset[str]]] = field(default_factory=lambda: [(0, 65535, frozenset({"*"}))])
@@ -125,19 +128,46 @@ def _exploitable(v: Vuln, s: Settings) -> tuple[bool, str]:
     return False, f"no exploitation signal (not in KEV, {detail}, no public exploit)"
 
 
+def _internet_range(a: Asset, port: int) -> tuple[int, int] | None:
+    if not a.public:
+        return None
+    return next((r for r in a.internet_ports if r[0] <= port <= r[1]), None)
+
+
+def _via(a: Asset, r: tuple[int, int]) -> str:
+    v = a.internet_via.get(r)
+    return f"via {v}" if v else f"on {a.name or a.id} ({a.source})"
+
+
+def _zl(zone: str) -> str:
+    """Short zone label for reasons: an Azure VNet resource id prints as its name."""
+    return zone.rstrip("/").rsplit("/", 1)[-1] if "/" in zone else zone
+
+
 def _reach(v: Vuln, a: Asset, internet_assets_by_zone: dict[str, list[Asset]]) -> tuple[str, str]:
+    neighbours = [x for x in internet_assets_by_zone.get(a.zone, []) if x.id != a.id] if a.zone else []
+    if v.port == ANY_PORT:
+        # package-level finding: judge by what the workload exposes at all
+        if a.public and a.internet_ports:
+            r = a.internet_ports[0]
+            return "internet", (f"image / package finding on a workload reachable from the internet {_via(a, r)} "
+                                f"(port {r[0]}{'-' + str(r[1]) if r[1] != r[0] else ''})")
+        entry = [x for x in neighbours if any(a.reachable_from(lo, x) for lo, _hi, _s in a.lateral)]
+        if entry:
+            return "one_hop", f"image / package finding; workload reachable inside zone {_zl(a.zone)} from internet-facing {', '.join(x.name or x.id for x in entry[:3])}"
+        return "isolated", f"image / package finding; nothing exposes this workload to the internet or to internet-facing neighbours in {_zl(a.zone) or '?'}"
     if v.port is None:
         return "local", "no network-facing port: exploitable only after a foothold on the host"
-    if a.open_to_internet(v.port):
-        return "internet", f"port {v.port} is open to the internet on {a.name or a.id} ({a.source})"
-    neighbours = [x for x in internet_assets_by_zone.get(a.zone, []) if x.id != a.id] if a.zone else []
+    r = _internet_range(a, v.port)
+    if r:
+        return "internet", f"port {v.port} is reachable from the internet {_via(a, r)}"
     entry = [x for x in neighbours if a.reachable_from(v.port, x)]
     if entry:
-        return "one_hop", (f"port {v.port} reachable inside zone {a.zone} from internet-facing "
+        return "one_hop", (f"port {v.port} reachable inside zone {_zl(a.zone)} from internet-facing "
                            f"{', '.join(x.name or x.id for x in entry[:3])}")
     if not neighbours:
-        return "isolated", f"no internet path: nothing in zone {a.zone or '?'} faces the internet and port {v.port} is not exposed"
-    return "isolated", (f"port {v.port} is not exposed to the internet, and the internet-facing assets in zone {a.zone} "
+        return "isolated", f"no internet path: nothing in zone {_zl(a.zone) or '?'} faces the internet and port {v.port} is not exposed"
+    return "isolated", (f"port {v.port} is not exposed to the internet, and the internet-facing assets in zone {_zl(a.zone)} "
                         f"({', '.join(x.name or x.id for x in neighbours[:3])}) are not allowed to reach it")
 
 
@@ -148,7 +178,8 @@ def _defended(v: Vuln, a: Asset, s: Settings) -> tuple[str, str]:
     # Only controls that can stop the exploit count as a defence. EDR detects post-exploitation activity
     # but does not block the exploit itself, so it is reported, never used to lower the tier.
     edr = "; EDR on the host will see post-exploitation activity (detection, not prevention)" if a.edr else ""
-    if a.waf and v.port in WEB_PORTS:
+    web = v.port in WEB_PORTS or (v.port == ANY_PORT and any(lo <= p <= hi for lo, hi in a.internet_ports for p in WEB_PORTS))
+    if a.waf and web:
         return "partial", "WAF in front of the web port (generic rules, no CVE-specific virtual patch)" + edr
     if v.port is None:
         return "none", "no network control applies to a local vulnerability; patching is the fix" + edr
@@ -196,8 +227,12 @@ def assess(vulns: list[Vuln], assets: list[Asset], settings: Settings | None = N
         defended, why_d = _defended(v, a, s)
         crown = 0 if a.sensitivity >= CRITICAL else (1 if a.zone and a.zone in crown_zones else None)
         why_c = ("the asset is a crown jewel" if crown == 0 else
-                 f"shares zone {a.zone} with a crown-jewel asset" if crown == 1 else "no crown jewel in its zone")
+                 f"shares zone {_zl(a.zone)} with a crown-jewel asset" if crown == 1 else "no crown jewel in its zone")
         tier = _tier(exploitable, reach, defended, crown, v.cvss)
+        if v.port == ANY_PORT and tier == "ACT_NOW":
+            # a package CVE is not proven to sit on the exposed path (e.g. a libc flaw in a web image)
+            tier = "ACT"
+            why_r += "; capped at ACT until the vulnerable component is confirmed on the exposed path"
         out.append(Exposure(
             tier=tier, cve=v.cve, title=v.title, asset=a.id, asset_name=a.name or a.id, port=v.port,
             exploitable=exploitable, reach=reach, defended=defended, crown_distance=crown,
@@ -231,4 +266,4 @@ def summarize(exposures: list[Exposure]) -> dict[str, int]:
     return {t: c.get(t, 0) for t in TIERS}
 
 
-__all__ = ["ALL_PORTS", "TIERS", "Asset", "Exposure", "Settings", "Vuln", "assess", "funnel", "in_ranges", "summarize"]
+__all__ = ["ALL_PORTS", "ANY_PORT", "TIERS", "Asset", "Exposure", "Settings", "Vuln", "assess", "funnel", "in_ranges", "summarize"]

@@ -1,0 +1,4 @@
+asset,cve,title,port,cvss,epss,kev,poc
+i-app,CVE-2022-22965,Spring4Shell,8080,9.8,0.97,yes,yes
+i-mq,CVE-2023-46604,ActiveMQ OpenWire RCE,5672,10.0,0.97,yes,yes
+i-admin,CVE-2021-44228,Log4Shell,8443,10.0,0.94,yes,yes
