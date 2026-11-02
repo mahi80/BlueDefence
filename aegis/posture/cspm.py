@@ -266,5 +266,7 @@ def scan(bundle: dict) -> list[PostureFinding]:
 
 
 def coverage_gaps(bundle: dict) -> list[str]:
-    """Bundle sections that were not supplied, so the report never implies 'clean' for them."""
-    return [k for k in BUNDLE_KEYS if k not in bundle]
+    """Bundle sections that were not supplied (or that the collector was refused), so the report never
+    implies 'clean' for them. A refused section names the reason, e.g. an SCP explicit deny."""
+    errs = bundle.get("collection_errors") or {}
+    return [f"{k} (access denied or failed: {errs[k]})" if k in errs else k for k in BUNDLE_KEYS if k not in bundle]

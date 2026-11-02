@@ -112,61 +112,88 @@ def collect_aws_cspm(region: str | None = None, *, require_flag: bool = True) ->
     c = lambda svc: _boto3_client(svc, require_flag=require_flag, **({"region_name": region} if region else {}))
     sts, s3, s3c, ec2, rds, ct, kms, gd, cfg, iam = (c(s) for s in
         ("sts", "s3", "s3control", "ec2", "rds", "cloudtrail", "kms", "guardduty", "config", "iam"))
-    acct = sts.get_caller_identity()["Account"]
-    b: dict[str, Any] = {"account_id": acct, "region": ec2.meta.region_name}
-
-    b["account_public_access_block"] = _safe(s3c.get_public_access_block, AccountId=acct,
-                                             missing=("NoSuchPublicAccessBlockConfiguration",), default={}).get("PublicAccessBlockConfiguration")
-    buckets = []
-    for bk in s3.list_buckets().get("Buckets", []):
-        n = bk["Name"]
-        nf = ("NoSuchPublicAccessBlockConfiguration", "NoSuchBucketPolicy", "ServerSideEncryptionConfigurationNotFoundError")
-        buckets.append({
-            "Name": n,
-            "PublicAccessBlock": (_safe(s3.get_public_access_block, Bucket=n, missing=nf, default={}) or {}).get("PublicAccessBlockConfiguration"),
-            "PolicyStatus": (_safe(s3.get_bucket_policy_status, Bucket=n, missing=nf, default={}) or {}).get("PolicyStatus"),
-            "Acl": {"Grants": s3.get_bucket_acl(Bucket=n).get("Grants", [])},
-            "Encryption": (_safe(s3.get_bucket_encryption, Bucket=n, missing=nf, default={}) or {}).get("ServerSideEncryptionConfiguration"),
-            "Versioning": {"Status": s3.get_bucket_versioning(Bucket=n).get("Status")},
-            "Logging": s3.get_bucket_logging(Bucket=n).get("LoggingEnabled"),
-        })
-    b["buckets"] = buckets
-
+    acct = sts.get_caller_identity()["Account"]  # must succeed: no identity, no scan
+    region = ec2.meta.region_name
+    b: dict[str, Any] = {"account_id": acct, "region": region}
+    errors: dict[str, str] = {}
     page = lambda cl, op, key, **kw: [x for p in cl.get_paginator(op).paginate(**kw) for x in p.get(key, [])]
-    b["security_groups"] = page(ec2, "describe_security_groups", "SecurityGroups")
-    b["instances"] = [i for r in page(ec2, "describe_instances", "Reservations") for i in r.get("Instances", [])]
-    b["volumes"] = page(ec2, "describe_volumes", "Volumes")
-    b["ebs_encryption_by_default"] = ec2.get_ebs_encryption_by_default().get("EbsEncryptionByDefault")
-    flows = {f.get("ResourceId") for f in page(ec2, "describe_flow_logs", "FlowLogs")}
-    b["vpcs"] = [{"VpcId": v["VpcId"], "IsDefault": v.get("IsDefault"), "FlowLogs": [v["VpcId"]] if v["VpcId"] in flows else []}
-                 for v in page(ec2, "describe_vpcs", "Vpcs")]
-    b["db_instances"] = page(rds, "describe_db_instances", "DBInstances")
 
-    # Include shadow trails: a multi-region trail homed in another region still covers this one.
-    # Its status has to be read from its home region.
-    trails, home_clients = [], {ec2.meta.region_name: ct}
-    for t in ct.describe_trails(includeShadowTrails=True).get("trailList", []):
-        home = t.get("HomeRegion") or ec2.meta.region_name
-        if home not in home_clients:
-            home_clients[home] = _boto3_client("cloudtrail", require_flag=require_flag, region_name=home)
-        st = home_clients[home].get_trail_status(Name=t["TrailARN"])
-        trails.append({**t, "IsLogging": st.get("IsLogging"), "KmsKeyId": t.get("KmsKeyId")})
-    b["trails"] = trails
+    def section(key: str, fn: Any) -> None:
+        """Collect one bundle section. An AWS API refusal (an SCP explicit deny, a missing permission)
+        drops only that section and records why, so the report says "not checked: access denied"
+        instead of the whole scan failing. Anything that is not an AWS API error still propagates."""
+        try:
+            b[key] = fn()
+        except Exception as e:
+            err = getattr(e, "response", None)
+            if not isinstance(err, dict) or "Error" not in err:
+                raise
+            errors[key] = f"{err['Error'].get('Code', 'Error')}: {str(err['Error'].get('Message', ''))[:200]}"
 
-    keys = []
-    for k in page(kms, "list_keys", "Keys"):
-        meta = kms.describe_key(KeyId=k["KeyId"])["KeyMetadata"]
-        if meta.get("KeyManager") == "CUSTOMER" and meta.get("KeyState") == "Enabled":
-            rot = _safe(kms.get_key_rotation_status, KeyId=k["KeyId"], missing=("UnsupportedOperationException",), default={})
-            meta["KeyRotationEnabled"] = (rot or {}).get("KeyRotationEnabled")
-        keys.append({x: meta.get(x) for x in ("KeyId", "Arn", "KeyManager", "KeyState", "KeySpec", "KeyRotationEnabled")})
-    b["kms_keys"] = keys
+    def buckets() -> list:
+        out = []
+        nf = ("NoSuchPublicAccessBlockConfiguration", "NoSuchBucketPolicy", "ServerSideEncryptionConfigurationNotFoundError")
+        for bk in s3.list_buckets().get("Buckets", []):
+            n = bk["Name"]
+            out.append({
+                "Name": n,
+                "PublicAccessBlock": (_safe(s3.get_public_access_block, Bucket=n, missing=nf, default={}) or {}).get("PublicAccessBlockConfiguration"),
+                "PolicyStatus": (_safe(s3.get_bucket_policy_status, Bucket=n, missing=nf, default={}) or {}).get("PolicyStatus"),
+                "Acl": {"Grants": s3.get_bucket_acl(Bucket=n).get("Grants", [])},
+                "Encryption": (_safe(s3.get_bucket_encryption, Bucket=n, missing=nf, default={}) or {}).get("ServerSideEncryptionConfiguration"),
+                "Versioning": {"Status": s3.get_bucket_versioning(Bucket=n).get("Status")},
+                "Logging": s3.get_bucket_logging(Bucket=n).get("LoggingEnabled"),
+            })
+        return out
 
-    b["guardduty_detectors"] = [{"DetectorId": d, "Status": gd.get_detector(DetectorId=d).get("Status")}
-                                for d in gd.list_detectors().get("DetectorIds", [])]
-    statuses = {s["name"]: s.get("recording") for s in cfg.describe_configuration_recorder_status().get("ConfigurationRecordersStatus", [])}
-    b["config_recorders"] = [{"name": n, "recording": r} for n, r in statuses.items()]
-    b["password_policy"] = (_safe(iam.get_account_password_policy, missing=("NoSuchEntity",), default={}) or {}).get("PasswordPolicy")
+    def vpcs() -> list:
+        flows = {f.get("ResourceId") for f in page(ec2, "describe_flow_logs", "FlowLogs")}
+        return [{"VpcId": v["VpcId"], "IsDefault": v.get("IsDefault"), "FlowLogs": [v["VpcId"]] if v["VpcId"] in flows else []}
+                for v in page(ec2, "describe_vpcs", "Vpcs")]
+
+    def trails() -> list:
+        # Include shadow trails: a multi-region trail homed in another region still covers this one.
+        # Its status has to be read from its home region.
+        out, home_clients = [], {region: ct}
+        for t in ct.describe_trails(includeShadowTrails=True).get("trailList", []):
+            home = t.get("HomeRegion") or region
+            if home not in home_clients:
+                home_clients[home] = _boto3_client("cloudtrail", require_flag=require_flag, region_name=home)
+            st = home_clients[home].get_trail_status(Name=t["TrailARN"])
+            out.append({**t, "IsLogging": st.get("IsLogging"), "KmsKeyId": t.get("KmsKeyId")})
+        return out
+
+    def kms_keys() -> list:
+        out = []
+        for k in page(kms, "list_keys", "Keys"):
+            meta = kms.describe_key(KeyId=k["KeyId"])["KeyMetadata"]
+            if meta.get("KeyManager") == "CUSTOMER" and meta.get("KeyState") == "Enabled":
+                rot = _safe(kms.get_key_rotation_status, KeyId=k["KeyId"], missing=("UnsupportedOperationException",), default={})
+                meta["KeyRotationEnabled"] = (rot or {}).get("KeyRotationEnabled")
+            out.append({x: meta.get(x) for x in ("KeyId", "Arn", "KeyManager", "KeyState", "KeySpec", "KeyRotationEnabled")})
+        return out
+
+    def recorders() -> list:
+        st = {s["name"]: s.get("recording") for s in cfg.describe_configuration_recorder_status().get("ConfigurationRecordersStatus", [])}
+        return [{"name": n, "recording": r} for n, r in st.items()]
+
+    section("account_public_access_block", lambda: _safe(s3c.get_public_access_block, AccountId=acct,
+            missing=("NoSuchPublicAccessBlockConfiguration",), default={}).get("PublicAccessBlockConfiguration"))
+    section("buckets", buckets)
+    section("security_groups", lambda: page(ec2, "describe_security_groups", "SecurityGroups"))
+    section("instances", lambda: [i for r in page(ec2, "describe_instances", "Reservations") for i in r.get("Instances", [])])
+    section("volumes", lambda: page(ec2, "describe_volumes", "Volumes"))
+    section("ebs_encryption_by_default", lambda: ec2.get_ebs_encryption_by_default().get("EbsEncryptionByDefault"))
+    section("vpcs", vpcs)
+    section("db_instances", lambda: page(rds, "describe_db_instances", "DBInstances"))
+    section("trails", trails)
+    section("kms_keys", kms_keys)
+    section("guardduty_detectors", lambda: [{"DetectorId": d, "Status": gd.get_detector(DetectorId=d).get("Status")}
+                                            for d in gd.list_detectors().get("DetectorIds", [])])
+    section("config_recorders", recorders)
+    section("password_policy", lambda: (_safe(iam.get_account_password_policy, missing=("NoSuchEntity",), default={}) or {}).get("PasswordPolicy"))
+    if errors:
+        b["collection_errors"] = errors
     return b
 
 
@@ -232,30 +259,45 @@ def collect_azure(subscription: str | None = None, *, require_flag: bool = True,
         raise PostureSourceError("live posture collection is off; set AEGIS_POSTURE_LIVE=1 or pass --bundle FILE")
     run = _az_runner(az, subscription, timeout_s)
 
-    acct = run("account", "show")
+    acct = run("account", "show")  # must succeed: no subscription, no scan
     b: dict[str, Any] = {"subscription": {"id": acct.get("id"), "name": acct.get("name"), "tenant": acct.get("tenantId")}}
-    b["storage_accounts"] = run("storage", "account", "list")
-    b["network_security_groups"] = run("network", "nsg", "list")
+    errors: dict[str, str] = {}
 
-    sql = run("sql", "server", "list")
-    for s in sql:
-        rg, nm = s.get("resourceGroup"), s.get("name")
-        s["firewall_rules"] = run("sql", "server", "firewall-rule", "list", "--resource-group", rg, "--server", nm)
-        s["audit_state"] = (run("sql", "server", "audit-policy", "show", "--resource-group", rg, "--name", nm) or {}).get("state")
-    b["sql_servers"] = sql
+    def section(key: str, fn: Any) -> None:
+        """One bundle section. An az refusal (missing role, Azure Policy deny, provider not registered)
+        drops only that section and records why; the report shows it as not checked, never clean."""
+        try:
+            b[key] = fn()
+        except PostureSourceError as e:
+            errors[key] = str(e)[:300]
 
-    for key, svc in (("postgres_servers", "postgres"), ("mysql_servers", "mysql")):
+    def sql() -> list:
+        servers = run("sql", "server", "list")
+        for s in servers:
+            rg, nm = s.get("resourceGroup"), s.get("name")
+            s["firewall_rules"] = run("sql", "server", "firewall-rule", "list", "--resource-group", rg, "--server", nm)
+            s["audit_state"] = (run("sql", "server", "audit-policy", "show", "--resource-group", rg, "--name", nm) or {}).get("state")
+        return servers
+
+    def flexible(svc: str) -> list:
         servers = run(svc, "flexible-server", "list")
         for s in servers:
             s["firewall_rules"] = run(svc, "flexible-server", "firewall-rule", "list",
                                       "--resource-group", s.get("resourceGroup"), "--name", s.get("name"))
-        b[key] = servers
+        return servers
 
-    b["key_vaults"] = [run("keyvault", "show", "--name", v.get("name"), "--resource-group", v.get("resourceGroup"))
-                       for v in run("keyvault", "list")]
-    b["aks_clusters"] = run("aks", "list")
-    b["defender_plans"] = run("security", "pricing", "list")
-    b["activity_log_diagnostics"] = run("monitor", "diagnostic-settings", "subscription", "list")
-    b["role_assignments"] = run("role", "assignment", "list", "--all")
-    b["custom_roles"] = run("role", "definition", "list", "--custom-role-only", "true")
+    section("storage_accounts", lambda: run("storage", "account", "list"))
+    section("network_security_groups", lambda: run("network", "nsg", "list"))
+    section("sql_servers", sql)
+    section("postgres_servers", lambda: flexible("postgres"))
+    section("mysql_servers", lambda: flexible("mysql"))
+    section("key_vaults", lambda: [run("keyvault", "show", "--name", v.get("name"), "--resource-group", v.get("resourceGroup"))
+                                   for v in run("keyvault", "list")])
+    section("aks_clusters", lambda: run("aks", "list"))
+    section("defender_plans", lambda: run("security", "pricing", "list"))
+    section("activity_log_diagnostics", lambda: run("monitor", "diagnostic-settings", "subscription", "list"))
+    section("role_assignments", lambda: run("role", "assignment", "list", "--all"))
+    section("custom_roles", lambda: run("role", "definition", "list", "--custom-role-only", "true"))
+    if errors:
+        b["collection_errors"] = errors
     return b

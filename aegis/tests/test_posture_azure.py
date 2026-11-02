@@ -173,10 +173,21 @@ def test_collected_bundle_matches_export_and_is_read_only(monkeypatch, az_cli, b
     assert all(c[-2:] == ["--subscription", "bank-prod-centralindia"] for c in az_cli)
 
 
-def test_az_permission_error_is_not_swallowed(monkeypatch, bundle):
+def test_az_permission_error_drops_one_section(monkeypatch, bundle):
     monkeypatch.setenv("AEGIS_POSTURE_LIVE", "1")
     monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/az")
     monkeypatch.setattr(subprocess, "run", fake_az(bundle, [], fail="role assignment"))
+    b = sources.collect_azure()
+    assert "role_assignments" not in b and "AuthorizationFailed" in b["collection_errors"]["role_assignments"]
+    ids = {f.id for f in az.scan(b)}
+    assert "AZ-RBAC-STANDING-PRIVILEGE" not in ids and "AZ-SQL-OPEN-TO-INTERNET" in ids
+    assert any(g.startswith("role_assignments (access denied") for g in az.coverage_gaps(b))
+
+
+def test_az_account_show_failure_stops_the_collection(monkeypatch, bundle):
+    monkeypatch.setenv("AEGIS_POSTURE_LIVE", "1")
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/az")
+    monkeypatch.setattr(subprocess, "run", fake_az(bundle, [], fail="account show"))
     with pytest.raises(sources.PostureSourceError, match="AuthorizationFailed"):
         sources.collect_azure()
 
