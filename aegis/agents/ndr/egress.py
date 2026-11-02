@@ -385,6 +385,9 @@ class EgressDetector:
         known = handshake_seen or key is not None          # this connection's handshake was already counted
         sni = str(ev.get("sni") or "").strip().lower().strip(".")
         key = key or sni or dst
+        # Known limit: the SNI is client-chosen, so a forged allow-listed SNI on a clean IP also skips the
+        # volume (exfil) heuristic here. Closing it needs certificate-to-SNI verification; intel hits on the
+        # IP / JA3S / certificate are still caught at the handshake.
         if self._allowed_domain(sni) or self._allowed_domain(key):
             return []
         p = self._pair(src, key, ts)
