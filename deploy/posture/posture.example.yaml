@@ -4,6 +4,9 @@ interval_minutes: 1440                  # only used with --loop; the systemd tim
 keep_runs: 365                          # one year of dated assessment records
 waivers: /etc/aegis/waivers.yaml        # the exception register (reason, approver, expiry)
 sla_days: {critical: 7, high: 30, medium: 90, low: 180}
+# ACT NOW exposures get a remediation proposal through the approval queue (AEGIS_HITL_TRANSPORT in
+# /etc/aegis/posture.env: dashboard | servicenow | file); the next run verifies the path closed.
+remediation: {enabled: true, tiers: [ACT_NOW]}
 
 scans:
   - name: aws-prod-iam
@@ -32,3 +35,12 @@ scans:
     type: iac
     plan: /var/lib/aegis/exports/infra-repo/plan.json
     k8s: [/var/lib/aegis/exports/infra-repo/k8s]
+  - name: exposure-prod
+    type: exposure
+    vulns: [/var/lib/aegis/exports/tenable]              # Tenable / Qualys CSV / Trivy JSON
+    aws_bundles: [/var/lib/aegis/exports/aws-prod-aps1.json]
+    azure_bundles: [/var/lib/aegis/exports/azure-prod/azure.json]
+    k8s_exports: [eks-payments=/var/lib/aegis/exports/eks-payments.json]
+    kev: /var/lib/aegis/feeds/known_exploited_vulnerabilities.json
+    epss: /var/lib/aegis/feeds/epss_scores.csv
+    waf_coverage: [/var/lib/aegis/exports/waf-coverage.json]   # python -m aegis.exposure.coverage

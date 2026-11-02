@@ -56,6 +56,7 @@ class RunnerConfig:
     sla_days: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_SLA_DAYS))
     interval_minutes: int = 1440
     keep_runs: int = 90
+    remediation: dict[str, Any] = field(default_factory=dict)   # exposure proposals: {enabled, tiers}
 
 
 def load_config(path: str | Path, *, store: str | Path | None = None) -> RunnerConfig:
@@ -95,7 +96,7 @@ def load_config(path: str | Path, *, store: str | Path | None = None) -> RunnerC
     sla = {**DEFAULT_SLA_DAYS, **{k: int(v) for k, v in (raw.get("sla_days") or {}).items() if k in SEVERITY_ORDER}}
     return RunnerConfig(store=store_path, scans=scans, waivers=rel(raw["waivers"]) if raw.get("waivers") else None,
                         sla_days=sla, interval_minutes=int(raw.get("interval_minutes") or 1440),
-                        keep_runs=int(raw.get("keep_runs") or 90))
+                        keep_runs=int(raw.get("keep_runs") or 90), remediation=dict(raw.get("remediation") or {}))
 
 
 # ---- executing one scan ---------------------------------------------------------------------------
@@ -175,8 +176,25 @@ def _write_atomic(p: Path, text: str) -> None:
     os.replace(tmp, p)
 
 
-def run_once(cfg: RunnerConfig, *, now: datetime | None = None) -> dict:
-    """Execute every scan, diff against the previous run, persist, and return the run record."""
+_FROM_ENV = object()
+
+
+def _remediation_hitl(hitl: Any) -> Any:
+    if hitl is not _FROM_ENV:
+        return hitl
+    from ..hitl.dashboard import hitl_from_env
+    try:
+        return hitl_from_env()
+    except Exception as e:  # noqa: BLE001 - no approval channel still leaves the proposals visible
+        logger.warning("remediation approval channel unavailable: %s", e)
+        return None
+
+
+def run_once(cfg: RunnerConfig, *, now: datetime | None = None, hitl: Any = _FROM_ENV) -> dict:
+    """Execute every scan, diff against the previous run, persist, and return the run record.
+
+    With an exposure scan configured, ACT NOW findings also get remediation proposals filed through
+    ``hitl`` (default: the deployment's ``AEGIS_HITL_TRANSPORT``) and approved ones are re-tested."""
     now = now or datetime.now(UTC)
     store = cfg.store
     run_id = now.strftime("%Y%m%dT%H%M%S") + f"{now.microsecond // 1000:03d}Z"
@@ -273,6 +291,15 @@ def run_once(cfg: RunnerConfig, *, now: datetime | None = None) -> dict:
         "open": open_rows, "resolved": resolved, "waived": waived_rows, "notes": waiver_notes,
     }
 
+    rem_cfg = cfg.remediation
+    if any(sc.type == "exposure" for sc in cfg.scans) and rem_cfg.get("enabled", True):
+        from ..exposure import remediation
+        tiers = tuple(str(t).upper() for t in rem_cfg.get("tiers") or ["ACT_NOW"])
+        section = remediation.reconcile(store, record, hitl=_remediation_hitl(hitl), now=now, tiers=tiers)
+        record["remediation"] = section
+        record["notes"] = record["notes"] + section["notes"]
+        remediation.save(store, section)
+
     _write_atomic(store / "runs" / f"{run_id}.json", json.dumps(record, indent=1))
     _write_atomic(store / "runs" / f"{run_id}.md", report_markdown(record))
     _write_atomic(store / "state.json", json.dumps(state, indent=1))
@@ -345,8 +372,11 @@ def report_markdown(r: dict) -> str:
     if r["waived"]:
         L += ["", "## Accepted risk (waivers in force)", "", "| Finding | Resource | Reason | Approved by | Expires |", "|---|---|---|---|---|"]
         L += [f"| {w['id']} | {w['affected_component']} | {w['waiver']['reason']} | {w['waiver']['approved_by']} | {w['waiver']['expires']} |" for w in r["waived"]]
+    if r.get("remediation"):
+        from ..exposure.remediation import markdown as remediation_md
+        L += remediation_md(r["remediation"])
     if r["notes"]:
-        L += ["", "## Waiver register notes", ""] + [f"- {n}" for n in r["notes"]]
+        L += ["", "## Notes", ""] + [f"- {n}" for n in r["notes"]]
     L += ["", "---", ("Method: automated configuration review against CIS AWS Foundations v2.0, CIS Kubernetes v1.9 and the "
                       "Kubernetes Pod Security Standards, plus BlueDefence policy rules. Read-only collection. Penetration testing of "
                       "production remains with the bank's empanelled auditor; this report tracks configuration exposure continuously "
