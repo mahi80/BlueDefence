@@ -1,4 +1,5 @@
 import type { Chain, ChainSummary, Approval, Proposal } from "./types";
+import { cached, SNAPSHOT_TTL_MS } from "./cache";
 import fixtureChains from "../fixtures/chains.json";
 import fixtureApprovals from "../fixtures/approvals.json";
 import fixtureProposals from "../fixtures/proposals.json";
@@ -51,22 +52,32 @@ export async function getChain(id: string): Promise<Chain | null> {
 }
 
 export async function listApprovals(): Promise<Approval[]> {
-  const live = await backend<{ approvals?: Approval[] } | Approval[]>("/api/approvals", fixtureApprovals as Approval[], []);
-  return (Array.isArray(live) ? live : (live.approvals ?? [])) as Approval[];
+  if (USE_FIXTURES) return fixtureApprovals as Approval[];
+  // Cached + coalesced so every watching analyst shares one detector fetch (see lib/cache.ts).
+  return cached("approvals", SNAPSHOT_TTL_MS, async () => {
+    const live = await backend<{ approvals?: Approval[] } | Approval[]>("/api/approvals", fixtureApprovals as Approval[], []);
+    return (Array.isArray(live) ? live : (live.approvals ?? [])) as Approval[];
+  });
 }
 
 export async function listProposals(): Promise<Proposal[]> {
-  const live = await backend<{ proposals?: Proposal[] } | Proposal[]>("/api/soc/proposals", fixtureProposals as Proposal[], []);
-  return (Array.isArray(live) ? live : (live.proposals ?? [])) as Proposal[];
+  if (USE_FIXTURES) return fixtureProposals as Proposal[];
+  return cached("proposals", SNAPSHOT_TTL_MS, async () => {
+    const live = await backend<{ proposals?: Proposal[] } | Proposal[]>("/api/soc/proposals", fixtureProposals as Proposal[], []);
+    return (Array.isArray(live) ? live : (live.proposals ?? [])) as Proposal[];
+  });
 }
 
-// Full chains for the live map. Fixtures carry the whole chain; against the
-// backend we list summaries then hydrate the most recent few.
+// Full chains for the live map. Fixtures carry the whole chain; against the backend we list summaries
+// then hydrate the most recent few — an N+1 that is shared across all analysts by the snapshot cache,
+// so the detector sees one list + hydrate per TTL window regardless of how many are watching.
 export async function getRecentChains(): Promise<Chain[]> {
   if (USE_FIXTURES) return CHAINS;
-  const summaries = await listChains();
-  const full = await Promise.all(summaries.slice(0, 40).map((s) => getChain(s.chain_id)));
-  return full.filter((c): c is Chain => c !== null);
+  return cached("recent-chains", SNAPSHOT_TTL_MS, async () => {
+    const summaries = await listChains();
+    const full = await Promise.all(summaries.slice(0, 40).map((s) => getChain(s.chain_id)));
+    return full.filter((c): c is Chain => c !== null);
+  });
 }
 
 export const isFixtureMode = USE_FIXTURES;
