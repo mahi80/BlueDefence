@@ -147,4 +147,36 @@ waivers:
 A ready-to-copy GitHub Actions workflow is in `deploy/ci/bluedefence-iac-gate.yml` (OIDC read-only plan
 role, gate on `high`, report in the job summary).
 
+## The VAPT loop (`run`) and the console Posture tab
+
+`posture.yaml` lists every scan, the waiver register, the remediation SLA per severity and where results
+are stored (sample: `samples/posture.yaml`). Paths are relative to the config file.
+
+```bash
+python -m aegis.posture run --config /etc/aegis/posture.yaml              # one run (cron / systemd timer)
+python -m aegis.posture run --config /etc/aegis/posture.yaml --loop       # or keep running every interval_minutes
+python -m aegis.posture run --config posture.yaml --fail-on-overdue       # exit 1 if anything is past SLA
+```
+
+Each run:
+
+- executes every scan (export or `live: true`); **one failing scan never stops the others**;
+- applies the single waiver register to all findings — if the register cannot be read, **nothing is
+  waived** and the run says so (fail safe: more findings, never fewer);
+- fingerprints every finding → **new**, **still open** (first-seen date, age), **resolved**. A fixed
+  problem that comes back is new again, with a fresh SLA. A waived finding keeps its true first-seen
+  date, so when the waiver lapses the SLA clock has not reset;
+- a scan that **fails** carries its previous findings forward marked **stale** — never "resolved";
+- checks every open finding against `sla_days` (default critical 7, high 30, medium 90, low 180);
+- writes `runs/<run_id>.json`, a VAPT-style `runs/<run_id>.md` (summary, scope, past-SLA, new, every open
+  finding with evidence / fix / control, resolved, accepted risk), `state.json`, and `latest.json`.
+
+The SOC console's **Posture** tab reads `latest.json` from `AEGIS_POSTURE_DIR` (same SOC host; no new
+backend endpoint, no cloud credentials near the console): past-SLA criticals first, filters by scan /
+severity / past SLA / new, finding detail with the fix and control, accepted risk, resolved since last
+run. Without `AEGIS_POSTURE_DIR` a live console says posture is not connected; with no backend at all it
+shows the sample run. Timestamps render in `NEXT_PUBLIC_AEGIS_TZ` (default `Asia/Kolkata`).
+
+Systemd units for a daily run are in `deploy/posture/`.
+
 Exit codes: `0` ok, `1` a finding at or above `--fail-on`, `2` bad or missing input.

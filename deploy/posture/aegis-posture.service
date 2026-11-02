@@ -1,0 +1,23 @@
+# One posture run (the VAPT loop). Triggered daily by aegis-posture.timer.
+#   install: cp aegis-posture.{service,timer} /etc/systemd/system/ && systemctl enable --now aegis-posture.timer
+[Unit]
+Description=BlueDefence posture scan (IAM, CSPM, Kubernetes, IaC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aegis
+Group=aegis
+EnvironmentFile=-/etc/aegis/posture.env
+# exports are dropped into /var/lib/aegis/exports by the bank's cloud / platform teams;
+# results land in the store named in posture.yaml (the console reads its latest.json)
+ExecStart=/opt/aegis/venv/bin/python -m aegis.posture run --config /etc/aegis/posture.yaml
+WorkingDirectory=/opt/aegis
+# read-only scanner: no new privileges, private tmp, the rest of the filesystem read-only
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/aegis/posture
+TimeoutStartSec=30min

@@ -149,6 +149,10 @@ export default function Console({
           <span className="logo"><b>AEGIS</b> SOC</span>
           <span className="tag">autonomous defense · human-in-the-loop</span>
         </div>
+        <nav className="tabs" aria-label="Views">
+          <a href="/" aria-current="page">Incidents</a>
+          <a href="/posture">Posture</a>
+        </nav>
         <div className="live">
           <span className="pulse-dot" aria-hidden style={backendError ? { background: "var(--v-malicious)" } : undefined} />{" "}
           {fixtureMode ? "sample stream" : backendError ? `backend unreachable · ${backendError}` : "live"}

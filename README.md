@@ -38,6 +38,10 @@ cadence. Full technical detail: [`aegis/README.md`](aegis/README.md).
 | Egress | Zeek / Suricata TLS metadata, proxy logs | C2 beacons, slow exfiltration, known-bad certificates, shadow AI and uncensored-model pulls |
 | Identity & endpoints | SIEM (Sentinel / Splunk), EDR, IdP | privileged-engineer compromise (DevOps / SRE), crown-jewel access and control changes outside a ticketed window |
 | Payments | core-banking / treasury streams | outflow guard and circuit breaker: high-value transfers to new beneficiaries, drain bursts (the Oct 2026 Binance pattern) |
+| **Cloud & identity posture** (CSPM, IAM review) | AWS exports from the bank's own read-only role, or live read-only APIs | public buckets and databases, internet-open DB / admin ports, IMDSv1, logging and encryption gaps; standing admin users, stale keys, missing MFA, roles anyone can assume — CIS AWS Foundations v2.0 |
+| **Kubernetes posture** | `kubectl get … -o json` export (never secrets), or live read-only `kubectl` | privileged / host-mounting workloads, pods holding cluster-admin tokens, plaintext secrets in manifests, anonymous and wildcard RBAC, namespaces with no NetworkPolicy — CIS Kubernetes v1.9 + Pod Security Standards |
+| **DevSecOps / policy-as-code** | Terraform plans and Kubernetes YAML in CI | the same rules and IDs as runtime block the pull request; exceptions only through a waiver register with reason, approver and expiry |
+| **Continuous VAPT tracking** | all of the above, on a schedule | new / still open / resolved per run, remediation SLA by severity, a dated assessment report per run, and a **Posture** tab in the SOC console |
 | **Network operations** | Cisco IOS / NX-OS syslog, SNMP traps, NetFlow / IPFIX, gNMI telemetry, RANCID / Oxidized configs, LLDP / CDP | topology-aware root cause, alarm suppression (53 → 1 on a fibre cut), flaps, congestion, device silence, **bad config push** detection with rollback |
 | AI governance | ACP governance events (optional) | the SOC brain itself runs as a governed agent under ACP |
 
