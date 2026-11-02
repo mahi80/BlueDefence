@@ -114,7 +114,7 @@ def from_cloudflare(zones: list[str], token: str, transport: Transport = httpx_t
         if not proxied:
             continue
 
-        def phase(name: str) -> list[dict]:
+        def phase(name: str, z: str = z) -> list[dict]:
             res = call(transport, "GET", f"{base}/zones/{z}/rulesets/phases/{name}/entrypoint", headers=hdr, expect=(404,))
             return [] if res.status == 404 else ((res.json().get("result") or {}).get("rules") or [])  # 404: no ruleset in this phase
 
