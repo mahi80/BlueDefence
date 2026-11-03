@@ -35,7 +35,7 @@ logger = logging.getLogger("aegis.finetune.hot_reload")
 class ReloadResult:
     """What a reload attempt did. ``changed`` is True only when the live model actually swapped."""
     changed: bool
-    mode: str = "noop"            # set_model | restart_required | noop
+    mode: str = "noop"            # set_model | restart_required | refused | noop
     run: str = ""
     adapter: str = ""
     served_model: str = ""
@@ -113,6 +113,12 @@ def apply_reload(primary: Any, prev_key: str, ptr: Optional[dict]) -> ReloadResu
     adapter = str(ptr.get("adapter", ""))
     if key and key == prev_key:
         return ReloadResult(changed=False, mode="noop", run=run, adapter=adapter, key=key, detail="unchanged")
+    if adapter and os.path.isdir(adapter) and ptr.get("sha256"):
+        from aegis.finetune.digest import verify_adapter
+        ok, why = verify_adapter(adapter, str(ptr.get("sha256")))
+        if not ok:                   # tampered or swapped after approval: keep the running model
+            logger.error("[hot_reload] promotion run=%s refused: %s", run, why)
+            return ReloadResult(changed=False, mode="refused", run=run, adapter=adapter, key=key, detail=why)
     served = served_name(ptr)
     if served and swap_in_place(primary, served):
         logger.info("[hot_reload] swapped triage model → run=%s served=%s (no restart)", run, served)

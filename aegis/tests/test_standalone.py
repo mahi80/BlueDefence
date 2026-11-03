@@ -56,7 +56,10 @@ def test_exposure_proposal_approved_in_the_console_with_no_dashboard(tmp_path):
 def test_model_promotion_round_trip_through_the_local_queue(tmp_path):
     runs = tmp_path / "runs"
     st = rt.State(runs / "retrain" / "state.json")
-    st.runs["r1"] = {"stage": "shadowed", "adapter": str(tmp_path / "ad"), "sha256": "abc",
+    from aegis.finetune.digest import adapter_digest
+    (tmp_path / "ad").mkdir()
+    (tmp_path / "ad" / "adapter_model.safetensors").write_bytes(b"w" * 64)
+    st.runs["r1"] = {"stage": "shadowed", "adapter": str(tmp_path / "ad"), "sha256": adapter_digest(tmp_path / "ad"),
                      "stages": {"gated": {"summary": "ok"}, "shadowed": {"verdict": "ready", "n": 40, "why": "better"}}}
     st.runs["r0-failed"] = {"stage": "trained", "adapter": "bad", "stages": {"gated": {"summary": "FAIL"}}}
     st.save()

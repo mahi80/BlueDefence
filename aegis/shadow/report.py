@@ -176,9 +176,12 @@ def _target_matches(target: str, patterns: Iterable[str]) -> bool:
 
 
 def _human_signal(action_type: str, decisions: list[dict]) -> str:
-    """``agree`` / ``disagree`` / ``unreviewed`` for one receipt."""
-    exact = [d for d in decisions if str(d.get("action_type") or "") == action_type]
-    pool = exact or decisions
+    """``agree`` / ``disagree`` / ``unreviewed`` for one receipt.
+
+    Only a decision on this same action type counts: approving ``monitor`` on an alert says nothing about
+    the ``throttle`` that was shadowed on it (the old fallback to any decision let one action's approvals
+    justify flipping another live)."""
+    pool = [d for d in decisions if str(d.get("action_type") or "") == action_type]
     if not pool:
         return "unreviewed"
     states = {str(d.get("decision") or d.get("status") or "").lower() for d in pool}

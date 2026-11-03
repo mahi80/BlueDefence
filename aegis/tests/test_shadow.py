@@ -102,7 +102,7 @@ def test_report_groups_judges_and_orders_flip_candidates():
     for i in range(24):
         receipts.append(_receipt(i, day=i * 16 // 23, alert=f"AL-T{i}"))
         if i % 2 == 0:
-            decisions[f"AL-T{i}"] = [{"action_type": "block", "decision": "approved"}]   # alert-level confirmation
+            decisions[f"AL-T{i}"] = [{"action_type": "throttle", "decision": "approved"}]
     # challenge via waf: enough volume, one explicit rejection → not yet
     for i in range(30):
         receipts.append(_receipt(100 + i, action="challenge", day=i, alert=f"AL-C{i}"))
@@ -197,3 +197,12 @@ def test_main_py_wiring_imports():
         reg.apply(RecommendedAction(action_type="monitor", target="x", reasoning="r", requires_hitl=False, confidence=0.5),
                   alert_id="A")
         assert log.events == 1 and time.time() - list(ReceiptLog.read(log.path))[0]["recorded_at"] < 60
+
+
+def test_approving_another_action_is_not_agreement():
+    """20 throttle receipts; the analyst only ever approved `monitor` on those alerts → nothing reviewed."""
+    receipts = [_receipt(i, day=i, alert=f"AL-{i}") for i in range(20)]
+    decisions = {f"AL-{i}": [{"action_type": "monitor", "decision": "approved"}] for i in range(20)}
+    rep = build_report(receipts, decisions_by_alert=decisions)
+    g = next(g for g in rep.groups if g.action_type == "throttle")
+    assert (g.agree, g.unreviewed) == (0, 20) and g.verdict != "ready"
