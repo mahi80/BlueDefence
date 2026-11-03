@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Optional
 
@@ -113,6 +114,8 @@ def _normalise_triage(decision: dict) -> dict:
         decision.setdefault("reason", "Triage gave no next step; investigating")
     try:
         c = float(decision.get("confidence"))
+        if not math.isfinite(c):
+            raise ValueError("non-finite")           # max(0, min(1, nan)) is 1.0 (review round 4 O4-10)
         decision["confidence"] = max(0.0, min(1.0, c))
     except (TypeError, ValueError):
         decision.pop("confidence", None)
@@ -120,21 +123,55 @@ def _normalise_triage(decision: dict) -> dict:
 
 
 
+_SCAN_CHUNK, _SCAN_MAX = 200_000, 4_000_000
+
+
+def _alert_carries_injection(alert: Any) -> bool:
+    """Injection text or hidden / bidi characters anywhere in the alert. It used to read only the first 200 KB
+    and only ``injection_detected``: an RLO file name (``invoice\u202etxt.exe``) or text after 200 KB of padding
+    left the host-route (Sysmon → EDR) chain unflagged (review round 4 O4-7). An alert too large to scan whole
+    counts as flagged."""
+    try:
+        text = json.dumps(alert, default=str)
+    except Exception:  # noqa: BLE001
+        return True
+    if len(text) > _SCAN_MAX:
+        return True
+    for i in range(0, max(1, len(text)), _SCAN_CHUNK - 2_000):        # overlapping windows: no phrase split
+        try:
+            w = wrap_untrusted("alert", text[i:i + _SCAN_CHUNK])
+        except Exception:  # noqa: BLE001 — a scan that cannot run is not a clean scan
+            return True
+        if w.injection_detected or w.obfuscation_findings:
+            return True
+    return False
+
+
 def _carry_injection(chain: Any, alert: dict, triage: dict) -> None:
     """Every chain says whether its alert carried prompt-injection text. Only three specialists recorded
     injection evidence, and triage's flag never reached a specialist's chain, so `injection_flagged()` — the
     "nothing unattended" check — was blind for the other nine (review round 3 G1-4)."""
     tm = triage.get("_triage_metadata") if isinstance(triage, dict) else None
-    flagged = bool(isinstance(tm, dict) and tm.get("injection_detected"))
+    flagged = bool(isinstance(tm, dict) and (tm.get("injection_detected") or tm.get("obfuscation_findings")))
     if not flagged:
-        try:
-            flagged = wrap_untrusted("alert", json.dumps(alert, default=str)[:200_000]).injection_detected
-        except Exception:  # noqa: BLE001
-            flagged = False
+        flagged = _alert_carries_injection(alert)
     if flagged:
         md = chain.metadata
         md["injection_detected"] = True
         md.setdefault("_triage_metadata", {}).update({"injection_detected": True})
+
+def _auto_close_context(alert: Any, triage: dict) -> str:
+    """What the reviewer needs to judge an auto-close: there is no specialist evidence, so it sees the alert
+    (redacted, inside the untrusted wrapper) and triage's own reason (review round 4 O4-4)."""
+    from ..shared.redact import redact
+    try:
+        body = json.dumps(redact(alert), default=str)
+    except Exception:  # noqa: BLE001
+        body = "(alert could not be serialised)"
+    if len(body) > 6000:
+        body = body[:3000] + " … " + body[-2900:]
+    return f"triage reason: {str(triage.get('reason', ''))[:300]} | alert: {body}"
+
 
 class SOCOrchestrator:
     name = "soc_orchestrator"
@@ -363,7 +400,7 @@ class SOCOrchestrator:
             # Closing is the one decision that skips every specialist, so it is the one an injected
             # `{"next": "auto_close"}` wants. It had no second opinion (review round 3 G2-2): now the
             # independent reviewer must concur, or the alert goes to the perimeter specialist instead.
-            v = vote_best([self._voter, *self._extra_voters], chain)
+            v = vote_best([self._voter, *self._extra_voters], chain, context=_auto_close_context(alert, triage))
             chain.metadata["vote_concur"] = v.concur
             chain.metadata["vote_reason"] = v.reason
             chain.metadata["vote_tally"] = f"{v.n_concur}/{v.n_voters}"
@@ -418,6 +455,16 @@ class SOCOrchestrator:
                 for a in chain.recommended_actions:
                     if a.action_type not in ("allow", "monitor"):
                         a.requires_hitl = True
+                if chain.verdict in ("benign", "uncertain") and v.disputed:
+                    # A dissent on a benign verdict is the case injection aims for (the specialist talked into
+                    # "benign"); capping confidence and gating non-allow actions did nothing there, and the alert
+                    # closed with nobody looking (review round 4 O4-2). It goes to an analyst instead.
+                    chain.verdict = "uncertain"
+                    if not any(a.action_type == "escalate" for a in chain.recommended_actions):
+                        chain.recommended_actions.append(RecommendedAction(
+                            action_type="escalate", target=str(alert.get("id", chain.alert_id)), requires_hitl=True,
+                            confidence=chain.confidence,
+                            reasoning=f"Independent reviewer disputed a benign verdict: {str(v.reason)[:200]}"))
             return chain
 
         if triage["next"] == "respond":

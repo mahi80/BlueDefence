@@ -168,7 +168,10 @@ def _force_conservative_verdict(text: str) -> str:
     try:
         obj = parse_json(text)
     except Exception:  # noqa: BLE001
-        return text
+        # No usable object (prose, or conflicting answers): the raw text went through unhardened, so a degraded
+        # model's "benign … allow" could still be read by a lenient caller (review round 4 X4-14).
+        return json.dumps({"verdict": "uncertain", "confidence": 0.0,
+                           "summary": "[degraded-mode] fallback model gave no usable answer", "actions": []}, indent=2)
     if "verdict" in obj and obj["verdict"] == "benign":
         obj["verdict"] = "uncertain"
         obj["confidence"] = min(float(obj.get("confidence", 0.5)), 0.5)

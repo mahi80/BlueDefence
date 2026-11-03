@@ -36,8 +36,9 @@ from dataclasses import dataclass
 # or internal account numbers.
 _BUILTIN_PATTERNS: list[tuple[str, str]] = [
     # India-specific (DPDP Act 2023 in scope)
-    ("AADHAAR",  r"\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b"),    # 12-digit ID, first digit 2-9
-    ("PAN_IN",   r"\b[A-Z]{3}[ABCEFGHJLPT][A-Z]\d{4}[A-Z]\b"),  # 10-char India PAN
+    # 12-digit ID, first digit 2-9; written with spaces or hyphens too (round 4 O4-6)
+    ("AADHAAR",  r"\b[2-9]\d{3}[\s-]?\d{4}[\s-]?\d{4}\b"),
+    ("PAN_IN",   r"(?i)\b[A-Z]{3}[ABCEFGHJLPT][A-Z]\d{4}[A-Z]\b"),  # 10-char India PAN, any case
     ("IFSC",     r"\b[A-Z]{4}0[A-Z0-9]{6}\b"),          # bank routing code
     # Internal IDs — match BEFORE PHONE so digit-runs don't get eaten
     ("ACCOUNT",  r"\bACC-\d{8,12}\b"),                  # internal account format
@@ -45,7 +46,7 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
     # names it an account (review round 3 G2-4). Only the `v` group is replaced.
     ("ACCOUNT",  r"(?i)(?:acc(?:oun)?t|a/c|beneficiary)[\w ]{0,20}?[\"']?\s*[:=#]?\s*[\"']?(?P<v>\d{9,18})\b"),
     # Global
-    ("PAN_CC",   r"\b(?:\d[ -]*?){13,19}\b"),           # credit-card PAN (Luhn-validated below)
+    ("PAN_CC",   r"\b(?:\d[ .-]*?){13,19}\b"),          # credit-card PAN (Luhn-validated below), any separator
     ("EMAIL",    r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
     # UPI VPA (name@okhdfcbank, 98xxxxxx@ybl): an e-mail-like handle with no dot in the provider
     ("UPI_VPA",  r"\b[\w.-]{2,64}@[A-Za-z][A-Za-z0-9]{1,31}\b(?![.@\w-])"),
