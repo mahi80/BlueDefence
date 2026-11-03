@@ -27,44 +27,22 @@ class ValidationResult:
 
 
 def _proposal_to_patch(proposal: Proposal) -> Patch | None:
-    if proposal.change_type == "heuristic_primitive":
-        target = proposal.target_module
-        addition = proposal.change.get("add")
-        if not target or not addition:
-            return None
+    """The proposal as the applier would apply it — same allowlist, same lower-casing, same compiled regex
+    (``aegis.evolve.applier.plan_change``). A proposal the applier would refuse is not validated at all."""
+    from aegis.evolve.applier import _Err, plan_change
+    plan = plan_change({"change_type": proposal.change_type, "target_module": proposal.target_module,
+                        "change": proposal.change})
+    if isinstance(plan, str):
+        return None
+    target, _spec, mutate = plan
 
-        def mutate(current):
-            if isinstance(current, tuple):
-                if addition in current:
-                    return current
-                return current + (addition,)
-            if isinstance(current, list):
-                if addition in current:
-                    return current
-                return current + [addition]
-            if isinstance(current, set):
-                return current | {addition}
-            return current  # unsupported container type — no-op patch
+    def safe(current):
+        out = mutate(current)
+        return current if isinstance(out, _Err) else out
 
-        return Patch(target=target, mutate=mutate,
-                     description=f"add {addition!r} to {target}")
-
-    if proposal.change_type == "threshold_adjustment":
-        target = proposal.target_module
-        new_value = proposal.change.get("new_value")
-        if not target or new_value is None:
-            return None
-
-        def mutate(current):
-            return type(current)(new_value) if current is not None else new_value
-
-        return Patch(target=target, mutate=mutate,
-                     description=f"set {target} = {new_value}")
-
-    # prompt_addendum: production would re-read the prompt file with text appended;
-    # for the walking skeleton we don't validate prompt-level changes (they require
-    # an LLM call to measure impact, and the mock doesn't honor prompt addenda).
-    return None
+    verb = "add" if proposal.change_type == "heuristic_primitive" else "set"
+    what = proposal.change.get("add") if verb == "add" else proposal.change.get("new_value")
+    return Patch(target=target, mutate=safe, description=f"{verb} {what!r} {'to' if verb == 'add' else 'on'} {target}")
 
 
 def validate(proposal: Proposal,
