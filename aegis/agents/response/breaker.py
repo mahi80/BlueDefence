@@ -25,6 +25,7 @@ to keep the hold or release it — and the fraud team still gets the recall esca
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -49,8 +50,17 @@ def _concurred(chain: Any) -> bool:
                                               or str(getattr(chain, "investigated_by", "")) in DETERMINISTIC_BUILDERS)
 
 
-@dataclass
+def _min_conf(raw: str) -> float:
+    """The breaker's floor: never below 0.85 (the moderate floor), never NaN — ``nan`` or ``0`` used to let a hold
+    run at confidence 0.30 (review round 4 X4-6)."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.90
+    return 0.90 if not math.isfinite(v) else min(1.0, max(0.85, v))
 
+
+@dataclass
 class OutflowBreaker:
     mode: str = "shadow"            # off | shadow | live
     min_confidence: float = 0.90
@@ -65,7 +75,7 @@ class OutflowBreaker:
         raw = _flag("AEGIS_OUTFLOW_BREAKER", "shadow").lower()
         mode = "off" if raw in ("0", "false", "off", "no") else "live" if raw in ("live", "1", "on", "true") else "shadow"
         return cls(mode=mode,
-                   min_confidence=float(_flag("AEGIS_OUTFLOW_BREAKER_MIN_CONF", "0.90")),
+                   min_confidence=_min_conf(_flag("AEGIS_OUTFLOW_BREAKER_MIN_CONF", "0.90")),
                    ttl_sec=int(_flag("AEGIS_OUTFLOW_BREAKER_TTL", "3600")),
                    max_per_hour=int(_flag("AEGIS_OUTFLOW_BREAKER_MAX_PER_HOUR", "5")))
 

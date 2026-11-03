@@ -364,7 +364,12 @@ class SwarmOrchestrator:
                 alert = attach_campaign_context(alert, self._events, min_events=self._campaign_min)
             except Exception as e:  # noqa: BLE001 — context is a bonus, never a blocker
                 logger.debug("[swarm] campaign context skipped: %s", str(e)[:120])
-        chain = self._orch.handle(alert)
+        from .walkers.campaign import TRUSTED_CONTEXT
+        tok = TRUSTED_CONTEXT.set(alert)
+        try:
+            chain = self._orch.handle(alert)
+        finally:
+            TRUSTED_CONTEXT.reset(tok)
         if isinstance(alert.get("tls_client"), dict) and "tls_client" not in chain.metadata:
             chain.metadata["tls_client"] = alert["tls_client"]
         if "campaign_context" in alert:
@@ -511,6 +516,16 @@ class SwarmOrchestrator:
             # independent re-vote on the enriched chain
             vote_note = ""
             panel = [v for v in [self._voter, *self._extra_voters] if v is not None]
+            deterministic = chain.metadata.get("deterministic") is True
+            first_pass_concur = deterministic or chain.metadata.get("vote_concur") is True
+            if raised and deterministic:
+                # the verdict is no longer the builder's own: it now needs the reviewer like any model verdict
+                chain.metadata.pop("deterministic", None)
+                deterministic = False
+            if deterministic:
+                # a deterministic builder's verdict has no model in it to second-guess; a model re-vote must not
+                # overrule it (review round 4 X4-2 — a dissent here silently disabled the treasury breaker)
+                panel = []
             if panel and added:
                 try:
                     v = vote_best(panel, chain)
@@ -533,7 +548,9 @@ class SwarmOrchestrator:
             if raised:
                 # The first-pass concur was for the old verdict. Autonomy and the HITL timeout read
                 # ``vote_concur``: after a raise it is the re-vote's answer, and no re-vote = no concur.
-                chain.metadata["vote_concur"] = chain.metadata.get("swarm_vote_concur") is True
+                # Both reviewers must have concurred: an intel hit on any public IP in the alert raises the verdict,
+                # and that must not turn a first-pass dissent into a concur on record (review round 4 O4-9).
+                chain.metadata["vote_concur"] = first_pass_concur and chain.metadata.get("swarm_vote_concur") is True
                 if "swarm_vote_tally" in chain.metadata:
                     chain.metadata["vote_tally"] = chain.metadata["swarm_vote_tally"]
             chain.reasoning.append(ReasoningStep(

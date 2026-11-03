@@ -313,7 +313,8 @@ class ResponseAgent:
                 done.note = f"{done.note} ({why})"
                 return done
         # Outflow circuit breaker: a drain in progress does not wait for an analyst to open a card.
-        if action.action_type == "hold":
+        # A producer's / governance's HITL flag binds the breaker too, as it does auto-block (review round 4 R4-8).
+        if action.action_type == "hold" and not action.requires_hitl:
             ok, why = self._breaker.check(action, chain)
             if ok:
                 ok, why = self._unattended(action, chain, own_floor=self._breaker.min_confidence)

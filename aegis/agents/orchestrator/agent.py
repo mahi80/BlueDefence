@@ -193,6 +193,11 @@ class SOCOrchestrator:
     def handle(self, alert: dict) -> EvidenceChain:
         from ..shared import observability as obs
 
+        from .walkers.campaign import ORCH_DERIVED_KEYS, TRUSTED_CONTEXT
+        if isinstance(alert, dict) and any(k in alert for k in ORCH_DERIVED_KEYS) and TRUSTED_CONTEXT.get() is not alert:
+            # campaign_context / tls_client are AEGIS's own findings; on an alert that did not just come through the
+            # swarm's attach step they were written by the sender (forged retry_ips became unattended blocks)
+            alert = {k: v for k, v in alert.items() if k not in ORCH_DERIVED_KEYS}
         with obs.span("aegis.orchestrator.handle", alert_id=alert.get("id", "?")) as sp:
             try:
                 chain = self._route(alert, sp)
