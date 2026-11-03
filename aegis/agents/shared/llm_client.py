@@ -1355,6 +1355,14 @@ def _promoted_model() -> str | None:
             cur = _json.load(fh)
         adapter = cur.get("adapter")
         if adapter and os.path.isdir(adapter):
+            from aegis.finetune.digest import verify_adapter
+            ok, why = verify_adapter(adapter, cur.get("sha256"))
+            if not ok and cur.get("sha256"):
+                # the weights on disk are not the ones a human approved: never load them
+                _log.error("promoted adapter %s refused: %s; falling back to AEGIS_MODEL", adapter, why)
+                return None
+            if not ok:
+                _log.warning("promoted adapter %s has no recorded digest; loading it unverified", adapter)
             _log.info("using promoted triage model %s (run %s, approved by %s)", adapter, cur.get("run"), cur.get("approved_by"))
             return adapter
         _log.warning("AEGIS_MODEL_POINTER %s names no usable adapter; falling back to AEGIS_MODEL", ptr)

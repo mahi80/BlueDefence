@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from aegis.finetune.digest import adapter_digest, verify_adapter
+
 logger = logging.getLogger("aegis.retrain")
 
 SHADOW_MIN_N = 20
@@ -86,11 +88,7 @@ class State:
 
 
 def _sha256_dir(d: Path) -> str:
-    h = hashlib.sha256()
-    for p in sorted(d.rglob("*")):
-        if p.is_file() and p.suffix in (".safetensors", ".json", ".bin"):
-            h.update(p.name.encode()); h.update(p.read_bytes()[: 4 << 20])
-    return h.hexdigest()[:16]
+    return adapter_digest(d)            # full content of every file (the old digest read only the first 4 MiB)
 
 
 # --------------------------------------------------------------------------- stages (each injectable for tests)
@@ -405,6 +403,10 @@ def cmd_sync(a, *, accepted=None) -> int:
         if change.get("sha256") and info.get("sha256") and change["sha256"] != info["sha256"]:
             print(f"  refused {run}: adapter digest changed since it was proposed")
             continue
+        ok, why = verify_adapter(info.get("adapter") or "", info.get("sha256"))
+        if not ok:                       # the files on disk must still be the ones that were gated and proposed
+            print(f"  refused {run}: {why}")
+            continue
         if st.current and st.current.get("run") == run:
             continue
         _promote(st, run, approved_by=rule.get("decided_by") or "dashboard", rationale=rule.get("decision_rationale") or rule.get("rationale", ""),
@@ -422,6 +424,9 @@ def cmd_promote(a) -> int:
         print(f"unknown run {a.run}"); return 1
     if st.runs[a.run].get("stage") not in ("shadowed", "proposed", "gated"):
         print(f"{a.run} is at stage {st.runs[a.run].get('stage')!r}; promote only a gated+shadowed run"); return 1
+    ok, why = verify_adapter(st.runs[a.run].get("adapter") or "", st.runs[a.run].get("sha256"))
+    if not ok:
+        print(f"refused {a.run}: {why}"); return 1
     _promote(st, a.run, approved_by=a.approved_by, rationale=a.rationale, proposal_id=None)
     st.save(); print(f"  promoted {a.run} (offline approval by {a.approved_by}) → AEGIS_MODEL={st.current['adapter']}")
     return 0

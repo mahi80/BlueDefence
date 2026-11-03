@@ -91,9 +91,19 @@ def test_shadow_compare_thresholds():
     assert rt.shadow_compare(rows, err, None)["candidate_agreement"] == 0.0
 
 
+def _adapter(d: Path, payload: bytes = b"w" * 64) -> tuple[str, str]:
+    """A real adapter directory and its recorded digest."""
+    from aegis.finetune.digest import adapter_digest
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "adapter_config.json").write_text('{"r": 16}')
+    (d / "adapter_model.safetensors").write_bytes(payload)
+    return str(d), adapter_digest(d)
+
+
 def test_shadow_propose_sync_promote_flow(tmp_path):
     runs = tmp_path / "runs"; st = rt.State(runs / "retrain" / "state.json")
-    st.runs["r1"] = {"stage": "gated", "adapter": str(tmp_path / "ad"), "sha256": "abc", "data_counts": {"human": 60},
+    ad, sha = _adapter(tmp_path / "ad")
+    st.runs["r1"] = {"stage": "gated", "adapter": ad, "sha256": sha, "data_counts": {"human": 60},
                      "stages": {"exported": {"ts": "2026-10-20T00:00:00+00:00"}, "gated": {"summary": "34/37 PASS", "passes": True}}}
     st.save()
     newer = tmp_path / "newer"; _export(newer, n_human=30, verdict="benign")
@@ -130,7 +140,8 @@ def test_propose_refuses_a_worse_candidate(tmp_path):
 def test_offline_promote_records_approver_and_previous(tmp_path):
     runs = tmp_path / "runs"; st = rt.State(runs / "retrain" / "state.json")
     st.current = {"run": "r0", "adapter": "/a0", "sha256": "0"}
-    st.runs["r1"] = {"stage": "shadowed", "adapter": "/a1", "sha256": "1"}; st.runs["r2"] = {"stage": "trained", "adapter": "/a2"}
+    ad, sha = _adapter(tmp_path / "a1")
+    st.runs["r1"] = {"stage": "shadowed", "adapter": ad, "sha256": sha}; st.runs["r2"] = {"stage": "trained", "adapter": "/a2"}
     st.save()
     assert rt.main(["promote", "--runs", str(runs), "--run", "r2", "--approved-by", "x", "--rationale", "y"]) == 1   # not gated
     assert rt.main(["promote", "--runs", str(runs), "--run", "r1", "--approved-by", "ciso", "--rationale", "ok"]) == 0
@@ -158,3 +169,37 @@ def test_model_pointer_resolves_promoted_adapter(tmp_path, monkeypatch):
     assert lc._promoted_model() is None
     monkeypatch.delenv("AEGIS_MODEL_POINTER")
     assert lc._promoted_model() is None
+
+
+def test_tampered_adapter_is_never_promoted_or_loaded(tmp_path, monkeypatch):
+    from aegis.agents.shared import llm_client as lc
+    from aegis.finetune.hot_reload import apply_reload
+    runs = tmp_path / "runs"; st = rt.State(runs / "retrain" / "state.json")
+    payload = bytearray(b"\0" * (6 << 20))                       # 6 MiB: bigger than the old 4 MiB digest window
+    ad, sha = _adapter(tmp_path / "ad", bytes(payload))
+    st.runs["r1"] = {"stage": "shadowed", "adapter": ad, "sha256": sha}; st.save()
+    payload[5 << 20] = 1                                          # one byte flipped past 4 MiB after approval
+    (Path(ad) / "adapter_model.safetensors").write_bytes(bytes(payload))
+    assert rt.main(["promote", "--runs", str(runs), "--run", "r1", "--approved-by", "ciso", "--rationale", "ok"]) == 1
+    a = SimpleNamespace(runs=str(runs), run=None, dashboard=False, dry_run=False)
+    rt.cmd_sync(a, accepted=lambda d: [{"change_type": "model_promotion", "change": {"run": "r1", "sha256": sha}}])
+    assert rt.State.load(runs).current is None
+    ptr = tmp_path / "current.json"; ptr.write_text(json.dumps({"run": "r1", "adapter": ad, "sha256": sha}))
+    monkeypatch.setenv("AEGIS_MODEL_POINTER", str(ptr))
+    assert lc._promoted_model() is None                           # falls back to AEGIS_MODEL
+    swapped = []
+    primary = SimpleNamespace(set_model=swapped.append)
+    res = apply_reload(primary, "", {"run": "r1", "adapter": ad, "sha256": sha})
+    assert res.mode == "refused" and not res.changed and swapped == []
+
+
+def test_legacy_digest_still_verifies(tmp_path):
+    import hashlib
+
+    from aegis.finetune.digest import verify_adapter
+    ad, _ = _adapter(tmp_path / "ad")
+    h = hashlib.sha256()
+    for f in sorted(Path(ad).rglob("*")):
+        h.update(f.name.encode()); h.update(f.read_bytes()[: 4 << 20])
+    assert verify_adapter(ad, h.hexdigest()[:16]) == (True, "")
+    assert not verify_adapter(ad, "deadbeefdeadbeef")[0]
