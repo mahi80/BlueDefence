@@ -98,7 +98,7 @@ class AlertCheckpoint:
     def advance(self, source: str, value: str) -> None:
         with self._lock:
             cur = self._state.setdefault("watermark", {}).get(source)
-            if cur is None or value > cur:
+            if cur is None or _later(value, cur):
                 self._state["watermark"][source] = value
                 self._dirty += 1
             self._maybe_flush()
@@ -190,6 +190,31 @@ class AlertCheckpoint:
             tmp.replace(self.path)
         except Exception as e:  # noqa: BLE001
             logger.warning("[ingest] checkpoint write failed: %s", e)
+
+
+def _when(v: str) -> float | None:
+    s = str(v).strip()
+    try:
+        f = float(s)
+        return f / 1000.0 if f > 1e11 else f
+    except ValueError:
+        pass
+    try:
+        from datetime import UTC, datetime
+        d = datetime.fromisoformat(s)
+        return (d if d.tzinfo else d.replace(tzinfo=UTC)).timestamp()
+    except ValueError:
+        return None
+
+
+def _later(a: str, b: str) -> bool:
+    """Is watermark ``a`` after ``b``? Compared as times when both parse: as strings, epoch "999" sorted after
+    "1000" and "+05:30" times against "Z" ones, so the watermark could move backwards or stick (review round 3
+    I3-15)."""
+    ta, tb = _when(a), _when(b)
+    if ta is not None and tb is not None:
+        return ta > tb
+    return str(a) > str(b)
 
 
 #: returned by ``normalize`` when a record was consumed but produced no alert *yet* (a stateful

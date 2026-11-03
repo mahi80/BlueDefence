@@ -66,6 +66,13 @@ _BGP_DOWN_RX = re.compile(r"\bDown\b", re.I)
 _MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
 
 
+
+def _as_utc(d: datetime) -> datetime:
+    """A timestamp with no zone is UTC (what log shippers mean), not this host's local time — an IST host read
+    every naive vendor time 5 h 30 min off, which broke windows and lag (review round 3 I3-16)."""
+    from datetime import UTC
+    return d if d.tzinfo is not None else d.replace(tzinfo=UTC)
+
 def _parse_cisco_ts(raw: str | None, year_hint: int | None = None) -> float | None:
     if not raw:
         return None
@@ -107,7 +114,7 @@ def _ts_any(v: Any) -> float | None:
     except ValueError:
         pass
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        return _as_utc(datetime.fromisoformat(s.replace("Z", "+00:00"))).timestamp()
     except ValueError:
         return _parse_cisco_ts(s)
 

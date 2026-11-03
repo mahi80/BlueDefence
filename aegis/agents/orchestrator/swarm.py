@@ -32,6 +32,7 @@ attacker-simulation twin — and is not what this module does.
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 import re
 import threading
@@ -337,6 +338,8 @@ class SwarmOrchestrator:
         self._extra_voters = [] if voter is not None else list(getattr(orchestrator, "_extra_voters", None) or [])
         self._pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="aegis-swarm")
         self._hung: set = set()             # workers that outlived their time box and still hold a pool thread
+        self._abandoned: set = set()          # futures of replaced pools still running (capped)
+        self._cap_logged = False
         self._lock = threading.Lock()
         # recent fan-outs for the status page / tests — the last 1,000, not one per alert forever
         self.runs: deque[dict] = deque(maxlen=1000)
@@ -401,10 +404,26 @@ class SwarmOrchestrator:
         """A hung worker keeps its thread: once they fill the pool every later fan-out "times out after 0 s"
         (review E10). Abandon a wedged pool for a fresh one; the stuck threads finish (or not) on their own."""
         self._hung = {f for f in self._hung if not f.done()}
+        self._abandoned = {f for f in self._abandoned if not f.done()}
         if len(self._hung) < self.max_workers:
             return
+        # Every replacement leaves its stuck threads alive. Unbounded, a worker that always hangs (a dead TI
+        # endpoint with no timeout) grew the process by max_workers threads per wedge (review round 3 R3-14).
+        try:
+            cap = int(os.environ.get("AEGIS_SWARM_MAX_ABANDONED", "") or 4 * self.max_workers)
+        except ValueError:
+            cap = 4 * self.max_workers
+        if len(self._abandoned) + len(self._hung) > cap:
+            if not self._cap_logged:
+                self._cap_logged = True
+                logger.critical("[swarm] %d threads stuck in abandoned workers — not replacing the pool again; the "
+                                "swarm runs degraded until they finish (find the worker that never returns)",
+                                len(self._abandoned) + len(self._hung))
+            return
+        self._cap_logged = False
         logger.error("[swarm] %d worker(s) hung past the time box — replacing the worker pool", len(self._hung))
         old, self._pool = self._pool, ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="aegis-swarm")
+        self._abandoned |= self._hung
         self._hung = set()
         old.shutdown(wait=False, cancel_futures=True)
 

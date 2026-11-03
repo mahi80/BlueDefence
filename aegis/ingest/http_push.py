@@ -260,7 +260,8 @@ class PushServer:
                     raise InflateTooLarge("records expand past the receiver's inflate budget")
         except InflateTooLarge as e:
             return 413, {"requestId": req_id, "timestamp": now_ms, "errorMessage": str(e)[:120]}
-        except (KeyError, TypeError, ValueError, UnicodeDecodeError, RecursionError) as e:
+        except (KeyError, TypeError, ValueError, AttributeError, UnicodeDecodeError, RecursionError) as e:
+            # AttributeError: a JSON array / string body has no .get (it answered 500; review round 3 I3-14)
             return 400, {"requestId": req_id, "timestamp": now_ms, "errorMessage": f"malformed Firehose request: {str(e)[:120]}"}
         if not self.queue.put_many("firehose", lines):
             return 503, {"requestId": req_id, "timestamp": now_ms, "errorMessage": "queue full, retry"}

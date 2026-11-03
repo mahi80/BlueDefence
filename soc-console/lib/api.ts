@@ -80,8 +80,16 @@ export async function getRecentChains(): Promise<Chain[]> {
   if (USE_FIXTURES) return CHAINS;
   return cached("recent-chains", SNAPSHOT_TTL_MS, async () => {
     const summaries = await listChains();
-    const full = await Promise.all(summaries.slice(0, 40).map((s) => getChain(s.chain_id)));
-    return full.filter((c): c is Chain => c !== null);
+    const top = summaries.slice(0, 40);
+    // one failed detail read used to reject the whole Promise.all and empty the map (review round 3 R3-12):
+    // a detail that fails shows its summary instead; only when every read fails is the backend reported down
+    const res = await Promise.allSettled(top.map((s) => getChain(s.chain_id)));
+    if (top.length && res.every((r) => r.status === "rejected")) {
+      throw (res[0] as PromiseRejectedResult).reason;
+    }
+    return res
+      .map((r, i) => (r.status === "fulfilled" ? r.value : ({ ...top[i] } as unknown as Chain)))
+      .filter((c): c is Chain => c !== null);
   });
 }
 
