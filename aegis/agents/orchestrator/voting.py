@@ -47,6 +47,12 @@ class VoteResult:
     n_concur: int = 1            # how many reviewers concurred
     n_voters: int = 1            # how many reviewers actually voted
     unanimous: bool = True       # all reviewers agreed; drives the HITL gate
+    n_abstain: int = 0           # "dissents" that were no vote at all (voter unreachable / mock fallback / bad JSON)
+
+    @property
+    def disputed(self) -> bool:
+        """At least one reviewer actually read the chain and disagreed (not merely unavailable)."""
+        return self.n_voters - self.n_concur - self.n_abstain > 0
 
 
 _VOTER_SYSTEM = """\
@@ -80,26 +86,39 @@ def ensemble_enabled() -> bool:
     return _ensemble_enabled()
 
 
-def _vote_user_msg(chain: EvidenceChain) -> str:
+def _one_line(v: Any, n: int) -> str:
+    """One field on one line: a signal or target carrying newlines could forge lines of the block below
+    (``recommended actions:`` / ``prompt_injection_flagged=False``) — review round 4 O4-8."""
+    s = str(v if v is not None else "")[:n]
+    return s.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n").replace("\u2028", " ").replace("\u2029", " ")
+
+
+def _vote_user_msg(chain: EvidenceChain, context: str | None = None) -> str:
     """What the reviewer sees. It used to be verdict, confidence, an evidence COUNT and the action types —
     no targets, no signals — so it could not tell `block -> 10.0.0.1` (the bank's own gateway) from
     `block -> 185.x`, nor a verdict that contradicts its own evidence (review round 3 G2-3). All of it is
-    derived from the alert, so it goes inside the untrusted wrapper."""
+    derived from the alert, so it goes inside the untrusted wrapper. ``context``: the (redacted) alert and the
+    triage reason, for a decision taken with no specialist evidence at all (auto-close, round 4 O4-4)."""
     md = chain.metadata if isinstance(getattr(chain, "metadata", None), dict) else {}
     lines = [
-        f"alert_id={chain.alert_id} investigated_by={chain.investigated_by}",
-        f"verdict={chain.verdict} confidence={chain.confidence}",
+        f"alert_id={_one_line(chain.alert_id, 200)} investigated_by={_one_line(chain.investigated_by, 80)}",
+        f"verdict={_one_line(chain.verdict, 40)} confidence={chain.confidence}",
         f"prompt_injection_flagged={bool(md.get('injection_detected'))}",
         f"evidence ({len(chain.evidence)} items):",
     ]
     for e in list(chain.evidence)[:12]:
-        lines.append(f"  - [{getattr(e, 'weight', '')}] {getattr(e, 'source', '')}: {str(getattr(e, 'signal', ''))[:240]}")
+        lines.append(f"  - [{_one_line(getattr(e, 'weight', ''), 20)}] {_one_line(getattr(e, 'source', ''), 60)}: "
+                     f"{_one_line(getattr(e, 'signal', ''), 240)}")
     lines.append(f"reasoning ({len(chain.reasoning)} steps):")
     for r in list(chain.reasoning)[:6]:
-        lines.append(f"  - {str(getattr(r, 'conclusion', '') or getattr(r, 'action', ''))[:200]}")
+        lines.append(f"  - {_one_line(getattr(r, 'conclusion', '') or getattr(r, 'action', ''), 200)}")
     lines.append("recommended actions:")
     for a in list(chain.recommended_actions)[:10]:
-        lines.append(f"  - {a.action_type} -> {str(a.target)[:120]} (confidence={a.confidence}, requires_hitl={a.requires_hitl})")
+        lines.append(f"  - {_one_line(a.action_type, 40)} -> {_one_line(a.target, 120)} "
+                     f"(confidence={a.confidence}, requires_hitl={a.requires_hitl})")
+    if context:
+        lines.append("the alert the decision was taken on (untrusted):")
+        lines.append(_one_line(context, 6000))
     wrapped = wrap_untrusted("primary_verdict", "\n".join(lines))
     return (
         "Vote on this verdict from the primary agent. Check the targets and the evidence, not only the label.\n\n"
@@ -118,33 +137,40 @@ def _is_mock(llm: Any) -> bool:
     return False
 
 
+_ABSTAIN = "[no vote] "
+
+
 def _single_vote(voter_llm: LLMClient, chain: EvidenceChain, user_msg: str) -> tuple[bool, str]:
     """One reviewer's concur/dissent. A failed or unreachable voter is a
     dissent, not a dropped verdict — fail safe toward HITL."""
     if _is_mock(voter_llm) and os.environ.get("LLM_BACKEND", "").strip().lower() != "mock":
         # the voter fell back to the mock (no voter backend reachable): it concurs on almost anything, so it is not
         # a second opinion — autonomy and the HITL timeout must not treat it as one (review round 3 G1-11)
-        return False, "no independent voter available (mock fallback) — defaulting to dissent"
+        return False, _ABSTAIN + "no independent voter available (mock fallback) — defaulting to dissent"
     try:
         resp = voter_llm.complete(_VOTER_SYSTEM, user_msg, max_tokens=256)
-        parsed = parse_json(resp.text)
+        # The voter's own object is the one carrying `concur` that it did not echo from the prompt: an alert can
+        # carry `{"concur": true, "verdict": …}`, and a dissenting voter that quotes it used to be read as concur
+        # (review round 4 O4-1). Conflicting `concur` answers raise → dissent.
+        parsed = parse_json(resp.text, prefer_keys=("concur",), exclude_text=user_msg)
         # only a JSON `true` concurs: "false", "no" and 0.0001 used to count as concur (review round 3 G1-10)
         return parsed.get("concur") is True, str(parsed.get("reason", ""))
     except Exception as exc:  # noqa: BLE001
         logger.warning("[voter] no usable vote for alert %s (%s: %s); defaulting to dissent",
                        getattr(chain, "alert_id", "?"), type(exc).__name__, str(exc)[:120])
-        return False, f"Voter unavailable or produced no valid JSON ({type(exc).__name__}); defaulting to dissent"
+        return False, _ABSTAIN + f"Voter unavailable or produced no valid JSON ({type(exc).__name__}); defaulting to dissent"
 
 
-def vote(voter_llm: LLMClient, chain: EvidenceChain) -> VoteResult:
+def vote(voter_llm: LLMClient, chain: EvidenceChain, context: str | None = None) -> VoteResult:
     """Single independent reviewer (original behavior). unanimous == concur."""
-    concur, reason = _single_vote(voter_llm, chain, _vote_user_msg(chain))
+    concur, reason = _single_vote(voter_llm, chain, _vote_user_msg(chain, context))
     final_conf = chain.confidence if concur else min(chain.confidence, 0.6)
     return VoteResult(concur=concur, reason=reason, final_confidence=final_conf,
-                      n_concur=1 if concur else 0, n_voters=1, unanimous=concur)
+                      n_concur=1 if concur else 0, n_voters=1, unanimous=concur,
+                      n_abstain=int(not concur and reason.startswith(_ABSTAIN)))
 
 
-def vote_ensemble(voters: list[LLMClient], chain: EvidenceChain) -> VoteResult:
+def vote_ensemble(voters: list[LLMClient], chain: EvidenceChain, context: str | None = None) -> VoteResult:
     """Majority vote across N independent reviewers.
 
     Autonomy is bought by unanimity, not by majority: only when every reviewer
@@ -158,9 +184,9 @@ def vote_ensemble(voters: list[LLMClient], chain: EvidenceChain) -> VoteResult:
                           final_confidence=min(chain.confidence, 0.6),
                           n_concur=0, n_voters=0, unanimous=False)
     if len(live) == 1:
-        return vote(live[0], chain)
+        return vote(live[0], chain, context)
 
-    user_msg = _vote_user_msg(chain)
+    user_msg = _vote_user_msg(chain, context)
     votes = [_single_vote(v, chain, user_msg) for v in live]
     n_voters = len(votes)
     n_concur = sum(1 for c, _ in votes if c)
@@ -179,17 +205,18 @@ def vote_ensemble(voters: list[LLMClient], chain: EvidenceChain) -> VoteResult:
     reason = (f"{n_concur}/{n_voters} reviewers concur. "
               f"Concur: {concurring}. Dissent: {dissenting}.")
     return VoteResult(concur=majority_concur, reason=reason, final_confidence=final_conf,
-                      n_concur=n_concur, n_voters=n_voters, unanimous=unanimous_concur)
+                      n_concur=n_concur, n_voters=n_voters, unanimous=unanimous_concur,
+                      n_abstain=sum(1 for c, r in votes if not c and r.startswith(_ABSTAIN)))
 
 
-def vote_best(voters: list[LLMClient], chain: EvidenceChain) -> VoteResult:
+def vote_best(voters: list[LLMClient], chain: EvidenceChain, context: str | None = None) -> VoteResult:
     """Pick single vs ensemble by the AEGIS_ENSEMBLE_VOTE flag and voter count.
     One shared gate for every call site; flag OFF or <2 voters -> single-voter path."""
     live = [v for v in (voters or []) if v is not None]
     if len(live) >= 2 and _ensemble_enabled():
-        return vote_ensemble(live, chain)
+        return vote_ensemble(live, chain, context)
     if live:
-        return vote(live[0], chain)
+        return vote(live[0], chain, context)
     return VoteResult(concur=False, reason="no voter configured",
                       final_confidence=min(chain.confidence, 0.6),
                       n_concur=0, n_voters=0, unanimous=False)

@@ -49,9 +49,10 @@ _ATTACK_RX = re.compile(
 
 #: any key ending in one of these is a credential too (db_password, githubToken, stripeSecretKey, …)
 SECRET_SUFFIXES: tuple[str, ...] = ("password", "passwd", "passphrase", "secret", "secret_key", "token",
-                                    "api_key", "apikey", "private_key", "access_key")
+                                    "api_key", "apikey", "private_key", "access_key", "pwd", "_pin", "mpin", "tpin",
+                                    "_otp")
 _PAIR_KEYS = "|".join(sorted((re.escape(k).replace("_", "[_-]?") for k in SECRET_KEYS), key=len, reverse=True))
-_PAIR_KEYS = rf"(?:[A-Za-z0-9]*[_-]?)?(?:password|passwd|passphrase|secret(?:[_-]?key)?|token|api[_-]?key|access[_-]?key|private[_-]?key)|{_PAIR_KEYS}"
+_PAIR_KEYS = rf"(?:[A-Za-z0-9]*[_-]?)?(?:password|passwd|passphrase|secret(?:[_-]?key)?|token|api[_-]?key|access[_-]?key|private[_-]?key|pwd|[Pp]wd|mpin|MPin|[mt][Pp]in)|{_PAIR_KEYS}"
 # key=value in query strings / form bodies / log lines. The value runs to the next "&" or end of line: a
 # password may contain spaces, quotes or ";" — over-redacting the rest of a log line is the safe direction,
 # and an attack-shaped value (the whole of it) is kept by redact_value.
@@ -102,10 +103,36 @@ def redact_value(key: Any, value: str) -> str:
     return _mark(k, value)
 
 
-def redact_text(text: str) -> str:
-    """Credentials inside free text (query strings, form bodies, JSON text, header dumps, logs)."""
+_JSON_MAX = 4 * 1024 * 1024
+
+
+def _as_json(text: str) -> Any:
+    """The parsed value when ``text`` is a JSON object / array, else ``None``."""
+    t = text.strip()
+    if len(t) < 2 or len(t) > _JSON_MAX or t[0] not in "{[" or t[-1] not in "}]":
+        return None
+    try:
+        import json
+        v = json.loads(t)
+    except ValueError:
+        return None
+    return v if isinstance(v, (dict, list)) else None
+
+
+def redact_text(text: str, _depth: int = 0) -> str:
+    """Credentials inside free text (query strings, form bodies, JSON text, header dumps, logs).
+
+    JSON text is redacted field by field: run over ``json.dumps(alert)`` as one string, a ``token=`` value ran
+    to the end of the whole alert and blanked every later field (the model saw no source IP, no URI), while a
+    password inside a JSON-escaped nested body or a ``\\r\\n``-escaped header dump was not matched at all
+    (review round 4 O4-3 / O4-5)."""
     if not text or not isinstance(text, str):
         return text
+    if _depth < 4:
+        parsed = _as_json(text)
+        if parsed is not None:
+            import json
+            return json.dumps(_redact(parsed, _depth + 1))
     out = _PEM_RX.sub("[REDACTED:private_key]", text)
     out = _COOKIE_LINE_RX.sub(lambda m: m.group(1) + redact_value("cookie", m.group(2)), out)
     out = _JSON_RX.sub(lambda m: m.group(1) + redact_value(m.group(1).strip("\"' :"), m.group(4)) + m.group(5), out)
@@ -118,6 +145,13 @@ def redact_text(text: str) -> str:
 
 def redact(obj: Any) -> Any:
     """Deep copy of a JSON-like object with every credential redacted (input never mutated)."""
+    return _redact(obj, 0)
+
+
+def _redact(obj: Any, depth: int) -> Any:
+    def redact(v: Any) -> Any:                 # recursion at the same JSON-string depth
+        return _redact(v, depth)
+
     if isinstance(obj, dict):
         out: dict = {}
         for k, v in obj.items():
@@ -133,7 +167,7 @@ def redact(obj: Any) -> Any:
     if isinstance(obj, tuple):
         return tuple(redact(v) for v in obj)
     if isinstance(obj, str):
-        return redact_text(obj)
+        return redact_text(obj, depth)        # a JSON body kept as a string is redacted field by field too
     return obj
 
 
