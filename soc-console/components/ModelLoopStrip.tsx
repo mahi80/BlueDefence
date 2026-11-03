@@ -41,8 +41,8 @@ export default function ModelLoopStrip({
       {proposals.length === 0 && <span className="flabel">no proposals in the queue</span>}
       {error && <span className="flabel ferror" role="alert">{error}</span>}
       {proposals.map((p) => {
-        let st: "accepted" | "rejected" | "pending" =
-          p.status === "accepted" ? "accepted" : p.status === "rejected" ? "rejected" : "pending";
+        // pending / pending_hitl / proposed can be decided; accepted, rejected, applied, expired are final
+        let st: string = !p.status || p.status.startsWith("pending") || p.status === "proposed" ? "pending" : p.status;
         const override = status[p.id];
         if (override) st = override;
         return (

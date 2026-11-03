@@ -358,7 +358,11 @@ class ConsoleAPI:
             except (json.JSONDecodeError, RecursionError):
                 continue
             if isinstance(d, dict) and d.get("proposal_id"):
-                decided[str(d["proposal_id"])] = d
+                # only a decision the service would honour shows as decided: a hand-appended row used to read
+                # "accepted" here while retrain sync (correctly) ignored it
+                from ..hitl.signing import trusted_approver, verify
+                if verify(d)[0] and trusted_approver(d.get("decided_by"))[0]:
+                    decided[str(d["proposal_id"])] = d
         rows: list[dict] = []
         for line in _tail_lines(self.hitl_dir / "proposals.jsonl"):
             try:
@@ -387,6 +391,12 @@ class ConsoleAPI:
             return 503, {"error": "no HITL directory on this host"}
         if not _ID_RX.match(proposal_id) or decision not in ("accept", "reject"):
             return 400, {"error": "bad proposal id or decision"}
+        # an unknown id used to get 200 and a decision row; accept-then-reject got 200 twice (review C5)
+        cur = next((r for r in self.proposals()["proposals"] if r["id"] == proposal_id), None)
+        if cur is None:
+            return 404, {"error": "unknown proposal"}
+        if not (cur["status"].startswith("pending") or cur["status"] == "proposed"):
+            return 409, {"error": f"already {cur['status']}", "status": cur["status"]}
         row = {"proposal_id": proposal_id, "decision": decision, "decided_by": decided_by[:120] or "console",
                "rationale": rationale[:500], "ts": time.time(), "via": "console"}
         from ..hitl.signing import sign

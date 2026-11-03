@@ -172,6 +172,13 @@ class PushServer:
         return (hmac.compare_digest(presented.encode(), self.read_token.encode())
                 or (bool(self.console_token) and hmac.compare_digest(presented.encode(), self.console_token.encode())))
 
+    def holds_other_token(self, headers: Any) -> bool:
+        """The caller presented the push or read token (configured, and matching)."""
+        presented = self._presented(headers)
+        if not presented:
+            return False
+        return any(t and hmac.compare_digest(presented.encode(), t.encode()) for t in (self.token, self.read_token))
+
     def console_authorized(self, headers: Any) -> bool:
         """Decisions: only the console token (never the push or read token, which relays and bridges hold)."""
         if not self.console_token:
@@ -192,6 +199,10 @@ class PushServer:
         if path.startswith("/api/soc/chains/"):
             c = api.chain(path[len("/api/soc/chains/"):])
             return (200, c) if c else (404, {"error": "unknown chain"})
+        if path in ("/api/approvals", "/api/soc/proposals") and getattr(api, "hitl_dir", "") is None:
+            # decisions already answered 503 here; reads answered an empty 200, so the console showed an empty queue
+            # on a misconfigured host instead of the misconfiguration (review C6)
+            return 503, {"error": "no HITL directory on this host (set AEGIS_HITL_DIR)"}
         if path == "/api/approvals":
             return 200, api.approvals()
         if path == "/api/soc/proposals":
@@ -464,8 +475,9 @@ class _Handler(BaseHTTPRequestHandler):
             if self.server_ref.status is not None:
                 try:
                     body.update(self.server_ref.status())
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # a status check that cannot run is not "healthy" (review E14)
+                    body["degraded"] = [f"status check failed: {type(e).__name__}"]
             degraded = bool(body.get("degraded"))
             if not self.server_ref.read_authorized(self.headers):
                 # the public probe (load balancer, pilot.ps1 status, uptime check) learns liveness only — never
@@ -531,6 +543,11 @@ class _Handler(BaseHTTPRequestHandler):
         path = parts.path
         if path.startswith("/api/"):
             if not srv.console_authorized(self.headers):
+                if srv.holds_other_token(self.headers):
+                    # a valid push / read token: authenticated, just not allowed to decide (review C11 — a 401
+                    # looked like an expired session)
+                    self._refuse(403, {"error": "this token cannot decide; decisions need the console token"})
+                    return
                 self._unauthorized(path)
                 return
             raw = self._body()

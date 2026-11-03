@@ -106,7 +106,8 @@ export interface Approval {
 export interface Proposal {
   id: string;
   change_type: string; // model_promotion | rule | ...
-  status: "pending" | "accepted" | "rejected";
+  // applied / expired come from the meta-agent; anything not pending is final and has no buttons (review C5)
+  status: "pending" | "pending_hitl" | "proposed" | "accepted" | "rejected" | "applied" | "expired";
   summary: string;
   validation_passed?: boolean;
   rationale?: string;

@@ -123,7 +123,7 @@ def test_http_routes_and_tokens(files):
         assert code == 200 and out["alert_id"] == "ALR-1"
         assert _req(f"{base}/api/approvals", token="read")[1]["approvals"][0]["status"] == "pending"
         body = json.dumps({"rationale": "contain it"}).encode()
-        assert _req(f"{base}/api/approvals/aegis_ALR-1_block_1a2b3c/approve", token="read", data=body)[0] == 401   # read token cannot decide
+        assert _req(f"{base}/api/approvals/aegis_ALR-1_block_1a2b3c/approve", token="read", data=body)[0] == 403   # read token cannot decide: authenticated, not allowed (C11)
         code, out = _req(f"{base}/api/approvals/aegis_ALR-1_block_1a2b3c/approve", token="console", user="bu_head:asha", data=body)
         assert code == 200 and out["status"] == "approved"
         d = json.loads((hitl / "decisions.jsonl").read_text().splitlines()[0])
@@ -141,6 +141,6 @@ def test_decisions_disabled_without_console_token(files):
     try:
         base = f"http://127.0.0.1:{srv.port}"
         assert _req(f"{base}/api/soc/chains", token="read")[0] == 200
-        assert _req(f"{base}/api/approvals/aegis_ALR-1_block_1a2b3c/approve", token="read", data=b"{}")[0] == 401
+        assert _req(f"{base}/api/approvals/aegis_ALR-1_block_1a2b3c/approve", token="read", data=b"{}")[0] == 403
     finally:
         srv.stop()

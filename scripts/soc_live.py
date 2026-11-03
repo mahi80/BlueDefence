@@ -691,6 +691,12 @@ class LiveSoc:
         except Exception as exc:  # noqa: BLE001 — enforcement is best-effort; fall back to shadow
             print(f"  [enforce] target control call failed ({str(exc)[:120]}) — staying shadow-contained")
             return
+        refused = _enforcement_refused(res, camp.src_ip)
+        if refused:
+            # a 200 is not a block: the edge answers {"accepted": false} for a never-block or malformed target and
+            # the demo target {"ok": false} when nothing applied — both used to print "✓ CONTAINED" (review C7)
+            print(f"  [enforce] target did not block {camp.src_ip}: {refused} — staying shadow-contained")
+            return
         with self._lock:
             camp.enforced = True
             camp.enforcement = {"blocked_ips": res.get("blocked_ips", [camp.src_ip]),
@@ -731,6 +737,23 @@ class LiveSoc:
 
 
 # ----------------------------------------------------------------------------- HTTP surface
+
+def _enforcement_refused(res: dict, ip: str) -> str:
+    """Why a control reply does not show ``ip`` blocked ('' = it does). Understands the edge
+    (``accepted`` + ``pushed``) and the demo target (``ok`` + ``blocked_ips``)."""
+    if not isinstance(res, dict):
+        return "reply is not a JSON object"
+    if res.get("accepted") is False:
+        return "the edge did not accept the block"
+    if res.get("ok") is False:
+        return "the target applied nothing"
+    listed = res.get("blocked_ips", res.get("pushed"))
+    if isinstance(listed, list) and ip not in listed:
+        return f"{ip} is not in the target's block list"
+    if "accepted" not in res and "ok" not in res and listed is None:
+        return "the reply does not say what was blocked"
+    return ""
+
 
 class _Handler(BaseHTTPRequestHandler):
     soc: LiveSoc = LiveSoc()

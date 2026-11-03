@@ -9,29 +9,34 @@ const USE_FIXTURES = !API_ORIGIN || process.env.NEXT_PUBLIC_AEGIS_USE_FIXTURES =
 
 const CHAINS = fixtureChains as unknown as Chain[];
 
-// Set when a live backend call failed during this render; the page shows it instead of pretending.
-// (Module-level is fine: the console is rendered per request in a single Node process.)
-export let backendError: string | null = null;
-
-async function backend<T>(path: string, fallback: T, empty: T): Promise<T> {
-  if (USE_FIXTURES) return fallback;
-  try {
-    const res = await fetch(`${API_ORIGIN}${path}`, {
-      headers: process.env.AEGIS_API_KEY ? { Authorization: `Bearer ${process.env.AEGIS_API_KEY}` } : {},
-      cache: "no-store",
-    });
-    if (!res.ok) throw new Error(`${path} -> ${res.status}`);
-    backendError = null;
-    return (await res.json()) as T;
-  } catch (e) {
-    // Live mode never substitutes sample data: an empty list plus a visible error, so nobody approves a fixture.
-    backendError = `${(e as Error).message}`.slice(0, 160);
-    return empty;
+/** A live backend read failed. Thrown, never turned into an empty list: an empty list used to be cached
+ * for the snapshot window and shared by every analyst, and one shared module variable carried the error, so
+ * a 500 from /api/approvals rendered as "live, 0 pending" (code review 2026-11-03 C3). */
+export class BackendError extends Error {
+  constructor(public path: string, public status: number | null, message: string) {
+    super(message);
+    this.name = "BackendError";
   }
 }
 
+async function backend<T>(path: string, fallback: T, opts: { notFound?: T } = {}): Promise<T> {
+  if (USE_FIXTURES) return fallback;
+  let res: Response;
+  try {
+    res = await fetch(`${API_ORIGIN}${path}`, {
+      headers: process.env.AEGIS_API_KEY ? { Authorization: `Bearer ${process.env.AEGIS_API_KEY}` } : {},
+      cache: "no-store",
+    });
+  } catch (e) {
+    throw new BackendError(path, null, `${path} unreachable: ${(e as Error).message}`.slice(0, 160));
+  }
+  if (res.status === 404 && "notFound" in opts) return opts.notFound as T;
+  if (!res.ok) throw new BackendError(path, res.status, `${path} -> ${res.status}`);
+  return (await res.json()) as T;
+}
+
 export async function listChains(): Promise<ChainSummary[]> {
-  const live = await backend<{ chains?: ChainSummary[] } | ChainSummary[]>("/api/soc/chains", CHAINS, []);
+  const live = await backend<{ chains?: ChainSummary[] } | ChainSummary[]>("/api/soc/chains", CHAINS);
   const rows = Array.isArray(live) ? live : (live.chains ?? []);
   return rows as ChainSummary[];
 }
@@ -44,7 +49,7 @@ export async function getChain(id: string): Promise<Chain | null> {
   const live = await backend<(Chain & { chain?: Partial<Chain> }) | null>(
     `/api/soc/chains/${encodeURIComponent(id)}`,
     null,
-    null,
+    { notFound: null },
   );
   if (!live) return null;
   const { chain: inner, ...top } = live;
@@ -55,7 +60,7 @@ export async function listApprovals(): Promise<Approval[]> {
   if (USE_FIXTURES) return fixtureApprovals as Approval[];
   // Cached + coalesced so every watching analyst shares one detector fetch (see lib/cache.ts).
   return cached("approvals", SNAPSHOT_TTL_MS, async () => {
-    const live = await backend<{ approvals?: Approval[] } | Approval[]>("/api/approvals", fixtureApprovals as Approval[], []);
+    const live = await backend<{ approvals?: Approval[] } | Approval[]>("/api/approvals", fixtureApprovals as Approval[]);
     return (Array.isArray(live) ? live : (live.approvals ?? [])) as Approval[];
   });
 }
@@ -63,7 +68,7 @@ export async function listApprovals(): Promise<Approval[]> {
 export async function listProposals(): Promise<Proposal[]> {
   if (USE_FIXTURES) return fixtureProposals as Proposal[];
   return cached("proposals", SNAPSHOT_TTL_MS, async () => {
-    const live = await backend<{ proposals?: Proposal[] } | Proposal[]>("/api/soc/proposals", fixtureProposals as Proposal[], []);
+    const live = await backend<{ proposals?: Proposal[] } | Proposal[]>("/api/soc/proposals", fixtureProposals as Proposal[]);
     return (Array.isArray(live) ? live : (live.proposals ?? [])) as Proposal[];
   });
 }
@@ -81,4 +86,5 @@ export async function getRecentChains(): Promise<Chain[]> {
 }
 
 export const isFixtureMode = USE_FIXTURES;
-export function lastBackendError(): string | null { return backendError; }
+
+export { settle } from "./settle";
