@@ -806,56 +806,89 @@ def _forward_alert(aegis_url: str | None, token: str | None, alert: dict[str, An
     headers = {"Content-Type": "application/x-ndjson"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    _SENDER.submit(aegis_url, data, headers)
+    sev = str(alert.get("severity") or "").lower()
+    # findings outrank page views: in a flood the queue sheds routine traffic first (round 4 I4-8)
+    _SENDER.submit(aegis_url, data, headers, priority=sev in ("medium", "high", "critical") or bool(alert.get("signature")))
 
 
 class _AlertSender:
     """One background sender with a bounded queue. Each alert used to start its own thread with no limit, and a
     503 (the SOC applying backpressure) dropped the event silently — during a flood the edge grew threads without
     bound and lost the telemetry the SOC most needed (review round 3 I3-18). A 503 / connection error is retried
-    with backoff; when the queue is full the oldest event goes, and the count is kept."""
+    with backoff.
 
-    def __init__(self, cap: int = 5000):
+    Round 4 I4-8: one event per POST drained ~700/s, so a flood of cheap requests evicted the exploit's own event
+    before it was sent. Events now go out as NDJSON batches (up to ``batch`` per POST), findings (medium+ / a
+    signature) are queued apart from routine page views and are the last to be shed when the queue is full, and
+    ``sent`` / ``dropped`` / ``dropped_findings`` / ``queued`` are reported on the edge's health page."""
+
+    def __init__(self, cap: int = 5000, batch: int = 200):
         import collections
-        self._q: collections.deque = collections.deque()
+        self._hi: collections.deque = collections.deque()
+        self._lo: collections.deque = collections.deque()
         self._cap = cap
+        self._batch = batch
         self._cv = threading.Condition()
         self._thread: threading.Thread | None = None
         self.dropped = 0
+        self.dropped_findings = 0
         self.sent = 0
 
-    def submit(self, url: str, data: bytes, headers: dict[str, str]) -> None:
+    def stats(self) -> dict[str, int]:
         with self._cv:
-            if len(self._q) >= self._cap:
-                self._q.popleft()
+            return {"sent": self.sent, "dropped": self.dropped, "dropped_findings": self.dropped_findings,
+                    "queued": len(self._hi) + len(self._lo)}
+
+    def submit(self, url: str, data: bytes, headers: dict[str, str], *, priority: bool = False) -> None:
+        with self._cv:
+            if len(self._hi) + len(self._lo) >= self._cap:
+                if self._lo:
+                    self._lo.popleft()
+                else:
+                    self._hi.popleft()
+                    self.dropped_findings += 1
                 self.dropped += 1
-            self._q.append((url, data, headers))
+            (self._hi if priority else self._lo).append((url, data, headers))
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._run, name="aegis-alert-sender", daemon=True)
                 self._thread.start()
             self._cv.notify()
 
+    def _take(self) -> list[tuple[str, bytes, dict[str, str]]]:
+        """Up to ``batch`` events for one (url, headers), findings first."""
+        with self._cv:
+            while not self._hi and not self._lo:
+                self._cv.wait()
+            first = (self._hi or self._lo)[0]
+            out = []
+            for q in (self._hi, self._lo):
+                while q and len(out) < self._batch and q[0][0] == first[0] and q[0][2] == first[2]:
+                    out.append(q.popleft())
+            return out
+
     def _run(self) -> None:
         import time as _time
         while True:
-            with self._cv:
-                while not self._q:
-                    self._cv.wait()
-                url, data, headers = self._q.popleft()
+            batch = self._take()
+            url, headers = batch[0][0], batch[0][2]
+            data = b"".join(d if d.endswith(b"\n") else d + b"\n" for _, d, _ in batch)
             delay = 0.5
             for attempt in range(4):
                 try:
                     urllib.request.urlopen(urllib.request.Request(url, data=data, method="POST", headers=headers),
-                                           timeout=2.0).read()
-                    self.sent += 1
+                                           timeout=5.0).read()
+                    with self._cv:
+                        self.sent += len(batch)
                     break
                 except urllib.error.HTTPError as e:
                     if e.code not in (429, 502, 503, 504) or attempt == 3:
-                        self.dropped += 1
+                        with self._cv:
+                            self.dropped += len(batch)
                         break
                 except (urllib.error.URLError, OSError, ValueError):
                     if attempt == 3:
-                        self.dropped += 1         # the demo must never stall on the SOC side being down
+                        with self._cv:
+                            self.dropped += len(batch)   # the demo must never stall on the SOC side being down
                         break
                 _time.sleep(delay)
                 delay = min(delay * 2, 5.0)

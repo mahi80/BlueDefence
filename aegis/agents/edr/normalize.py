@@ -71,7 +71,7 @@ def from_sysmon(evt: dict) -> dict:
         return {**base,
                 "dest_ip": evt.get("DestinationIp"),
                 "dst_port": _int(evt.get("DestinationPort")),
-                "egress_ts": _float(evt.get("ts") or evt.get("UtcTimeEpoch"))}
+                "egress_ts": _float(evt.get("ts") or evt.get("UtcTimeEpoch")) or _utc(evt.get("UtcTime"))}
     if eid == 22:  # DnsQuery
         q = evt.get("QueryName", "")
         return {**base, "dns_queries": [q], "dest_domain": q}
@@ -158,6 +158,20 @@ class BeaconAggregator:
 _AGG: BeaconAggregator | None = None
 
 
+def _utc(v: object) -> float | None:
+    """Sysmon's ``UtcTime`` ("2026-11-03 10:30:00.123") as epoch seconds — real EID 3 events carry no ``ts``,
+    so the beacon series was never built from stock Sysmon (round 4 S4-8)."""
+    if not isinstance(v, str) or not v.strip():
+        return None
+    from datetime import UTC, datetime
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(v.strip(), fmt).replace(tzinfo=UTC).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
 def to_alert(raw: dict) -> dict | None:
     """One collector record — a Sysmon event (``EventID`` / ``event_id``) or an osquery result log line (``name`` +
     ``columns``) — as an EDR alert with an id, or None for a shape this module does not know. This is what wires the
@@ -187,6 +201,16 @@ def to_alert(raw: dict) -> dict | None:
             _AGG = BeaconAggregator()
         _AGG.enrich(alert)
     if len(alert) <= 3:                       # only source/host/host_class: nothing a scorer can use
+        return None
+    # Pre-filter: every Sysmon / osquery row used to become an LLM investigation (a notepad launch, one DNS
+    # query), and storm mode then deferred real alerts behind them. Only a row a scorer finds something in is an
+    # alert; the rest has been folded into the beacon window above and is done (round 4 S4-8).
+    from .tools import run_all_tools
+    try:
+        quiet = all(getattr(r, "weight", "low") == "low" for r in run_all_tools(alert))
+    except Exception:  # noqa: BLE001 — a scorer that cannot run must not drop the row: let the specialist see it
+        quiet = False
+    if quiet:
         return None
     digest = hashlib.sha256(repr(sorted(raw.items(), key=lambda kv: str(kv[0])))[:4000].encode()).hexdigest()[:16]
     return {"id": f"edr-{digest}", "alert_type": "host_endpoint", **alert}

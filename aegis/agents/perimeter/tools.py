@@ -58,8 +58,63 @@ _XXE_PRIMITIVES = ("<!doctype", "<!entity", "<!element", 'system "file:', "syste
                    "file:///", "expect://", "xinclude", "<!entity %")
 
 
-_COMMENT_RX = re.compile(r"/\*(?:[^*]|\*(?!/)){0,4000}\*/")
 _UNION_RX = re.compile(r"union(?:\s|/\*\*/|\+)+(?:all|distinct)(?:\s|/\*\*/|\+)+select")
+# `union(select(…))`, `union%0aselect`, `union/*x*/select` — any non-word run between the two keywords
+_UNION_ANY_RX = re.compile(r"\bunion\W{0,40}?select\b")
+# MySQL `#…\n` / `-- …\n` line comments used as whitespace (`UNION#x\nSELECT`)
+_LINE_COMMENT_RX = re.compile(r"(?:#|--)[^\r\n]{0,200}[\r\n]")
+# base64 tokens: no `=` inside (so `q=<b64>` is not one token), up to two pad characters, URL-safe alphabet too
+_B64_RX = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
+_MAX_COMMENTS = 512
+_JSON_ESC_RX = re.compile(r"\\(u[0-9a-fA-F]{4}|[nrt\"/\\])")
+_JSON_ESC = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "/": "/", "\\": "\\"}
+
+
+def _json_unescape(m: re.Match) -> str:
+    g = m.group(1)
+    return chr(int(g[1:], 16)) if g[0] == "u" else _JSON_ESC[g]
+
+
+def _strip_comments(text: str) -> str:
+    """Remove ``/* … */`` comments in one linear pass (``str.find`` for each ``*/``). The bounded regex still
+    rescanned 4,000 characters from every unclosed ``/*`` — 12 s on a 32 KB ``/*a/*a…`` body (round 4 S4-9)."""
+    out: list[str] = []
+    i, n = 0, 0
+    while True:
+        j = text.find("/*", i)
+        if j < 0 or n >= _MAX_COMMENTS:
+            out.append(text[i:])
+            break
+        k = text.find("*/", j + 2)
+        if k < 0:
+            out.append(text[i:])                       # unclosed: nothing after it can close either
+            break
+        out.append(text[i:j])
+        i, n = k + 2, n + 1
+    return "".join(out)
+
+
+def _b64_layers(texts: list[str]) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        for token in _B64_RX.findall(text)[:200]:
+            body = token.rstrip("=")
+            if body in seen:
+                continue
+            seen.add(body)
+            padded = body + "=" * (-len(body) % 4)
+            for dec in (base64.b64decode, base64.urlsafe_b64decode):
+                try:
+                    out = dec(padded.replace("-", "+").replace("_", "/") if dec is base64.b64decode else padded)
+                except Exception:  # noqa: BLE001, S112 — not base64; try the next form
+                    continue
+                txt = out.decode("utf-8", errors="ignore")
+                # mostly printable: a random id that happens to decode is noise, not a layer
+                if txt and txt != token and sum(c.isprintable() or c in "\r\n\t" for c in txt) >= 0.9 * len(txt):
+                    found.append(txt)
+                break
+    return found
 
 
 def decode_payload(raw: str) -> ToolResult:
@@ -84,34 +139,38 @@ def decode_payload(raw: str) -> ToolResult:
             cur = nxt
     except Exception:  # noqa: BLE001, S110 — decode probing: failure is the common case, not an error
         pass
+    # JSON string escapes (`\\n`, `\\uff07`): a JSON body serialised with ensure_ascii hid newline and full-width
+    # evasions from the layers below (round 4 S4-11)
+    if "\\" in raw:
+        unesc = _JSON_ESC_RX.sub(_json_unescape, raw)
+        if unesc != raw:
+            layers.append(unesc)
     # HTML entities (&#39; &lt;script) and full-width / compatibility forms (＇ＯＲ　１＝１) fold to ASCII
     for layer in list(layers):
         for alt in (html.unescape(layer), unicodedata.normalize("NFKC", layer)):
             if alt != layer and alt not in layers:
                 layers.append(alt)
-    # Try base64 on substrings that look like base64
-    for token in re.findall(r"[A-Za-z0-9+/=]{16,}", raw):
-        try:
-            decoded_b64 = base64.b64decode(token, validate=True).decode("utf-8", errors="ignore")
-            if decoded_b64 and decoded_b64 != token:
-                layers.append(decoded_b64)
-        except Exception:  # noqa: BLE001, S112 — not base64; try the next token
-            continue
-    # Comment-stripping evasion (UNI/**/ON SELECT -> UNION SELECT)
+    # base64 on substrings that look like base64, in the raw and URL-decoded layers: `q=<b64>` used to be one
+    # token (the class included `=`), and %3D padding or missing padding failed validation (round 4 S4-4)
+    layers.extend(_b64_layers(list(layers)))
+    # Comment-stripping evasion (UNI/**/ON SELECT -> UNION SELECT), MySQL line comments, whitespace collapsing
     extra_layers = []
     for layer in layers:
-        # bounded: `.*?` with DOTALL rescanned to the end from every unclosed /* — quadratic on a padded body
-        no_comments = _COMMENT_RX.sub("", layer)
+        no_comments = _strip_comments(layer)
         if no_comments != layer:
             extra_layers.append(no_comments)
+        no_line = _LINE_COMMENT_RX.sub(" ", no_comments)
+        if no_line != no_comments:
+            extra_layers.append(no_line)
         # Whitespace-collapsing evasion (' OR  1 = 1 -> ' OR 1=1)
-        collapsed = re.sub(r"\s*=\s*", "=", re.sub(r"\s+", " ", layer))
+        collapsed = re.sub(r"\s*=\s*", "=", re.sub(r"\s+", " ", no_line))
         if collapsed != layer:
             extra_layers.append(collapsed)
     layers.extend(extra_layers)
 
     flat = " ".join(layers).lower()
     flat = _UNION_RX.sub("union select", flat)        # UNION ALL / DISTINCT SELECT is UNION SELECT
+    flat = _UNION_ANY_RX.sub("union select", flat)    # union(select(…)) — round 4 S4-11
     primitives_found = {
         "sqli": [p for p in _SQLI_PRIMITIVES if p in flat],
         "xss": [p for p in _XSS_PRIMITIVES if p in flat],
@@ -308,6 +367,11 @@ def ssrf_probe(raw: str) -> ToolResult:
             hits.append({"url": m[:200], "host": host, "reason": why})
     # scheme-less service refs like meta:8000 — only when the host is known-internal
     for name, port in re.findall(r"\b([a-z0-9][a-z0-9.\-]{1,62}):(\d{2,5})\b", low):
+        # `10:30`, `16:00`, an ISO timestamp's `T10:30` are times, not host:port: a bare 1–3 digit "host" read
+        # through inet_aton as 0.0.0.10 made every UPI / NEFT body an SSRF probe (round 4 S4-3). A scheme-less
+        # ref needs a letter in the name, or a full dotted quad.
+        if not any(c.isalpha() for c in name) and name.count(".") != 3:
+            continue
         internal, why = _host_is_internal(name)
         if internal and name not in seen:
             seen.add(name)
@@ -633,6 +697,21 @@ _DISCLOSURE_CONTENT_TYPES = ("application/octet-stream", "text/plain", "applicat
                              "text/x-php", "application/json")
 
 
+#: a customer's own export (a zipped statement, a passbook download) is not a dump (round 4 S4-16)
+_CUSTOMER_EXPORT_HINTS = ("statement", "passbook", "/me/", "/my/", "/self/", "invoice", "receipt", "/customer/")
+
+
+def _sign_in(sign: str, path: str) -> bool:
+    """``.env`` family on a path-segment boundary: ``/.env``, ``/.env.local``, ``/.env~`` — not ``/.envelope/``
+    or ``/api/.environment`` (round 4 S4-16)."""
+    if not sign.startswith(".env"):
+        return sign in path
+    for seg in path.split("/"):
+        if seg == sign or (seg.startswith(sign) and seg[len(sign):len(sign) + 1] in (".", "~", "_", "-")):
+            return True
+    return False
+
+
 def _decoded_path(alert: dict) -> str:
     raw = str(alert.get("url") or alert.get("uri") or alert.get("path") or "")
     path = urllib.parse.urlsplit(raw).path or raw
@@ -667,8 +746,9 @@ def secret_file_probe(alert: dict) -> ToolResult:
     path = _decoded_path(alert)
     if not path:
         return ToolResult(name="secret_file_probe", data={"applicable": False}, weight="low")
-    hit = next((s for s in _SECRET_PATH_SIGNS if s in path), "")
-    if not hit and any(d in path for d in _DUMP_DIRS) and path.endswith(_DUMP_EXT):
+    hit = next((s for s in _SECRET_PATH_SIGNS if _sign_in(s, path)), "")
+    if not hit and any(d in path for d in _DUMP_DIRS) and path.endswith(_DUMP_EXT) \
+            and not any(h in path for h in _CUSTOMER_EXPORT_HINTS):
         hit = next(d for d in _DUMP_DIRS if d in path)
     if not hit:
         hit = next((f"*{suf}" for suf in _SECRET_SUFFIXES if path.endswith(suf)), "")

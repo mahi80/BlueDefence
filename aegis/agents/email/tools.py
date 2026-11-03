@@ -16,22 +16,53 @@ class ToolResult:
 
 # ---- Header authentication (SPF / DKIM / DMARC) --------------------
 
+_AR_METHOD_RX = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*([a-z]+)")
+
+
+def _trusted_auth_results(headers: dict) -> str:
+    """The Authentication-Results our own gateway wrote. A message can carry any number of them and the sender
+    writes the rest, so with ``AEGIS_MAIL_AUTHSERV_ID`` set only an A-R whose authserv-id (the text before the
+    first ``;``) is one of ours counts; without it, the top-most one (the last hop's, which a receiving gateway
+    prepends) does (review round 4 X4-12)."""
+    import os
+    raw = headers.get("authentication-results")
+    items = [str(x) for x in raw] if isinstance(raw, (list, tuple)) else ([str(raw)] if raw else [])
+    ours = {x.strip().lower() for x in os.environ.get("AEGIS_MAIL_AUTHSERV_ID", "").split(",") if x.strip()}
+    if ours:
+        items = [x for x in items if x.split(";", 1)[0].strip().lower() in ours]
+    return items[0].lower() if items else ""
+
+
+def _verdict(v: str) -> str:
+    """``pass (signature verified)`` → ``pass``; the first word of a method result."""
+    m = re.match(r"\s*([a-z]+)", str(v or "").lower())
+    return m.group(1) if m else ""
+
+
 def header_auth_check(headers: dict | None) -> ToolResult:
     if not headers:
         return ToolResult(name="header_auth", data={"verdict": "no_headers"}, weight="low")
-    spf = str(headers.get("spf") or headers.get("Received-SPF") or "").lower()
-    auth_results = str(headers.get("Authentication-Results") or "").lower()
-    dmarc = str(headers.get("dmarc") or auth_results).lower()
-    # A DKIM-Signature header is something the SENDER writes; only the receiving gateway's verdict (a `dkim`
-    # field from the mail pipeline, or dkim=… in Authentication-Results) says whether it verified. Any non-empty
-    # signature header used to count as a pass (review round 3 G7-15).
-    m = re.search(r"\bdkim=(\w+)", auth_results)
-    dkim = str(headers.get("dkim") or (m.group(1) if m else "")).lower()
+    # header names are case-insensitive: an authenticated mail with lower-case keys scored medium (round 4 S4-16)
+    h = {str(k).lower(): v for k, v in headers.items()}
+    ar = _trusted_auth_results(h)
+    methods: dict[str, str] = {}
+    for meth, val in _AR_METHOD_RX.findall(ar):
+        methods.setdefault(meth, val)
+    # Per-method results. DMARC used to read "fail" anywhere in the whole A-R line, so a forwarded mail with a
+    # broken DKIM signature and a DMARC pass was a DMARC fail too. A DKIM-Signature header is something the
+    # SENDER writes; only the gateway's verdict counts (review round 3 G7-15).
+    spf = _verdict(h.get("spf") or methods.get("spf") or h.get("received-spf") or "")
+    dkim = _verdict(h.get("dkim") or methods.get("dkim") or "")
+    dmarc = _verdict(h.get("dmarc") or methods.get("dmarc") or "")
 
-    spf_fail = "fail" in spf or "softfail" in spf
-    dkim_fail = dkim not in ("pass",)
-    dmarc_fail = "fail" in dmarc or "dmarc=fail" in dmarc
+    spf_fail = spf in ("fail", "softfail")
+    dkim_fail = dkim != "pass"
+    dmarc_fail = dmarc == "fail"
     fails = sum([spf_fail, dkim_fail, dmarc_fail])
+    # DMARC pass is the domain owner's own alignment verdict: a DKIM failure under it (a forwarder, a list) is
+    # not a spoof on its own
+    if dmarc == "pass" and fails == 1 and dkim_fail:
+        fails = 0
     if fails >= 2:
         weight = "high"
     elif fails == 1:
@@ -40,6 +71,7 @@ def header_auth_check(headers: dict | None) -> ToolResult:
         weight = "low"
     return ToolResult(name="header_auth", data={
         "spf_fail": spf_fail, "dkim_fail": dkim_fail, "dmarc_fail": dmarc_fail,
+        "spf": spf or None, "dkim": dkim or None, "dmarc": dmarc or None,
         "fail_count": fails,
     }, weight=weight)
 
@@ -54,15 +86,20 @@ _PROTECTED_DISPLAY_NAMES = {
 }
 
 
+_INTERNAL_MAIL_DOMAINS = ("bank.in", "bank.example")
+
+
 def display_name_spoof_check(from_display: str | None,
                              from_address: str | None) -> ToolResult:
     if not from_display or not from_address:
         return ToolResult(name="display_spoof", data={"verdict": "no_data"}, weight="low")
     display_lower = from_display.lower().strip()
-    address_domain = from_address.split("@", 1)[-1].lower() if "@" in from_address else ""
-    is_internal_domain = address_domain.endswith("bank.in") or address_domain.endswith("bank.example")
+    address_domain = from_address.rsplit("@", 1)[-1].lower().strip(" >.") if "@" in from_address else ""
+    # dot boundary: `evilbank.in` is not `bank.in` (round 1 low, still open in round 4)
+    is_internal_domain = any(address_domain == d or address_domain.endswith("." + d) for d in _INTERNAL_MAIL_DOMAINS)
+    # whole words: "rbi" inside "Harbinder" was an RBI impersonation (round 4 S4-16)
     impersonates_protected = any(
-        name in display_lower for name in _PROTECTED_DISPLAY_NAMES
+        re.search(rf"(?<![a-z]){re.escape(name)}(?![a-z])", display_lower) for name in _PROTECTED_DISPLAY_NAMES
     )
     spoof = impersonates_protected and not is_internal_domain
     return ToolResult(name="display_spoof", data={
@@ -118,22 +155,60 @@ def _is_lookalike(domain: str, target: str) -> bool:
     return True
 
 
+_GENERIC_BRANDS = {"bank"}     # "bank" as a label token is every bank's name, not an imitation of bank.in
+
+
+def _glyph_fold(t: str) -> str:
+    """Letters that read alike in a mail client: ``sbl`` / ``sb1`` read as ``sbi``. A short brand matches only
+    through these, not through any one-letter edit (``ubi`` is a different bank, not ``sbi``)."""
+    return t.translate(str.maketrans({"l": "i", "1": "i", "!": "i", "|": "i", "0": "o"}))
+
+
+def _lookalike_of(domain: str, target: str) -> str:
+    """How ``domain`` imitates ``target``: the whole name, its registrable part (``netbanking.sbl.co.in`` →
+    ``sbl.co.in``), or the brand as a label token (``sbl-kyc.in``, ``sbi-kyc.in``) — only the full host used to be
+    compared (round 4 S4-16)."""
+    if domain == target or domain.endswith("." + target):
+        return ""
+    if _is_lookalike(domain, target):
+        return "name"
+    n = target.count(".") + 1
+    reg = ".".join(domain.split(".")[-n:])
+    if reg != target and _is_lookalike(reg, target):
+        return "registrable"
+    brand = target.split(".")[0]
+    if len(brand) >= 3 and brand not in _GENERIC_BRANDS:
+        for label in domain.split(".")[:-1]:
+            for tok in re.split(r"[-_]", label):
+                if tok == brand or (len(tok) == len(brand) and (
+                        _is_lookalike(tok, brand) if len(brand) >= 4 else _glyph_fold(tok) == _glyph_fold(brand))):
+                    return "brand"
+    return ""
+
+
 def lookalike_domain_check(from_address: str | None,
                            urls_in_body: list[str] | None) -> ToolResult:
     if not from_address and not urls_in_body:
         return ToolResult(name="lookalike_domain", data={"verdict": "no_data"}, weight="low")
+    from urllib.parse import urlsplit
     domains_to_check: list[str] = []
     if from_address and "@" in from_address:
-        domains_to_check.append(from_address.split("@", 1)[1].lower())
+        domains_to_check.append(from_address.rsplit("@", 1)[1].lower().strip(" >."))
     for u in (urls_in_body or []):
-        m = re.search(r"https?://([^/]+)", u)
-        if m:
-            domains_to_check.append(m.group(1).lower())
+        try:
+            host = urlsplit(u if "://" in u else f"http://{u}").hostname or ""   # userinfo (sbi.co.in@evil) stripped
+        except ValueError:
+            host = ""
+        if host:
+            domains_to_check.append(host.lower().rstrip("."))
     matches: list[dict] = []
     for d in domains_to_check:
+        if any(d == t or d.endswith("." + t) for t in _PROTECTED_DOMAINS):
+            continue                                   # the genuine domain (or a host under it)
         for target in _PROTECTED_DOMAINS:
-            if _is_lookalike(d, target):
-                matches.append({"observed": d, "lookalike_of": target})
+            hit = _lookalike_of(d, target)
+            if hit:
+                matches.append({"observed": d, "lookalike_of": target, "how": hit})
     weight = "high" if matches else "low"
     return ToolResult(name="lookalike_domain", data={
         "checked_domains": domains_to_check,

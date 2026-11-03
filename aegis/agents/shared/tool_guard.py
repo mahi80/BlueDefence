@@ -3,7 +3,7 @@
 Each specialist builds its evidence from ``run_all_tools(alert)``: a list of tool calls. A number sent as a string,
 ``None`` inside a list, a dict ``payload`` or a string ``requestParameters`` raised inside ONE tool, the whole list
 was lost and the chain fell back to an uncertain escalation (review round 3 S3-22). ``isolated`` runs one tool and
-turns a crash into a low-weight result that says which tool failed and why.
+turns a crash into a medium-weight result that says which tool failed and why.
 """
 
 from __future__ import annotations
@@ -21,8 +21,11 @@ def isolated(call: Callable[[], Any], name: str, result_type: type) -> Any:
     except Exception as e:  # noqa: BLE001 — the point: one tool's crash is one tool's problem
         logger.warning("[tools] %s failed on this alert (%s: %s) — its signal is missing, the others stand",
                        name, type(e).__name__, str(e)[:160])
+        # medium, not low: a tool that could not read the alert has not cleared it — "low" read as "checked, nothing
+        # there" and an attacker could pick the field shape that crashes the one tool that would have fired
+        # (review round 4 S4-15)
         return result_type(name=name, data={"error": f"{type(e).__name__}: {str(e)[:160]}", "tool_failed": True},
-                           weight="low")
+                           weight="medium")
 
 
 __all__ = ["isolated"]

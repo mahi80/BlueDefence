@@ -333,6 +333,11 @@ class EgressDetector:
         # reported: "SNI c2.windowsupdate.com" on a known-bad IP used to return before the intel match.
         allowed = self._allowed_domain(sni)
         p = self._pair(src, key, ts)
+        # The SNI is client-chosen: a beacon that names a fresh SNI on every connection to one IP never repeated a
+        # key. The destination IP keeps its own connection starts (review round 4 S4-6).
+        ip_pair = self._ip_pair(src, dst, ts, p) if sni and dst else None
+        if ip_pair is not None:
+            ip_pair.starts.append(ts)
         p.sni, p.sensor = sni, str(ev.get("sensor") or "")
         p.dport = int(ev.get("dport") or 0)
         _keep(p.dsts, dst, 8)
@@ -345,9 +350,10 @@ class EgressDetector:
         p.no_sni = not sni and p.dport in TLS_PORTS
         out: list[dict | None] = []
         hit = self.intel.match(cert_sha1=cert.get("sha1", ""), cert_sha256=cert.get("sha256", ""), sni=sni, ip=dst,
-                               ja3s=str(ev.get("ja3s") or ""), ja4=str(ev.get("ja4") or ""), ja3=str(ev.get("ja3") or ""))
+                               ja3s=str(ev.get("ja3s") or ""), ja4=str(ev.get("ja4") or ""), ja3=str(ev.get("ja3") or ""),
+                               skip_domain=allowed)
         if hit is None:
-            hit = self._store_hit(sni, dst)
+            hit = self._store_hit("" if allowed else sni, dst)
         if hit is not None and not (allowed and hit.kind == "domain"):
             p.intel = hit.to_dict()
             out.append(self._emit("tls_known_bad", p, ts, 1, indicator=f"{hit.kind}:{hit.value}"))
@@ -361,8 +367,21 @@ class EgressDetector:
                 out.append(self._emit("shadow_ai", p, ts, 1, indicator=svc.endpoint,
                                       shadow_ai={**u.to_dict(), "level": "use"}))
             return out                       # an AI service is judged as AI usage, not as a beacon
-        out.append(self._check_beacon(p, ts))
+        hit_b = self._check_beacon(p, ts)
+        if hit_b is None and ip_pair is not None and not p.beacon:
+            hit_b = self._check_beacon(ip_pair, ts)
+        out.append(hit_b)
         return out
+
+    def _ip_pair(self, src: str, dst: str, ts: float, like: _Pair) -> _Pair:
+        ip_pair = self._pair(src, f"ip:{dst}", ts)
+        _keep(ip_pair.dsts, dst, 8)
+        ip_pair.dport = ip_pair.dport or like.dport
+        ip_pair.sensor = ip_pair.sensor or like.sensor
+        srcs = self._lru_get(self._prev, f"ip:{dst}", set, self.max_keys)
+        if len(srcs) < 64:
+            srcs.add(src)
+        return ip_pair
 
     def _store_hit(self, sni: str, dst: str) -> Any:
         if self.ioc_store is None:
@@ -389,10 +408,24 @@ class EgressDetector:
         known = handshake_seen or key is not None          # this connection's handshake was already counted
         sni = str(ev.get("sni") or "").strip().lower().strip(".")
         key = key or sni or dst
-        # Known limit: the SNI is client-chosen, so a forged allow-listed SNI on a clean IP also skips the
-        # volume (exfil) heuristic here. Closing it needs certificate-to-SNI verification; intel hits on the
-        # IP / JA3S / certificate are still caught at the handshake.
+        out_b, in_b = max(0, int(ev.get("bytes_out") or 0)), max(0, int(ev.get("bytes_in") or 0))
+        # The destination IP keeps its own running total whatever the SNI says: a forged allow-listed SNI
+        # (`x.windowsupdate.com`) or an AI endpoint's name used to skip the volume heuristic entirely (round 4
+        # S4-6). Behind an allow-listed / AI name the IP total needs AEGIS_NDR_ALLOWED_SNI_EXFIL_FACTOR × the
+        # threshold, so a sanctioned backup does not alarm at the ordinary line.
+        ip_pair = None
+        if dst and (key != dst):
+            ip_pair = self._pair(src, f"ip:{dst}", ts)
+            _keep(ip_pair.dsts, dst, 8)
+            ip_pair.dport = ip_pair.dport or int(ev.get("dport") or 0)
+            ip_pair.sensor = ip_pair.sensor or str(ev.get("sensor") or "")
+            srcs = self._lru_get(self._prev, f"ip:{dst}", set, self.max_keys)
+            if len(srcs) < 64:
+                srcs.add(src)
+            self._add_volume(ip_pair, ts, out_b, in_b)
         if self._allowed_domain(sni) or self._allowed_domain(key):
+            if ip_pair is not None and not ip_pair.exfil:
+                return [self._check_exfil(ip_pair, ts, factor=self._allowed_factor())]
             return []
         p = self._pair(src, key, ts)
         _keep(p.dsts, dst, 8)
@@ -404,21 +437,8 @@ class EgressDetector:
             if len(srcs) < 64:
                 srcs.add(src)
             p.starts.append(ts)
-        out_b, in_b = max(0, int(ev.get("bytes_out") or 0)), max(0, int(ev.get("bytes_in") or 0))
         p.sizes.append(out_b)
         self._add_volume(p, ts, out_b, in_b)
-        # The SNI is client-chosen: the same upload spread over a1.evil … a50.evil (one IP) stayed under the
-        # threshold for every name. The destination IP keeps its own running total (review round 3 G7-7).
-        ip_pair = None
-        if key != dst and dst:
-            ip_pair = self._pair(src, f"ip:{dst}", ts)
-            _keep(ip_pair.dsts, dst, 8)
-            ip_pair.dport = ip_pair.dport or p.dport
-            ip_pair.sensor = ip_pair.sensor or p.sensor
-            srcs = self._lru_get(self._prev, f"ip:{dst}", set, self.max_keys)
-            if len(srcs) < 64:
-                srcs.add(src)
-            self._add_volume(ip_pair, ts, out_b, in_b)
         out: list[dict | None] = []
         svc = ai_service(p.sni or sni)
         if svc is not None:
@@ -428,6 +448,9 @@ class EgressDetector:
                 rows = [r for r in self.usage.rows() if r["host"] == src and r["endpoint"] == svc.endpoint]
                 out.append(self._emit("shadow_ai", p, ts, 2, indicator=svc.endpoint,
                                       shadow_ai={**(rows[0] if rows else {}), "level": "upload", "uploaded_last_hour": sent}))
+            if ip_pair is not None and not ip_pair.exfil:
+                # an AI endpoint's name on the SNI does not vouch for where the bytes went (round 4 S4-6)
+                out.append(self._check_exfil(ip_pair, ts, factor=self._allowed_factor() if status == "approved" else 1.0))
             return out
         if not known:
             out.append(self._check_beacon(p, ts))
@@ -473,8 +496,17 @@ class EgressDetector:
         p.beacon = b
         return self._emit("tls_beacon", p, ts, 1)
 
-    def _check_exfil(self, p: _Pair, ts: float) -> dict | None:
-        if p.out_sum < self.exfil_bytes or p.out_sum < self.exfil_ratio * max(1, p.in_sum) or not self._rare(p.key):
+    @staticmethod
+    def _allowed_factor() -> float:
+        import os
+        try:
+            return max(1.0, float(os.environ.get("AEGIS_NDR_ALLOWED_SNI_EXFIL_FACTOR", "4") or 4))
+        except ValueError:
+            return 4.0
+
+    def _check_exfil(self, p: _Pair, ts: float, factor: float = 1.0) -> dict | None:
+        need = self.exfil_bytes * factor
+        if p.out_sum < need or p.out_sum < self.exfil_ratio * max(1, p.in_sum) or not self._rare(p.key):
             return None
         level = 2 if p.out_sum >= 10 * self.exfil_bytes else 1
         span = ts - p.volume[0][0] if p.volume else 0.0

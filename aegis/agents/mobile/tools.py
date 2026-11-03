@@ -22,6 +22,15 @@ def _flag(v: object) -> bool:
     return bool(v)
 
 
+def _number(v: object) -> float | None:
+    import math
+    try:
+        f = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def jailbreak_root_check(device_telemetry: dict | None) -> ToolResult:
     if not device_telemetry:
         return ToolResult(name="jailbreak_root", data={"verdict": "no_data"}, weight="low")
@@ -80,13 +89,15 @@ def sim_swap_check(mno_signals: dict | None,
 def mobile_session_anomaly_check(session: dict | None) -> ToolResult:
     if not session:
         return ToolResult(name="mobile_session", data={"verdict": "no_data"}, weight="low")
-    velocity_kmh = session.get("device_velocity_kmh", 0)
-    app_version_age_days = session.get("app_version_age_days")
-    os_eol = session.get("os_eol", False)
-    side_loaded = session.get("side_loaded", False)
-    overlay_detected = session.get("screen_overlay_detected", False)
-    impossible_velocity = velocity_kmh and velocity_kmh > 900
-    stale = isinstance(app_version_age_days, (int, float)) and app_version_age_days > 365
+    # string flags and numbers ("true", "950") are telemetry too: sum() over a "true" raised, and the tool failure
+    # scored the overlay-fraud session low (round 4 S4-15)
+    velocity_kmh = _number(session.get("device_velocity_kmh")) or 0.0
+    app_version_age_days = _number(session.get("app_version_age_days"))
+    os_eol = _flag(session.get("os_eol", False))
+    side_loaded = _flag(session.get("side_loaded", False))
+    overlay_detected = _flag(session.get("screen_overlay_detected", False))
+    impossible_velocity = velocity_kmh > 900
+    stale = app_version_age_days is not None and app_version_age_days > 365
     severity = sum([
         impossible_velocity,
         os_eol,

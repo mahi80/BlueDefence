@@ -126,15 +126,17 @@ class TlsIntel:
             self.add(TlsIndicator(kind, row[col], reason[:120], 0.9, f"abuse.ch SSLBL ({src})"))
 
     def match(self, *, cert_sha1: str = "", cert_sha256: str = "", sni: str = "", ip: str = "", ja3s: str = "",
-              ja4: str = "", ja3: str = "") -> TlsIndicator | None:
-        """The strongest indicator this connection matches, or ``None``."""
+              ja4: str = "", ja3: str = "", skip_domain: bool = False) -> TlsIndicator | None:
+        """The strongest indicator this connection matches, or ``None``. ``skip_domain``: the SNI is allow-listed,
+        so a domain hit would be suppressed anyway — the IP, JA3S and certificate must still be consulted (a
+        domain hit used to return first and hide a known-bad IP behind an allow-listed name; round 4 S4-7)."""
         if not self._by:
             return None
         for kind, value in (("cert_sha1", cert_sha1), ("cert_sha256", cert_sha256)):
             hit = self._by.get((kind, _norm(kind, value))) if value else None
             if hit:
                 return hit
-        if sni:
+        if sni and not skip_domain:
             labels = _norm("domain", sni).split(".")
             for i in range(len(labels) - 1):               # the name and each parent domain
                 hit = self._by.get(("domain", ".".join(labels[i:])))

@@ -203,14 +203,31 @@ def payment_rail_anomaly(user_id: str | None, rail: str | None,
 # Indian threshold context: Cash Transaction Reports trigger at
 # Rs 10L (1 million); structuring is splitting just under the
 # threshold to evade (e.g., 9.5L + 9.5L + 9.5L on consecutive days).
+def _flag(v: object) -> bool:
+    """A telemetry flag: ``"true"`` is True and ``"false"`` is False (bool("false") is True)."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(v)
+
+
+def _amount(v: object) -> float | None:
+    import math
+    try:
+        f = float(str(v).replace(",", "")) if isinstance(v, str) else float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def aml_structuring_check(recent_amounts_inr: list[float] | None,
                           *, threshold_inr: float = 1_000_000.0) -> ToolResult:
     if not recent_amounts_inr or len(recent_amounts_inr) < 3:
         return ToolResult(name="aml_structuring", data={
             "verdict": "insufficient_data",
         }, weight="low")
+    amounts = [a for a in (_amount(x) for x in recent_amounts_inr) if a is not None]   # "950000" counts (S4-15)
     just_under_threshold = [
-        a for a in recent_amounts_inr
+        a for a in amounts
         if 0.85 * threshold_inr <= a < threshold_inr
     ]
     structuring_pattern = (
@@ -218,7 +235,7 @@ def aml_structuring_check(recent_amounts_inr: list[float] | None,
         and statistics.stdev(just_under_threshold) / statistics.mean(just_under_threshold) < 0.10
     )
     return ToolResult(name="aml_structuring", data={
-        "n_recent": len(recent_amounts_inr),
+        "n_recent": len(amounts),
         "n_just_under": len(just_under_threshold),
         "threshold_inr": threshold_inr,
         "structuring_pattern": structuring_pattern,
@@ -254,9 +271,9 @@ def swift_specific_check(alert: dict) -> ToolResult:
 
     event_type = alert.get("swift_event_type") or ""
     bic = alert.get("beneficiary_bic") or ""
-    mac_fail = alert.get("lau_mac_verification_failed", False)
-    rma_change = alert.get("rma_change", False)
-    bic_blacklisted = alert.get("bic_blacklisted", False)
+    mac_fail = _flag(alert.get("lau_mac_verification_failed", False))
+    rma_change = _flag(alert.get("rma_change", False))
+    bic_blacklisted = _flag(alert.get("bic_blacklisted", False))
 
     severity = sum([
         event_type in _SWIFT_CRITICAL_EVENTS,

@@ -58,7 +58,8 @@ class PerimeterAgent:
         if not isinstance(payload, str):
             # a JSON-body payload arrives as a dict: scan its text (it used to crash the decoder and escalate)
             import json as _json
-            payload = _json.dumps(payload, default=str) if payload is not None else ""
+            # ensure_ascii=False: `\\n` and full-width text stay themselves for the whitespace / NFKC layers (S4-11)
+            payload = _json.dumps(payload, default=str, ensure_ascii=False) if payload is not None else ""
         ip = alert.get("source_ip", "")
         user_id = alert.get("user_id")
 

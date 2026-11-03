@@ -8,8 +8,10 @@ about both with one toolkit.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from ..shared.tool_guard import isolated
 
@@ -134,7 +136,9 @@ def iam_change_check(event: dict | None) -> ToolResult:
     policy_text = unquote(doc if isinstance(doc, str) else __import__("json").dumps(doc))
     # the policy ARN (AttachUserPolicy / AttachRolePolicy) and the Azure role definition id name the grant
     grant_text = " ".join(str(params.get(k) or "") for k in ("policyArn", "roleDefinitionId", "role", "roleName"))
-    has_wildcard = bool(_WILDCARD_RX.search(policy_text))
+    stmts = _statements(doc)
+    has_wildcard = (any(_has_star(st.get(k)) for st in stmts for k in ("Action", "NotAction", "Resource", "actions"))
+                    if stmts is not None else bool(_WILDCARD_RX.search(policy_text)))
     has_dangerous_role = any(role.lower() in (policy_text + " " + grant_text).lower() for role in _DANGEROUS_ROLES)
     # Was a long-lived access key created for a service principal?
     user_type = (event.get("userIdentity") or {}).get("type", "")
@@ -160,6 +164,64 @@ def iam_change_check(event: dict | None) -> ToolResult:
 
 # ---- Resource policy / S3-bucket-policy check -----------------------
 
+def _statements(doc: Any) -> list[dict] | None:
+    """A policy document's statements, parsed (``None`` when it is not a policy we can read). A regex over the
+    raw text missed ``"Action":"\\u002a"`` and Python-repr'd dicts (round 4 S4-5 / S4-12)."""
+    import json
+    from urllib.parse import unquote
+    if isinstance(doc, str):
+        try:
+            doc = json.loads(unquote(doc))
+        except ValueError:
+            try:
+                doc = json.loads(doc)
+            except ValueError:
+                return None
+    if isinstance(doc, dict) and "properties" in doc and "Statement" not in doc and isinstance(doc["properties"], dict):
+        perms = doc["properties"].get("permissions")
+        if isinstance(perms, list):                     # Azure role definition: permissions[].actions
+            return [p for p in perms if isinstance(p, dict)]
+    if not isinstance(doc, dict):
+        return None
+    st = doc.get("Statement", doc.get("statement"))
+    if isinstance(st, dict):
+        st = [st]
+    if not isinstance(st, list):
+        return [] if st is None else None
+    return [x for x in st if isinstance(x, dict)]
+
+
+def _has_star(v: Any) -> bool:
+    if isinstance(v, str):
+        return v.strip() == "*"
+    if isinstance(v, (list, tuple)):
+        return any(isinstance(x, str) and x.strip() == "*" for x in v)
+    return False
+
+
+def _public_principal(p: Any) -> bool:
+    if _has_star(p):
+        return True
+    if isinstance(p, dict):
+        return any(_has_star(v) for v in p.values())
+    return False
+
+
+def _ci(d: Any, *keys: str) -> Any:
+    """``d[key]`` matched case-insensitively (CloudTrail writes ``PublicAccessBlockConfiguration``)."""
+    if not isinstance(d, dict):
+        return None
+    low = {str(k).lower(): v for k, v in d.items()}
+    for k in keys:
+        if k.lower() in low:
+            return low[k.lower()]
+    return None
+
+
+def _truthy(v: Any) -> bool:
+    return v is True or (isinstance(v, str) and v.strip().lower() == "true")
+
+
 _PUBLIC_PRINCIPAL_RX = re.compile(r'"Principal"\s*:\s*"\*"|"Principal"\s*:\s*\{\s*"AWS"\s*:\s*"\*"\s*\}')
 
 
@@ -175,8 +237,21 @@ def resource_policy_check(event: dict | None) -> ToolResult:
 
     if action in ("PutBucketPolicy", "s3:PutBucketPolicy",
                   "Microsoft.Storage/storageAccounts/write"):
-        policy = str(params.get("bucketPolicy") or params.get("policy") or params.get("publicNetworkAccess") or "")
-        is_public = bool(_PUBLIC_PRINCIPAL_RX.search(policy)) or '"Effect": "Allow"' in policy and '"*"' in policy or '"Enabled"' in policy
+        raw = params.get("bucketPolicy") or params.get("policy")
+        stmts = _statements(raw) if raw else []
+        if stmts is not None:
+            is_public = any(str(_ci(st, "Effect") or "").lower() == "allow" and _public_principal(_ci(st, "Principal"))
+                            for st in stmts)
+        else:
+            policy = str(raw or "")
+            is_public = bool(_PUBLIC_PRINCIPAL_RX.search(policy)) or ('"Effect": "Allow"' in policy and '"*"' in policy)
+        # Azure storage account opened to the internet: publicNetworkAccess "Enabled" / allowBlobPublicAccess true,
+        # at the top of the request or under properties (the old test compared against '"Enabled"' with quotes)
+        props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+        for src in (params, props):
+            if str(_ci(src, "publicNetworkAccess") or "").strip().lower() == "enabled" \
+                    or _truthy(_ci(src, "allowBlobPublicAccess")):
+                is_public = True
         return ToolResult(name="resource_policy", data={
             "action": action, "grants_public": is_public,
         }, weight="high" if is_public else "low")
@@ -188,8 +263,8 @@ def resource_policy_check(event: dict | None) -> ToolResult:
         }, weight="high" if removed else "low")
 
     if action in ("PutBucketPublicAccessBlock",):
-        block = (params.get("publicAccessBlockConfiguration") or {})
-        weakened = not all(block.get(k, True) for k in [
+        block = _ci(params, "publicAccessBlockConfiguration", "PublicAccessBlockConfiguration") or {}
+        weakened = not all(_truthy(_ci(block, k)) if _ci(block, k) is not None else True for k in [
             "blockPublicAcls", "ignorePublicAcls", "blockPublicPolicy", "restrictPublicBuckets",
         ])
         return ToolResult(name="resource_policy", data={
@@ -636,7 +711,17 @@ _ANY_SOURCE = {"*", "any", "internet", "0.0.0.0/0", "::/0", "0.0.0.0", "all"}
 
 
 def _is_internet(cidr: str) -> bool:
-    return str(cidr).strip().lower() in _ANY_SOURCE
+    """Any source, or a public range of /8 or wider: ``0.0.0.0/1`` + ``128.0.0.0/1`` is the whole internet in two
+    rules, and only the exact ``0.0.0.0/0`` string used to count (round 4 S4-12)."""
+    c = str(cidr).strip().lower()
+    if c in _ANY_SOURCE:
+        return True
+    try:
+        net = ipaddress.ip_network(c, strict=False)
+    except ValueError:
+        return False
+    wide = net.prefixlen <= (8 if net.version == 4 else 16)
+    return wide and not (net.is_private or net.is_loopback or net.is_link_local or net.is_multicast)
 
 
 def _items(v) -> list:

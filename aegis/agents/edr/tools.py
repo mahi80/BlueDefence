@@ -1,6 +1,8 @@
 """Tools for the EDR/Host specialist."""
 from __future__ import annotations
 
+import itertools
+
 import re
 from dataclasses import dataclass
 
@@ -121,12 +123,15 @@ _IOC_IPS = {"203.0.113.66", "198.51.100.99",
 
 def ioc_match(file_hash: str | None, dest_domain: str | None, dest_ip: str | None) -> ToolResult:
     matches: list[str] = []
-    if file_hash and file_hash in _IOC_HASHES:
-        matches.append(f"hash:{file_hash}={_IOC_HASHES[file_hash]}")
-    if dest_domain and dest_domain in _IOC_DOMAINS:
-        matches.append(f"domain:{dest_domain}")
-    if dest_ip and dest_ip in _IOC_IPS:
-        matches.append(f"ip:{dest_ip}")
+    # case-insensitive: Sysmon writes hashes upper-case, DNS names arrive with any case and a trailing dot
+    fh = str(file_hash or "").strip().lower()
+    dom = str(dest_domain or "").strip().lower().rstrip(".")
+    if fh and fh in _IOC_HASHES:
+        matches.append(f"hash:{fh}={_IOC_HASHES[fh]}")
+    if dom and dom in _IOC_DOMAINS:
+        matches.append(f"domain:{dom}")
+    if dest_ip and str(dest_ip).strip() in _IOC_IPS:
+        matches.append(f"ip:{str(dest_ip).strip()}")
     return ToolResult(
         name="ioc_match",
         data={"matches": matches, "n": len(matches)},
@@ -297,18 +302,40 @@ def beacon_periodicity(connect_times: list[float] | None, dest: str | None = Non
         return ToolResult(name="beacon_periodicity",
                           data={"dest": dest, "hits": len(times), "verdict": "insufficient_data"},
                           weight="low")
-    gaps = [b - a for a, b in zip(times, times[1:])]
+    if _internal_dest(dest):
+        # a 60 s poll to the bank's own server is a health check, not C2 (round 4 S4-8)
+        return ToolResult(name="beacon_periodicity", data={"dest": dest, "hits": len(times), "verdict": "internal"},
+                          weight="low")
+    gaps = sorted(b - a for a, b in itertools.pairwise(times))
     mean = sum(gaps) / len(gaps)
-    if mean <= 0:
+    med = gaps[len(gaps) // 2]
+    if mean <= 0 or med <= 0:
         return ToolResult(name="beacon_periodicity", data={"dest": dest, "verdict": "degenerate"}, weight="low")
-    jitter = (max(gaps) - min(gaps)) / mean
+    # median absolute deviation over the median gap: robust to one long sleep, and a 30% uniform jitter (Cobalt
+    # Strike's default) stays near 0.15 — max-min / mean read it as irregular (round 4 S4-8)
+    dev = sorted(abs(g - med) for g in gaps)
+    jitter = dev[len(dev) // 2] / med
     regular = jitter <= max_jitter
     return ToolResult(
         name="beacon_periodicity",
-        data={"dest": dest, "hits": len(times), "mean_interval_s": round(mean, 1),
+        data={"dest": dest, "hits": len(times), "mean_interval_s": round(mean, 1), "median_interval_s": round(med, 1),
               "jitter": round(jitter, 3), "regular": regular},
         weight="high" if regular else "low",
     )
+
+
+def _internal_dest(dest: str | None) -> bool:
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(str(dest or "").strip())
+    except ValueError:
+        return False
+    # RFC 1918 / CGNAT / ULA / loopback / link-local only (is_private also covers the documentation ranges)
+    return ip.is_loopback or ip.is_link_local or any(ip in ipaddress.ip_network(n) for n in _INTERNAL_NETS
+                                                     if ipaddress.ip_network(n).version == ip.version)
+
+
+_INTERNAL_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7")
 
 
 # ---- macOS TCC sensitive grant ----------------------------------------
