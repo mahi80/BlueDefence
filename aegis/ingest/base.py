@@ -6,6 +6,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -51,6 +52,14 @@ def severity_to_score(raw: Any) -> float:
     return _SEVERITY_SCORE.get(normalize_severity(raw), 0.6)
 
 
+def _feed_family(source: Any) -> str:
+    """The feed a pushed record came through (``edr``, ``cloudflare``, ``waf``, ``alerts`` …), not the free-text
+    ``?source=`` / ``?collector=`` suffix: two HA relays (``edr-relay-a`` / ``edr-relay-b``) carrying the same
+    alert are one feed, and a sender varying the suffix must not create a dedupe bucket per name (round 5 Y5-12)."""
+    m = re.match(r"[a-z]+", str(source or "").strip().lower())
+    return m.group(0)[:32] if m else ""
+
+
 class AlertCheckpoint:
     """Per-source watermark + recently-seen ids, persisted to a small JSON file.
 
@@ -86,6 +95,8 @@ class AlertCheckpoint:
                 self._state = {"watermark": {}, "seen": []}
                 self._seen = {}
 
+    MAX_BUCKETS = 64
+
     def _lru(self, key: str) -> OrderedDict[str, None]:
         # every pushed feed is consumed as "stream": its LRU is per pushed source (stream:<ingest_source>:id), so a
         # WAF flood cannot evict an EDR alert's id (review round 4 I4-9)
@@ -93,6 +104,12 @@ class AlertCheckpoint:
         src = (f"{parts[0]}:{parts[1]}" if parts[0] == "stream" and len(parts) == 3 else parts[0]) if ":" in key else ""
         lru = self._seen.get(src)
         if lru is None:
+            if len(self._seen) >= self.MAX_BUCKETS:
+                # bounded: a sender varying ?source= cannot grow the checkpoint without limit (round 5 Y5-12)
+                src = "overflow"
+                lru = self._seen.get(src)
+                if lru is not None:
+                    return lru
             lru = self._seen[src] = OrderedDict()
         return lru
 
@@ -367,8 +384,8 @@ class BaseConsumer:
                 if not one or not one.get("id"):
                     self.skipped_invalid += 1
                     continue
-                src = one.get("ingest_source") if self.name == "stream" else None
-                key = f"{self.name}:{str(src).replace(':', '_')[:64]}:{one['id']}" if src else f"{self.name}:{one['id']}"
+                src = _feed_family(one.get("ingest_source")) if self.name == "stream" else ""
+                key = f"{self.name}:{src}:{one['id']}" if src else f"{self.name}:{one['id']}"
                 if self.checkpoint.seen(key):
                     self.skipped_duplicates += 1
                     continue

@@ -172,11 +172,12 @@ def test_sentinel_queries_from_the_watermark():
         seen.append(json.loads(body)["query"])
         return 200, json.dumps({"tables": []})
     cp = AlertCheckpoint()
-    cp.advance("sentinel", "2026-11-03T10:00:00+00:00")
+    cp.advance("sentinel:ingested", "2026-11-03T10:00:00+00:00")
     c = SentinelConsumer(SentinelConfig(workspace_id="w", tenant_id="t", client_id="c", client_secret="s"),
                          checkpoint=cp, transport=transport)
     list(c.fetch())
-    assert "TimeGenerated > datetime(2026-11-03T09:55:00Z)" in seen[-1] and "asc" in seen[-1]
+    # round 5 Y5-4: on ingestion_time(), with a 10-minute overlap
+    assert "ingestion_time() > datetime(2026-11-03T09:50:00Z)" in seen[-1] and "asc" in seen[-1]
     assert seen[-1] != DEFAULT_KQL
 
 

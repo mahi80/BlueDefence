@@ -207,7 +207,7 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     if receipt_log is not None:
         try:
             from aegis.agents.response.receipts import ReceiptLog
-            connectors.restore(ReceiptLog.latest_per_receipt(ReceiptLog.read(receipt_log.path)))
+            connectors.restore(ReceiptLog.read(receipt_log.path))     # every event, in order: last per key wins
         except Exception as e:  # noqa: BLE001 — a damaged log must not stop the service; say so loudly
             logger.error("[service] active receipts not restored from %s: %s — enforcement in force before the "
                          "restart is not tracked (no TTL rollback, no drift check)", receipt_log.path, e)

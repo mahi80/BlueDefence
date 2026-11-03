@@ -51,6 +51,8 @@ DEFAULT_KQL = (
     " | order by TimeGenerated desc"
 )
 
+_INGESTED_COL = "AegisIngested"
+
 #: transport(method, url, body_bytes|None, headers, timeout) -> (status, body_text)
 Transport = Callable[[str, str, Optional[bytes], dict, float], tuple[int, str]]
 
@@ -116,7 +118,8 @@ class SentinelConsumer(BaseConsumer):
     def fetch(self, *, kql: Optional[str] = None, timespan: Optional[str] = None) -> Iterator[dict]:
         """Run the KQL and yield one dict per row (column name → value)."""
         query = kql or self.cfg.kql
-        if kql is None and self.cfg.kql == DEFAULT_KQL:
+        watermarked = kql is None and self.cfg.kql == DEFAULT_KQL
+        if watermarked:
             query = self._since_watermark()
         payload = json.dumps({"query": query, "timespan": timespan or self.cfg.timespan}).encode()
         url = f"{self.cfg.api_base}/workspaces/{self.cfg.workspace_id}/query"
@@ -124,23 +127,49 @@ class SentinelConsumer(BaseConsumer):
         if status != 200:
             raise RuntimeError(f"Sentinel query failed: HTTP {status}: {body[:200]}")
         data = json.loads(body or "{}")
+        newest: float | None = None
+        ceiling = time.time() + 60                    # an ingestion time in the future is a clock error, not progress
+        from .base import _when
         for table in data.get("tables", []):
             cols = [c.get("name") for c in table.get("columns", [])]
             for row in table.get("rows", []):
-                yield dict(zip(cols, row))
+                rec = dict(zip(cols, row))
+                yield rec
+                t = _when(str(rec.get(_INGESTED_COL) or "")) if rec.get(_INGESTED_COL) else None
+                if t is not None:
+                    newest = min(max(newest or t, t), ceiling)
+        if watermarked and newest is not None and self.checkpoint is not None:
+            # reached only once the caller asked past the last row, i.e. after it was handled (at-least-once)
+            self.checkpoint.advance(self._ingest_key, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(newest)))
+
+    @property
+    def _ingest_key(self) -> str:
+        return f"{self.name}:ingested"
 
     def _since_watermark(self) -> str:
-        """The default query from the last alert handled (5 min overlap), oldest first. It re-read the whole
-        1-hour window every poll, newest first: with more than the 5,000-id dedupe window of unresolved alerts,
-        each poll evicted what it had just marked and re-triaged every alert on every poll (round 4 I4-3)."""
+        """The default query from the last ingestion time handled, oldest first, with an overlap
+        (``AEGIS_SENTINEL_OVERLAP_S``, 600 s; the id dedupe drops the repeats). It re-read the whole 1-hour window
+        every poll (round 4 I4-3). The watermark is Log Analytics' ``ingestion_time()``, not ``TimeGenerated``:
+        an alert generated earlier but ingested late was below a TimeGenerated watermark and lost for good, and
+        one alert with a skewed clock (IST written as UTC) pushed it hours ahead and silenced the source (round 5
+        Y5-4). It is also never later than now."""
         from .base import _when
-        wm = self.checkpoint.watermark(self.name) if self.checkpoint is not None else None
+        try:
+            overlap = max(60.0, float(os.environ.get("AEGIS_SENTINEL_OVERLAP_S", "600")))
+        except ValueError:
+            overlap = 600.0
+        cp = self.checkpoint
+        # no ingestion watermark yet (first poll, or an upgrade): the whole timespan once, deduped by id. The
+        # TimeGenerated watermark the base consumer keeps is never used here — it is what a skewed clock moves.
+        wm = cp.watermark(self._ingest_key) if cp is not None else None
         t = _when(wm) if wm else None
+        base = DEFAULT_KQL.replace("| project TimeGenerated,", f"| extend {_INGESTED_COL} = ingestion_time()"
+                                                                f" | project {_INGESTED_COL}, TimeGenerated,", 1)
+        base = base.replace("order by TimeGenerated desc", f"order by {_INGESTED_COL} asc")
         if t is None:
-            return DEFAULT_KQL.replace("order by TimeGenerated desc", "order by TimeGenerated asc")
-        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(0.0, t - 300)))
-        return (DEFAULT_KQL.replace("SecurityAlert", f"SecurityAlert | where TimeGenerated > datetime({since})", 1)
-                .replace("order by TimeGenerated desc", "order by TimeGenerated asc"))
+            return base
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(0.0, min(t, time.time()) - overlap)))
+        return base.replace("SecurityAlert", f"SecurityAlert | where ingestion_time() > datetime({since})", 1)
 
     def _request_with_retry(self, method: str, url: str, body: Optional[bytes]) -> tuple[int, str]:
         delay = 1.0
