@@ -333,6 +333,8 @@ class ConsoleAPI:
                "reason": reason[:500], "ts": time.time(), "via": "console"}
         if corrected_verdict in _VERDICTS:
             row["corrected_verdict"] = corrected_verdict
+        from ..hitl.signing import sign
+        row = sign(row)                       # the service executes only rows the console signed
         self.hitl_dir.mkdir(parents=True, exist_ok=True)
         with (self.hitl_dir / "decisions.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -387,6 +389,8 @@ class ConsoleAPI:
             return 400, {"error": "bad proposal id or decision"}
         row = {"proposal_id": proposal_id, "decision": decision, "decided_by": decided_by[:120] or "console",
                "rationale": rationale[:500], "ts": time.time(), "via": "console"}
+        from ..hitl.signing import sign
+        row = sign(row)
         self.hitl_dir.mkdir(parents=True, exist_ok=True)
         with (self.hitl_dir / "proposal-decisions.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")

@@ -100,6 +100,15 @@ class FileHITL(BaseHITL):
         d = self._read_new_decisions().pop(p.approval_id, None)
         if not d:
             return None
+        from .signing import trusted_approver, verify
+        ok, why = verify(d)
+        if ok:
+            ok, why = trusted_approver(d.get("decided_by"))
+        if not ok:
+            # a forged or hand-appended line is not a decision: log it loudly and keep waiting for a real one
+            logger.error("[hitl:file] decision for %s ignored: %s (decide in the console, or sign it with "
+                         "`python -m aegis.hitl decide`)", p.approval_id, why)
+            return None
         status = str(d.get("status", "")).lower()
         if status not in ("approved", "rejected"):
             logger.warning("[hitl:file] decision for %s has unknown status %r; ignored", p.approval_id, status); return None

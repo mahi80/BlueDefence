@@ -136,7 +136,7 @@ Component roles:
 | **AEGIS SOC host** | Bank VM / container | The long-running service (`python -m aegis.service`): ingest, triage, swarm, walkers, response, local audit. Needs no inbound internet. |
 | **Local model host** | GPU box (can be the same host if it has a GPU) | Serves the fine-tuned triage brain and the voter with no data egress. Alert payloads never leave the bank. |
 | **ACP dashboard** | Bank VM (only `soc`/`full`) | Approval cards, chains, receipts, shadow report, retrain/model-promotion queue; PostgreSQL is its store. |
-| **SOC analysts** | — | Approve/reject each containment card. In `external`, this is ServiceNow or an appended `decisions.jsonl` file, not the dashboard. |
+| **SOC analysts** | — | Approve/reject each containment card. In `external`, this is the SOC console (or ServiceNow), not the dashboard; decisions are signed. |
 | **Edge enforcers** | Bank's existing edge | Optionally pull `GET /ingest/blocklist` (IPs, CIDRs, fingerprints with expiry) and apply AEGIS's decisions inline, with no vendor API call. |
 
 > In the **`external`** edition the dashboard box is replaced by a ServiceNow instance or a file
@@ -518,11 +518,12 @@ curl -sS -X POST http://127.0.0.1:8787/ingest/alerts \
 
 **4. A chain appears, and an approval card is filed.**
 
-- `external` / file transport: the card lands in `cards.jsonl`, and approving it is an appended
-  line to `decisions.jsonl` which the next cycle executes through the (shadow) connector → receipt:
+- `external` / file transport: the card lands in `cards.jsonl`; approve it in the SOC console, or on the
+  host with the signed CLI (a hand-appended, unsigned line is ignored once `AEGIS_CONSOLE_TOKEN` is set);
+  the next cycle executes it through the (shadow) connector → receipt:
   ```bash
   cat $AEGIS_HITL_DIR/cards.jsonl
-  echo '{"approval_id":"<id from a card>","status":"approved","decided_by":"analyst"}' >> $AEGIS_HITL_DIR/decisions.jsonl
+  python -m aegis.hitl decide <id from a card> approve --by analyst:name
   ```
 - `soc` / `full`: the card appears on the ACP **Approvals** page; approve/reject with a rationale.
 - Confirm the hash-chained audit: the chain and its `governance_block`/receipt rows are in

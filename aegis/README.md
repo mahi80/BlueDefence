@@ -79,7 +79,7 @@ AEGIS_WAF_VENDOR=mock AEGIS_SOAR_VENDOR=mock AEGIS_HITL_DIR=/tmp/aegis-hitl \
 python -m aegis.service --once
 
 cat /tmp/aegis-hitl/cards.jsonl            # the approval cards (and the investigation rows)
-echo '{"approval_id":"<id from a card>","status":"approved","decided_by":"me"}' >> /tmp/aegis-hitl/decisions.jsonl
+AEGIS_HITL_DIR=/tmp/aegis-hitl python -m aegis.hitl decide <id from a card> approve --by me
 # next cycle executes it through the (mock) WAF connector in shadow mode → receipt
 ```
 
@@ -104,7 +104,7 @@ bank gives you anything:
 | Network sensor | Zeek / Suricata on the egress tap, or the proxy's logs | `AEGIS_SOURCES=ndr NDR_EVENT_FILE=aegis/ingest/fixtures/ndr/zeek_tls.sample.jsonl` (or `suricata_eve.sample.jsonl`), with `AEGIS_TLS_IOC_FILE` and `AEGIS_AI_REGISTER` from the same folder |
 | Network operations | device syslog, SNMP traps, NetFlow, telemetry, RANCID/Oxidized configs, LLDP — usually already on Kafka → the [Kafka bridge](../kafka-bridge/README.md) | `AEGIS_SOURCES=netops NETOPS_EVENT_FILE=aegis/ingest/fixtures/netops/campus.sample.log` |
 | Topology for the blast radius | a `TelemetrySource` adapter over Okta / EDR / NetFlow / CBS | `MockTenant` (deterministic world; `AEGIS_MOCK_SPREAD` sets how compromised it looks) |
-| Approvals | ServiceNow / dashboard | `AEGIS_HITL_TRANSPORT=file` (append decisions by hand) |
+| Approvals | ServiceNow / dashboard | `AEGIS_HITL_TRANSPORT=file` (decide in the console, or `python -m aegis.hitl decide`) |
 | WAF / SOAR | Imperva · F5 · Cloudflare · AWS WAF · Azure WAF · XSOAR · Sentinel playbooks | `AEGIS_WAF_VENDOR=mock` (Imperva), `mock-cloudflare`, `mock-aws`, `mock-azure`; `AEGIS_SOAR_VENDOR=mock` — the *real* connector classes against stateful fakes with 429 / 5xx / dropped connections, lock-token and etag races, bad signatures |
 | Shadow window | two weeks of real receipts | `python -m aegis.shadow report --receipts aegis/_receipts.jsonl --audit aegis/_audit_log.jsonl` |
 | Model | the fine-tuned adapter | `LLM_BACKEND=mock` (deterministic) or `LLM_BACKEND=local AEGIS_MODEL=<adapter>` |
@@ -679,7 +679,7 @@ detection on the web tier.
 |---|---|
 | `dashboard` | Approve / Reject (with rationale) on the ACP Approvals page |
 | `servicenow` | one incident per approval (Table API); set `u_aegis_decision` or resolve with an *Approved* close code; the investigation lands in work notes. `AEGIS_SERVICENOW_URL`, user/pass or `_TOKEN`, `_TABLE`, `_ASSIGNMENT_GROUP` |
-| `file` | append `{"approval_id","status","decided_by"}` to `decisions.jsonl`; optional `AEGIS_SLACK_WEBHOOK` notify. `AEGIS_HITL_DIR` |
+| `file` | the console (or `python -m aegis.hitl decide <id> approve --by <name>`) writes a **signed** row to `decisions.jsonl`; only signed rows execute, and no row may claim an `aegis:` approver. The key is `AEGIS_DECISION_KEY`, or derived from `AEGIS_CONSOLE_TOKEN` (so every `install.sh` host signs); with neither, rows are accepted unsigned with a warning (lab only). Optional `AEGIS_SLACK_WEBHOOK` notify. `AEGIS_HITL_DIR` |
 
 Pending approvals survive a restart on every transport: each filed card and each settlement is
 journalled (`AEGIS_HITL_STATE`, default `<AEGIS_HITL_DIR or ./.aegis-hitl>/pending.jsonl`, `off`
