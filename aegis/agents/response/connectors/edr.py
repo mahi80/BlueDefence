@@ -53,6 +53,7 @@ class CrowdStrikeConnector(Connector):
     """CrowdStrike Falcon: contain/lift a host, RTR-kill a process."""
 
     name = "crowdstrike"
+    reapply_on_human_approval = True
     actions = frozenset({"isolate", "kill_process"})
 
     def __init__(self, *, base_url: str, token_provider: Callable[[], str],

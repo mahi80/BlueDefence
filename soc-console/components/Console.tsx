@@ -213,7 +213,7 @@ export default function Console({
         onOpenChange={(o) => setAsk((a) => ({ ...a, open: o }))}
         autoAsk={ask.q ? { q: ask.q, nonce: ask.nonce } : undefined}
         mood={counts.malicious > 0 ? "critical" : counts.suspicious > 0 ? "alert" : "calm"}
-        pending={approvals.filter((a) => a.status === "pending").length}
+        pending={approvals.filter((a) => a.status === "pending" || a.status === "awaiting_second").length}
       />
     </div>
   );

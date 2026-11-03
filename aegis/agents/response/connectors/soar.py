@@ -61,6 +61,8 @@ def parse_playbook_map(raw: str) -> dict[str, str]:
 class _PlaybookConnector(Connector):
     """Shared behaviour: supported actions = configured playbooks; undo via ``<action>.undo``."""
 
+    reapply_on_human_approval = True
+
     def __init__(self, *, playbooks: dict[str, str], transport: Optional[Transport] = None,
                  default_ttl_sec: int = 0, **kw: Any):
         super().__init__(default_ttl_sec=default_ttl_sec, **kw)

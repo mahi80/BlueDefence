@@ -276,7 +276,7 @@ def _guard_response(response: Any, guard: Any) -> None:
         try:
             guard.pre_tool_call(tool, {**_args(action), "approver": str(approver)[:64]}, user_role="approver")
         except acp_violation as v:
-            return ExecutedAction(action=action, status="skipped",
+            return ExecutedAction(action=action, status="skipped", reason="governance",
                                   note=f"[ACP blocked] approved action not executed: {str(v)[:200]}")
         try:
             executed = orig_approve(action, approver, *a, **kw)

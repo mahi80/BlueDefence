@@ -47,6 +47,7 @@ STATUS_EXPIRED = "expired"
 STATUS_FAILED = "failed"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_REFUSED = "refused"           # never-block guard: enforcing this would risk own/lab infra
+STATUS_SUPERSEDED = "superseded"     # replaced by a fresh apply (live after shadow, or a human re-approval)
 ACTIVE_STATUSES = (STATUS_APPLIED, STATUS_DRY_RUN, STATUS_RENEWED)
 
 
@@ -96,6 +97,11 @@ class Connector:
 
     name: str = "base"
     actions: frozenset[str] = frozenset()
+    # A permanent action a person can undo at the vendor (lift containment, re-enable an account) leaves our
+    # receipt "active" while the vendor no longer enforces it. For these connectors a human re-approval of an
+    # active permanent receipt calls the vendor again instead of a no-op renewal. Set where the vendor call is
+    # idempotent or re-running it is the point (EDR contain, SOAR playbooks, SWG category add).
+    reapply_on_human_approval: bool = False
 
     def __init__(self, *, dry_run: Optional[bool] = None, default_ttl_sec: int = DEFAULT_TTL_SEC,
                  clock: Callable[[], float] = time.time):
@@ -168,7 +174,14 @@ class Connector:
         with self._lock:
             existing = self._active.get(key)
             if existing is not None and existing.active and not existing.expired(now):
-                return self._renew_locked(existing, ttl, now, approver=approver)
+                human = bool(approver) and not approver.startswith("aegis:")
+                fresh = ((existing.dry_run and not self.dry_run)          # shadow receipt, now live: enforce it
+                         or (self.reapply_on_human_approval and human and not existing.dry_run
+                             and existing.expires_at is None))
+                if not fresh:
+                    return self._renew_locked(existing, ttl, now, approver=approver)
+                existing.status = STATUS_SUPERSEDED
+                self._active.pop(key, None)
         expires = None if ttl <= 0 else now + ttl
         receipt = Receipt(
             receipt_id=_rid(), connector=self.name, action_type=action.action_type,

@@ -38,6 +38,8 @@ MAX_SCAN_BYTES = 64 * 1024 * 1024          # read at most the last 64 MB of the 
 DEFAULT_LIMIT = 200
 _ID_RX = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _VERDICTS = ("benign", "suspicious", "malicious", "uncertain")
+# what an approval card can show: pending until the service settles it (failed = approved but could not run)
+_CARD_STATUSES = ("approved", "rejected", "expired", "failed", "awaiting_second")
 
 
 def _num(v: Any) -> float:
@@ -256,6 +258,7 @@ class ConsoleAPI:
             return {"approvals": []}
         decisions = self._decisions()
         settled: dict[str, dict] = {}
+        awaiting: dict[str, str] = {}
         cards: list[dict] = []
         for line in _tail_lines(self.hitl_dir / "cards.jsonl"):
             try:
@@ -265,7 +268,9 @@ class ConsoleAPI:
             if not isinstance(card, dict):
                 continue
             if card.get("kind") == "settled" and card.get("approval_id"):
-                settled[str(card["approval_id"])] = card      # expired / timed out / decided by the service itself
+                settled[str(card["approval_id"])] = card      # what the service actually did with it
+            elif card.get("kind") == "awaiting_second" and card.get("approval_id"):
+                awaiting[str(card["approval_id"])] = str(card.get("first_approver") or "")
             elif card.get("kind") == "approval":
                 cards.append(card)
         rows: list[dict] = []
@@ -274,12 +279,18 @@ class ConsoleAPI:
             cid = str(card.get("id"))
             d = decisions.get(cid)
             st = settled.get(cid)
-            if st and not d:
-                d = {"status": st.get("status"), "decided_by": st.get("decided_by") or "aegis", "reason": st.get("reason"), "ts": st.get("ts")}
+            if st:
+                # the service's settled marker wins over the analyst's row: an approval that could not run is
+                # `failed`, not `approved` (the console used to show "approved" while nothing was contained)
+                d = {"status": st.get("status"), "decided_by": st.get("decided_by") or (d or {}).get("decided_by") or "aegis",
+                     "reason": st.get("reason"), "ts": st.get("ts")}
+            elif cid in awaiting:
+                d = {"status": "awaiting_second", "decided_by": awaiting[cid], "reason": "a second, different approver is required",
+                     "ts": (d or {}).get("ts")}
             status = str(d.get("status", "")).lower() if d else "pending"
             rows.append({
                 "id": cid,
-                "status": status if status in ("approved", "rejected", "expired") else "pending",
+                "status": status if status in _CARD_STATUSES else "pending",
                 "created_at": _iso(card.get("ts")),
                 "action_type": str(args.get("action_type") or str(card.get("action", "")).split(" -> ")[0]),
                 "target": str(args.get("target") or ""),
@@ -309,11 +320,15 @@ class ConsoleAPI:
             return 400, {"error": "bad approval id"}
         if status not in ("approved", "rejected"):
             return 400, {"error": "status must be approved or rejected"}
-        state = {a["id"]: a["status"] for a in self.approvals()["approvals"]}
-        if approval_id not in state:
+        cards = {a["id"]: a for a in self.approvals()["approvals"]}
+        if approval_id not in cards:
             return 404, {"error": "unknown approval"}
-        if state[approval_id] != "pending":
-            return 409, {"error": f"already {state[approval_id]}"}
+        cur = cards[approval_id]
+        if cur["status"] == "awaiting_second":
+            if (decided_by[:120] or "console") == (cur.get("decided_by") or ""):
+                return 409, {"error": "a second, different approver is required"}
+        elif cur["status"] != "pending":
+            return 409, {"error": f"already {cur['status']}"}
         row = {"approval_id": approval_id, "status": status, "decided_by": decided_by[:120] or "console",
                "reason": reason[:500], "ts": time.time(), "via": "console"}
         if corrected_verdict in _VERDICTS:

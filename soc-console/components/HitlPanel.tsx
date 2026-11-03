@@ -18,7 +18,13 @@ const VERB: Record<string, string> = {
   allow: "Allow",
 };
 
-type Decision = { status: "approved" | "rejected"; note: string };
+type Decision = { status: "approved" | "rejected" | "failed" | "expired"; note: string };
+const SETTLED_LABEL: Record<Decision["status"], string> = {
+  approved: "Approved",
+  rejected: "Rejected",
+  failed: "Approved — NOT executed",
+  expired: "Expired — no decision",
+};
 
 export default function HitlPanel({
   chain,
@@ -41,7 +47,8 @@ export default function HitlPanel({
   useEffect(() => {
     const seed: Record<string, Decision> = {};
     for (const a of approvals) {
-      if (a.alert_id === chain.alert_id && (a.status === "approved" || a.status === "rejected")) {
+      if (a.alert_id === chain.alert_id && (a.status === "approved" || a.status === "rejected"
+          || a.status === "failed" || a.status === "expired")) {
         seed[key(a.action_type, a.target)] = { status: a.status, note: a.rationale ?? "" };
       }
     }
@@ -114,6 +121,11 @@ export default function HitlPanel({
               </div>
               <div className="target mono">{a.target}</div>
               {a.reasoning && <div className="reason">{a.reasoning}</div>}
+              {!dec && approvalFor(a)?.status === "awaiting_second" && (
+                <div className="reason" role="status">
+                  Approved by {approvalFor(a)?.decided_by || "one analyst"} — protected target, a second, different approver is needed.
+                </div>
+              )}
 
               {auto ? (
                 <div className="foot">
@@ -123,8 +135,8 @@ export default function HitlPanel({
               ) : dec ? (
                 <div className="foot">
                   <span className="conf">{Math.round((a.confidence ?? chain.confidence) * 100)}%</span>
-                  <span className={`decided ${dec.status === "rejected" ? "rej" : ""}`}>
-                    <b>{dec.status === "approved" ? "Approved" : "Rejected"}</b>
+                  <span className={`decided ${dec.status === "approved" ? "" : "rej"}`}>
+                    <b>{SETTLED_LABEL[dec.status]}</b>
                     {dec.note ? ` — ${dec.note}` : ""}
                   </span>
                 </div>

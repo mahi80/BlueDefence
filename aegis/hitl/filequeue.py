@@ -109,6 +109,10 @@ class FileHITL(BaseHITL):
         self._append(self.cards, {"kind": "settled", "ts": time.time(), "approval_id": p.approval_id, "alert_id": p.alert_id,
                                   "status": status, "decided_by": decided_by, "reason": reason[:500]})
 
+    def _record_awaiting_second(self, p: PendingApproval, first: str) -> None:
+        self._append(self.cards, {"kind": "awaiting_second", "ts": time.time(), "approval_id": p.approval_id,
+                                  "alert_id": p.alert_id, "first_approver": first})
+
     def _annotate(self, p: PendingApproval, card: dict) -> bool:
         self._append(self.cards, {"kind": "investigation", "ts": time.time(), "approval_id": p.approval_id, "alert_id": p.alert_id, "investigation": card})
         return True

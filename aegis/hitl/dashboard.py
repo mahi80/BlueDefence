@@ -119,11 +119,18 @@ class DashboardHITL(BaseHITL):
 
     def _poll(self, p: PendingApproval) -> Optional[tuple[str, str, str]]:
         data = self.status(p.external_id or p.approval_id)
+        if not isinstance(data, dict) or data.get("error"):
+            # the dashboard answers some failures as 200 {"error": ...}: that is not "pending", so raise and let
+            # sync() hold the approval (never fall through to the timeout auto-execute)
+            raise RuntimeError(f"dashboard status for {p.approval_id} unreadable: "
+                               f"{str((data or {}).get('error') if isinstance(data, dict) else data)[:160]}")
         st = str(data.get("status", "")).lower()
         if st == "approved":
             return "approved", str(data.get("decided_by") or "dashboard"), ""
         if st == "rejected":
             return "rejected", str(data.get("decided_by") or "dashboard"), str(data.get("reject_reason") or "")
+        if st not in ("", "pending", "pending_hitl", "awaiting", "expired"):
+            raise RuntimeError(f"dashboard status for {p.approval_id} is {st!r}, which this transport does not know")
         return None
 
     def _annotate(self, p: PendingApproval, card: dict) -> bool:
