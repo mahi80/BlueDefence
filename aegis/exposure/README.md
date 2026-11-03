@@ -138,7 +138,7 @@ collector inferred (role, WAF / EDR coverage). AWS instances can carry the same 
 ## Limits
 
 Reachability is reasoned from network configuration, not proven by packets. No application-level
-reachability (whether the vulnerable code path is called). Modelled since the 2026-11-02 review: AWS rule protocols (an ICMP rule opens no port), world-open rules count inside the VPC too, IPv6-only instances, Azure NSG protocol and destination scoping, Azure LB inbound NAT rules; an empty or unreadable export fails the scan instead of resolving everything (set `allow_empty: true` on a scanner entry for an estate that is genuinely clean). That guard is in the posture runner; `python -m aegis.exposure` on its own still treats an empty export as zero findings, so do not use its `--fail-on-act-now` as a gate on raw exports yet. Not yet modelled: Azure Application Gateway /
+reachability (whether the vulnerable code path is called). Modelled since the 2026-11-02 review: AWS rule protocols (an ICMP rule opens no port), world-open rules count inside the VPC too, IPv6-only instances, Azure NSG protocol and destination scoping, Azure LB inbound NAT rules; an empty or unreadable export fails the scan instead of resolving everything (set `allow_empty: true` on a scanner entry for an estate that is genuinely clean). `python -m aegis.exposure` refuses an empty export too (exit 2) unless `--allow-empty`. Not yet modelled: Azure Application Gateway /
 Front Door, AWS classic ELB and CloudFront, Kubernetes NetworkPolicy rule evaluation, NACLs; Cloudflare
 managed-rule CVE coverage beyond "managed ruleset deployed". Proposing the compensating control through
 the HITL queue and re-testing closure is the next PR (see the scope doc).
