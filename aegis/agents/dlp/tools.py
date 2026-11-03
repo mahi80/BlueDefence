@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
+
 
 @dataclass
 class ToolResult:
@@ -257,22 +259,22 @@ def egress_volume_anomaly_check(user_id: str | None,
 
 def run_all_tools(alert: dict) -> list[ToolResult]:
     return [
-        bulk_read_check(
+        isolated(lambda: bulk_read_check(
             alert.get("table"),
             alert.get("rows_returned"),
             alert.get("queries_per_session"),
-        ),
-        sensitive_data_pattern_check(
+        ), "bulk_read_check", ToolResult),
+        isolated(lambda: sensitive_data_pattern_check(
             alert.get("payload") or alert.get("query") or alert.get("attachment_text"),
             context=alert.get("source", "data"),
-        ),
-        external_recipient_check(
+        ), "sensitive_data_pattern_check", ToolResult),
+        isolated(lambda: external_recipient_check(
             alert.get("recipients"),
             alert.get("attachment_summary"),
-        ),
-        hr_risk_signal_check(alert.get("user_id") or alert.get("principal_id")),
-        egress_volume_anomaly_check(
+        ), "external_recipient_check", ToolResult),
+        isolated(lambda: hr_risk_signal_check(alert.get("user_id") or alert.get("principal_id")), "hr_risk_signal_check", ToolResult),
+        isolated(lambda: egress_volume_anomaly_check(
             alert.get("user_id") or alert.get("principal_id"),
             alert.get("observed_mb_last_hour"),
-        ),
+        ), "egress_volume_anomaly_check", ToolResult),
     ]

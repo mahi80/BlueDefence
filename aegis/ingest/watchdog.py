@@ -151,11 +151,11 @@ class FeedWatchdog:
         source = str(source).strip().lower()
         if not source or source in _IGNORED_SOURCES or n <= 0:
             return
-        if source not in self._count and len(self._count) >= _MAX_FEEDS:
+        now = self._clock() if now is None else now
+        if source not in self._count and len(self._count) >= _MAX_FEEDS and not self._make_room(now):
             # feed names come from free-text ?source= / headers; an unbounded set of armed feeds would each
             # later page "SILENT" and grow memory and metric cardinality without limit
             source = "other"
-        now = self._clock() if now is None else now
         self._count[source] = self._count.get(source, 0) + n
         self._last_event_at[source] = now
         self._armed.add(source)
@@ -163,6 +163,20 @@ class FeedWatchdog:
         _metric_set("aegis_feed_last_event_age_seconds", 0.0, source=source)
         if source in self._silent:
             self._recover(source, now)
+
+    def _make_room(self, now: float) -> bool:
+        """Forget the feed idle longest (over a day) that the operator did not configure, so a real feed first
+        seen after 256 junk names is still watched (review round 3 R3-15). Configured and expected feeds stay."""
+        keep = set(self.per_source) | self._boot_armed | {"other"}
+        cand = [s for s in self._count if s not in keep and now - self._last_event_at.get(s, 0.0) > 86400]
+        if not cand:
+            return False
+        old = min(cand, key=lambda s: self._last_event_at.get(s, 0.0))
+        for d in (self._count, self._last_event_at, self._stream_seen):
+            d.pop(old, None)
+        self._armed.discard(old)
+        self._silent.discard(old)
+        return True
 
     def sync_stream(self, by_source: dict[str, int], *, now: Optional[float] = None) -> None:
         """Attribute pushed/streamed events from the cumulative ``StreamQueue.stats.by_source``.
@@ -172,10 +186,11 @@ class FeedWatchdog:
             src = str(source).strip().lower()
             if src in _IGNORED_SOURCES:
                 continue
-            if src not in self._stream_seen and len(self._stream_seen) >= _MAX_FEEDS:
+            if src not in self._stream_seen and len(self._stream_seen) >= _MAX_FEEDS and not self._make_room(now):
                 continue
             prev = self._stream_seen.get(src, 0)
-            delta = int(total) - prev
+            # a name the stream expired and saw again restarts its count: a smaller total is a reset, not nothing
+            delta = int(total) - prev if int(total) >= prev else int(total)
             if delta > 0:
                 self.record(src, delta, now=now)
             self._stream_seen[src] = int(total)

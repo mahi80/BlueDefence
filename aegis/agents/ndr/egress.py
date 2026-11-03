@@ -59,6 +59,7 @@ from datetime import UTC, datetime
 from itertools import pairwise
 from typing import Any
 
+from ..shared.netguard import unwrap
 from ..shared.tls_client import parse_ja4
 from .ai_usage import AiRegister, AiUsageRegister, ai_service
 from .tls_intel import TlsIntel
@@ -239,7 +240,7 @@ class EgressDetector:
     # ----------------------------------------------------------- plumbing --
     def _is_internal(self, ip: str) -> bool:
         try:
-            a = ipaddress.ip_address(ip)
+            a = unwrap(ipaddress.ip_address(str(ip).strip("[]")))   # ::ffff:10.x is 10.x (review round 3 S3-24)
         except ValueError:
             return False
         return any(a.version == n.version and a in n for n in self.internal)

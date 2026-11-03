@@ -19,6 +19,7 @@ import urllib.parse
 from dataclasses import dataclass
 
 from ..shared.bounded import BoundedDict
+from ..shared.tool_guard import isolated
 
 _URL_RX = re.compile(r"[a-zA-Z0-9+.\-]{1,64}://[^\s\"'&<>]+")
 _SCHEME_LEAD = re.compile(r"^[^a-zA-Z]+")
@@ -752,18 +753,18 @@ def run_all_tools(raw_payload: str, source_ip: str, user_id: str | None,
                   alert: dict | None = None) -> list[ToolResult]:
     alert = alert or {}
     return [
-        decode_payload(raw_payload),
-        ip_reputation(source_ip),
-        similar_past_requests(raw_payload),
-        user_baseline(user_id),
-        ssrf_probe(raw_payload),
-        cors_reflection(alert),
-        mass_assignment(alert, raw_payload),
-        host_header_anomaly(alert),
-        header_injection(alert),
-        scanner_signature(alert),
-        recon_sweep(source_ip, alert),
-        id_enumeration(source_ip, alert, raw_payload),
-        secret_file_probe(alert),
-        secret_exfil_probe(alert),
+        isolated(lambda: decode_payload(raw_payload), "decode_payload", ToolResult),
+        isolated(lambda: ip_reputation(source_ip), "ip_reputation", ToolResult),
+        isolated(lambda: similar_past_requests(raw_payload), "similar_past_requests", ToolResult),
+        isolated(lambda: user_baseline(user_id), "user_baseline", ToolResult),
+        isolated(lambda: ssrf_probe(raw_payload), "ssrf_probe", ToolResult),
+        isolated(lambda: cors_reflection(alert), "cors_reflection", ToolResult),
+        isolated(lambda: mass_assignment(alert, raw_payload), "mass_assignment", ToolResult),
+        isolated(lambda: host_header_anomaly(alert), "host_header_anomaly", ToolResult),
+        isolated(lambda: header_injection(alert), "header_injection", ToolResult),
+        isolated(lambda: scanner_signature(alert), "scanner_signature", ToolResult),
+        isolated(lambda: recon_sweep(source_ip, alert), "recon_sweep", ToolResult),
+        isolated(lambda: id_enumeration(source_ip, alert, raw_payload), "id_enumeration", ToolResult),
+        isolated(lambda: secret_file_probe(alert), "secret_file_probe", ToolResult),
+        isolated(lambda: secret_exfil_probe(alert), "secret_exfil_probe", ToolResult),
     ]

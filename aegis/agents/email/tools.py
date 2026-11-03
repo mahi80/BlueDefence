@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
+
 
 @dataclass
 class ToolResult:
@@ -255,13 +257,13 @@ def reply_chain_anomaly_check(internal_sender: str | None,
 
 def run_all_tools(alert: dict) -> list[ToolResult]:
     return [
-        header_auth_check(alert.get("headers")),
-        display_name_spoof_check(alert.get("from_display"), alert.get("from_address")),
-        lookalike_domain_check(alert.get("from_address"), alert.get("urls_in_body")),
-        attachment_risk_check(alert.get("attachments")),
-        body_pattern_check(alert.get("subject"), alert.get("body")),
-        reply_chain_anomaly_check(
+        isolated(lambda: header_auth_check(alert.get("headers")), "header_auth_check", ToolResult),
+        isolated(lambda: display_name_spoof_check(alert.get("from_display"), alert.get("from_address")), "display_name_spoof_check", ToolResult),
+        isolated(lambda: lookalike_domain_check(alert.get("from_address"), alert.get("urls_in_body")), "lookalike_domain_check", ToolResult),
+        isolated(lambda: attachment_risk_check(alert.get("attachments")), "attachment_risk_check", ToolResult),
+        isolated(lambda: body_pattern_check(alert.get("subject"), alert.get("body")), "body_pattern_check", ToolResult),
+        isolated(lambda: reply_chain_anomaly_check(
             alert.get("internal_sender"),
             alert.get("external_send_count_last_hour"),
-        ),
+        ), "reply_chain_anomaly_check", ToolResult),
     ]

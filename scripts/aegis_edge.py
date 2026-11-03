@@ -332,6 +332,9 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._reply_close(400, b"bad Content-Length")
             return None
+        if n < 0:                                              # was read as "no body" with the connection kept open
+            self._reply_close(400, b"bad Content-Length")
+            return None
         if n > _MAX_BODY:
             self._reply_close(413, b"request body too large for the edge to inspect")
             return None
@@ -354,8 +357,14 @@ class Handler(BaseHTTPRequestHandler):
             if len(out) + size > _MAX_BODY:
                 self._reply_close(413, b"request body too large for the edge to inspect")
                 return None
-            out += self.rfile.read(size)
-            self.rfile.readline(1024)                          # CRLF after the chunk
+            chunk = self.rfile.read(size)
+            if len(chunk) != size:                             # the body ended inside a chunk (I3-18)
+                self._reply_close(400, b"chunked body ended early")
+                return None
+            out += chunk
+            if self.rfile.readline(1024) not in (b"\r\n", b"\n"):   # the CRLF after every chunk
+                self._reply_close(400, b"malformed chunked body")
+                return None
 
     def _local_peer(self) -> bool:
         return self.client_address[0] in ("127.0.0.1", "::1")

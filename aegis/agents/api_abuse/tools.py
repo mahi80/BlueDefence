@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
+
 
 @dataclass
 class ToolResult:
@@ -232,19 +234,19 @@ def db_direct_query_check(client_app: str | None,
 
 def run_all_tools(alert: dict) -> list[ToolResult]:
     return [
-        bola_pattern_check(
+        isolated(lambda: bola_pattern_check(
             alert.get("principal_id"),
             alert.get("accessed_object_owner"),
             alert.get("endpoint"),
             alert.get("http_method"),
-        ),
-        schema_drift_check(alert.get("endpoint"), alert.get("params")),
-        volumetric_anomaly_check(alert.get("endpoint"), alert.get("observed_per_min")),
-        auth_boundary_check(alert.get("role"), alert.get("endpoint")),
-        db_direct_query_check(
+        ), "bola_pattern_check", ToolResult),
+        isolated(lambda: schema_drift_check(alert.get("endpoint"), alert.get("params")), "schema_drift_check", ToolResult),
+        isolated(lambda: volumetric_anomaly_check(alert.get("endpoint"), alert.get("observed_per_min")), "volumetric_anomaly_check", ToolResult),
+        isolated(lambda: auth_boundary_check(alert.get("role"), alert.get("endpoint")), "auth_boundary_check", ToolResult),
+        isolated(lambda: db_direct_query_check(
             alert.get("client_app"),
             alert.get("query"),
             alert.get("rows_returned"),
             alert.get("source_ip"),
-        ),
+        ), "db_direct_query_check", ToolResult),
     ]

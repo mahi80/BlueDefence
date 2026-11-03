@@ -137,14 +137,8 @@ def test_edge_telemetry_is_redacted_before_it_leaves(monkeypatch):
     import demo_target as dt
 
     sent: list[bytes] = []
-
-    class Req:
-        def __init__(self, url, data=None, method=None, headers=None):
-            sent.append(data)
-
-    monkeypatch.setattr(dt.urllib.request, "Request", Req)
-    monkeypatch.setattr(dt.urllib.request, "urlopen", lambda *a, **k: type("R", (), {"read": lambda self: b""})())
-    monkeypatch.setattr(dt.threading, "Thread", lambda target, daemon=True: type("T", (), {"start": lambda self: target()})())
+    # the edge sends through one bounded background sender now (review round 3 I3-18): capture what it is handed
+    monkeypatch.setattr(dt._SENDER, "submit", lambda url, data, headers: sent.append(data))
     dt._forward_alert("http://soc/ingest", "tok", {**_alert(), "payload": "u=asha&password=Winter2026!"})
     assert sent and _leaks(json.loads(sent[0])) == []
 

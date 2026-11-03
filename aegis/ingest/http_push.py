@@ -8,6 +8,7 @@
                               must echo requestId. WAF logs arrive one JSON object per record.
     POST /ingest/waf          any forwarder: NDJSON / CEF / F5 key=value lines, plain or gzip
                               (Imperva, F5, Azure via a Logstash / Fluent Bit / syslog relay).
+    POST /ingest/edr          host telemetry: Sysmon events, osquery result logs (one JSON per line)
     POST /ingest/apigw        API-gateway access logs (Azure APIM, AWS API Gateway, Kong, generic JSON),
                               NDJSON plain or gzip — fed to the object-walk (BOLA) detector; only its
                               alerts reach the orchestrator. ``?gateway=apim`` tags the source.
@@ -625,6 +626,9 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/ingest/apigw":
                 gw = (parse_qs(parts.query).get("gateway") or [""])[0].strip().lower()[:24]
                 status, out = srv.ingest_waf(body, f"apigw-{gw}" if gw else "apigw")
+            elif path == "/ingest/edr":
+                host = (parse_qs(parts.query).get("collector") or [""])[0].strip().lower()[:24]
+                status, out = srv.ingest_waf(body, f"edr-{host}" if host else "edr")
             elif path == "/ingest/ndr":
                 sensor = (parse_qs(parts.query).get("sensor") or [""])[0].strip().lower()[:24]
                 status, out = srv.ingest_waf(body, f"ndr-{sensor}" if sensor else "ndr")

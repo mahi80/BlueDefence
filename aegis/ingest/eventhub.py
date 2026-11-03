@@ -70,12 +70,26 @@ class EventHubReader:
         except Exception as e:  # noqa: BLE001
             logger.warning("[ingest:eventhub] checkpoint write failed: %s", e)
 
-    def starting_position(self) -> Any:
-        """Per-partition sequence numbers (exclusive) where known; otherwise the configured default."""
+    def starting_position(self, partition_ids: Any = None) -> Any:
+        """Per-partition sequence numbers (exclusive) where known; otherwise the configured default.
+
+        With a dict, the SDK applies its OWN default (``@latest``) to any partition missing from it — so with
+        ``START=earliest`` a reconnect before partition N had checkpointed skipped N's whole backlog (review round
+        3 I3-13). Every known partition is therefore listed, the unseen ones at the configured default."""
         default = "-1" if self.default_start == "earliest" else "@latest"
         if not self._positions:
             return default
-        return {pid: seq for pid, seq in self._positions.items()}
+        out: dict[str, Any] = {str(pid): default for pid in (partition_ids or ())}
+        out.update({pid: seq for pid, seq in self._positions.items()})
+        return out
+
+    def _partition_ids(self) -> list[str]:
+        try:
+            return [str(p) for p in self._client.get_partition_ids()]
+        except Exception as e:  # noqa: BLE001 — without the list the saved positions still apply
+            logger.warning("[ingest:eventhub] could not list partitions (%s); unseen partitions start at the SDK default",
+                           str(e)[:120])
+            return []
 
     # -- batch handling (also the unit the tests drive directly)
     def on_batch(self, partition_context: Any, events: list[Any]) -> None:
@@ -140,8 +154,9 @@ class EventHubReader:
             try:
                 self._client = self._make_client()
                 with self._client:
-                    logger.info("[ingest:eventhub] receiving (%s) from %s", self.consumer_group, self.starting_position())
-                    self._client.receive_batch(on_event_batch=self.on_batch, starting_position=self.starting_position(),
+                    start = self.starting_position(self._partition_ids() if self._positions else None)
+                    logger.info("[ingest:eventhub] receiving (%s) from %s", self.consumer_group, start)
+                    self._client.receive_batch(on_event_batch=self.on_batch, starting_position=start,
                                                max_batch_size=500, max_wait_time=5)
                 delay = self.backoff_s
             except Exception as e:  # noqa: BLE001 — network / auth / SDK: back off and reconnect, never die

@@ -225,6 +225,15 @@ def span(name: str, **attributes: Any):
                 yield record
             finally:
                 record.duration_ms = (time.time() - record.started_at) * 1000.0
+                # attributes the caller set during the span (specialist, verdict) were only on the local record
+                # and never reached the OTel span (review round 3 O3-20)
+                for k, v in record.attributes.items():
+                    if k in attributes and attributes[k] == v:
+                        continue
+                    try:
+                        otel_span.set_attribute(k, v)
+                    except Exception:  # noqa: BLE001, S110 — same rule as at the start
+                        pass
                 with _SPAN_LOG_LOCK:
                     _SPAN_LOG.append(record)
         return

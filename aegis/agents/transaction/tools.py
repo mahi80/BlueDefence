@@ -17,6 +17,8 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
+
 
 @dataclass
 class ToolResult:
@@ -179,8 +181,14 @@ def payment_rail_anomaly(user_id: str | None, rail: str | None,
         return ToolResult(name="payment_rail", data={
             "user_id": user_id, "baseline_known": False,
         }, weight="low")
-    novel_rail = rail not in baseline["rails_used"]
-    high_value = (amount_inr or 0) >= 100000  # 1L INR threshold for "large"
+    # `upi` and `UPI` are one rail (it was "novel" by case alone; review round 3 S3-23)
+    rail = str(rail).strip().upper()
+    novel_rail = rail not in {str(r).upper() for r in baseline["rails_used"]}
+    try:
+        amount = float(amount_inr or 0)               # a number sent as a string used to raise (S3-22)
+    except (TypeError, ValueError):
+        amount = 0.0
+    high_value = amount >= 100000  # 1L INR threshold for "large"
     weight = "high" if (novel_rail and high_value) else "medium" if novel_rail else "low"
     return ToolResult(name="payment_rail", data={
         "user_id": user_id, "rail": rail,
@@ -279,21 +287,21 @@ def swift_specific_check(alert: dict) -> ToolResult:
 
 def run_all_tools(alert: dict) -> list[ToolResult]:
     return [
-        mule_pattern_check(alert.get("beneficiary_account")),
-        beneficiary_risk(
+        isolated(lambda: mule_pattern_check(alert.get("beneficiary_account")), "mule_pattern_check", ToolResult),
+        isolated(lambda: beneficiary_risk(
             alert.get("beneficiary_account"),
             alert.get("sender_geo"),
-        ),
-        velocity_check(
+        ), "beneficiary_risk", ToolResult),
+        isolated(lambda: velocity_check(
             alert.get("user_id"),
             alert.get("recent_24h_count"),
             alert.get("recent_24h_total_inr"),
-        ),
-        payment_rail_anomaly(
+        ), "velocity_check", ToolResult),
+        isolated(lambda: payment_rail_anomaly(
             alert.get("user_id"),
             alert.get("rail"),
             alert.get("amount_inr"),
-        ),
-        aml_structuring_check(alert.get("recent_amounts_inr")),
-        swift_specific_check(alert),
+        ), "payment_rail_anomaly", ToolResult),
+        isolated(lambda: aml_structuring_check(alert.get("recent_amounts_inr")), "aml_structuring_check", ToolResult),
+        isolated(lambda: swift_specific_check(alert), "swift_specific_check", ToolResult),
     ]
