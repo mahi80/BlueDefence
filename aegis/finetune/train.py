@@ -22,6 +22,11 @@ from .config import DEFAULT, get_preset, preset_for_vram
 from .data import is_non_analyst, load_sft, split_rows
 
 
+def _drop_stale_gate(out: str) -> None:
+    """New weights invalidate any gate report beside --out (review round 4 D4-4)."""
+    from .gate import gate_report_path
+    gate_report_path(out).unlink(missing_ok=True)
+
 def _plan(args, preset, n_train, n_val) -> str:
     return (
         f"model           {preset.model}  ({preset.key})\n"
@@ -121,6 +126,7 @@ def _train_unsloth(args, preset, train, val):  # pragma: no cover — needs a GP
                                         learning_rate=args.lr, bf16=True, logging_steps=10, dataset_text_field="text",
                                         max_seq_length=preset.max_seq_len))
     trainer.train(resume_from_checkpoint=_resume_path(args))
+    _drop_stale_gate(args.out)
     model.save_pretrained(args.out); tok.save_pretrained(args.out)
 
 
@@ -167,6 +173,7 @@ def _train_peft(args, preset, train, val):  # pragma: no cover — needs a GPU
                                                 learning_rate=args.lr, bf16=True, logging_steps=10,
                                                 gradient_checkpointing=True))
     trainer.train(resume_from_checkpoint=_resume_path(args))
+    _drop_stale_gate(args.out)
     model.save_pretrained(args.out); tok.save_pretrained(args.out)
 
 

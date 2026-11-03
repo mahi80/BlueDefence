@@ -147,8 +147,18 @@ class DatasetBuilder:
             elif not r.split:
                 r.split = split_for(r.fingerprint, self.opt.val_pct)
         test_fps = {r.fingerprint for r in records if r.split == "test"}
+        # The held-out eval alerts are test data whether or not this build includes them: a `--no-eval` export (the
+        # retrain path) or a contributor submitting the public eval alerts put 19/37 of them into train/val, and the
+        # 3.3 gate then scored memorisation (review round 4 D4-11). The fingerprint is recomputed from the alert
+        # too — a record's own value is whatever its producer wrote.
+        from .importers.mix import _eval_fps
+        from .schema import fingerprint
+        held = _eval_fps()
         for r in records:
-            if r.split != "test" and r.fingerprint in test_fps:
+            leaked = r.fingerprint in test_fps or r.fingerprint in held
+            if not leaked and held and isinstance(r.alert, dict) and not r.origin.startswith("eval_"):
+                leaked = fingerprint(r.alert) in held
+            if r.split != "test" and leaked:
                 r.split = "test"
                 r.tags.append("leak_moved_to_test")
                 self.stats["leak_moved_to_test"] += 1

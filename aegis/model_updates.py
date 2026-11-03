@@ -20,7 +20,8 @@ does not match the signed manifest is deleted. Staged rollout: ``rollout_pct`` o
 stable hash of the installation id, so a bad adapter reaches 10 % of the fleet, not all of it.
 Rollback: the previous version stays on disk; ``python -m aegis.model_updates rollback`` repoints.
 
-Env: ``AEGIS_MODEL_UPDATES`` (default 1 when ``AEGIS_LICENSE_SERVER`` is set), ``AEGIS_MODEL_CHANNEL``
+Env: ``AEGIS_MODEL_UPDATES`` (default 1 when ``AEGIS_LICENSE_SERVER`` is set; a pointer approved by the bank's
+own retrain loop is never replaced unless ``AEGIS_MODEL_UPDATES_REPLACE_LOCAL=1``), ``AEGIS_MODEL_CHANNEL``
 (stable | beta), ``AEGIS_MODEL_DIR`` (/var/lib/aegis/models), ``AEGIS_MODEL_POINTER`` (the pointer file
 ``hot_reload`` reads; defaults to ``<AEGIS_MODEL_DIR>/current.json``), ``AEGIS_MODEL_BASE`` (which base
 the installation runs — only releases for that base are offered).
@@ -268,9 +269,20 @@ def update_once(*, server: str, token: str, installation_id: str, env: dict | No
             return {"updated": False, "reason": f"release manifest rejected: {why}", "current": cur}
         if str(rel.get("channel")) != channel or rel.get("base_model") not in (base, "any"):
             return {"updated": False, "reason": f"release {rel.get('version')} is for {rel.get('channel')}/{rel.get('base_model')}, not {channel}/{base}", "current": cur}
-        if str(rel.get("version")) in _denied(env):
+        denied = _denied(env)
+        if _ALL in denied:
+            return {"updated": False, "reason": f"{_denied_path(env)} is unreadable — no update is applied until it is fixed",
+                    "current": cur}
+        if str(rel.get("version")) in denied:
             return {"updated": False, "reason": f"release {rel.get('version')} was rolled back on this host — not re-applied "
                                                  "(remove it from denied.json to allow it)", "current": cur}
+        local = _local_model(env)
+        if local:
+            # the pointer names a model this bank trained and a person here approved (aegis.finetune.retrain): a
+            # vendor release must not replace it silently (review round 4 D4-9)
+            return {"updated": False, "reason": f"the current model {cur or '?'} is the bank's own ({local}); set "
+                                                 "AEGIS_MODEL_UPDATES_REPLACE_LOCAL=1 to let releases replace it",
+                    "current": cur, "offered": rel.get("version")}
         if cur and _vkey(str(rel.get("version"))) <= _vkey(cur):
             return {"updated": False, "reason": f"offered {rel.get('version')} is not newer than {cur} (downgrade refused)", "current": cur}
         if not in_rollout(installation_id, int(rel.get("rollout_pct", 100))):
@@ -285,6 +297,20 @@ def update_once(*, server: str, token: str, installation_id: str, env: dict | No
     except Exception as e:  # noqa: BLE001 — a failed update never affects the running SOC
         logger.warning("[model_updates] update failed: %s", str(e)[:200])
         return {"updated": False, "reason": str(e)[:200], "current": cur}
+
+
+def _local_model(env: dict) -> str:
+    """Who approved the current pointer, when it is not a BlueDefence release (else "")."""
+    if str(env.get("AEGIS_MODEL_UPDATES_REPLACE_LOCAL", "")).strip().lower() in ("1", "true", "yes", "on"):
+        return ""
+    try:
+        ptr = json.loads(pointer_path(env).read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(ptr, dict) or not ptr.get("run"):
+        return ""
+    who = str(ptr.get("approved_by") or "")
+    return "" if who == "bluedefence-release" else f"approved by {who or 'an operator'}"
 
 
 def _prune(root: Path, keep: set[str], max_keep: int = 3) -> None:
@@ -326,11 +352,23 @@ def _denied_path(env: dict) -> Path:
     return model_dir(env) / "denied.json"
 
 
+_ALL = "*"
+
+
 def _denied(env: dict) -> set[str]:
-    try:
-        return {str(v) for v in json.loads(_denied_path(env).read_text())}
-    except (OSError, ValueError, TypeError):
+    """Versions rolled back on this host. A deny file that exists but cannot be read refuses every update
+    (``*``): an empty set re-offered the release an operator had rolled back (review round 4 D4-10)."""
+    p = _denied_path(env)
+    if not p.exists():
         return set()
+    try:
+        v = json.loads(p.read_text())
+        if not isinstance(v, list):
+            raise TypeError("denied.json is not a list")
+        return {str(x) for x in v}
+    except (OSError, ValueError, TypeError) as e:
+        logger.error("[model_updates] %s is unreadable (%s) — refusing every model update until it is fixed", p, e)
+        return {_ALL}
 
 
 def _deny(env: dict, version: str) -> None:

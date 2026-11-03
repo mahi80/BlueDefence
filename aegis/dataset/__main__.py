@@ -41,6 +41,32 @@ def _bool_env(name: str, default: bool) -> bool:
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
 
+_IP_KINDS = ("ipv4", "ipv6")
+
+
+def _privacy_gated(recs: list, *, scrub_ips: bool, where: str) -> list:
+    """Records leaving for training (often a vendor GPU) pass the same privacy gate as Community bundles. It ran on
+    the contribution path only: e-mails / phones as dict keys and DB users in connection URLs left with
+    ``dataset export`` (review round 4 D4-12). IPs are kept unless ``--scrub-ips`` (inside the bank by design)."""
+    from . import privacy_gate
+    from .contrib import redact_for_contrib
+    out, dropped, kinds = [], 0, {}
+    for r in recs:
+        # e-mail domains and hostnames the scrubber keeps on purpose are tokenised for the check only; what is still
+        # found after that is a real leak (a phone in a key, an Aadhaar, a credential)
+        probe = redact_for_contrib(r.to_dict() if hasattr(r, "to_dict") else r, "privacy-probe")
+        f = [x for x in privacy_gate.findings(probe) if scrub_ips or x.get("kind") not in _IP_KINDS]
+        if f:
+            dropped += 1
+            for x in f:
+                kinds[x["kind"]] = kinds.get(x["kind"], 0) + 1
+            continue
+        out.append(r)
+    if dropped:
+        print(f"  privacy gate: {dropped} {where} record(s) held back ({kinds}) — fix the capture or the scrubber")
+    return out
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     scrubber = scrubber_from_env(scrub_ips=args.scrub_ips or _bool_env("AEGIS_DATASET_SCRUB_IPS", False))
     sources: list[str] = []
@@ -60,7 +86,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         print(f"  eval corpora: {len(recs)} records → split={args.eval_split}")
 
     for p in args.local_audit or []:
-        recs = local_audit_records(p, scrubber)
+        recs = _privacy_gated(local_audit_records(p, scrubber), scrub_ips=scrubber.scrub_ips, where="local audit")
         builder.add(recs)
         sources.append(f"local_audit:{p} ({len(recs)})")
         print(f"  local audit {p}: {len(recs)} records")
@@ -70,7 +96,8 @@ def cmd_export(args: argparse.Namespace) -> int:
         if not url:
             print("  --dashboard needs ACP_DASHBOARD_URL (and ACP_API_KEY)", file=sys.stderr)
             return 2
-        recs = dashboard_records(url, key, scrubber, since=args.since)
+        recs = _privacy_gated(dashboard_records(url, key, scrubber, since=args.since), scrub_ips=scrubber.scrub_ips,
+                              where="dashboard")
         builder.add(recs)
         sources.append(f"dashboard_chains ({len(recs)})")
         print(f"  dashboard chains: {len(recs)} records "

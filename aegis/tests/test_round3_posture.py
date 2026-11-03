@@ -60,7 +60,7 @@ def test_empty_asset_model_fails_the_exposure_scan(tmp_path):
     from aegis.exposure.scan import run_scan
     inv = tmp_path / "inv.csv"
     inv.write_text((EXPOSURE / "inventory.csv").read_text().splitlines()[0] + "\n")     # header, no assets
-    with pytest.raises(sources.PostureSourceError, match="asset model is empty"):
+    with pytest.raises(sources.PostureSourceError, match="asset model is empty|gave no assets"):
         run_scan({"vulns": [EXPOSURE / "tenable_vulns.json"], "inventory": inv})
 
 

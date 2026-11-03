@@ -130,7 +130,8 @@ def execute(scan: ScanConfig) -> tuple[list[PostureFinding], list[str]] | tuple[
         _require_input(scan, details, ("UserDetailList", "RoleDetailList", "GroupDetailList", "Policies"),
                        "an `aws iam get-account-authorization-details` export")
         note = iam_review.coverage_note(report)
-        return iam_review.review(details, report, trusted_accounts=o.get("trusted_accounts") or ()), [note] if note else []
+        return (iam_review.review(details, report, trusted_accounts=o.get("trusted_accounts") or ()), [note] if note else [],
+                {"unchecked_sections": iam_review.unchecked_sections(details, report)})
     if scan.type == "cspm":
         bundle = sources.collect_aws_cspm(o.get("region")) if o.get("live") else sources.load_json(_need(o, "bundle", scan))
         _require_input(scan, bundle, tuple(cspm.BUNDLE_KEYS), "an AEGIS AWS CSPM bundle")
@@ -152,12 +153,24 @@ def execute(scan: ScanConfig) -> tuple[list[PostureFinding], list[str]] | tuple[
         return k8s_posture.scan(export, include_system=inc), k8s_posture.notes(export, include_system=inc)
     # iac
     findings: list[PostureFinding] = []
-    if o.get("plan"):
-        findings += iac_policy.scan_plan(sources.load_json(o["plan"]), changed_only=bool(o.get("changed_only")))
-    if o.get("k8s"):
-        findings += iac_policy.scan_manifests(iac_policy.load_manifests(o["k8s"]))
     if not o.get("plan") and not o.get("k8s"):
         raise sources.PostureSourceError("iac scan needs plan and/or k8s")
+    if o.get("plan"):
+        plan = sources.load_json(o["plan"])
+        # a plan with no resources (the wrong file, `terraform show` without -json, an empty workspace) resolved
+        # every IaC finding with 0 failed scans (review round 4 D4-6)
+        if not isinstance(plan, dict) or "resource_changes" not in plan:
+            raise sources.PostureSourceError(f"iac scan {scan.name!r}: {o['plan']} is not a `terraform show -json` plan "
+                                             "(no resource_changes) — refusing to report it clean")
+        if not plan.get("resource_changes") and not o.get("changed_only"):
+            raise sources.PostureSourceError(f"iac scan {scan.name!r}: the plan has no resources — refusing to report it clean")
+        findings += iac_policy.scan_plan(plan, changed_only=bool(o.get("changed_only")))
+    if o.get("k8s"):
+        docs = iac_policy.load_manifests(o["k8s"])
+        if not docs:
+            raise sources.PostureSourceError(f"iac scan {scan.name!r}: {o['k8s']} gave no Kubernetes manifests — refusing "
+                                             "to report it clean")
+        findings += iac_policy.scan_manifests(docs)
     return findings, []
 
 
@@ -247,7 +260,7 @@ def run_once(cfg: RunnerConfig, *, now: datetime | None = None, hitl: Any = _FRO
             findings, notes = res[0], res[1]
             meta = res[2] if len(res) > 2 else {}
             if meta.get("unchecked_sections"):
-                mod = cspm if sc.type == "cspm" else azure_cspm
+                mod = {"cspm": cspm, "azure": azure_cspm, "iam": iam_review}[sc.type]
                 partial[sc.name] = (set(meta["unchecked_sections"]), mod.section_of)
                 meta = {k: v for k, v in meta.items() if k != "unchecked_sections"}
             current += [(sc.name, f) for f in findings]

@@ -250,6 +250,28 @@ def review(
     return sort_findings(out)
 
 
+#: the sections of `aws iam get-account-authorization-details`, plus the credential report
+IAM_SECTIONS = ("UserDetailList", "RoleDetailList", "GroupDetailList", "Policies")
+_SECTION_OF = (("IAM-POLICY-", "Policies"), ("IAM-ROLE-", "RoleDetailList"), ("IAM-USER-ADMIN", "UserDetailList"),
+               ("IAM-USER-DIRECT-POLICY", "UserDetailList"), ("IAM-ROOT-", "credential_report"),
+               ("IAM-USER-NO-MFA", "credential_report"), ("IAM-USER-INACTIVE-PASSWORD", "credential_report"),
+               ("IAM-KEY-", "credential_report"), ("IAM-USER-TWO-KEYS", "credential_report"))
+
+
+def section_of(finding_id: str) -> str | None:
+    """The export section an IAM finding comes from, so a section missing from this run's export carries its
+    findings forward instead of resolving them (a ``--filter LocalManagedPolicy`` export resolved every user and
+    role finding — review round 4 D4-6)."""
+    return next((sec for pre, sec in _SECTION_OF if str(finding_id).startswith(pre)), None)
+
+
+def unchecked_sections(details: Any, credential_report: list | None) -> list[str]:
+    missing = [k for k in IAM_SECTIONS if not isinstance(details, dict) or k not in details]
+    if credential_report is None:
+        missing.append("credential_report")
+    return missing
+
+
 def coverage_note(credential_report: list | None) -> str | None:
     if credential_report is None:
         return "credential report not supplied: MFA, root-account, key-age and inactivity checks were skipped"

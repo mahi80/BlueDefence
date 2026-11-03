@@ -72,6 +72,7 @@ VOLATILE_KEYS: frozenset[str] = frozenset({
     "_ingest", "ingest", "ttl", "sequence", "seq",
 })
 
+_URL_USER_RX = re.compile(r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/@:]+)(?::([^\s/@]*))?@")
 _EMAIL_RX = re.compile(r"(?<![A-Za-z0-9._%+-])([A-Za-z0-9._%+-]{1,64})@([A-Za-z0-9.-]+\.[A-Za-z]{2,24})\b")
 _CARD_RX = re.compile(r"(?<![\w-])(?:\d[ -]?){12,18}\d(?![\w-])")
 _AADHAAR_RX = re.compile(r"(?<![\w-])[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}(?![\w-])")
@@ -203,7 +204,9 @@ class Scrubber:
             out = {}
             for k, v in obj.items():
                 ident = str(k).lower() in self._identity_keys
-                out[k] = self._walk(v, literals, under_identity_key=ident)
+                # keys carry identities too: {"r.verma@sbi.co.in": 12, "9876543210": 3} (review round 4 D4-12)
+                nk = self._scrub_string(k, literals) if isinstance(k, str) else k
+                out[nk] = self._walk(v, literals, under_identity_key=ident)
             return out
         if isinstance(obj, list):
             return [self._walk(v, literals, under_identity_key=under_identity_key) for v in obj]
@@ -250,7 +253,8 @@ class Scrubber:
             return text
         # shape regexes first (they produce the same tokens the fields got),
         # then literal identity values that have no recognisable shape
-        out = _EMAIL_RX.sub(self._sub_email, text)
+        out = _URL_USER_RX.sub(self._sub_url_user, text)        # postgresql://acpadmin:…@db — before the e-mail rule
+        out = _EMAIL_RX.sub(self._sub_email, out)
         out = _CARD_RX.sub(self._sub_card, out)
         out = _AADHAAR_RX.sub(self._sub_aadhaar, out)
         out = _PAN_RX.sub(self._sub_pan, out)
@@ -275,6 +279,10 @@ class Scrubber:
     def _sub_arn(self, m: re.Match) -> str:
         self.replacements += 1
         return f"{m.group(1)}acct_{self.token('acct', m.group(2))}"
+
+    def _sub_url_user(self, m: re.Match) -> str:
+        self.replacements += 1
+        return m.group(1)                  # the account (and any password) in a URL is dropped, not pseudonymised
 
     def _sub_email(self, m: re.Match) -> str:
         self.replacements += 1

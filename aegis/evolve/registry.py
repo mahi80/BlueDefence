@@ -109,6 +109,35 @@ def _redos_risk(source: str) -> str | None:
     return None
 
 
+_PROBE_CHARS = "a1 _.-/\\=<'\"%:;,\t"
+_PROBE_SCRIPT = r"""
+import re, sys
+rx = re.compile(sys.argv[1], re.IGNORECASE)
+n = int(sys.argv[2])
+chars = sys.argv[3]
+probes = [c * n + "\x00!" for c in chars] + ["a1" * (n // 2) + "\x00!", "a " * (n // 2) + "\x00!", "1." * (n // 2) + "\x00!"]
+for p in probes:
+    rx.search(p)
+"""
+
+
+def _probe_slow(source: str, *, n: int = 2000, budget_s: float = 2.0) -> str | None:
+    """Run the regex on worst-case inputs in a child process with a hard time budget. The structural check above
+    sees nested / alternated groups only; adjacent unbounded quantifiers over overlapping classes (``\\w+\\d+\\w+\\d+=``,
+    ``\\s*\\s*\\s*=zq``) backtrack polynomially and passed it (review round 4 X4-3 / D4-14). A regex cannot be
+    interrupted in-process, so the probe runs in a child that is killed at the budget."""
+    import subprocess
+    import sys
+    try:
+        subprocess.run([sys.executable, "-I", "-c", _PROBE_SCRIPT, source, str(n), _PROBE_CHARS],
+                       timeout=budget_s, check=True, capture_output=True)
+    except subprocess.TimeoutExpired:
+        return f"regex backtracks on a {n}-character input (over {budget_s:.0f} s) — refused (ReDoS guard)"
+    except (subprocess.CalledProcessError, OSError) as e:
+        return f"regex could not be probed ({type(e).__name__}) — refused"
+    return None
+
+
 def validate_regex(source: str, max_len: int, min_len: int = 4) -> Optional[str]:
     """Return an error string, or None when the regex is acceptable."""
     if not isinstance(source, str) or not source.strip():
@@ -127,7 +156,7 @@ def validate_regex(source: str, max_len: int, min_len: int = 4) -> Optional[str]
     hit = next((b for b in BENIGN_SAMPLES if rx.search(b)), None)
     if hit is not None:
         return f"regex matches ordinary traffic ({hit!r})"
-    return None
+    return _probe_slow(source)
 
 
 def validate_primitive(value: object, spec: PatchSpec) -> str | None:

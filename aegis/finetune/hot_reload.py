@@ -140,7 +140,9 @@ def apply_reload(primary: Any, prev_key: str, ptr: Optional[dict]) -> ReloadResu
     why = _unverified(ptr, adapter, run)
     if why:                          # tampered, swapped after approval, or never fingerprinted: keep the running model
         logger.error("[hot_reload] promotion run=%s refused: %s", run, why)
-        return ReloadResult(changed=False, mode="refused", run=run, adapter=adapter, key=key, detail=why)
+        # no key: a refused pointer is judged again next time (the GPU register step may have stamped it by then);
+        # storing its key made it "unchanged" forever (review round 4 D4-15)
+        return ReloadResult(changed=False, mode="refused", run=run, adapter=adapter, key="", detail=why)
     served = served_name(ptr)
     if served and swap_in_place(primary, served):
         logger.info("[hot_reload] swapped triage model → run=%s served=%s (no restart)", run, served)

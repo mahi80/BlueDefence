@@ -15,7 +15,7 @@ from aegis.dataset.schema import HumanDecision, _label_from_human
 
 def _row(i, *, verdict="malicious", label=("benign", "ground_truth"), split="train", human=None):
     return {"record_id": f"r{i}", "kind": "triage", "origin": "attacker_says", "split": split,
-            "fingerprint": f"{i:032x}", "alert": {"id": f"a{i}", "path": "/login?id=1' OR 1=1--"},
+            "fingerprint": f"{i:032x}", "alert": {"id": f"a{i}", "path": f"/login?id={i}' OR 1=1--"},   # distinct content: the fingerprint is recomputed
             "label": {"verdict": label[0], "source": label[1]}, "chain": {"verdict": verdict},
             "rationale": "r", "techniques": [], "human": human or [], "tags": ["eval_holdout"]}
 

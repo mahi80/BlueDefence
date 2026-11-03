@@ -77,8 +77,19 @@ class State:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({"current": self.current, "runs": self.runs, "last_export": self.last_export,
                                          "history": self.history[-200:]}, indent=2, sort_keys=True), encoding="utf-8")
+        cur = self.path.parent / "current.json"
         if self.current:
-            (self.path.parent / "current.json").write_text(json.dumps(self.current, indent=2), encoding="utf-8")
+            out = dict(self.current)
+            try:
+                on_disk = json.loads(cur.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                on_disk = {}
+            if (isinstance(on_disk, dict) and on_disk.get("served_model") and on_disk.get("run") == out.get("run")
+                    and on_disk.get("sha256") == out.get("sha256")):
+                out["served_model"] = on_disk["served_model"]    # the GPU register step's stamp survives a sync (D4-15)
+            cur.write_text(json.dumps(out, indent=2), encoding="utf-8")
+        else:
+            cur.unlink(missing_ok=True)       # rolled back to the base model
 
     def log(self, run: str, stage: str, **info) -> None:
         self.history.append({"ts": _now(), "run": run, "stage": stage, **info})
@@ -411,6 +422,8 @@ def cmd_sync(a, *, accepted=None) -> int:
         if not run or run not in st.runs or st.runs[run].get("stage") == "promoted":
             continue
         info = st.runs[run]
+        if info.get("denied"):
+            continue                     # rolled back by a person: its old acceptance never promotes it again
         # an accepted proposal can only promote a run that passed its gate and shadow, and only the adapter
         # that was proposed: a rule naming a failed run (or one whose adapter changed since) is refused
         if info.get("stage") not in ("shadowed", "proposed") or not _shadow_ready(info):
@@ -454,6 +467,8 @@ def cmd_promote(a) -> int:
     runs = Path(a.runs).expanduser(); st = State.load(runs)
     if a.run not in st.runs:
         print(f"unknown run {a.run}"); return 1
+    if st.runs[a.run].get("denied"):
+        print(f"{a.run} was rolled back — denied for good"); return 1
     if st.runs[a.run].get("stage") not in ("shadowed", "proposed") or not _shadow_ready(st.runs[a.run]):
         print(f"{a.run} is at stage {st.runs[a.run].get('stage')!r} (shadow verdict "
               f"{_shadow_verdict(st.runs[a.run])!r}); promote only a gated run whose shadow said 'ready'"); return 1
@@ -472,6 +487,31 @@ def _promote(st: State, run: str, *, approved_by: str, rationale: str, proposal_
                   "approved_by": approved_by, "rationale": rationale[:500], "proposal_id": proposal_id,
                   "previous": {k: prev.get(k) for k in ("run", "adapter", "sha256")} if prev else None}
     st.log(run, "promoted", approved_by=approved_by, previous=(prev or {}).get("run"))
+
+
+def cmd_rollback(a) -> int:
+    """Undo the current promotion: the previous model becomes current again (or the base model, if there was
+    none) and the rolled-back run is recorded as denied, so neither ``sync`` nor ``promote`` brings it back.
+    Hand-restoring ``current.json`` used to be overwritten by the next sync (review round 4 D4-8)."""
+    runs = Path(a.runs).expanduser(); st = State.load(runs)
+    if not st.current:
+        print("nothing is promoted"); return 1
+    bad = st.current.get("run")
+    prev = st.current.get("previous") or None
+    if bad in st.runs:
+        st.runs[bad]["denied"] = {"ts": _now(), "by": a.approved_by, "rationale": a.rationale[:500]}
+    st.log(bad, "denied", approved_by=a.approved_by, rationale=a.rationale[:500])
+    if prev and prev.get("run"):
+        ok, why = verify_adapter(prev.get("adapter") or "", prev.get("sha256"))
+        if not ok:
+            print(f"  previous model {prev.get('run')} cannot be restored ({why}); rolling back to the base model")
+            prev = None
+    st.current = ({"run": prev["run"], "adapter": prev.get("adapter"), "sha256": prev.get("sha256"),
+                   "promoted_at": _now(), "approved_by": a.approved_by, "rationale": a.rationale[:500],
+                   "rolled_back_from": bad, "previous": None} if prev else None)
+    st.save()
+    print(f"  rolled back {bad} → {st.current['run'] if st.current else 'base model (no adapter)'}")
+    return 0
 
 
 def cmd_status(a) -> int:
@@ -510,9 +550,12 @@ def main(argv: list[str] | None = None) -> int:
     y = sub.add_parser("sync", help="accepted model_promotion proposals → current pointer"); common(y)
     m = sub.add_parser("promote", help="offline promotion with a recorded approver"); common(m)
     m.add_argument("--approved-by", required=True); m.add_argument("--rationale", required=True)
+    b = sub.add_parser("rollback", help="undo the current promotion; the run is denied for good"); common(b)
+    b.add_argument("--approved-by", required=True); b.add_argument("--rationale", required=True)
     t = sub.add_parser("status"); common(t)
     a = ap.parse_args(argv)
-    return {"run": cmd_run, "shadow": cmd_shadow, "propose": cmd_propose, "sync": cmd_sync, "promote": cmd_promote, "status": cmd_status}[a.cmd](a)
+    return {"run": cmd_run, "shadow": cmd_shadow, "propose": cmd_propose, "sync": cmd_sync, "promote": cmd_promote,
+            "rollback": cmd_rollback, "status": cmd_status}[a.cmd](a)
 
 
 if __name__ == "__main__":
