@@ -49,6 +49,8 @@ class PendingApproval:
     approved_by: str = ""              # a human approval the service is still trying to execute (retry)
     second_by: str = ""                # ... and its second approver, when the two-person rule applied
     attempts: int = 0                  # execution attempts of that approval
+    unfiled: bool = False              # the channel refused the card; sync() files it again (review E3)
+    card: dict | None = None           # the card to re-file while unfiled
 
 
 @dataclass
@@ -121,14 +123,22 @@ def _with_why(executed: Any, why: str) -> Any:
     return {"error": why}
 
 
-def _state_path(explicit: Optional[str | Path], transport_dir: Optional[Path]) -> Optional[Path]:
+def _state_path(explicit: Optional[str | Path], transport_dir: Optional[Path], scope: str = "soc") -> Optional[Path]:
+    """The approvals journal. Each scope has its own file: the posture/exposure runner and the SOC used to
+    share ``pending.jsonl`` under the same transport name, so the runner restored the SOC's cards and settled
+    them through its own recorder — a SOC block card became ``approved`` with nothing applied (code review
+    2026-11-03 C2)."""
     raw = str(explicit) if explicit is not None else os.environ.get("AEGIS_HITL_STATE", "").strip()
     if raw.lower() in ("off", "0", "none", "false"):
         return None
     if raw:
-        return Path(raw)
-    base = transport_dir or Path(os.environ.get("AEGIS_HITL_DIR") or (Path.cwd() / ".aegis-hitl"))
-    return Path(base) / "pending.jsonl"
+        path = Path(raw)
+    else:
+        base = transport_dir or Path(os.environ.get("AEGIS_HITL_DIR") or (Path.cwd() / ".aegis-hitl"))
+        path = Path(base) / "pending.jsonl"
+    if scope and scope != "soc":
+        path = path.with_name(f"{path.stem}-{scope}{path.suffix}")
+    return path
 
 
 def _action_dict(action: Any) -> dict:
@@ -139,6 +149,7 @@ def _action_dict(action: Any) -> dict:
 
 class BaseHITL:
     name = "base"
+    scope = "soc"          # whose approvals these are; set before first use (the exposure runner uses "exposure")
 
     def __init__(self, *, state_path: Optional[str | Path] = None) -> None:
         self._pending: dict[str, PendingApproval] = {}
@@ -161,7 +172,7 @@ class BaseHITL:
         if self._loaded:
             return
         self._loaded = True
-        self._journal = _state_path(self._state_arg, self._journal_dir())
+        self._journal = _state_path(self._state_arg, self._journal_dir(), self.scope)
         if self._journal is None or not self._journal.exists():
             return
         live: dict[str, dict] = {}
@@ -181,7 +192,8 @@ class BaseHITL:
                 elif row.get("op") == "settled":
                     live.pop(str(row.get("approval_id")), None)
                 elif row.get("op") == "progress" and str(row.get("approval_id")) in live:
-                    live[str(row["approval_id"])].update({k: row[k] for k in ("first_approver", "approved_by", "second_by", "attempts")
+                    live[str(row["approval_id"])].update({k: row[k] for k in ("first_approver", "approved_by", "second_by", "attempts",
+                                                                              "external_id", "unfiled")
                                                           if k in row})
         except OSError as e:
             logger.warning("[hitl:%s] approvals journal %s unreadable (%s); starting with none pending", self.name, self._journal, e)
@@ -215,7 +227,8 @@ class BaseHITL:
                                external_id=str(row.get("external_id") or ""),
                                first_approver=str(row.get("first_approver") or ""),
                                approved_by=str(row.get("approved_by") or ""), second_by=str(row.get("second_by") or ""),
-                               attempts=int(row.get("attempts") or 0))
+                               attempts=int(row.get("attempts") or 0), unfiled=bool(row.get("unfiled")),
+                               card=row.get("card") if isinstance(row.get("card"), dict) else None)
 
     def _journal_append(self, row: dict) -> None:
         if self._journal is None:
@@ -223,8 +236,19 @@ class BaseHITL:
         try:
             with self._jlock:
                 self._journal.parent.mkdir(parents=True, exist_ok=True)
-                with self._journal.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps({"transport": self.name, "ts": time.time(), **row}, ensure_ascii=False, default=str) + "\n")
+                data = (json.dumps({"transport": self.name, "ts": time.time(), **row}, ensure_ascii=False, default=str) + "\n").encode()
+                with self._journal.open("ab") as f:
+                    start = f.tell()
+                    try:
+                        f.write(data)
+                        f.flush()
+                    except OSError:
+                        # a fragment left by ENOSPC would swallow the next row (code review 2026-11-03 E8)
+                        try:
+                            f.truncate(start)
+                        except OSError:
+                            pass
+                        raise
         except OSError as e:
             # the approval is still filed and pending in memory; only restart-safety is lost — say so
             logger.warning("[hitl:%s] approvals journal write failed (%s): pending decisions will not survive a restart",
@@ -255,7 +279,7 @@ class BaseHITL:
                                        if k in (getattr(p.chain, "metadata", None) or {})}},
                 # progress survives journal compaction too
                 "first_approver": p.first_approver, "approved_by": p.approved_by, "second_by": p.second_by,
-                "attempts": p.attempts}
+                "attempts": p.attempts, **({"unfiled": True, "card": p.card} if p.unfiled else {})}
 
     # ---- contract
     @property
@@ -279,11 +303,23 @@ class BaseHITL:
                 "severity": str(getattr(chain, "verdict", "")), "alert_id": key[0]}
         try:
             external_id = self._file(card)
-        except Exception as e:  # noqa: BLE001 — channel down is a runtime condition; the stdout card is the fallback
-            logger.warning("[hitl:%s] could not file approval for %s (%s: %s); falling back to the stdout card",
-                           self.name, key[0], type(e).__name__, str(e)[:160])
-            return None
+            why = "" if external_id is not None else "the channel returned no id"
+        except Exception as e:  # noqa: BLE001 — channel down is a runtime condition
+            external_id, why = None, f"{type(e).__name__}: {str(e)[:160]}"
         if external_id is None:
+            # Keep it, journal it and file it again on every sync until the channel takes it (code review
+            # 2026-11-03 E3: a dashboard ConnectError used to lose `isolate host-7` for good). It never times
+            # out into an execution while unfiled — no analyst has seen it. None still tells the caller to
+            # print the stdout card now.
+            pa = PendingApproval(approval_id=approval_id, alert_id=key[0], action=action, chain=chain,
+                                 unfiled=True, card=card)
+            self._pending[approval_id] = pa
+            self._by_key[key] = approval_id
+            row = self._filed_row(pa)
+            row.pop("transport", None)
+            self._journal_append(row)
+            logger.error("[hitl:%s] could not file approval %s for %s on alert %s (%s) — kept and retried every sync",
+                         self.name, approval_id, key[1], key[0], why)
             return None
         pa = PendingApproval(approval_id=approval_id, alert_id=key[0], action=action, chain=chain, external_id=str(external_id))
         self._pending[approval_id] = pa
@@ -293,6 +329,27 @@ class BaseHITL:
         self._journal_append(row)
         logger.info("[hitl:%s] approval %s filed for %s on alert %s", self.name, approval_id, key[1], key[0])
         return approval_id
+
+    def _refile(self, p: PendingApproval) -> bool:
+        """File an approval the channel refused earlier. True once it is filed."""
+        card = p.card or {"id": p.approval_id, "action": f"{p.action.action_type} -> {p.action.target}",
+                          "args": card_args(p.action, p.chain), "severity": str(getattr(p.chain, "verdict", "")),
+                          "alert_id": p.alert_id}
+        try:
+            external_id = self._file(card)
+        except Exception as e:  # noqa: BLE001
+            key = (p.approval_id, "refile:" + str(e)[:80])
+            if key not in self._poll_failed:
+                self._poll_failed.add(key)
+                logger.warning("[hitl:%s] approval %s still not filed: %s", self.name, p.approval_id, str(e)[:160])
+            return False
+        if external_id is None:
+            return False
+        p.external_id, p.unfiled, p.card = str(external_id), False, None
+        self._journal_append({"op": "progress", "approval_id": p.approval_id, "external_id": p.external_id,
+                              "unfiled": False})
+        logger.info("[hitl:%s] approval %s filed after a retry", self.name, p.approval_id)
+        return True
 
     def sync(self, response_agent: Any, *, max_age_sec: Optional[float] = None,
              timeout_policy: Any = None) -> list[Decision]:
@@ -313,6 +370,15 @@ class BaseHITL:
             # Preserve the original path exactly when the timeout policy is not in use.
             if expired and timeout_policy is None:
                 made.append(self._settle(p, "expired", "", f"no decision within {int(max_age_sec)} s")); continue
+            # a card the channel refused: file it again; nothing is decided (or timed out) on a card nobody has seen
+            if p.unfiled:
+                if expired:
+                    logger.error("[hitl:%s] approval %s for %s on alert %s expired without ever reaching the channel",
+                                 self.name, approval_id, p.action.action_type, p.alert_id)
+                    made.append(self._settle(p, "expired", "", "never filed: the approval channel refused it until it expired"))
+                    continue
+                self._refile(p)
+                continue
             # 0) an approval already given that has not run yet (rate cap, vendor error): try it again
             if p.approved_by:
                 d = self._execute_approved(p, response_agent, p.approved_by, second=p.second_by or None)

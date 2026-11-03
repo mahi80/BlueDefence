@@ -292,6 +292,8 @@ class CycleStats:
     errors: int = 0
     audit_failures: int = 0
     deferred: int = 0
+    lost: int = 0          # alerts that could be neither handled nor parked
+    source_errors: list[str] = field(default_factory=list)
     redelivered: int = 0
     seconds: float = 0.0
     investigations: int = 0
@@ -304,23 +306,31 @@ class CycleStats:
     def line(self) -> str:
         v = " ".join(f"{k}={n}" for k, n in sorted(self.verdicts.items()))
         lag = f" streamed={self.streamed} lag_ms={self.max_lag_ms} handle_ms={self.max_handle_ms}" if self.streamed else ""
-        extra = (f"deferred={self.deferred} " if self.deferred else "") + (f"redelivered={self.redelivered} " if self.redelivered else "")
+        extra = (f"deferred={self.deferred} " if self.deferred else "") + (f"redelivered={self.redelivered} " if self.redelivered else "") \
+            + (f"LOST={self.lost} " if self.lost else "")
         return (f"alerts={self.alerts} executed={self.executed} hitl_queued={self.hitl_queued} "
                 f"decisions={self.decisions} rolled_back={self.rolled_back} errors={self.errors} {extra}"
                 f"{self.seconds:.1f}s{lag} {v}".rstrip())
 
 
+_SOURCE_ERROR = "__aegis_source_error__"
+
+
 def _alerts_from_env(watchdog: Any = None) -> Iterator[dict]:
+    """Every configured source in turn. A source that raises (Sentinel 401, a vendor 503) ends only ITS pass:
+    the error is handed to run_cycle as a marker and the next source still runs (code review 2026-11-03 E6 —
+    one chained iterator let a single bad bearer token blind the WAF feed for as long as it lasted)."""
     from aegis.ingest import sources_from_env
     for name, it in sources_from_env():
-        if watchdog is None:
-            yield from it
-        else:
-            # attribute each polled alert to its ingest source for liveness; pushed/streamed
-            # vendors are counted from StreamQueue.stats.by_source in the service loop instead
+        try:
             for alert in it:
-                watchdog.record(name)
+                if watchdog is not None:
+                    # attribute each polled alert to its ingest source for liveness; pushed/streamed
+                    # vendors are counted from StreamQueue.stats.by_source in the service loop instead
+                    watchdog.record(name)
                 yield alert
+        except Exception as e:  # noqa: BLE001 — reported per source, the others keep running
+            yield {_SOURCE_ERROR: name, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
 def _stream_alerts(p: Pipeline) -> Iterator[dict]:
@@ -369,6 +379,12 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             logger.error("[service] source stopped mid-cycle: %s: %s — remaining sources skipped until the next cycle",
                          type(e).__name__, str(e)[:200])
             break
+        if _SOURCE_ERROR in alert:
+            stats.errors += 1
+            stats.source_errors.append(alert[_SOURCE_ERROR])
+            logger.error("[service] source %s stopped mid-cycle: %s — the other sources keep running",
+                         alert[_SOURCE_ERROR], alert.get("error"))
+            continue
         if max_alerts and stats.alerts >= max_alerts:
             break
         stats.alerts += 1
@@ -386,9 +402,14 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             # queue and re-feed it once the log is writable. One line per cycle — a full disk is noisy enough.
             stats.errors += 1
             stats.audit_failures += 1
-            if storm is not None and not alert.get("audit_deferred"):
-                if storm.queue.push({**alert, "audit_deferred": True}):
-                    stats.deferred += 1
+            # a re-fed alert that fails again is parked again: its old row is behind the cursor once the re-feed
+            # batch is acked (code review 2026-11-03 E1 — it used to vanish with dropped=0)
+            if storm is not None and storm.queue.push({**alert, "audit_deferred": True}, "audit"):
+                stats.deferred += 1
+            else:
+                stats.lost += 1
+                logger.error("[service] alert %s could not be parked (no spill space) — it must be re-sent from its source",
+                             alert.get("id"))
             if stats.audit_failures == 1:
                 logger.error("[service] audit log not writable (%s): alerts are parked in the deferred queue and re-fed once it is", e)
             continue
@@ -543,9 +564,8 @@ class Service:
         self.stream_cycles = 0
         self.history: list[CycleStats] = []
         self._stop = False
-        from aegis.ops.deferred import DeferredQueue
-        spill = os.environ.get("AEGIS_DEFERRED_PATH", "").strip() or str(Path(pipeline.audit_path).parent / "deferred.jsonl")
-        self.storm = StormControl(DeferredQueue(spill), pipeline.stream, self.interval)
+        from aegis.ops.deferred import default_spill
+        self.storm = StormControl(default_spill(pipeline.audit_path), pipeline.stream, self.interval)
 
     def stop(self, *_: Any) -> None:
         self._stop = True
@@ -711,6 +731,9 @@ class Service:
                     logger.exception("[service] re-feed cycle crashed")
                     break
                 self.storm.queue.ack()                              # processed (or re-spilled): commit the cursor
+                if st2.audit_failures:                              # still failing: stop, or the re-parked rows loop
+                    stats.errors += st2.errors
+                    break
                 stats.redelivered += st2.alerts
                 stats.executed += st2.executed
                 sdnotify.watchdog()
@@ -827,10 +850,12 @@ def status_main(audit: str) -> int:
         rep = AuditLog(p, repair=False).verify_report(all_files=False)
         print(f"chain      {p}: {'intact' if rep['ok'] else 'BROKEN at ' + str(rep['broken_at'])} · {rep['entries']} entries in the live segment")
         ok = ok and rep["ok"]
-    dq = Path(os.environ.get("AEGIS_DEFERRED_PATH", "").strip() or str(p.parent / "deferred.jsonl"))
-    if dq.exists():
-        from aegis.ops.deferred import DeferredQueue
-        print(f"deferred   {DeferredQueue(dq).pending()} alert(s) waiting (storm backlog)")
+    from aegis.ops.deferred import default_spill
+    spill = default_spill(p)
+    n = spill.pending()
+    if n:
+        fb = spill.fallback.pending() if spill.fallback is not None else 0
+        print(f"deferred   {n} alert(s) waiting (storm / audit backlog)" + (f", {fb} on the fallback {spill.fallback.path}" if fb else ""))
     return 0 if ok else 1
 
 

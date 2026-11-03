@@ -393,6 +393,14 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(status, body)
 
     def _body(self) -> Optional[bytes]:
+        # Fluent Bit / Vector post NDJSON chunked. Reading only Content-Length (absent → 0) answered 200 with
+        # 0 accepted and parsed the chunk bytes as the next request (code review 2026-11-03 C1).
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if te:
+            if te.split(",")[-1].strip() != "chunked":
+                self._refuse(501, {"error": f"Transfer-Encoding {te!r} not supported"})
+                return None
+            return self._read_chunked()
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -405,6 +413,33 @@ class _Handler(BaseHTTPRequestHandler):
             self._refuse(413, {"error": f"body over {self.server_ref.max_bytes} bytes"})
             return None
         return self.rfile.read(n) if n else b""
+
+    def _read_chunked(self) -> bytes | None:
+        out = bytearray()
+        cap = self.server_ref.max_bytes
+        while True:
+            line = self.rfile.readline(1024)
+            size_txt = line.split(b";", 1)[0].strip()
+            # hex digits only: int(b"-1", 16) is -1, and rfile.read(-1) reads to EOF with no cap
+            if not size_txt or len(size_txt) > 8 or any(c not in b"0123456789abcdefABCDEF" for c in size_txt):
+                self._refuse(400, {"error": "malformed chunked body"})
+                return None
+            size = int(size_txt, 16)
+            if size == 0:
+                while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):   # trailers
+                    pass
+                return bytes(out)
+            if len(out) + size > cap:
+                self._refuse(413, {"error": f"body over {cap} bytes"})
+                return None
+            chunk = self.rfile.read(size)
+            if len(chunk) != size:
+                self._refuse(400, {"error": "chunked body ended early"})
+                return None
+            out += chunk
+            if self.rfile.readline(1024) not in (b"\r\n", b"\n"):
+                self._refuse(400, {"error": "malformed chunked body"})
+                return None
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib naming
         try:
