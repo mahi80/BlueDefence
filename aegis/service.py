@@ -432,6 +432,9 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             # AEGIS's own findings, never trusted from a feed: a forged campaign_context became unattended blocks
             # on IPs the sender chose (review round 3 G1-9). The swarm re-derives them from its own history.
             alert = {k: v for k, v in alert.items() if k not in _FORGEABLE}
+        if "audit_attempts" in alert and not alert.get("audit_deferred"):
+            # only AEGIS's own audit re-feed counts attempts; a feed's value would dead-letter on the first error (X4-13)
+            alert = {k: v for k, v in alert.items() if k != "audit_attempts"}
         stats.alerts += 1
         if alert.get("deferred_at") or alert.get("audit_deferred"):
             stats.refed += 1                                 # metered when it first arrived, not again (G4-8)

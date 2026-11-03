@@ -14,6 +14,8 @@ cheap enough for the hot path (in-memory, O(window)).
 
 from __future__ import annotations
 
+import contextvars
+
 import logging
 import os
 import re
@@ -463,6 +465,14 @@ def attach_campaign_context(alert: dict, store: EventStore, **kw) -> dict:
 
 
 _DERIVED_KEYS = ("campaign_context", "tls_client", "low_and_slow", "deferred_at", "deferred_by", "audit_deferred")
+
+# Keys only AEGIS writes about an alert, which the orchestrator's fast paths act on with no model in the loop.
+ORCH_DERIVED_KEYS = ("campaign_context", "tls_client", "low_and_slow")
+
+# The alert object whose derived keys were just attached here, in this thread/context. The orchestrator trusts derived
+# keys only on that exact object; anywhere else (aegis/main.py, tenant / async callers, future entry points) they were
+# written by the sender and are stripped (review round 4 O4-11).
+TRUSTED_CONTEXT: contextvars.ContextVar[object | None] = contextvars.ContextVar("aegis_trusted_context", default=None)
 
 
 __all__ = ["EventStore", "attach_campaign_context", "campaign_summary", "is_auth_write"]

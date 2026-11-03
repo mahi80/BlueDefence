@@ -140,6 +140,14 @@ class _OutflowBook:
         self._by_sender: BoundedDict = BoundedDict(int(os.environ.get("AEGIS_OUTFLOW_MAX_SENDERS", "100000")))
 
     def add(self, sender: str, ts: float, amount: float, txn_id: str, window: float) -> tuple[int, float]:
+        """(transfers, total) in the window — every recorded transfer, split-size ones included."""
+        n, total, _nh, _th = self.add_detail(sender, ts, amount, txn_id, window)
+        return n, total
+
+    def add_detail(self, sender: str, ts: float, amount: float, txn_id: str, window: float
+                   ) -> tuple[int, float, int, float]:
+        """(transfers, total, high-value transfers, high-value total) in the window."""
+        line = high_value_inr()
         with self._lock:
             q = self._by_sender.get(sender)
             if q is None:
@@ -152,9 +160,10 @@ class _OutflowBook:
             while q and q[0][0] < cutoff:
                 q.popleft()
             n, total = len(q), sum(a for _, a, _ in q)
+            high = [a for _, a, _ in q if a >= line]
             if not q:
                 self._by_sender.pop(sender, None)
-            return n, total
+            return n, total, len(high), sum(high)
 
     def reset(self) -> None:
         with self._lock:
@@ -164,8 +173,12 @@ class _OutflowBook:
 BOOK = _OutflowBook()
 
 
-def split_floor_inr() -> float:
-    """Transfers from this size up go into the ledger even below the high-value line (default: 1/20 of it)."""
+def split_floor_inr(alert: dict | None = None) -> float:
+    """Transfers from this size up go into the ledger even below the high-value line (default: 1/20 of it). A
+    treasury / service sender has no customer baseline, and IMPS caps a transfer at INR 5 lakh — exactly the
+    default floor — so every one of its transfers to a new beneficiary is recorded (review round 4 S4-2)."""
+    if alert is not None and is_treasury_sender(alert):
+        return 0.0
     return _num(os.environ.get("AEGIS_OUTFLOW_SPLIT_FLOOR_INR")) or high_value_inr() / 20
 
 
@@ -189,7 +202,7 @@ def is_treasury_outflow(alert: dict) -> bool:
     if not isinstance(alert, dict):
         return False
     amount = _num(alert.get("amount_inr"))
-    if amount is None or amount < split_floor_inr():
+    if amount is None or amount <= 0 or amount < split_floor_inr(alert):
         return False
     if not is_new_beneficiary(alert):
         return False
@@ -207,16 +220,19 @@ def treasury_outflow_chain(alert: dict) -> EvidenceChain:
     amount = _num(alert.get("amount_inr")) or 0.0
     sender, txn = _sender(alert), _txn_id(alert)
     treasury = is_treasury_sender(alert)
-    count, total = BOOK.add(sender, _ts(alert), amount, txn, _window_s())
-    burst = count >= _burst_n() and total >= high_value_inr()
+    count, total, n_high, high_total = BOOK.add_detail(sender, _ts(alert), amount, txn, _window_s())
+    # Only transfers at or above the line count toward the drain burst that the breaker may hold on its own: three
+    # ordinary INR 34 lakh supplier payments are not a drain (review round 4 S4-1). Splits below the line still
+    # raise a human-held chain once they add up to the line.
+    burst = n_high >= _burst_n() and high_total >= high_value_inr()
     s_geo, b_geo = str(alert.get("sender_geo") or ""), str(alert.get("beneficiary_geo") or "")
     offshore = bool(s_geo and b_geo and s_geo != b_geo)
     window_min = _window_s() / 60
 
     if burst:
         verdict, conf = "malicious", 0.95
-        why = (f"{count} high-value transfers to new beneficiaries from {sender} within {window_min:.0f} min "
-               f"({_crore(total)}) — the shape of a drain by a compromised signer")
+        why = (f"{n_high} high-value transfers to new beneficiaries from {sender} within {window_min:.0f} min "
+               f"({_crore(high_total)}) — the shape of a drain by a compromised signer")
     elif treasury:
         verdict, conf = "suspicious", 0.85
         why = f"{_crore(amount)} from treasury / service account {sender} to a new beneficiary"

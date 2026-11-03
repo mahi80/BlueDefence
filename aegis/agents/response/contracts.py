@@ -21,6 +21,7 @@ The default tier is L4, which keeps today's behaviour; an operator dials autonom
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from enum import IntEnum
@@ -142,11 +143,31 @@ def gate(action: Any, chain: Any, *, protected: bool = False, own_floor: float |
         impact = Impact(impact + 1)           # a protected asset raises the stakes one rank
     if impact >= Impact.SEVERE:
         return False, f"{at} is {impact.name.lower()} impact — never runs without a human"
+    if protected and impact >= Impact.HIGH and own_floor is None:
+        # protecting a target must tighten things: HIGH is "a human always decides" (always_hitl), and a protected
+        # target bumped there used to run unattended at L4 ≥ 0.95 (review round 4 R4-3)
+        return False, f"{at} on a protected target is {impact.name.lower()} impact — a human decides"
     t = tier()
-    if own_floor is None and impact > TIER_CEILING[t] and impact > Impact.READ_ONLY:
+    if own_floor is not None:
+        # the breaker is a separate switch, but the operator's tier still bounds it: L0–L2 mean "nothing that cuts
+        # anyone off runs unattended" (review round 4 X4-6 — L0 + breaker live still held payments)
+        if TIER_CEILING[t] < Impact.MODERATE:
+            return False, f"{at} is outside the autonomy tier {t} — a human decides"
+    elif impact > TIER_CEILING[t] and impact > Impact.READ_ONLY:
         return False, f"{at} ({impact.name.lower()}) is above the autonomy tier {t} — a human decides"
     conf = float(getattr(chain, "confidence", 0.0) or 0.0)
-    need = floor(impact) if own_floor is None else float(own_floor)
+    if not math.isfinite(conf):
+        return False, "chain confidence is not a number — a human decides"
+    if own_floor is None:
+        need = floor(impact)
+    else:
+        try:
+            of = float(own_floor)
+        except (TypeError, ValueError):
+            of = float("nan")
+        if not math.isfinite(of):
+            return False, "the mechanism's own confidence floor is not a number — a human decides"
+        need = max(floor(Impact.MODERATE), min(1.0, of))
     if conf < need:
         return False, f"confidence {conf:.2f} is below the {need:.2f} an unattended {impact.name.lower()} action needs"
     return True, ""

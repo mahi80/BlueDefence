@@ -96,7 +96,30 @@ class _AuthFailLimiter:
 
 
 #: keys only AEGIS itself sets on an alert; a pushed alert carrying one is stripped of it
-_INTERNAL_KEYS = ("deferred_at", "deferred_by", "audit_deferred", "campaign_context", "tls_client", "low_and_slow")
+_INTERNAL_KEYS = ("deferred_at", "deferred_by", "audit_deferred", "audit_attempts", "campaign_context", "tls_client",
+                  "low_and_slow")
+
+# Alert shapes that only AEGIS's own detectors produce, and that the orchestrator turns into a verdict with no model and
+# no reviewer (deterministic fast paths). A pushed alert in one of these shapes was written by whoever holds the push
+# token: it is demoted to an ordinary alert, its detector block kept as untrusted text under ``claimed_*`` (review
+# round 4 I4-1 — a pushed `object_walk` became an unattended block on an IP the sender chose).
+_DERIVED_SHAPES = {"network_fault": "netops", "object_walk": "object_walk", "pxe_icmp_overflow": "pxe",
+                   "tls_known_bad": "egress", "tls_beacon": "egress", "tls_exfil": "egress", "shadow_ai": "egress"}
+
+
+def _demote_derived(obj: dict) -> dict:
+    kind = str(obj.get("alert_type") or "")
+    nested = _DERIVED_SHAPES.get(kind)
+    if nested is not None:
+        if nested in obj:
+            obj[f"claimed_{nested}"] = obj.pop(nested)
+        obj["alert_type"] = "network_event" if kind == "network_fault" else f"pushed_{kind}"
+        obj["claimed_alert_type"] = kind
+        obj["note"] = f"pushed as {kind}; demoted — that finding is only derived inside AEGIS"
+    if "governed_agent" in obj:
+        # control-plane facts (Q37 block, pause, critical rogue) arrive from the ACP dashboard, never from a push
+        obj["claimed_governed_agent"] = obj.pop("governed_agent")
+    return obj
 
 
 class PushServer:
@@ -291,14 +314,9 @@ class PushServer:
                 obj["id"] = f"push:{str(obj['id'])[:200]}" if not str(obj["id"]).startswith("push:") else str(obj["id"])[:205]
                 for k in _INTERNAL_KEYS:
                     obj.pop(k, None)
-                ln = json.dumps(obj, separators=(",", ":"))
-                if obj.get("alert_type") == "network_fault" and isinstance(obj.get("netops"), dict):
-                    # a pre-correlated network fault would skip the LLM and go straight to config_rollback / revoke_sessions
-                    # proposals; faults are derived here from raw syslog/telemetry (/ingest/netops), never accepted ready-made
-                    obj.pop("netops", None)
-                    obj["alert_type"] = "network_event"
-                    obj["note"] = "pushed as network_fault; demoted — correlation happens inside AEGIS"
-                    ln = json.dumps(obj, separators=(",", ":"))
+                # a pre-correlated finding would skip the LLM and the reviewer and go straight to blocks / rollbacks;
+                # these are derived inside AEGIS from raw telemetry (/ingest/netops, /ingest/apigw, …), never accepted
+                ln = json.dumps(_demote_derived(obj), separators=(",", ":"))
                 good.append(ln)
             else:
                 bad += 1
