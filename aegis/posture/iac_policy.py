@@ -307,12 +307,21 @@ def load_waivers(path: str | Path) -> list[Waiver]:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError) as e:
         raise PostureSourceError(f"cannot read waivers {path}: {e}") from e
+    if not isinstance(raw, dict) or not isinstance(raw.get("waivers") or [], list):
+        raise PostureSourceError(f"waivers {path}: expected a mapping with a `waivers:` list")
     out = []
     for i, w in enumerate(raw.get("waivers") or [], 1):
-        missing = [k for k in ("id", "resource", "reason", "approved_by", "expires") if not (w or {}).get(k)]
+        if not isinstance(w, dict):
+            raise PostureSourceError(f"waiver #{i} is not a mapping")
+        missing = [k for k in ("id", "resource", "reason", "approved_by", "expires") if not w.get(k)]
         if missing:
             raise PostureSourceError(f"waiver #{i} is missing {', '.join(missing)}: every exception needs a reason, an approver and an expiry")
-        exp = w["expires"] if isinstance(w["expires"], date) else date.fromisoformat(str(w["expires"]))
+        try:
+            exp = w["expires"] if isinstance(w["expires"], date) else date.fromisoformat(str(w["expires"]))
+        except ValueError as e:
+            # a typo'd date raised ValueError, which nothing caught: every posture run crashed and the console kept
+            # showing the previous run (review round 3 G6-4). It is a register problem, applied fail-safe.
+            raise PostureSourceError(f"waiver #{i} ({w.get('id')}) has an unreadable expiry {w['expires']!r}: {e}") from e
         out.append(Waiver(str(w["id"]), str(w["resource"]), str(w["reason"]), str(w["approved_by"]), exp))
     return out
 

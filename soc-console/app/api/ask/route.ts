@@ -4,22 +4,35 @@
 // the same way the console does offline. Either way the analyst gets a grounded answer.
 
 import { NextResponse } from "next/server";
+import { getChain } from "../../../lib/api";
 import { answerLocally } from "../../../lib/ask";
 import { getSession } from "../../../lib/auth";
+import { sameOrigin } from "../../../lib/origin";
 import type { Chain } from "../../../lib/types";
 
 export const runtime = "nodejs";
 
 export async function POST(req: Request) {
+  if (!sameOrigin(req.headers)) return NextResponse.json({ error: "cross-site request refused" }, { status: 403 });
   if (!(await getSession())) return NextResponse.json({ error: "not signed in" }, { status: 401 });
   let question = "";
-  let chain: Chain | undefined;
+  let chainId = "";
   try {
     const body = await req.json();
     question = String(body?.question ?? "").slice(0, 2000);
-    chain = body?.chain as Chain | undefined;
+    chainId = String(body?.chain_id ?? body?.chain?.chain_id ?? "").slice(0, 200);
   } catch {
     return NextResponse.json({ answer: "I couldn't read that question — try again.", source: "error" }, { status: 400 });
+  }
+  // The chain is read from the backend by id. The browser used to send the whole chain and Q answered from it,
+  // so anyone signed in could have Q "confirm" a verdict, evidence or approval that does not exist (round 3 G6-7).
+  let chain: Chain | undefined;
+  if (chainId) {
+    try {
+      chain = (await getChain(chainId)) ?? undefined;
+    } catch {
+      return NextResponse.json({ answer: "I couldn't load that detection from the SOC backend right now.", source: "error" }, { status: 502 });
+    }
   }
 
   const upstream = process.env.AEGIS_ASK_URL?.trim();

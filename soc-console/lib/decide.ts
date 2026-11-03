@@ -5,10 +5,12 @@
 // backend with the key and an `X-AEGIS-User` header (role:user) the backend records in the decision row.
 import { NextResponse } from "next/server";
 import { canDecide, getSession } from "@/lib/auth";
+import { sameOrigin } from "@/lib/origin";
 
 const ORIGIN = process.env.AEGIS_API_ORIGIN || "";
 
-export async function forwardDecision(path: string, body: unknown): Promise<NextResponse> {
+export async function forwardDecision(path: string, body: unknown, req?: Request): Promise<NextResponse> {
+  if (req && !sameOrigin(req.headers)) return NextResponse.json({ error: "cross-site request refused" }, { status: 403 });
   const s = await getSession();
   if (!s) return NextResponse.json({ error: "not signed in" }, { status: 401 });
   if (!canDecide(s.role)) return NextResponse.json({ error: `role ${s.role} may not decide` }, { status: 403 });

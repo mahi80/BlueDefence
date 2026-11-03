@@ -10,7 +10,7 @@ import type { Role } from "./auth";
 //   { "users": { "r.verma": { "role": "ciso", "hash": "scrypt$<salt>$<key>" }, ... } }
 // written by `npm run user -- add <name> <role>` (prompts for the password, never logs it).
 // Passwords are scrypt-hashed (N=2^15) with a per-user salt; comparison is constant-time.
-// A missing file with AEGIS_DEMO_USER/PASSWORD set keeps the old single demo account working.
+// A missing file with BOTH AEGIS_DEMO_USER and AEGIS_DEMO_PASSWORD set keeps the single demo account working.
 
 export interface UserRecord {
   role: Role;
@@ -37,6 +37,33 @@ export function loadUsers(): UsersFile | null {
   } catch {
     return null;
   }
+}
+
+/** "missing" (no file: first run), "ok", or "unreadable" (exists but cannot be read or parsed). A corrupt users
+ * file used to look like "no file" and fell back to the demo account (review round 3 G6-7). */
+export function usersFileState(): "missing" | "ok" | "unreadable" {
+  if (!fs.existsSync(usersPath())) return "missing";
+  return loadUsers() ? "ok" : "unreadable";
+}
+
+/** The demo account only when BOTH its name and its password are set: AEGIS_DEMO_USER alone used to mean
+ * password "demo" (review round 3 G6-7). */
+export function demoAccount(): { user: string; password: string; role: Role } | null {
+  const user = process.env.AEGIS_DEMO_USER || "";
+  const password = process.env.AEGIS_DEMO_PASSWORD || "";
+  if (!user || !password) return null;
+  const role = validRole(process.env.AEGIS_DEMO_ROLE || "") ? (process.env.AEGIS_DEMO_ROLE as Role) : "bu_head";
+  return { user, password, role };
+}
+
+// Verifying an unknown account cost nothing while a real one cost an scrypt run, so response time told which
+// names exist (review round 3 G6-7). An unknown name is checked against this throwaway hash instead.
+let DUMMY_HASH = "";
+export function verifyOrBurn(password: string, hash: string | undefined): boolean {
+  if (typeof hash === "string" && hash) return verifyPassword(password, hash);
+  if (!DUMMY_HASH) DUMMY_HASH = hashPassword(crypto.randomBytes(12).toString("hex"));
+  verifyPassword(password, DUMMY_HASH);
+  return false;
 }
 
 export function saveUsers(u: UsersFile): void {
@@ -102,16 +129,20 @@ export function lockedUntil(key: string): number {
   return 0;
 }
 
-export function noteFailure(key: string): void {
+/** Account-wide failures (from any address) lock only at this higher count: at MAX_FAILS anyone could lock any
+ * analyst out with five wrong guesses (review round 3 G6-7). Per-address failures still lock at MAX_FAILS. */
+export const ACCOUNT_MAX_FAILS = 50;
+
+export function noteFailure(key: string, max: number = MAX_FAILS): void {
   const now = Date.now();
   const f = fails.get(key);
   if (!f || now - f.first > WINDOW_MS) {
     if (!f) makeRoom(now);
-    fails.set(key, { n: 1, first: now, until: 0 });
+    fails.set(key, { n: 1, first: now, until: max <= 1 ? now + LOCK_MS : 0 });
     return;
   }
   f.n += 1;
-  if (f.n >= MAX_FAILS) f.until = now + LOCK_MS;
+  if (f.n >= max) f.until = now + LOCK_MS;
 }
 
 export function clearFailures(key: string): void {
