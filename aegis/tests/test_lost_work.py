@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import socket
 import types
-from pathlib import Path
 
 import pytest
 
@@ -72,13 +71,14 @@ def test_default_spill_has_a_fallback_off_the_audit_volume(tmp_path, monkeypatch
 # ---- E8: a torn append is cut back -------------------------------------------------------------------
 
 def test_partial_spill_append_is_truncated(tmp_path, monkeypatch):
+    import os
     q = DeferredQueue(tmp_path / "d.jsonl")
     assert q.push({"id": "ok-1"})
-    real_open = Path.open
+    real_fdopen = os.fdopen
 
-    def failing_open(self, mode="r", *a, **k):
-        fh = real_open(self, mode, *a, **k)
-        if "a" in mode and self.name == "d.jsonl":
+    def failing_fdopen(fd, mode="r", *a, **k):            # the spill opens its file with os.open + fdopen (0600)
+        fh = real_fdopen(fd, mode, *a, **k)
+        if "a" in mode:
             orig = fh.write
 
             def write(data):
@@ -86,9 +86,9 @@ def test_partial_spill_append_is_truncated(tmp_path, monkeypatch):
                 raise OSError(28, "No space left on device")
             fh.write = write
         return fh
-    monkeypatch.setattr(Path, "open", failing_open)
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
     assert q.push({"id": "torn"}) is False
-    monkeypatch.setattr(Path, "open", real_open)
+    monkeypatch.setattr(os, "fdopen", real_fdopen)
     assert q.push({"id": "ok-2"})
     assert [r["id"] for r in q.pop(10)] == ["ok-1", "ok-2"]   # the next row did not merge into a fragment
 

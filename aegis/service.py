@@ -20,6 +20,8 @@ it; the service never does).
 from __future__ import annotations
 
 import argparse
+import errno
+import json
 import logging
 import os
 import signal
@@ -299,6 +301,7 @@ class CycleStats:
     source_errors: list[str] = field(default_factory=list)
     redelivered: int = 0
     refed: int = 0                      # alerts in this pass that were deferred earlier (already metered)
+    dead_lettered: int = 0              # alerts that failed to seal for a non-transient reason, set aside
     seconds: float = 0.0
     handle_seconds: float = 0.0         # time inside orch.handle — the model-bound work storm mode protects
     investigations: int = 0
@@ -378,6 +381,26 @@ def _drift_check(p: Any) -> None:
     _drift_thread.start()
 
 
+def _dead_letter(alert: dict, err: Exception) -> bool:
+    """Set aside an alert that cannot be sealed for a reason that will not clear by itself. Returns True when it
+    was written (``AEGIS_DEAD_LETTER``, default beside the checkpoint)."""
+    path = Path(os.environ.get("AEGIS_DEAD_LETTER", "") or (Path(os.environ.get("AEGIS_CHECKPOINT", ".aegis-ingest.json")).parent
+                                                            / "dead-letter.jsonl"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {**alert, "dead_lettered_at": time.time(), "dead_letter_reason": f"{type(err).__name__}: {str(err)[:200]}"}
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, default=str) + "\n")
+        logger.error("[service] alert %s could not be sealed after %s attempts (%s) — set aside in %s for a person",
+                     alert.get("id"), alert.get("audit_attempts", "?"), str(err)[:120], path)
+        return True
+    except OSError as e2:
+        logger.error("[service] alert %s could not be sealed or set aside (%s / %s) — re-send it from its source",
+                     alert.get("id"), str(err)[:80], e2)
+        return False
+
+
 def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: int = 0,
               sweep: bool = True, hitl: bool = True, storm: "StormControl | None" = None) -> CycleStats:
     """One pass: new alerts → orchestrator → response; then HITL sync, TTL sweep, flush.
@@ -430,7 +453,19 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             stats.audit_failures += 1
             # a re-fed alert that fails again is parked again: its old row is behind the cursor once the re-feed
             # batch is acked (code review 2026-11-03 E1 — it used to vanish with dropped=0)
-            if storm is not None and storm.queue.push({**alert, "audit_deferred": True}, "audit"):
+            # A full / read-only / failing disk clears; anything else (a row that cannot be serialised, a bug) fails
+            # the same way every time, and re-parking it re-fed it forever (review round 3 G4-14). Those go to a
+            # dead-letter file after AEGIS_AUDIT_REFEED_MAX attempts.
+            transient = getattr(e, "errno", None) in (errno.ENOSPC, errno.EROFS, errno.EIO, errno.EDQUOT, errno.EACCES, errno.EPERM)
+            attempts = int(alert.get("audit_attempts") or 0) + 1
+            max_attempts = int(os.environ.get("AEGIS_AUDIT_REFEED_MAX", "3") or 3)
+            if not transient and attempts >= max_attempts:
+                if _dead_letter(alert, e):
+                    stats.dead_lettered += 1
+                else:
+                    stats.lost += 1
+                continue
+            if storm is not None and storm.queue.push({**alert, "audit_deferred": True, "audit_attempts": attempts}, "audit"):
                 stats.deferred += 1
             else:
                 stats.lost += 1

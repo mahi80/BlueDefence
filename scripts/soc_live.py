@@ -876,7 +876,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     brain: Optional[Brain] = Brain() if a.brain else None
-    _Handler.soc = LiveSoc(brain=brain, enforce_url=enforce_url, enforce_token=token, pg_dsn=a.pg_dsn.strip())
+    # the edge's own control token when it has one (AEGIS_EDGE_CONTROL_TOKEN), else the shared ingest token
+    enforce_token = os.environ.get("AEGIS_EDGE_CONTROL_TOKEN", "").strip() or token
+    _Handler.soc = LiveSoc(brain=brain, enforce_url=enforce_url, enforce_token=enforce_token, pg_dsn=a.pg_dsn.strip())
     _Handler.ingest_token = token
     httpd = ThreadingHTTPServer((a.bind, a.port), _Handler)
     httpd.daemon_threads = True
