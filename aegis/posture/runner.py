@@ -165,10 +165,17 @@ def _parse(s: str) -> datetime:
 
 
 def _read_json(p: Path, default: Any) -> Any:
+    """A missing file is a first run (``default``). A file that exists but cannot be read or parsed is NOT: it
+    used to become ``{}`` silently, resetting every finding's first-seen date and SLA clock — 86 overdue
+    findings turned "new" with no log line (code review 2026-11-03 E12). Refuse, and keep the bad file."""
+    if not p.exists():
+        return default
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
+    except (OSError, json.JSONDecodeError) as e:
+        raise sources.PostureSourceError(
+            f"{p} is unreadable ({type(e).__name__}: {str(e)[:120]}) — refusing to reset finding history; restore it "
+            f"from {p.parent / 'runs'} or move it aside to start over") from e
 
 
 def _write_atomic(p: Path, text: str) -> None:

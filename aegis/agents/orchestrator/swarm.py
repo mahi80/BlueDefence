@@ -329,6 +329,7 @@ class SwarmOrchestrator:
         # vote time so a voter swapped in after construction is honored.
         self._extra_voters = [] if voter is not None else list(getattr(orchestrator, "_extra_voters", None) or [])
         self._pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="aegis-swarm")
+        self._hung: set = set()             # workers that outlived their time box and still hold a pool thread
         self._lock = threading.Lock()
         # recent fan-outs for the status page / tests — the last 1,000, not one per alert forever
         self.runs: deque[dict] = deque(maxlen=1000)
@@ -379,11 +380,26 @@ class SwarmOrchestrator:
             for f in done:
                 results.append(f.result())
             for f in pending:
-                f.cancel()
-                results.append(WorkerResult(futures[f], error=f"timed out after {self.max_seconds:.0f}s"))
+                started_running = not f.cancel()             # cancel() only stops a worker that never started
+                results.append(WorkerResult(futures[f], error=(f"timed out after {self.max_seconds:.0f}s" if started_running
+                                                               else "not started: every swarm worker is busy")))
+                if started_running:
+                    self._hung.add(f)
+        self._replace_pool_if_wedged()
         self._merge(chain, results, started)
         self._reseal(alert, chain)
         return chain
+
+    def _replace_pool_if_wedged(self) -> None:
+        """A hung worker keeps its thread: once they fill the pool every later fan-out "times out after 0 s"
+        (review E10). Abandon a wedged pool for a fresh one; the stuck threads finish (or not) on their own."""
+        self._hung = {f for f in self._hung if not f.done()}
+        if len(self._hung) < self.max_workers:
+            return
+        logger.error("[swarm] %d worker(s) hung past the time box — replacing the worker pool", len(self._hung))
+        old, self._pool = self._pool, ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="aegis-swarm")
+        self._hung = set()
+        old.shutdown(wait=False, cancel_futures=True)
 
     def _reseal(self, alert: dict, chain: EvidenceChain) -> None:
         """Re-seal: the enriched chain (new evidence, re-vote, metadata.swarm) is what the ResponseAgent

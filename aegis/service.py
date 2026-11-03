@@ -461,8 +461,14 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             stats.errors += 1
             logger.warning("[service] TTL sweep failed: %s", str(e)[:200])
         _drift_check(p)
-    if p.persist_sink is not None:
-        p.persist_sink.flush()
+    if p.persist_sink is not None and sweep:
+        # only on the interval pass, and briefly: the background sender keeps going either way. Waiting 10 s on
+        # every pass — the stream fast path included — let a hung dashboard add seconds to each one (review E11).
+        try:
+            if not p.persist_sink.flush(timeout=float(os.environ.get("AEGIS_PERSIST_FLUSH_S", "2"))):
+                logger.warning("[service] dashboard persistence is behind (queue not drained); continuing")
+        except TypeError:                                   # a sink without a timeout parameter
+            p.persist_sink.flush()
     stats.seconds = time.time() - t0
     _meter_license(p, stats)
     return stats

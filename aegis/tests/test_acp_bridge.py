@@ -57,12 +57,19 @@ def test_consumer_pages_normalises_and_dedups(tmp_path):
     assert list(c2.iter_alerts()) == []
 
 
-def test_consumer_survives_outage_and_refusal(tmp_path):
+def test_consumer_outage_and_refusal_are_loud(tmp_path):
+    """Review E13: an outage / 401 is a failed source the cycle counts, not a clean empty poll."""
+    import pytest
+
+    from aegis.ingest.acp import AcpFeedError
     c = AcpGovernanceConsumer("https://dash.test", "k", checkpoint=AlertCheckpoint(), transport=Dash(fail=True))
-    assert list(c.iter_alerts()) == [] and c.last_error.startswith("ConnectionError")
-    refuse = lambda m, u, b, h, t: (503, '{"error":"database unavailable"}')     # noqa: E731
+    with pytest.raises(AcpFeedError):
+        list(c.iter_alerts())
+    assert c.last_error.startswith("ConnectionError")
+    refuse = lambda m, u, b, h, t: (401, '{"error":"bad api key"}')     # noqa: E731
     c = AcpGovernanceConsumer("https://dash.test", "k", checkpoint=AlertCheckpoint(), transport=refuse)
-    assert list(c.iter_alerts()) == [] and c.last_error.startswith("HTTP 503")
+    with pytest.raises(AcpFeedError, match="401"):
+        list(c.iter_alerts())
     assert not AcpGovernanceConsumer("", "", checkpoint=AlertCheckpoint()).configured
 
 

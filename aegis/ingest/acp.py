@@ -61,6 +61,10 @@ _CONTROL_HINTS = {
 }
 
 
+class AcpFeedError(RuntimeError):
+    """The ACP events feed could not be read this poll (outage, 401, 5xx)."""
+
+
 class AcpGovernanceConsumer(BaseConsumer):
     name = "acp"
 
@@ -90,12 +94,14 @@ class AcpGovernanceConsumer(BaseConsumer):
             q = urllib.parse.urlencode({"since": since, "limit": self.page, "min_severity": self.min_severity, "kinds": self.kinds})
             try:
                 status, body = self._transport("GET", f"{self.dashboard_url}/api/soc/events?{q}", None, headers, self.timeout)
-            except Exception as e:  # noqa: BLE001 — dashboard outage: nothing this poll, the watermark holds
+            except Exception as e:  # the watermark holds; the cycle counts it as a source error
                 self.last_error = f"{type(e).__name__}: {str(e)[:160]}"
-                logger.warning("[ingest:acp] events feed unreachable: %s", self.last_error); return
+                raise AcpFeedError(f"ACP events feed unreachable: {self.last_error}") from e
             if status != 200:
+                # an outage or a 401 used to log a warning and return: the cycle looked clean while rogue, Q37 and
+                # pause events stopped arriving (review E13). Raise so the service counts a failed source.
                 self.last_error = f"HTTP {status}: {body[:160]}"
-                logger.warning("[ingest:acp] events feed refused: %s", self.last_error); return
+                raise AcpFeedError(f"ACP events feed refused: {self.last_error}")
             try:
                 data = json.loads(body or "{}")
             except json.JSONDecodeError as e:
@@ -168,4 +174,4 @@ class AcpGovernanceConsumer(BaseConsumer):
         return alert
 
 
-__all__ = ["AcpGovernanceConsumer"]
+__all__ = ["AcpFeedError", "AcpGovernanceConsumer"]
