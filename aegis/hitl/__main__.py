@@ -30,7 +30,8 @@ def _card_action(d: Path, approval_id: str) -> str | None:
             continue
         if isinstance(c, dict) and c.get("kind") == "approval" and str(c.get("id")) == approval_id:
             args = c.get("args") or {}
-            found = f"{args.get('action_type')} -> {args.get('target')}" if args.get("action_type") else str(c.get("action"))
+            # the full card action: args.target is cut to 256 chars for display (R4-2)
+            found = str(c["action"]) if c.get("action") else f"{args.get('action_type')} -> {args.get('target')}"
     return found
 
 

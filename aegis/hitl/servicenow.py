@@ -63,6 +63,11 @@ class ServiceNowHITL(BaseHITL):
         self._transport: Transport = transport or _urllib_transport
         self.timeout = timeout
         self.last_error = ""
+        # ServiceNow accounts that are AEGIS itself: our own work-note PATCH makes us sys_updated_by, and that must
+        # never count as a human approver (review round 4 R4-6). Learnt from our own writes as well.
+        self._self_names: set[str] = {n.strip().lower() for n in
+                                      (self.user, *os.environ.get("AEGIS_SERVICENOW_SELF", "").split(","))
+                                      if n and n.strip()}
 
     @property
     def enabled(self) -> bool:
@@ -98,10 +103,11 @@ class ServiceNowHITL(BaseHITL):
             self.last_error = f"HTTP {status}: {json.dumps(data)[:160]}"
             raise RuntimeError(f"ServiceNow refused the incident: {self.last_error}")
         rec = data.get("result") or {}
+        self._learn_self(rec)
         return str(rec.get("sys_id") or "") or None
 
     def _poll(self, p: PendingApproval) -> Optional[tuple[str, str, str]]:
-        q = urllib.parse.urlencode({"sysparm_fields": "state,close_code,close_notes,u_aegis_decision,u_aegis_decided_by,resolved_by,closed_by,assigned_to",
+        q = urllib.parse.urlencode({"sysparm_fields": "state,close_code,close_notes,u_aegis_decision,u_aegis_decided_by,resolved_by,closed_by,assigned_to,sys_updated_by",
                                     "sysparm_display_value": "true"})
         status, data = self._transport("GET", self._api(f"/{p.external_id}?{q}"), None, self._headers(), self.timeout)
         if status != 200:
@@ -111,9 +117,7 @@ class ServiceNowHITL(BaseHITL):
             raise RuntimeError(f"ServiceNow poll for {p.external_id} returned HTTP {status}")
         rec = data.get("result") or {}
         decision = str(rec.get("u_aegis_decision") or "").strip().lower()
-        # who DECIDED — never the assignee: reassigning a ticket used to count as a second approver (review round 3
-        # G1-7). With no named decider the decision is still honoured, but it cannot be a two-person approval.
-        who = _display(rec.get("u_aegis_decided_by")) or _display(rec.get("resolved_by")) or _display(rec.get("closed_by"))
+        who = self._decider(rec)
         if decision in ("approved", "rejected"):
             return decision, who, str(rec.get("close_notes") or "")[:500]
         state = str(_display(rec.get("state")) or "").strip().lower()
@@ -124,6 +128,38 @@ class ServiceNowHITL(BaseHITL):
                 return "approved", who, ""
             return "rejected", who, (str(rec.get("close_notes") or "") or f"closed with code '{code or 'none'}'")[:500]
         return None
+
+    def _learn_self(self, rec: Any) -> None:
+        if isinstance(rec, dict):
+            for k in ("sys_created_by", "sys_updated_by"):
+                v = _display(rec.get(k)).strip().lower()
+                if v:
+                    self._self_names.add(v)
+
+    def _decider(self, rec: dict) -> str:
+        """Who DECIDED, from what ServiceNow itself recorded: ``sys_updated_by`` (the authenticated account that last
+        wrote the record), else resolved_by / closed_by. Never the assignee (review round 3 G1-7) and never the
+        free-text ``u_aegis_decided_by`` alone: one user who typed another name there satisfied the two-person
+        rule by himself (R4-6). The free-text name is used only when it IS the account that wrote the record.
+        Our own writes (work notes) are not a decider. '' = unattributed: honoured, but never a second approver."""
+        from .signing import same_person
+        typed = _display(rec.get("u_aegis_decided_by")).strip()
+        if "sys_updated_by" not in rec:
+            # an instance (or proxy) that does not return the audit field at all: nothing better to go on
+            return typed or _display(rec.get("resolved_by")) or _display(rec.get("closed_by"))
+        actor = _display(rec.get("sys_updated_by")).strip()
+        if actor.lower() in self._self_names:
+            actor = ""
+        if not actor:
+            for k in ("resolved_by", "closed_by"):
+                v = _display(rec.get(k)).strip()
+                if v and v.lower() not in self._self_names:
+                    actor = v
+                    break
+        if typed and actor and not same_person(typed, actor):
+            logger.warning("[hitl:servicenow] u_aegis_decided_by says %r but the record was written by %r; using %r",
+                           typed[:80], actor[:80], actor[:80])
+        return actor
 
     def _annotate(self, p: PendingApproval, card: dict) -> bool:
         br, plan, twin = card.get("blast_radius") or {}, card.get("plan") or {}, card.get("twin") or {}
@@ -136,7 +172,8 @@ class ServiceNowHITL(BaseHITL):
             lines.append(f"Twin: exposure {_pct(twin.get('exposure'))}, with plan {_pct(twin.get('with_plan'))}, plan stops {_pct(twin.get('plan_effectiveness'))}")
         for c in card.get("containment") or []:
             lines.append(f"Containment #{c.get('step')}: {c.get('action')} -> {c.get('target')}: critical {c.get('before')} -> {c.get('after')}")
-        status, _ = self._transport("PATCH", self._api(f"/{p.external_id}"), {"work_notes": "\n".join(lines)[:4000]}, self._headers(), self.timeout)
+        status, data = self._transport("PATCH", self._api(f"/{p.external_id}"), {"work_notes": "\n".join(lines)[:4000]}, self._headers(), self.timeout)
+        self._learn_self((data or {}).get("result") if isinstance(data, dict) else None)
         return status == 200
 
 

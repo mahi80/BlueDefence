@@ -145,6 +145,30 @@ def _state_path(explicit: Optional[str | Path], transport_dir: Optional[Path], s
     return path
 
 
+def action_text(action_type: Any, target: Any) -> str:
+    """What a decision binds to: the FULL ``type -> target``. The card's ``args.target`` is cut at 256 chars for
+    display; binding to that cut text dropped every decision on a long target (review round 4 R4-2)."""
+    return f"{action_type} -> {target}"
+
+
+def _sync_budget_s() -> float:
+    """``AEGIS_HITL_SYNC_BUDGET_S`` (default 30; 0 = no limit): wall-clock spent polling approvals per sync. A slow
+    channel with a backlog used to hold the service thread for minutes per cycle (R4-13)."""
+    try:
+        v = float(os.environ.get("AEGIS_HITL_SYNC_BUDGET_S", "30") or 0)
+    except ValueError:
+        return 30.0
+    return v if v > 0 and v == v else 0.0
+
+
+def _watchdog() -> None:
+    try:
+        from ..ops import sdnotify
+        sdnotify.watchdog()
+    except Exception:  # noqa: BLE001 — best-effort keep-alive
+        pass
+
+
 def _action_dict(action: Any) -> dict:
     if hasattr(action, "model_dump"):
         return action.model_dump()
@@ -166,6 +190,7 @@ class BaseHITL:
         self.restored = 0
         self._timeout_noted: set[str] = set()   # approvals already shadow-logged / escalated by the timeout policy
         self._poll_failed: set[tuple[str, str]] = set()   # (approval, error) pairs already warned about
+        self._last_polled: dict[str, float] = {}
 
     # ---- journal
     def _journal_dir(self) -> Optional[Path]:
@@ -197,7 +222,8 @@ class BaseHITL:
                     live.pop(str(row.get("approval_id")), None)
                 elif row.get("op") == "progress" and str(row.get("approval_id")) in live:
                     live[str(row["approval_id"])].update({k: row[k] for k in ("first_approver", "approved_by", "second_by", "attempts",
-                                                                              "external_id", "unfiled", "timeout_ok")
+                                                                              "external_id", "unfiled", "timeout_ok",
+                                                                              "requested_at")
                                                           if k in row})
         except OSError as e:
             logger.warning("[hitl:%s] approvals journal %s unreadable (%s); starting with none pending", self.name, self._journal, e)
@@ -305,7 +331,7 @@ class BaseHITL:
         if key in self._by_key and self._by_key[key] in self._pending:
             return self._by_key[key]
         approval_id = f"aegis_{_slug(key[0])}_{_slug(key[1])}_{uuid.uuid4().hex[:6]}"
-        card = {"id": approval_id, "action": f"{action.action_type} -> {action.target}", "args": card_args(action, chain),
+        card = {"id": approval_id, "action": action_text(action.action_type, action.target), "args": card_args(action, chain),
                 "severity": str(getattr(chain, "verdict", "")), "alert_id": key[0]}
         try:
             external_id = self._file(card)
@@ -339,7 +365,7 @@ class BaseHITL:
 
     def _refile(self, p: PendingApproval) -> bool:
         """File an approval the channel refused earlier. True once it is filed."""
-        card = p.card or {"id": p.approval_id, "action": f"{p.action.action_type} -> {p.action.target}",
+        card = p.card or {"id": p.approval_id, "action": action_text(p.action.action_type, p.action.target),
                           "args": card_args(p.action, p.chain), "severity": str(getattr(p.chain, "verdict", "")),
                           "alert_id": p.alert_id}
         try:
@@ -352,9 +378,11 @@ class BaseHITL:
             return False
         if external_id is None:
             return False
-        p.external_id, p.unfiled, p.card = str(external_id), False, None
+        # the wait window starts when an analyst can first see the card, not when the channel first refused it: a
+        # card refused for 10 min used to time out into an execution on the sync right after it was filed (R4-9)
+        p.external_id, p.unfiled, p.card, p.requested_at = str(external_id), False, None, time.time()
         self._journal_append({"op": "progress", "approval_id": p.approval_id, "external_id": p.external_id,
-                              "unfiled": False})
+                              "unfiled": False, "requested_at": p.requested_at})
         logger.info("[hitl:%s] approval %s filed after a retry", self.name, p.approval_id)
         return True
 
@@ -371,7 +399,17 @@ class BaseHITL:
         self._ensure_loaded()
         made: list[Decision] = []
         now = time.time()
-        for approval_id, p in list(self._pending.items()):
+        budget = _sync_budget_s()
+        t0 = time.monotonic()
+        # least-recently polled first, so a budget cut-off never starves the same cards every cycle (R4-13)
+        order = sorted(self._pending.items(), key=lambda kv: self._last_polled.get(kv[0], 0.0))
+        for n, (approval_id, p) in enumerate(order):
+            if n and budget and time.monotonic() - t0 > budget:
+                logger.warning("[hitl:%s] sync stopped after %.0f s with %d approval(s) not polled this cycle "
+                               "(AEGIS_HITL_SYNC_BUDGET_S)", self.name, budget, len(order) - n)
+                break
+            _watchdog()
+            self._last_polled[approval_id] = time.time()
             age = now - p.requested_at
             expired = max_age_sec is not None and age > max_age_sec
             # Preserve the original path exactly when the timeout policy is not in use.
@@ -386,8 +424,23 @@ class BaseHITL:
                     continue
                 self._refile(p)
                 continue
-            # 0) an approval already given that has not run yet (rate cap, vendor error): try it again
+            # 0) an approval already given that has not run yet (rate cap, vendor error): try it again — but read the
+            # channel first. A rejection made after the approval used to be ignored while the retry ran for up to 60
+            # cycles (R4-7); an unreadable channel holds the retry, as it holds the timeout.
             if p.approved_by:
+                try:
+                    res = self._poll(p)
+                except Exception as e:  # noqa: BLE001
+                    key = (approval_id, "retry:" + str(e)[:80])
+                    if key not in self._poll_failed:
+                        self._poll_failed.add(key)
+                        logger.warning("[hitl:%s] poll failed for %s; approved retry held: %s", self.name, approval_id,
+                                       str(e)[:160])
+                    continue
+                if res and res[0] == "rejected":
+                    made.append(self._settle(p, "rejected", res[1] or self.name,
+                                             res[2] or f"rejected after approval by {p.approved_by} (not yet run)"))
+                    continue
                 d = self._execute_approved(p, response_agent, p.approved_by, second=p.second_by or None)
                 if d is not None:
                     made.append(d)
@@ -407,6 +460,15 @@ class BaseHITL:
             if res:
                 status, decided_by, reason = res
                 if status == "approved":
+                    if not decided_by and (p.first_approver or bool(
+                            getattr(response_agent, "two_person_required", lambda a: False)(p.action))):
+                        # an approval nobody can be named for cannot be one of two people (R4-6)
+                        key = (approval_id, "unattributed")
+                        if key not in self._poll_failed:
+                            self._poll_failed.add(key)
+                            logger.warning("[hitl:%s] approval of %s has no attributable approver; a two-person "
+                                           "action needs named approvers — waiting", self.name, approval_id)
+                        continue
                     who = decided_by or self.name
                     if p.first_approver:
                         from .signing import same_person
@@ -420,6 +482,17 @@ class BaseHITL:
                     continue
                 if status == "rejected":
                     made.append(self._settle(p, "rejected", decided_by or self.name, reason)); continue
+                if status == "expired":
+                    # the channel closed the card to humans: settle it, never time it out into an execution (R4-12)
+                    made.append(self._settle(p, "expired", decided_by or self.name,
+                                             reason or "expired at the approval channel")); continue
+                if status == "contested":
+                    # a decision arrived that names another action (e.g. a mismatched target): somebody decided
+                    # something, so the timer must not decide instead (R4-2). Hold for a decision that matches.
+                    if p.timeout_ok:
+                        p.timeout_ok = False
+                        self._journal_append({"op": "progress", "approval_id": p.approval_id, "timeout_ok": False})
+                    continue
             # 2) no human decision — timeout auto-execute policy (opt-in). Never for an action that was sent to a
             # human because it could not run unattended (ungrounded / wide / injection / plan step), and never for
             # a two-person card: the timer is not a person, and it used to settle half-approved cards `failed`.
@@ -544,6 +617,7 @@ class BaseHITL:
         self._pending.pop(p.approval_id, None)
         self._by_key.pop((p.alert_id, str(p.action.action_type), str(p.action.target)), None)
         self._timeout_noted.discard(p.approval_id)
+        self._last_polled.pop(p.approval_id, None)
         self._journal_append({"op": "settled", "approval_id": p.approval_id, "status": status})
         try:
             self._record_settled(p, status, decided_by, reason)
@@ -557,4 +631,4 @@ class BaseHITL:
         return d
 
 
-__all__ = ["BaseHITL", "Decision", "PendingApproval", "card_args"]
+__all__ = ["BaseHITL", "Decision", "PendingApproval", "action_text", "card_args"]

@@ -34,7 +34,10 @@ AEGIS_API_ORIGIN=http://127.0.0.1:8787 AEGIS_API_KEY=<AEGIS_CONSOLE_TOKEN from a
 Decisions (`Approve` / `Reject`, model-loop `Promote`) never go browser → backend: `app/api/approvals/[id]/[decision]`
 and `app/api/soc/proposals/[id]/decide` check the session cookie, refuse roles that may not decide, then forward
 with the key and `X-AEGIS-User: role:user`, which the host writes into the decision row.
-| `AEGIS_ASK_URL` | Optional LLM-backed **Agent Q** endpoint. Empty → Q answers deterministically from the chain. |
+| `AEGIS_ASK_URL` | Optional LLM-backed **Agent Q** endpoint (https; http only on loopback). Empty → Q answers deterministically from the chain. |
+| `AEGIS_ASK_KEY` | Q's own key, sent as `X-API-Key`. The console **never** forwards `AEGIS_API_KEY` to Q: that key can approve actions. |
+| `AEGIS_CONSOLE_ORIGIN` | Comma list of origins this console is served at (`https://soc.bank.in`). Set it behind a reverse proxy that rewrites `Host` without `X-Forwarded-Host`, or every POST is refused as cross-site. |
+| `AEGIS_SESSION_EPOCH` | Any string; change it to sign every session out. Cookies minted under another `AEGIS_AUTH_MODE` are void. |
 
 The browser never talks to the backend: every call goes through a console route handler that checks the
 session and adds the key server-side (there is no pass-through rewrite). `AEGIS_CONSOLE_SECRET` (16+ chars)
