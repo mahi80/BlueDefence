@@ -118,14 +118,19 @@ def register_promoted_adapter(registry: VLLMAdapterRegistry, *, pointer_path: Op
     ptr = read_pointer(path)
     if not ptr:
         return RegisterResult(ok=True, action="noop", detail="pointer unreadable/empty")
-    name = str(ptr.get("served_model") or ptr.get("run") or "")
+    name = str(ptr.get("run") or "")            # never a pointer-chosen served name (review round 3 G5-2)
     adapter = str(ptr.get("adapter") or "")
     if not name or not adapter:
         return RegisterResult(ok=False, action="error", detail="pointer has no run/adapter")
-    if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") != "1" and os.path.isdir(adapter):
+    if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") != "1":
+        # this is the host that loads the bytes, so it must be able to check them: a hub repo id or a path that is
+        # not a local directory used to be loaded unchecked
+        if not os.path.isdir(adapter):
+            return RegisterResult(ok=False, action="error", served_model=name, adapter=adapter,
+                                  detail="adapter refused: not a local directory on the serving host, so its digest cannot be checked")
         from aegis.finetune.digest import verify_adapter
         ok, why = verify_adapter(adapter, ptr.get("sha256"))
-        if not ok:                     # the GPU side is where a remote adapter's bytes can be checked
+        if not ok:
             return RegisterResult(ok=False, action="error", served_model=name, adapter=adapter,
                                   detail=f"adapter refused: {why}")
     if ptr.get("served_model") == name and not force:

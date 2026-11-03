@@ -174,7 +174,7 @@ class DatasetBuilder:
         if not signals:
             signals = [f"{e['source']}: {e['signal']}" for e in chain.get("evidence", [])][:4]
         if actions is None:
-            actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": a["requires_hitl"]}
+            actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": bool(a.get("requires_hitl", True))}
                        for a in chain.get("recommended_actions", [])]
         if r.label.get("constraint") == "no_allow":
             actions = [a for a in actions if a["action_type"] != "allow"] or [
@@ -236,7 +236,7 @@ class DatasetBuilder:
         human_verdict = str(r.label.get("verdict") or "")
         model_verdict = str(r.label.get("model_verdict") or "")
 
-        model_actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": a["requires_hitl"]}
+        model_actions = [{"action_type": a["action_type"], "target": a["target"], "requires_hitl": bool(a.get("requires_hitl", True))}
                          for a in (r.chain or {}).get("recommended_actions", [])]
         held = [{**a, "requires_hitl": True} if raw.get("human_rejected") else a
                 for a, raw in zip(model_actions, (r.chain or {}).get("recommended_actions", []))]

@@ -28,9 +28,15 @@ from pathlib import Path
 def _tar_adapter(adapter: Path, out: Path) -> tuple[str, int]:
     # dereference: HF caches symlink weight files, and every installation's extractor refuses link members
     with tarfile.open(out, "w:gz", dereference=True) as tar:
+        root = adapter.resolve()
         for p in sorted(adapter.iterdir()):
             if p.name in ("gate.json", ".complete") or p.name.startswith("."):
                 continue
+            # dereferencing follows symlinks anywhere: a stray link would ship host files to every installation.
+            # Links are followed only when they resolve inside the adapter dir or the HF cache (review round 3).
+            real = p.resolve()
+            if p.is_symlink() and not (real.is_relative_to(root) or "huggingface" in real.parts):
+                raise SystemExit(f"{p.name} links outside the adapter directory ({real}) — refusing to publish it")
             tar.add(p, arcname=p.name)
     # self-check: the archive must pass exactly the member test the installations apply
     with tarfile.open(out, "r:gz") as tar:
@@ -86,7 +92,10 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"{adapter} has no adapter_config.json")
     cfg = json.loads((adapter / "adapter_config.json").read_text())
     base = a.base_model or str(cfg.get("base_model_name_or_path", "")) or "unknown"
-    gate = adapter / "gate.json"
+    from .gate import gate_report_path
+    gate = gate_report_path(adapter)
+    if not gate.exists() and (adapter / "gate.json").exists():
+        gate = adapter / "gate.json"                     # a report from before the gate wrote it beside the adapter
     if not a.skip_gate_check:
         if not gate.exists():
             ap.error(f"no gate.json next to the adapter — run python -m aegis.finetune.gate first (or --skip-gate-check)")

@@ -158,13 +158,19 @@ def train_stage(data: Path, adapter: Path, *, preset: str, epochs: int, max_rows
 
 def gate_stage(adapter: Path, *, dry_run: bool, runner=None) -> dict:
     runner = runner or _sh
+    from .gate import gate_report_path
+    rep = gate_report_path(adapter)
+    # a report from an earlier run in the same directory must not stand in for this one (review round 3 G5-6)
+    for stale in (rep, adapter / "gate.json"):
+        stale.unlink(missing_ok=True)
     cmd = [sys.executable, "-m", "aegis.finetune.gate", "--adapter", str(adapter), "--max-misses", str(GATE_MAX_MISSES)]
     rc = runner(cmd, dry_run=dry_run)
-    rep = adapter / "gate.json"
     if rep.exists():
         d = json.loads(rep.read_text(encoding="utf-8"))
-        return {"rc": rc, "passes": bool(d.get("passes")), "summary": d.get("summary", ""), "tracked": d.get("tracked", {})}
-    return {"rc": rc, "passes": rc == 0 and dry_run, "summary": "(no gate.json)" if not dry_run else "(dry run)"}
+        # both the exit code and the report must say pass
+        return {"rc": rc, "passes": rc == 0 and bool(d.get("passes")), "summary": d.get("summary", ""),
+                "tracked": d.get("tracked", {})}
+    return {"rc": rc, "passes": rc == 0 and dry_run, "summary": "(no gate report)" if not dry_run else "(dry run)"}
 
 
 def _shadow_rows(export_dir: Path) -> list[dict]:
@@ -407,8 +413,9 @@ def cmd_sync(a, *, accepted=None) -> int:
         info = st.runs[run]
         # an accepted proposal can only promote a run that passed its gate and shadow, and only the adapter
         # that was proposed: a rule naming a failed run (or one whose adapter changed since) is refused
-        if info.get("stage") not in ("shadowed", "proposed"):
-            print(f"  refused {run}: stage {info.get('stage')!r} — only a gated + shadowed run can be promoted")
+        if info.get("stage") not in ("shadowed", "proposed") or not _shadow_ready(info):
+            print(f"  refused {run}: stage {info.get('stage')!r}, shadow verdict {_shadow_verdict(info)!r} — only a "
+                  "gated run whose last shadow said 'ready' can be promoted")
             refused += 1
             continue
         if change.get("sha256") and info.get("sha256") and change["sha256"] != info["sha256"]:
@@ -433,12 +440,23 @@ def cmd_sync(a, *, accepted=None) -> int:
     return 1 if refused else 0
 
 
+def _shadow_verdict(info: dict) -> str:
+    return str(((info.get("stages") or {}).get("shadowed") or {}).get("verdict") or "")
+
+
+def _shadow_ready(info: dict) -> bool:
+    """A run re-shadowed as `worse` (or never shadowed) used to be promotable by an accepted rule or by
+    `promote` at stage `gated` (review round 3 G5-7)."""
+    return _shadow_verdict(info) == "ready"
+
+
 def cmd_promote(a) -> int:
     runs = Path(a.runs).expanduser(); st = State.load(runs)
     if a.run not in st.runs:
         print(f"unknown run {a.run}"); return 1
-    if st.runs[a.run].get("stage") not in ("shadowed", "proposed", "gated"):
-        print(f"{a.run} is at stage {st.runs[a.run].get('stage')!r}; promote only a gated+shadowed run"); return 1
+    if st.runs[a.run].get("stage") not in ("shadowed", "proposed") or not _shadow_ready(st.runs[a.run]):
+        print(f"{a.run} is at stage {st.runs[a.run].get('stage')!r} (shadow verdict "
+              f"{_shadow_verdict(st.runs[a.run])!r}); promote only a gated run whose shadow said 'ready'"); return 1
     ok, why = verify_adapter(st.runs[a.run].get("adapter") or "", st.runs[a.run].get("sha256"))
     if not ok:
         print(f"refused {a.run}: {why}"); return 1

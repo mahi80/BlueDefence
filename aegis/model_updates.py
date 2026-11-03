@@ -268,6 +268,9 @@ def update_once(*, server: str, token: str, installation_id: str, env: dict | No
             return {"updated": False, "reason": f"release manifest rejected: {why}", "current": cur}
         if str(rel.get("channel")) != channel or rel.get("base_model") not in (base, "any"):
             return {"updated": False, "reason": f"release {rel.get('version')} is for {rel.get('channel')}/{rel.get('base_model')}, not {channel}/{base}", "current": cur}
+        if str(rel.get("version")) in _denied(env):
+            return {"updated": False, "reason": f"release {rel.get('version')} was rolled back on this host — not re-applied "
+                                                 "(remove it from denied.json to allow it)", "current": cur}
         if cur and _vkey(str(rel.get("version"))) <= _vkey(cur):
             return {"updated": False, "reason": f"offered {rel.get('version')} is not newer than {cur} (downgrade refused)", "current": cur}
         if not in_rollout(installation_id, int(rel.get("rollout_pct", 100))):
@@ -311,8 +314,31 @@ def rollback(env: dict | None = None) -> dict:
     if not prev or not (prev_dir / ".complete").exists():
         return {"ok": False, "reason": "no previous release on disk"}
     rel = json.loads((prev_dir / "release.json").read_text())
+    bad = str(ptr.get("run") or "")
+    if bad:
+        # the version rolled away from must not come back at the next heartbeat (review round 3 G5-4)
+        _deny(env, bad)
     write_pointer({**rel, "adapter": str(prev_dir)}, pointer=ptr_path, previous="")
-    return {"ok": True, "version": prev, "adapter": str(prev_dir)}
+    return {"ok": True, "version": prev, "adapter": str(prev_dir), "denied": bad}
+
+
+def _denied_path(env: dict) -> Path:
+    return model_dir(env) / "denied.json"
+
+
+def _denied(env: dict) -> set[str]:
+    try:
+        return {str(v) for v in json.loads(_denied_path(env).read_text())}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def _deny(env: dict, version: str) -> None:
+    p = _denied_path(env)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(sorted(_denied(env) | {version})))
+    os.replace(tmp, p)
 
 
 def enabled(env: dict | None = None) -> bool:
