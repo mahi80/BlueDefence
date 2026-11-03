@@ -89,7 +89,17 @@ class State:
                 out["served_model"] = on_disk["served_model"]    # the GPU register step's stamp survives a sync (D4-15)
             cur.write_text(json.dumps(out, indent=2), encoding="utf-8")
         else:
-            cur.unlink(missing_ok=True)       # rolled back to the base model
+            # Nothing promoted locally. The same file is the pointer the fleet updater and serving share
+            # (AEGIS_MODEL_POINTER): a nightly run that promoted nothing used to delete an installed release, so
+            # serving fell back to the base model and the updater re-installed it — every night (review round 5
+            # Y5-8). Remove it only when it names one of THIS loop's runs (a rollback to the base model).
+            try:
+                on_disk = json.loads(cur.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                on_disk = None
+            if isinstance(on_disk, dict) and on_disk.get("run") in self.runs \
+                    and on_disk.get("approved_by") != "bluedefence-release":
+                cur.unlink(missing_ok=True)   # rolled back to the base model
 
     def log(self, run: str, stage: str, **info) -> None:
         self.history.append({"ts": _now(), "run": run, "stage": stage, **info})

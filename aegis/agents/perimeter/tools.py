@@ -368,10 +368,18 @@ def ssrf_probe(raw: str) -> ToolResult:
     # scheme-less service refs like meta:8000 — only when the host is known-internal
     for name, port in re.findall(r"\b([a-z0-9][a-z0-9.\-]{1,62}):(\d{2,5})\b", low):
         # `10:30`, `16:00`, an ISO timestamp's `T10:30` are times, not host:port: a bare 1–3 digit "host" read
-        # through inet_aton as 0.0.0.10 made every UPI / NEFT body an SSRF probe (round 4 S4-3). A scheme-less
-        # ref needs a letter in the name, or a full dotted quad.
-        if not any(c.isalpha() for c in name) and name.count(".") != 3:
-            continue
+        # through inet_aton as 0.0.0.10 made every UPI / NEFT body an SSRF probe (round 4 S4-3). Only a dotless
+        # name of fewer than four digits is skipped: requiring a letter or a full dotted quad also dropped the
+        # short and decimal forms a resolver accepts — `127.1:6379`, `2130706433:80`, `0177.1:8080`, `10.1:9200`
+        # (review round 5 Y5-11).
+        if not any(c.isalpha() for c in name):
+            # a numeric "host": only a port without a leading zero, and only an address a resolver would reach
+            # (not 0.0.0.0/8, where `1500:30`, `2026:11`, `25000:00` land) — amounts, years and clock times stay clean
+            if (name.isdigit() and len(name) < 4) or port.startswith("0"):
+                continue
+            a = _inet_aton(name)
+            if a is None or a in ipaddress.ip_network("0.0.0.0/8"):
+                continue
         internal, why = _host_is_internal(name)
         if internal and name not in seen:
             seen.add(name)
