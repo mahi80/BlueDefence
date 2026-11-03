@@ -101,24 +101,43 @@ def _protected_targets_from_env() -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
+_DEVICE_ID = __import__("re").compile(r"^[0-9a-f]{32}$")
+
+
 def _target_matches(target: str, patterns: list[str]) -> bool:
-    """CIDR match for IP targets, case-insensitive glob (``prod-*``) otherwise."""
+    """Is ``target`` covered by a protected pattern? IP and CIDR targets match a protected network they
+    overlap (``198.51.100.7/32`` or a wider block inside a protected /24 — only a bare IP used to match);
+    ``host:`` / ``device:`` prefixes and case are ignored for name globs; an opaque EDR device id cannot be
+    tied to a hostname here, so it counts as protected whenever any protection is configured."""
     import fnmatch
+
+    from .grounding import unwrap
+    if not patterns:
+        return False
     t = str(target).strip()
-    ip = None
+    low = t.lower()
+    for p in ("host:", "device:", "user:", "account:"):
+        if low.startswith(p):
+            t = t[len(p):].strip()
+            low = t.lower()
+            break
+    if _DEVICE_ID.match(low):
+        return True
+    net = None
     try:
-        ip = ipaddress.ip_address(t)
+        net = unwrap(ipaddress.ip_network(t.strip("[]"), strict=False))
     except ValueError:
         pass
     for pat in patterns:
-        if ip is not None and "/" in pat:
+        if net is not None:
             try:
-                if ip in ipaddress.ip_network(pat, strict=False):
+                pn = unwrap(ipaddress.ip_network(pat, strict=False))
+                if pn.version == net.version and pn.overlaps(net):
                     return True
                 continue
             except ValueError:
                 pass
-        if fnmatch.fnmatch(t.lower(), pat.lower()):
+        if fnmatch.fnmatch(low, pat.lower()):
             return True
     return False
 
@@ -174,7 +193,22 @@ class ResponseAgent:
             self._high_impact_times.popleft()
         return len(self._high_impact_times)
 
-    def execute(self, chain: EvidenceChain) -> ResponseSummary:
+    def execute(self, chain: EvidenceChain, alert: dict | None = None) -> ResponseSummary:
+        """Dispatch the chain's actions. ``alert`` (the raw alert) grounds actions that would run with no human:
+        their target must be one of the alert's entities. Without it the chain's own evidence is used."""
+        from .grounding import alert_entities, chain_entities
+
+        # the alert plus the chain's tool evidence (deterministic tool output — a campaign correlator's IP pool,
+        # a decoded payload's hosts — never the model's own text)
+        ev_vals, ev_ips = chain_entities(chain)
+        al_vals, al_ips = alert_entities(alert) if isinstance(alert, dict) else (set(), [])
+        self._entities = (ev_vals | al_vals, ev_ips + al_ips)
+        try:
+            return self._execute(chain)
+        finally:
+            self._entities = None
+
+    def _execute(self, chain: EvidenceChain) -> ResponseSummary:
         from ..shared import observability as obs
 
         with obs.span("aegis.response.execute",
@@ -232,11 +266,18 @@ class ResponseAgent:
 
     # ---- decision logic ------------------------------------------------
 
+    def _unattended(self, action: RecommendedAction, chain: EvidenceChain) -> tuple[bool, str]:
+        from .grounding import chain_entities, unattended_ok
+        ents = getattr(self, "_entities", None)
+        return unattended_ok(action, chain, ents if ents is not None else chain_entities(chain))
+
     def _dispatch(self, action: RecommendedAction, chain: EvidenceChain) -> ExecutedAction:
-        # Tiered autonomy first: a narrow, external, short-TTL block on strong evidence
-        # does not wait for a human (everything else below is unchanged).
-        if action.action_type == "block":
+        # Tiered autonomy first: a narrow, external, short-TTL block on strong evidence does not wait for a
+        # human — unless the producer flagged it for one, or its target is not one of the alert's own entities.
+        if action.action_type == "block" and not action.requires_hitl:
             ok, why = self._autonomy.check(action, chain, protected=self._is_protected)
+            if ok:
+                ok, why = self._unattended(action, chain)
             if ok and self._autonomy.mode == "shadow":
                 # record what auto-block would have done; the block itself still goes to a human
                 self._connectors.preview(action, alert_id=chain.alert_id, approver="aegis:auto-shadow",
@@ -255,6 +296,8 @@ class ResponseAgent:
         # Outflow circuit breaker: a drain in progress does not wait for an analyst to open a card.
         if action.action_type == "hold":
             ok, why = self._breaker.check(action, chain)
+            if ok:
+                ok, why = self._unattended(action, chain)
             if ok and self._breaker.mode == "shadow":
                 self._connectors.preview(action, alert_id=chain.alert_id, approver="aegis:breaker-shadow",
                                          ttl_sec=self._breaker.ttl_sec, note="outflow breaker shadow")
@@ -276,6 +319,11 @@ class ResponseAgent:
                                   note="Action explicitly flagged HITL by upstream agent")
 
         if action.action_type in _AUTO_SAFE_ACTIONS:
+            if action.action_type not in ("allow", "monitor"):
+                ok, why = self._unattended(action, chain)
+                if not ok:
+                    return ExecutedAction(action=action, status="queued_for_hitl", reason="ungrounded",
+                                          note=f"not run unattended: {why}; routed to a human")
             return self._execute_auto(action, alert_id=chain.alert_id)
 
         # Unknown action class → safe-by-default

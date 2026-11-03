@@ -94,7 +94,7 @@ def main() -> int:
         chain = orch.handle(alert)
         write_ticket(chain)
         notify(chain)
-        summary = response.execute(chain)
+        summary = response.execute(chain, alert)
         print(f"  [splunk-demo] response: executed={len(summary.executed)}  hitl_queued={len(summary.hitl_queue)}")
         seen += 1
 

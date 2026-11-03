@@ -414,7 +414,7 @@ class Harness:
         assert alert is not None
         t0 = time.time()
         chain = p.orch.handle(alert)
-        p.response.execute(chain)
+        p.response.execute(chain, alert)
         ms = (time.time() - t0) * 1000
         res.handle_ms.append(ms)
         res.verdicts[chain.verdict] = res.verdicts.get(chain.verdict, 0) + 1
@@ -428,7 +428,7 @@ class Harness:
         alert = self._gw.normalize(record)
         if alert:
             chain = p.orch.handle(alert)
-            p.response.execute(chain)
+            p.response.execute(chain, alert)
             res.verdicts[chain.verdict] = res.verdicts.get(chain.verdict, 0) + 1
             if a is not None:
                 a.verdict, a.investigated_by = chain.verdict, chain.investigated_by

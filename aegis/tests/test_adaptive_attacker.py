@@ -195,8 +195,8 @@ def test_live_auto_block_stops_the_whole_pool_on_cloudflare(orch):
     srv, cf = _cloudflare()
     agent = ResponseAgent(connectors=ConnectorRegistry([cf]), autonomy=AutonomyPolicy(mode="live"),
                           hitl_stream=open("/dev/null", "w"))
-    for _, chain in _run(rotating_agent(), orch):
-        agent.execute(chain)
+    for alert, chain in _run(rotating_agent(), orch):
+        agent.execute(chain, alert)
     (rule,) = srv.custom_rules()
     assert rule["action"] == "block" and AGENT_JA4 in rule["expression"] and 'http.user_agent eq "python-httpx/0.27"' in rule["expression"]
     assert srv.blocked() and srv.blocked() <= {"203.0.113.11", "203.0.113.12", "198.51.100.13", "192.0.2.14"}
@@ -214,8 +214,8 @@ def test_live_auto_block_on_aws_uses_the_rule_group(orch):
     srv, aws = _aws()
     agent = ResponseAgent(connectors=ConnectorRegistry([aws]), autonomy=AutonomyPolicy(mode="live"),
                           hitl_stream=open("/dev/null", "w"))
-    for _, chain in _run(rotating_agent(), orch):
-        agent.execute(chain)
+    for alert, chain in _run(rotating_agent(), orch):
+        agent.execute(chain, alert)
     (rule,) = srv.fingerprint_rules()
     stmts = rule["Statement"]["AndStatement"]["Statements"]
     assert "JA4Fingerprint" in stmts[0]["ByteMatchStatement"]["FieldToMatch"] and rule["Action"] == {"Block": {}}
@@ -228,8 +228,8 @@ def test_ip_only_waf_refuses_fingerprints_and_parks_them_for_a_human(orch):
     imp = ImpervaWafConnector(site_id="1", api_id="mock", api_key="mock", base_url="https://i", transport=srv, dry_run=False)
     agent = ResponseAgent(connectors=ConnectorRegistry([imp]), autonomy=AutonomyPolicy(mode="live"),
                           hitl_stream=open("/dev/null", "w"))
-    chain = [c for _, c in _run(rotating_agent(), orch) if c.investigated_by == "adaptive_attacker"][-1]
-    summary = agent.execute(chain)
+    alert, chain = [(a, c) for a, c in _run(rotating_agent(), orch) if c.investigated_by == "adaptive_attacker"][-1]
+    summary = agent.execute(chain, alert)
     fp = [x for x in summary.hitl_queue if x.action.target.startswith("fp:")]
     assert fp and fp[0].receipt.status == "unsupported"
     assert srv.blocked_ips()                                # the current IP was still blocked
@@ -240,8 +240,8 @@ def test_default_mode_is_shadow_records_and_still_asks_a_human(orch):
     seen = []
     reg = ConnectorRegistry([cf], on_receipt=[lambda ev, r: seen.append((ev, r))])
     agent = ResponseAgent(connectors=reg, hitl_stream=open("/dev/null", "w"))          # AutonomyPolicy.from_env()
-    chain = [c for _, c in _run(rotating_agent(), orch) if c.investigated_by == "adaptive_attacker"][-1]
-    summary = agent.execute(chain)
+    alert, chain = [(a, c) for a, c in _run(rotating_agent(), orch) if c.investigated_by == "adaptive_attacker"][-1]
+    summary = agent.execute(chain, alert)
     assert not srv.custom_rules() and not srv.blocked()                               # nothing enforced
     assert {x.action.action_type for x in summary.hitl_queue} >= {"block", "escalate"}
     previews = [r for ev, r in seen if ev == "preview"]
@@ -260,8 +260,8 @@ def test_mixed_traffic_only_the_agent_is_acted_on(orch):
     agent = ResponseAgent(connectors=ConnectorRegistry([cf]), autonomy=AutonomyPolicy(mode="live"),
                           hitl_stream=open("/dev/null", "w"))
     lines = (FIX / "agentic_rotation.jsonl").read_text().splitlines()
-    for _, chain in _run(lines, orch):
-        agent.execute(chain)
+    for alert, chain in _run(lines, orch):
+        agent.execute(chain, alert)
     customers = {f"198.51.100.{60 + i}" for i in range(8)} | {"203.0.113.50"}
     assert not (srv.blocked() & customers) and not srv.challenged()
     assert all(BROWSER_JA4 not in r["expression"] for r in srv.custom_rules())

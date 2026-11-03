@@ -23,6 +23,7 @@ from aegis.agents.response.hitl_timeout import EXECUTE, HOLD, HitlTimeoutPolicy
 from aegis.agents.shared.evidence_chain import EvidenceChain, RecommendedAction
 from aegis.hitl import DashboardHITL, FileHITL
 from aegis.hitl.base import Decision, execution_outcome
+from aegis.tests.helpers import alert_for
 
 
 def _chain(aid: str, target: str = "203.0.113.5", *, concur: bool | None = True, action: str = "block") -> EvidenceChain:
@@ -72,7 +73,7 @@ def test_protected_target_waits_for_a_second_approver_then_runs(caplog):
     srv, dash = MockImperva(), Dash()
     hitl = DashboardHITL("https://d", "k", transport=dash, state_path="off")
     agent = _agent(hitl, srv, protected_targets=["10.0.0.0/8"])
-    agent.execute(_chain("P1", "10.1.2.3"))
+    agent.execute((_c := _chain("P1", "10.1.2.3")), alert_for(_c))
     aid = hitl.pending[0].approval_id
     dash.statuses[aid] = {"status": "approved", "decided_by": "ciso"}
     with caplog.at_level(logging.WARNING, logger="aegis.hitl"):
@@ -88,7 +89,7 @@ def test_vendor_failure_on_approval_is_retried_then_failed_not_approved(caplog):
     srv, dash = MockImperva(), Dash()
     hitl = DashboardHITL("https://d", "k", transport=dash, state_path="off")
     agent = _agent(hitl, srv)
-    agent.execute(_chain("V1"))
+    agent.execute((_c := _chain("V1")), alert_for(_c))
     dash.statuses[hitl.pending[0].approval_id] = {"status": "approved", "decided_by": "ciso"}
 
     def boom(*a, **k):
@@ -106,7 +107,7 @@ def test_rate_capped_approval_runs_once_the_window_clears():
     hitl = DashboardHITL("https://d", "k", transport=dash, state_path="off")
     agent = _agent(hitl, srv)
     agent._high_impact_max = 0                                          # cap reached
-    agent.execute(_chain("R1"))
+    agent.execute((_c := _chain("R1")), alert_for(_c))
     dash.statuses[hitl.pending[0].approval_id] = {"status": "approved", "decided_by": "ciso"}
     assert agent.sync_hitl() == [] and len(hitl.pending) == 1
     agent._high_impact_max = 10                                         # window cleared
@@ -119,7 +120,7 @@ def test_decision_channel_down_never_triggers_the_timeout_auto_execute():
     srv, dash = MockImperva(), Dash()
     hitl = DashboardHITL("https://d", "k", transport=dash, state_path="off")
     agent = _agent(hitl, srv, timeout_mode="live")
-    agent.execute(_chain("B1", "198.51.100.7"))
+    agent.execute((_c := _chain("B1", "198.51.100.7")), alert_for(_c))
     p = hitl.pending[0]
     dash.statuses[p.approval_id] = {"status": "rejected", "decided_by": "analyst"}
     p.requested_at -= 600
@@ -137,7 +138,7 @@ def test_restored_card_keeps_the_dissent(tmp_path):
     srv = MockImperva()
     state = tmp_path / "state.jsonl"
     a1 = _agent(FileHITL(tmp_path / "hitl", state_path=state), srv, timeout_mode="live")
-    a1.execute(_chain("R1", concur=False))
+    a1.execute((_c := _chain("R1", concur=False)), alert_for(_c))
     a2 = _agent(FileHITL(tmp_path / "hitl", state_path=state), srv, timeout_mode="live")
     (p,) = a2._hitl.pending
     assert p.chain.metadata["vote_concur"] is False and p.chain.metadata["vote_tally"] == "1/3"
@@ -231,7 +232,7 @@ def test_live_auto_block_is_stopped_by_governance(monkeypatch):
     c.metadata["vote_concur"] = True
     c.recommended_actions.append(RecommendedAction(action_type="block", target="203.0.113.7", reasoning="r",
                                                    requires_hitl=False, confidence=0.95))
-    summary = agent.execute(c.finalize())
+    summary = agent.execute((_c := c.finalize()), alert_for(_c))
     assert summary.executed == [] and srv.blocked_ips() == set()
     assert "response.block" in guard.seen
     assert agent.connectors.active_receipts == []

@@ -14,6 +14,7 @@ from aegis.agents.response.receipts import ReceiptLog, receipt_log_from_env, rec
 from aegis.agents.shared.evidence_chain import EvidenceChain, RecommendedAction
 from aegis.shadow import Thresholds, build_report, render_text, to_json
 from aegis.shadow.__main__ import load_local, main
+from aegis.tests.helpers import alert_for
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +60,7 @@ def test_receipts_are_logged_locally_and_shipped(tmp_path):
     log = ReceiptLog(tmp_path / "r.jsonl", sink=sink)
     reg = ConnectorRegistry([WafStub(dry_run=True)], on_receipt=[log])
     agent = ResponseAgent(connectors=reg)
-    summary = agent.execute(_chain("A-1", [("throttle", "203.0.113.9", False), ("block", "203.0.113.9", True)]))
+    summary = agent.execute((_c := _chain("A-1", [("throttle", "203.0.113.9", False), ("block", "203.0.113.9", True)])), alert_for(_c))
     assert [e.action.action_type for e in summary.executed] == ["throttle"]
     assert summary.receipts and summary.receipts[0].dry_run and summary.receipts[0].status == "dry_run"
     agent.approve(summary.hitl_queue[0].action, approver="ciso@bank.test", source_alert_id="A-1")
@@ -158,7 +159,7 @@ def test_cli_local_and_dashboard_modes(tmp_path, monkeypatch, capsys):
     log = ReceiptLog(tmp_path / "r.jsonl")
     reg = ConnectorRegistry([WafStub(dry_run=True)], on_receipt=[log])
     agent = ResponseAgent(connectors=reg)
-    agent.execute(_chain("A-1", [("throttle", "203.0.113.9", False)]))
+    agent.execute((_c := _chain("A-1", [("throttle", "203.0.113.9", False)])), alert_for(_c))
     audit = tmp_path / "audit.jsonl"
     audit.write_text(json.dumps({"alert_id": "A-1", "verdict": "suspicious",
                                  "recommended_actions": [{"action_type": "throttle", "requires_hitl": False}]}) + "\n")

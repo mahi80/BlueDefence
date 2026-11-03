@@ -301,7 +301,7 @@ def run(preset: str = "bench", *, verbose: bool = False, seed: int = 7) -> dict:
                         continue
                     for alert in got:
                         chain = p.orch.handle(alert)
-                        p.response.execute(chain)
+                        p.response.execute(chain, alert)
                         who = host_actor.get((alert["source_ip"], alert["egress"]["destination"]), "?")
                         at = (datetime.fromisoformat(alert["timestamp"].replace("Z", "+00:00")).timestamp() - start) / 60
                         if verbose:

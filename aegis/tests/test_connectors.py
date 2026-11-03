@@ -10,6 +10,7 @@ from aegis.agents.response.connectors import (
     Connector, ConnectorError, ConnectorRegistry, LoggingConnector, enforcement_mode,
 )
 from aegis.agents.shared.evidence_chain import EvidenceChain, RecommendedAction
+from aegis.tests.helpers import alert_for
 
 
 class FakeClock:
@@ -127,7 +128,7 @@ def _chain(alert_id="EVAL-005"):
 def test_response_agent_auto_actions_produce_receipts():
     waf = FakeWaf(dry_run=False)
     agent = ResponseAgent(connectors=ConnectorRegistry([waf]), hitl_stream=io.StringIO())
-    summary = agent.execute(_chain())
+    summary = agent.execute((_c := _chain()), alert_for(_c))
     assert [a.action.action_type for a in summary.executed] == ["throttle"]
     rcpt = summary.executed[0].receipt
     assert rcpt is not None and rcpt.connector == "waf-fake" and rcpt.status == "applied"
@@ -138,7 +139,7 @@ def test_response_agent_auto_actions_produce_receipts():
 
 def test_response_agent_default_registry_is_the_logging_fallback():
     agent = ResponseAgent(hitl_stream=io.StringIO())
-    summary = agent.execute(_chain())
+    summary = agent.execute((_c := _chain()), alert_for(_c))
     assert summary.executed[0].receipt.connector == "log"
     assert agent.connectors.mode == "log-only"
 

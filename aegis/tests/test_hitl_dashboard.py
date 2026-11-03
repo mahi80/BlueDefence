@@ -11,6 +11,7 @@ import io
 from aegis.agents.response.agent import ResponseAgent
 from aegis.agents.shared.evidence_chain import EvidenceChain, RecommendedAction
 from aegis.hitl import DashboardHITL, hitl_from_env
+from aegis.tests.helpers import alert_for
 
 
 class FakeDashboard:
@@ -56,7 +57,7 @@ def test_hitl_card_is_filed_as_a_dashboard_approval_not_printed():
     dash = FakeDashboard()
     out = io.StringIO()
     agent = ResponseAgent(hitl=_hitl(dash), hitl_stream=out)
-    summary = agent.execute(_chain())
+    summary = agent.execute((_c := _chain()), alert_for(_c))
 
     assert [a.action.action_type for a in summary.executed] == ["throttle"]
     assert [a.action.action_type for a in summary.hitl_queue] == ["block"]
@@ -79,7 +80,7 @@ def test_dashboard_down_falls_back_to_the_stdout_card():
     dash = FakeDashboard(fail=True)
     out = io.StringIO()
     agent = ResponseAgent(hitl=_hitl(dash), hitl_stream=out)
-    summary = agent.execute(_chain())
+    summary = agent.execute((_c := _chain()), alert_for(_c))
     assert "[HITL APPROVAL REQUEST]" in out.getvalue()
     assert "dashboard approval" not in summary.hitl_queue[0].note
 
@@ -88,8 +89,8 @@ def test_sync_executes_approved_and_records_rejected():
     dash = FakeDashboard()
     hitl = _hitl(dash)
     agent = ResponseAgent(hitl=hitl, hitl_stream=io.StringIO())
-    agent.execute(_chain("web-001"))
-    agent.execute(_chain("web-002"))
+    agent.execute((_c := _chain("web-001")), alert_for(_c))
+    agent.execute((_c := _chain("web-002")), alert_for(_c))
     assert len(hitl.pending) == 2
     assert agent.sync_hitl() == []  # still pending on the dashboard
 
@@ -120,7 +121,7 @@ def test_expiry_settles_old_requests_without_executing():
     dash = FakeDashboard()
     hitl = _hitl(dash)
     agent = ResponseAgent(hitl=hitl, hitl_stream=io.StringIO())
-    agent.execute(_chain())
+    agent.execute((_c := _chain()), alert_for(_c))
     hitl.pending[0].requested_at -= 10_000
     decisions = agent.sync_hitl(max_age_sec=3600)
     assert decisions[0].status == "expired" and decisions[0].executed is None
@@ -139,7 +140,7 @@ def test_hitl_from_env(monkeypatch):
 def test_no_transport_keeps_the_old_behaviour():
     out = io.StringIO()
     agent = ResponseAgent(hitl_stream=out)
-    summary = agent.execute(_chain())
+    summary = agent.execute((_c := _chain()), alert_for(_c))
     assert "[HITL APPROVAL REQUEST]" in out.getvalue()
     assert agent.sync_hitl() == []
     assert len(summary.hitl_queue) == 1
