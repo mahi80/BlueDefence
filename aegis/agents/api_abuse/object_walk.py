@@ -27,6 +27,7 @@ victims' owner identifiers.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os
 import re
 import statistics
@@ -125,12 +126,16 @@ class _Ev:
 
 
 _JUDGE_LAST = 200
+_JUDGE_SIGNAL = 300       # not-own events judged per template, however much own-account padding lies between
 
 
 @dataclass
 class _Principal:
     events: deque = field(default_factory=deque)
     by_template: dict[str, deque] = field(default_factory=dict)                  # template → its recent events
+    # template → its events that are NOT the caller's own object (foreign, refused, unknown owner), over the whole
+    # window: own-account reads are padding an attacker controls (round 5 Y5-9)
+    signal: dict[str, deque] = field(default_factory=dict)
     emitted: dict[str, tuple[float, str, int]] = field(default_factory=dict)    # template → (ts, level, seq)
     emitted_ips: dict[str, set] = field(default_factory=dict)                     # template → client IPs already reported
 
@@ -180,17 +185,30 @@ class ObjectWalkDetector:
                 self._p.move_to_end(key)
             st.events.append(e)
             st.by_template.setdefault(template, deque()).append(e)
+            if e.owned is not True:
+                st.signal.setdefault(template, deque()).append(e)
             while st.events and (ts - st.events[0].ts > self.window_s or len(st.events) > self.max_events):
                 old_e = st.events.popleft()
-                q = st.by_template.get(old_e.template)
-                if q and q[0] is old_e:
-                    q.popleft()
-                    if not q:
-                        st.by_template.pop(old_e.template, None)
+                for table in (st.by_template, st.signal):
+                    q = table.get(old_e.template)
+                    if q and q[0] is old_e:
+                        q.popleft()
+                        if not q:
+                            table.pop(old_e.template, None)
             # per-template events are kept incrementally, and judged over the most recent 200 — every event used to
-            # rescan and sort up to 2,000 (2.8 ms an event for one busy principal; round 4 S4-14)
+            # rescan and sort up to 2,000 (2.8 ms an event for one busy principal; round 4 S4-14) — PLUS every
+            # not-own event in the window: judging only the last 200 let a walk padded with 210 own-account reads
+            # between foreign reads never alert (review round 5 Y5-9)
             q = st.by_template.get(template) or deque()
-            same = list(q)[-_JUDGE_LAST:]
+            recent = list(q)[-_JUDGE_LAST:]
+            sig = list(st.signal.get(template) or ())[-_JUDGE_SIGNAL:]
+            if sig and recent and sig[0].ts < recent[0].ts:
+                # both are in arrival order: the older not-own events, then the recent ones (no sort, no dupes)
+                first = recent[0]
+                older = list(itertools.takewhile(lambda x: x is not first and x.ts <= first.ts, sig))
+                same = older + recent
+            else:
+                same = recent
             level, stats = self._judge(same)
             if level is None:
                 return None

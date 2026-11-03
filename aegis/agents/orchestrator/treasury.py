@@ -30,7 +30,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any
 
@@ -130,14 +130,52 @@ def _ts(alert: dict) -> float:
     return time.time()
 
 
+class _Ledger:
+    """One sender's window: high-value and split-size transfers kept apart, so a payout run of thousands of small
+    transfers cannot evict the high-value ones (a 1,000-entry deque did: a 3 x INR 2 crore drain with a 1,098-payout
+    run between the transfers read as no burst — review round 5 Y5-5)."""
+
+    __slots__ = ("high", "small", "small_total", "split_alerted_at")
+
+    def __init__(self) -> None:
+        self.high: OrderedDict[str, tuple[float, float]] = OrderedDict()     # txn id -> (ts, amount), oldest first
+        self.small: OrderedDict[str, tuple[float, float]] = OrderedDict()
+        self.small_total = 0.0
+        self.split_alerted_at: float | None = None   # when this window's split total last raised a chain
+
+    def expire(self, now: float, window: float) -> None:
+        cutoff = now - window
+        while self.high and next(iter(self.high.values()))[0] < cutoff:
+            self.high.popitem(last=False)
+        while self.small and next(iter(self.small.values()))[0] < cutoff:
+            _, (_, a) = self.small.popitem(last=False)
+            self.small_total -= a
+        if self.split_alerted_at is not None and self.split_alerted_at < cutoff:
+            self.split_alerted_at = None
+
+    def empty(self) -> bool:
+        return not self.high and not self.small
+
+
+_MAX_HIGH, _MAX_SMALL = 1000, 50_000
+
+
 class _OutflowBook:
-    """Per-sender ledger of recent high-value transfers to new beneficiaries (in-process)."""
+    """Per-sender ledger of recent transfers to new beneficiaries (in-process)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # senders with a high-value transfer in the window; the least recently active is evicted past the cap,
-        # and a sender whose window empties is dropped (the defaultdict used to keep every sender ever seen)
+        # senders with a transfer in the window; the least recently active is evicted past the cap, and a sender
+        # whose window empties is dropped (the defaultdict used to keep every sender ever seen)
         self._by_sender: BoundedDict = BoundedDict(int(os.environ.get("AEGIS_OUTFLOW_MAX_SENDERS", "100000")))
+
+    def _ledger(self, sender: str) -> _Ledger:
+        led = self._by_sender.get(sender)
+        if led is None:
+            led = self._by_sender[sender] = _Ledger()
+        else:
+            self._by_sender.move_to_end(sender)
+        return led
 
     def add(self, sender: str, ts: float, amount: float, txn_id: str, window: float) -> tuple[int, float]:
         """(transfers, total) in the window — every recorded transfer, split-size ones included."""
@@ -149,21 +187,38 @@ class _OutflowBook:
         """(transfers, total, high-value transfers, high-value total) in the window."""
         line = high_value_inr()
         with self._lock:
-            q = self._by_sender.get(sender)
-            if q is None:
-                q = self._by_sender[sender] = deque(maxlen=1000)
-            else:
-                self._by_sender.move_to_end(sender)
-            if not any(t == txn_id for _, _, t in q):
-                q.append((ts, amount, txn_id))
-            cutoff = max(ts, max((x[0] for x in q), default=ts)) - window
-            while q and q[0][0] < cutoff:
-                q.popleft()
-            n, total = len(q), sum(a for _, a, _ in q)
-            high = [a for _, a, _ in q if a >= line]
-            if not q:
+            led = self._ledger(sender)
+            if txn_id not in led.high and txn_id not in led.small:      # O(1) dedupe (was a scan of the deque)
+                if amount >= line:
+                    led.high[txn_id] = (ts, amount)
+                    while len(led.high) > _MAX_HIGH:
+                        led.high.popitem(last=False)
+                else:
+                    led.small[txn_id] = (ts, amount)
+                    led.small_total += amount
+                    while len(led.small) > _MAX_SMALL:
+                        _, (_, a) = led.small.popitem(last=False)
+                        led.small_total -= a
+            newest = max([ts] + [v[0] for v in (next(reversed(d.values())) for d in (led.high, led.small) if d)])
+            led.expire(newest, window)
+            high_total = sum(a for _, a in led.high.values())
+            n, total = len(led.high) + len(led.small), high_total + max(0.0, led.small_total)
+            out = (n, total, len(led.high), high_total)
+            if led.empty():
                 self._by_sender.pop(sender, None)
-            return n, total, len(high), sum(high)
+            return out
+
+    def claim_split_alert(self, sender: str, ts: float, window: float) -> bool:
+        """True the first time in a window that the split total raises a chain for ``sender``; False after. A
+        payout run of 400 small transfers used to raise 201 chains, one per transfer past the line (Y5-5)."""
+        with self._lock:
+            led = self._by_sender.get(sender)
+            if led is None:
+                return True
+            if led.split_alerted_at is not None and ts - led.split_alerted_at < window:
+                return False
+            led.split_alerted_at = ts
+            return True
 
     def reset(self) -> None:
         with self._lock:
@@ -208,8 +263,10 @@ def is_treasury_outflow(alert: dict) -> bool:
         return False
     if amount >= high_value_inr():
         return True
-    _n, total = BOOK.add(_sender(alert), _ts(alert), amount, _txn_id(alert), _window_s())
-    return total >= high_value_inr()
+    sender, ts = _sender(alert), _ts(alert)
+    _n, total = BOOK.add(sender, ts, amount, _txn_id(alert), _window_s())
+    # once per window per sender: the split total crossing the line is one finding, not one per later transfer
+    return total >= high_value_inr() and BOOK.claim_split_alert(sender, ts, _window_s())
 
 
 def _crore(inr: float) -> str:
