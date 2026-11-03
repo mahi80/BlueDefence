@@ -50,6 +50,10 @@ class PendingApproval:
     second_by: str = ""                # ... and its second approver, when the two-person rule applied
     attempts: int = 0                  # execution attempts of that approval
     unfiled: bool = False              # the channel refused the card; sync() files it again (review E3)
+    # Could this action have run with no human when it was filed (grounded in the alert, narrow, no injection
+    # evidence)? Only then may the HITL-timeout fallback run it. Journaled, so a restart cannot turn a held card
+    # into an executable one; a card restored from an older journal has no flag and holds (review round 3 G1-1/2).
+    timeout_ok: bool = False
     card: dict | None = None           # the card to re-file while unfiled
 
 
@@ -193,7 +197,7 @@ class BaseHITL:
                     live.pop(str(row.get("approval_id")), None)
                 elif row.get("op") == "progress" and str(row.get("approval_id")) in live:
                     live[str(row["approval_id"])].update({k: row[k] for k in ("first_approver", "approved_by", "second_by", "attempts",
-                                                                              "external_id", "unfiled")
+                                                                              "external_id", "unfiled", "timeout_ok")
                                                           if k in row})
         except OSError as e:
             logger.warning("[hitl:%s] approvals journal %s unreadable (%s); starting with none pending", self.name, self._journal, e)
@@ -228,7 +232,8 @@ class BaseHITL:
                                first_approver=str(row.get("first_approver") or ""),
                                approved_by=str(row.get("approved_by") or ""), second_by=str(row.get("second_by") or ""),
                                attempts=int(row.get("attempts") or 0), unfiled=bool(row.get("unfiled")),
-                               card=row.get("card") if isinstance(row.get("card"), dict) else None)
+                               card=row.get("card") if isinstance(row.get("card"), dict) else None,
+                               timeout_ok=row.get("timeout_ok") is True)
 
     def _journal_append(self, row: dict) -> None:
         if self._journal is None:
@@ -279,7 +284,8 @@ class BaseHITL:
                                        if k in (getattr(p.chain, "metadata", None) or {})}},
                 # progress survives journal compaction too
                 "first_approver": p.first_approver, "approved_by": p.approved_by, "second_by": p.second_by,
-                "attempts": p.attempts, **({"unfiled": True, "card": p.card} if p.unfiled else {})}
+                "attempts": p.attempts, "timeout_ok": p.timeout_ok,
+                **({"unfiled": True, "card": p.card} if p.unfiled else {})}
 
     # ---- contract
     @property
@@ -291,7 +297,7 @@ class BaseHITL:
         self._ensure_loaded()
         return list(self._pending.values())
 
-    def request(self, action: Any, chain: Any) -> Optional[str]:
+    def request(self, action: Any, chain: Any, *, timeout_ok: bool = False) -> Optional[str]:
         if not self.enabled:
             return None
         self._ensure_loaded()
@@ -312,7 +318,7 @@ class BaseHITL:
             # out into an execution while unfiled — no analyst has seen it. None still tells the caller to
             # print the stdout card now.
             pa = PendingApproval(approval_id=approval_id, alert_id=key[0], action=action, chain=chain,
-                                 unfiled=True, card=card)
+                                 unfiled=True, card=card, timeout_ok=bool(timeout_ok))
             self._pending[approval_id] = pa
             self._by_key[key] = approval_id
             row = self._filed_row(pa)
@@ -321,7 +327,8 @@ class BaseHITL:
             logger.error("[hitl:%s] could not file approval %s for %s on alert %s (%s) — kept and retried every sync",
                          self.name, approval_id, key[1], key[0], why)
             return None
-        pa = PendingApproval(approval_id=approval_id, alert_id=key[0], action=action, chain=chain, external_id=str(external_id))
+        pa = PendingApproval(approval_id=approval_id, alert_id=key[0], action=action, chain=chain, external_id=str(external_id),
+                             timeout_ok=bool(timeout_ok))
         self._pending[approval_id] = pa
         self._by_key[key] = approval_id
         row = self._filed_row(pa)
@@ -402,7 +409,8 @@ class BaseHITL:
                 if status == "approved":
                     who = decided_by or self.name
                     if p.first_approver:
-                        if who == p.first_approver:
+                        from .signing import same_person
+                        if same_person(who, p.first_approver):
                             continue                          # the same person again: still waiting for a second
                         d = self._execute_approved(p, response_agent, p.first_approver, second=who)
                     else:
@@ -412,9 +420,19 @@ class BaseHITL:
                     continue
                 if status == "rejected":
                     made.append(self._settle(p, "rejected", decided_by or self.name, reason)); continue
-            # 2) no human decision — timeout auto-execute policy (opt-in)
+            # 2) no human decision — timeout auto-execute policy (opt-in). Never for an action that was sent to a
+            # human because it could not run unattended (ungrounded / wide / injection / plan step), and never for
+            # a two-person card: the timer is not a person, and it used to settle half-approved cards `failed`.
             if timeout_policy is not None:
-                decision, why = timeout_policy.evaluate(p.action, p.chain, age_sec=age)
+                two_person = bool(p.first_approver) or bool(
+                    getattr(response_agent, "two_person_required", lambda a: False)(p.action))
+                if not p.timeout_ok:
+                    decision, why = "hold", "was sent to a human because it could not run unattended"
+                elif two_person:
+                    decision, why = "hold", "two-person action — the timer is not an approver"
+                else:
+                    protected = bool(getattr(response_agent, "_is_protected", lambda t: False)(str(p.action.target)))
+                    decision, why = timeout_policy.evaluate(p.action, p.chain, age_sec=age, protected=protected)
                 if decision == "execute":
                     try:
                         executed = response_agent.approve(p.action, approver="aegis:hitl-timeout", source_alert_id=p.alert_id)
@@ -477,7 +495,8 @@ class BaseHITL:
         except Exception as e:  # noqa: BLE001 — one connector failure must not stall every other pending decision
             executed = {"error": str(e)[:200]}
         if getattr(executed, "reason", "") == "needs_second_approver" and not second:
-            if p.first_approver != approver:
+            from .signing import same_person
+            if not same_person(p.first_approver, approver):
                 p.first_approver, p.approved_by, p.second_by = approver, "", ""
                 self._journal_append({"op": "progress", "approval_id": p.approval_id, "first_approver": approver,
                                       "approved_by": "", "second_by": "", "attempts": p.attempts})

@@ -7,7 +7,7 @@ wide, internal, protected, low-confidence or disputed still waits for a human.
 
 A ``block`` runs automatically only when **all** hold:
     verdict ``malicious`` and chain confidence ≥ ``AEGIS_AUTO_BLOCK_MIN_CONF`` (0.90)
-    the independent voter did not dissent (``metadata.vote_concur`` is not False)
+    the independent voter did not dissent (``metadata.vote_concur`` is True, or the chain came from a deterministic builder with no model to vote on)
     target is a public IP, a CIDR no wider than /24 (IPv4) or /48 (IPv6), or a TLS
         fingerprint **paired with an exact, non-browser user agent** (a bare JA4, or one
         with a ``Mozilla/`` user agent, is never auto-blocked — it could be customers)
@@ -41,7 +41,20 @@ def _flag(name: str, default: str) -> str:
     return os.environ.get(name, default).strip()
 
 
+
+def _concurred(chain: Any) -> bool:
+    """The voter concurred, or no model decided this chain (a deterministic fast-path builder). A model chain with
+    no vote on record is not consent (review round 3 G1-15)."""
+    from .contracts import DETERMINISTIC_BUILDERS
+    md = getattr(chain, "metadata", None) or {}
+    if md.get("vote_concur") is True:
+        return True
+    return md.get("vote_concur") is None and (md.get("deterministic") is True
+                                              or str(getattr(chain, "investigated_by", "")) in DETERMINISTIC_BUILDERS)
+
+
 @dataclass
+
 class AutonomyPolicy:
     mode: str = "shadow"            # off | shadow | live
     min_confidence: float = 0.90
@@ -68,7 +81,7 @@ class AutonomyPolicy:
             return False, "only block is in scope"
         if chain.verdict != "malicious" or chain.confidence < self.min_confidence:
             return False, f"needs malicious ≥ {self.min_confidence:.2f} (got {chain.verdict} {chain.confidence:.2f})"
-        if (chain.metadata or {}).get("vote_concur") is False:
+        if not _concurred(chain):
             return False, "independent reviewer dissented"
         target = str(action.target)
         ok, why = _narrow_external(target)

@@ -57,6 +57,9 @@ def _never_block_hosts() -> set:
     return {h.strip().lower() for h in os.environ.get("AEGIS_NEVER_BLOCK_HOSTS", "").split(",") if h.strip()}
 
 
+_TARGET_PREFIXES = ("host:", "ip:", "url:", "domain:", "device:", "outbound:", "principal:", "user:", "account:", "session:")
+
+
 def never_block_target(target: str) -> Tuple[bool, str]:
     """``(refuse, reason)``. True when enforcing against this target would risk own/lab infra.
 
@@ -64,6 +67,13 @@ def never_block_target(target: str) -> Tuple[bool, str]:
     and principals return ``(False, "")`` — out of scope for this guard.
     """
     t = str(target or "").strip()
+    # `host:` / `ip:` / `url:` / `domain:` prefixes are stripped by grounding and the connectors, so the guard
+    # strips them too: `isolate host:soc-ingest…` used to sail past it (review round 3 G1-8)
+    low = t.lower()
+    for p in _TARGET_PREFIXES:
+        if low.startswith(p):
+            t = t[len(p):].strip()
+            break
     if not t:
         return False, ""
     hosts = _never_block_hosts()

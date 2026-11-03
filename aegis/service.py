@@ -317,6 +317,7 @@ class CycleStats:
 
 
 _SOURCE_ERROR = "__aegis_source_error__"
+_FORGEABLE = ("campaign_context", "tls_client", "low_and_slow")
 
 
 def _alerts_from_env(watchdog: Any = None) -> Iterator[dict]:
@@ -390,6 +391,10 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             continue
         if max_alerts and stats.alerts >= max_alerts:
             break
+        if any(k in alert for k in _FORGEABLE):
+            # AEGIS's own findings, never trusted from a feed: a forged campaign_context became unattended blocks
+            # on IPs the sender chose (review round 3 G1-9). The swarm re-derives them from its own history.
+            alert = {k: v for k, v in alert.items() if k not in _FORGEABLE}
         stats.alerts += 1
         sdnotify.watchdog()
         if storm is not None and storm.active and not alert.get("deferred_at") and not p.orch.is_fast_path(alert):

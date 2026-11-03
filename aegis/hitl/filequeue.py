@@ -67,47 +67,60 @@ class FileHITL(BaseHITL):
                 logger.warning("[hitl:file] slack notify failed for %s: %s", card["id"], str(e)[:120])
         return card["id"]
 
-    def _read_new_decisions(self) -> dict[str, dict]:
-        """New rows since the last byte offset. Binary, line-safe: a row still being written (no trailing
-        newline) is left for the next poll and the offset never lands mid-row; undecodable bytes are
-        replaced rather than wedging the queue (one bad byte must not stop every later decision)."""
-        out: dict[str, dict] = {}
+    def _read_new_decisions(self) -> dict[str, list[dict]]:
+        """Trusted decision rows since the last byte offset, oldest first, per approval id. Binary, line-safe: a
+        row still being written (no trailing newline) is left for the next poll and the offset never lands
+        mid-row; undecodable bytes are replaced rather than wedging the queue.
+
+        Each row is verified BEFORE it is kept (review round 3 G1-6): rows were merged last-row-wins and checked
+        afterwards, so an unsigned row appended after a signed rejection discarded the rejection, and two
+        approvals read in one batch collapsed into one."""
+        from .signing import trusted_approver, verify
+        buf: dict[str, list[dict]] = getattr(self, "_buffered", {})
         if not self.decisions_file.exists():
-            return out
+            return buf
+        if self.decisions_file.stat().st_size < self._consumed:      # rotated / truncated: start over
+            self._consumed = 0
         with self.decisions_file.open("rb") as f:
             f.seek(self._consumed)
             raw = f.read()
         cut = raw.rfind(b"\n")
-        if cut < 0:
-            return self._buffered if hasattr(self, "_buffered") else out
-        chunk, self._consumed = raw[:cut + 1], self._consumed + cut + 1
-        for line in chunk.decode("utf-8", "replace").split("\n"):
-            if not line.strip():
-                continue
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("[hitl:file] malformed decision line skipped: %s", line[:80]); continue
-            if isinstance(d, dict) and d.get("approval_id"):
-                out[str(d["approval_id"])] = d
-        # keep only decisions for approvals still pending here: a row for an unknown or already-settled id
-        # (a typo, a forged line, a decision for another host) used to be kept forever
-        merged = {**getattr(self, "_buffered", {}), **out}
-        self._buffered = {k: v for k, v in merged.items() if k in self._pending}
+        if cut >= 0:
+            chunk, self._consumed = raw[:cut + 1], self._consumed + cut + 1
+            for line in chunk.decode("utf-8", "replace").split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("[hitl:file] malformed decision line skipped: %s", line[:80]); continue
+                if not (isinstance(d, dict) and d.get("approval_id")):
+                    continue
+                ok, why = verify(d)
+                if ok:
+                    ok, why = trusted_approver(d.get("decided_by"))
+                if not ok:
+                    # a forged or hand-appended line is not a decision: log it and keep waiting for a real one
+                    logger.error("[hitl:file] decision for %s ignored: %s (decide in the console, or sign it with "
+                                 "`python -m aegis.hitl decide`)", d.get("approval_id"), why)
+                    continue
+                buf.setdefault(str(d["approval_id"]), []).append(d)
+        # keep only decisions for approvals still pending here
+        self._buffered = {k: v for k, v in buf.items() if k in self._pending and v}
         return self._buffered
 
     def _poll(self, p: PendingApproval) -> Optional[tuple[str, str, str]]:
-        d = self._read_new_decisions().pop(p.approval_id, None)
-        if not d:
+        rows = self._read_new_decisions().get(p.approval_id)
+        if not rows:
             return None
-        from .signing import trusted_approver, verify
-        ok, why = verify(d)
-        if ok:
-            ok, why = trusted_approver(d.get("decided_by"))
-        if not ok:
-            # a forged or hand-appended line is not a decision: log it loudly and keep waiting for a real one
-            logger.error("[hitl:file] decision for %s ignored: %s (decide in the console, or sign it with "
-                         "`python -m aegis.hitl decide`)", p.approval_id, why)
+        d = rows.pop(0)                                  # one decision per poll, in the order they were made
+        from .signing import enabled
+        want = f"{p.action.action_type} -> {p.action.target}"
+        if d.get("action") is not None and str(d["action"]) != want or (enabled() and d.get("action") is None):
+            # the signature binds the decision to the action it approved; a journal edited to point the card at
+            # another target no longer inherits the analyst's approval
+            logger.error("[hitl:file] decision for %s ignored: it approves %r, the card is %r", p.approval_id,
+                         d.get("action"), want)
             return None
         status = str(d.get("status", "")).lower()
         if status not in ("approved", "rejected"):

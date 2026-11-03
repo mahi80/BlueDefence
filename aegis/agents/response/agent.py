@@ -210,18 +210,32 @@ class ResponseAgent:
                 elif decision.status == "queued_for_hitl":
                     summary.hitl_queue.append(decision)
                     obs.record_action_hitl_queued()
-                    self._file_hitl(action, chain, decision)
+                    self._file_hitl(action, chain, decision, timeout_ok=self._timeout_ok(action, chain))
         return summary
 
+    def _timeout_ok(self, action: RecommendedAction, chain: EvidenceChain) -> bool:
+        """May the HITL-timeout fallback run this action if nobody decides? Only when it passes the same
+        grounding / width / injection checks an unattended action needs — judged now, while the alert is at hand,
+        and journaled with the card (review round 3 G1-1: the timer ran ungrounded and model-invented targets)."""
+        from .grounding import chain_entities, unattended_ok
+        try:
+            ents = getattr(self, "_entities", None)
+            return unattended_ok(action, chain, ents if ents is not None else chain_entities(chain))[0]
+        except Exception:  # noqa: BLE001 — unknown means "a human decides"
+            return False
+
     def _file_hitl(self, action: RecommendedAction, chain: EvidenceChain,
-                   decision: ExecutedAction) -> None:
+                   decision: ExecutedAction, *, timeout_ok: bool = False) -> None:
         """Dashboard approval when a transport is configured and reachable,
         else the stdout card. Never raises — HITL routing must not lose the
         decision record already in ``summary.hitl_queue``."""
         approval_id = None
         if self._hitl is not None:
             try:
-                approval_id = self._hitl.request(action, chain)
+                import inspect
+                params = inspect.signature(self._hitl.request).parameters
+                approval_id = (self._hitl.request(action, chain, timeout_ok=timeout_ok) if "timeout_ok" in params
+                               else self._hitl.request(action, chain))   # a transport without the flag never times out
             except Exception as e:  # noqa: BLE001
                 approval_id = None
                 print(f"[HITL] dashboard transport failed ({type(e).__name__}); using stdout card",
@@ -434,7 +448,8 @@ class ResponseAgent:
             )
         # Phase 1.1 — two-person rule on protected targets
         if self.two_person_required(action):
-            if not second_approver or second_approver == approver:
+            from ...hitl.signing import same_person
+            if not second_approver or same_person(second_approver, approver):
                 return ExecutedAction(
                     action=action, status="queued_for_hitl", reason="needs_second_approver",
                     note=f"{action.action_type} on protected target {action.target} needs a second "

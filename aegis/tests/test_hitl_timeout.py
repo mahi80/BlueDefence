@@ -108,7 +108,7 @@ class _StubResp:
 
 
 def _file_aged(h: _StubHITL, action, chain, age_sec: float) -> str:
-    aid = h.request(action, chain)
+    aid = h.request(action, chain, timeout_ok=True)      # filed as unattended-eligible
     h._pending[aid].requested_at = time.time() - age_sec
     return aid
 
