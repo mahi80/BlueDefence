@@ -112,6 +112,9 @@ class Investigator:
         self.verdicts = frozenset(verdicts)
         self._pool = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="aegis-investigate")
         self._jobs: dict[str, dict] = {}; self._lock = threading.Lock()
+        import os
+        self.max_queued = max(1, int(os.environ.get("AEGIS_INVESTIGATE_MAX_QUEUED", "200") or 200))
+        self.skipped = 0
 
     def wants(self, chain: EvidenceChain) -> bool:
         return chain.verdict in self.verdicts
@@ -123,6 +126,19 @@ class Investigator:
         with self._lock:
             if aid in self._jobs and self._jobs[aid]["state"] in ("queued", "running"):
                 return self._jobs[aid]["future"]
+            queued = sum(1 for j in self._jobs.values() if j["state"] == "queued")
+            if queued >= self.max_queued:
+                # a burst of 7,000 alerts left 6,998 walks queued behind 2 workers, unbounded (review B9): past the
+                # cap the walk is skipped and says so — the verdict and the HITL card are already out
+                self.skipped += 1
+                if self.skipped in (1, 10, 100) or self.skipped % 1000 == 0:
+                    logger.warning("[investigation] %d walk(s) queued (cap %d) — skipped %s (%d skipped so far)",
+                                   queued, self.max_queued, aid, self.skipped)
+                self._jobs.pop(aid, None)
+                self._jobs[aid] = {"state": "skipped", "submitted": time.time(), "future": None,
+                                   "error": f"investigation queue full ({queued} queued)"}
+                self._prune_locked()
+                return None
             fut = self._pool.submit(self._run, alert, chain)
             self._jobs.pop(aid, None)                 # re-insert so the newest job is last
             self._jobs[aid] = {"state": "queued", "submitted": time.time(), "future": fut}
@@ -136,7 +152,7 @@ class Investigator:
         excess = len(self._jobs) - self.MAX_JOBS
         if excess <= 0:
             return
-        for aid in [a for a, j in self._jobs.items() if j["state"] in ("done", "failed")][:excess]:
+        for aid in [a for a, j in self._jobs.items() if j["state"] in ("done", "failed", "skipped")][:excess]:
             del self._jobs[aid]
 
     def _run(self, alert: dict, chain: EvidenceChain) -> dict:
@@ -169,7 +185,7 @@ class Investigator:
     def drain(self, timeout: float = 30.0) -> None:
         """Wait for in-flight jobs (tests, graceful shutdown)."""
         with self._lock:
-            futs = [j["future"] for j in self._jobs.values() if j["state"] in ("queued", "running")]
+            futs = [j["future"] for j in self._jobs.values() if j["state"] in ("queued", "running") and j["future"] is not None]
         for f in futs:
             try:
                 f.result(timeout=timeout)

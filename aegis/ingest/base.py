@@ -168,14 +168,19 @@ class BaseConsumer:
                     self.skipped_invalid += 1
                     continue
                 key = f"{self.name}:{one['id']}"
-                if not self.checkpoint.mark(key):
+                if self.checkpoint.seen(key):
                     self.skipped_duplicates += 1
                     continue
+                self.yielded += 1
+                yield one
+                # Marked only once the caller asks for the next alert, i.e. after it handled this one. Marking before
+                # the yield made ingest at-most-once: a crash mid-handling, or a caller stopping at max_alerts with
+                # the alert already fetched, lost it for good (code review 2026-11-03 E15). Now at-least-once; the
+                # audit / HITL layers already dedupe on the alert id.
+                self.checkpoint.mark(key)
                 ts = one.get("timestamp")
                 if ts:
                     self.checkpoint.advance(self.name, str(ts))
-                self.yielded += 1
-                yield one
 
     @property
     def stats(self) -> dict:

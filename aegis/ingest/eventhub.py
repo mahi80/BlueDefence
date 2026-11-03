@@ -95,17 +95,19 @@ class EventHubReader:
             if isinstance(seq, int):
                 last_seq = seq
         if not self.queue.put_many(self.source, lines):
-            # queue full: do not advance the checkpoint; the SDK will not re-deliver, so we
-            # retry the same batch locally with backoff rather than lose it
-            for attempt in range(60):
+            # queue full: do not advance the checkpoint; the SDK will not re-deliver, so retry the same batch until
+            # it fits or we are stopped. Blocking here is the backpressure: the partition stops fetching. It used to
+            # give up after 60 tries and return — and the NEXT batch's checkpoint moved past the dropped one
+            # (code review 2026-11-03 E9). On stop we return without a checkpoint: the batch is re-read on restart.
+            attempt = 0
+            while not self.queue.put_many(self.source, lines):
                 if self._stop.is_set():
                     return
-                time.sleep(min(self.backoff_s, 0.1 * (attempt + 1)))
-                if self.queue.put_many(self.source, lines):
-                    break
-            else:
-                logger.error("[ingest:eventhub] partition %s: dropped %d records after sustained queue pressure", pid, len(lines))
-                return
+                attempt += 1
+                if attempt in (60, 600) or attempt % 3000 == 0:
+                    logger.error("[ingest:eventhub] partition %s: queue full for %d tries — holding %d record(s), "
+                                 "not checkpointing", pid, attempt, len(lines))
+                time.sleep(min(self.backoff_s, 0.1 * min(attempt, 20)))
         self.batches += 1
         self.events += len(events)
         if last_seq is not None:
