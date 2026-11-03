@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
@@ -86,7 +87,10 @@ class AlertCheckpoint:
                 self._seen = {}
 
     def _lru(self, key: str) -> OrderedDict[str, None]:
-        src = key.split(":", 1)[0] if ":" in key else ""
+        # every pushed feed is consumed as "stream": its LRU is per pushed source (stream:<ingest_source>:id), so a
+        # WAF flood cannot evict an EDR alert's id (review round 4 I4-9)
+        parts = key.split(":", 2)
+        src = (f"{parts[0]}:{parts[1]}" if parts[0] == "stream" and len(parts) == 3 else parts[0]) if ":" in key else ""
         lru = self._seen.get(src)
         if lru is None:
             lru = self._seen[src] = OrderedDict()
@@ -128,41 +132,119 @@ class AlertCheckpoint:
     def _inflight_path(self) -> Path | None:
         return self.path.with_name(self.path.name + ".inflight") if self.path else None
 
-    def begin(self, key: str) -> bool:
-        """About to hand ``key`` to the caller. False when it has crashed the process too often: skip it."""
+    def _read_inflight(self, p: Path) -> dict:
+        try:
+            st = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(st, dict):
+            return {}
+        if "key" in st and "attempts" in st and not isinstance(st.get("attempts"), dict):   # the round-3 format
+            st = {"current": st.get("key"), "attempts": {str(st.get("key")): int(st.get("attempts") or 0)}}
+        att = st.get("attempts")
+        st["attempts"] = {str(k): int(v) for k, v in att.items() if isinstance(v, (int, float))} \
+            if isinstance(att, dict) else {}
+        return st
+
+    def begin(self, key: str, alert: Any = None) -> bool:
+        """About to hand ``key`` to the caller. False when it has crashed the process too often: skip it (and set it
+        aside in the dead-letter file). Attempts are kept per key for the last few alerts begun: with one key, any
+        other alert begun first after a restart reset the crasher's count, so it never reached the limit, and a
+        skipped alert's body was lost (review round 4 I4-6 / X4-10)."""
         p = self._inflight_path()
         if p is None:
             return True
-        attempts = 0
-        try:
-            prev = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-            if prev.get("key") == key:
-                attempts = int(prev.get("attempts") or 0)
-        except (OSError, ValueError):
-            attempts = 0
+        st = self._read_inflight(p)
+        attempts = st["attempts"].get(key, 0)
         try:
             limit = int(os.environ.get("AEGIS_INGEST_POISON_MAX", "3") or 3)
         except ValueError:
             limit = 3
         if attempts >= limit:
-            logger.error("[ingest] %s did not finish in %d attempts (each one ended the process) — skipped; "
-                         "re-send it once the cause is fixed", key, attempts)
+            logger.error("[ingest] %s did not finish in %d attempts (each one ended the process) — skipped and set "
+                         "aside in the dead-letter file", key, attempts)
+            if alert is not None:
+                from ..ops import dead_letter
+                dead_letter.write(alert, f"ended the process {attempts} times while being handled (poison alert)")
             self.mark(key)
-            self.done()
+            st["attempts"].pop(key, None)
+            self._write_inflight(p, {"current": None, "attempts": st["attempts"]})
             return False
-        try:
-            p.write_text(json.dumps({"key": key, "attempts": attempts + 1}), encoding="utf-8")
-        except OSError:
-            pass
+        st["attempts"][key] = attempts + 1
+        while len(st["attempts"]) > 64:                   # bounded: the oldest unfinished keys fall off
+            st["attempts"].pop(next(iter(st["attempts"])))
+        self._write_inflight(p, {"current": key, "attempts": st["attempts"]})
         return True
 
-    def done(self) -> None:
-        p = self._inflight_path()
-        if p is not None:
-            try:
+    def _write_inflight(self, p: Path, st: dict) -> None:
+        try:
+            if not st.get("attempts") and not st.get("current"):
                 p.unlink(missing_ok=True)
-            except OSError:
-                pass
+                return
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(json.dumps(st), encoding="utf-8")
+            tmp.replace(p)
+        except OSError:
+            pass
+
+    def done(self) -> None:
+        """The alert in hand finished (or the caller stopped cleanly): it is not a crasher."""
+        p = self._inflight_path()
+        if p is None or not p.exists():
+            return
+        st = self._read_inflight(p)
+        cur = st.get("current")
+        if cur is not None:
+            st["attempts"].pop(str(cur), None)
+        self._write_inflight(p, {"current": None, "attempts": st["attempts"]})
+
+    # ---- file sources (review round 4 I4-3) -----------------------------------------------------------------------
+    # WAF / API-gateway / NDR / netops exports were re-read from the start every cycle: every record went through the
+    # stateful detectors again and only the per-source id LRU kept old alerts out — past its size, nothing did.
+    def tail_lines(self, path: str | Path) -> Iterator[str]:
+        """Complete lines appended to ``path`` since the last cycle. A rotated or truncated file starts over; a
+        ``.gz`` export is read whole only when it changed. The offset moves past a line only when the caller asks
+        for the next one (at-least-once, like ``mark``)."""
+        p = Path(path)
+        try:
+            st = p.stat()
+        except OSError:
+            return
+        key = str(p.resolve())
+        with self._lock:
+            files = self._state.setdefault("files", {})
+            prev = files.get(key) if isinstance(files.get(key), dict) else {}
+        if p.suffix == ".gz":
+            sig = [st.st_ino, st.st_size, int(st.st_mtime)]
+            if prev.get("sig") == sig:
+                return
+            with gzip.open(p, "rt", encoding="utf-8", errors="replace") as fh:
+                yield from fh
+            with self._lock:
+                self._state.setdefault("files", {})[key] = {"sig": sig}
+                self._dirty += 1
+                self._maybe_flush()
+            return
+        with p.open("rb") as fh:
+            prev_head = str(prev.get("head") or "")
+            # same file (inode), not shorter, and the same first bytes — a file rewritten in place starts over
+            same = (prev.get("ino") == st.st_ino and int(prev.get("off") or 0) <= st.st_size
+                    and fh.read(len(prev_head) // 2).hex() == prev_head)
+            off = int(prev.get("off") or 0) if same else 0
+            fh.seek(0)
+            head = fh.read(64).hex()
+            fh.seek(off)
+            while True:
+                raw = fh.readline()
+                if not raw or not raw.endswith(b"\n"):
+                    break                                   # a line still being written: next cycle
+                yield raw.decode("utf-8", "replace")
+                off += len(raw)
+                with self._lock:
+                    self._state.setdefault("files", {})[key] = {"ino": st.st_ino, "off": off,
+                                                                "head": head[:2 * min(64, off)]}
+                    self._dirty += 1
+                    self._maybe_flush()
 
     def flush(self) -> None:
         """Write the checkpoint now (end of a batch, shutdown)."""
@@ -285,12 +367,13 @@ class BaseConsumer:
                 if not one or not one.get("id"):
                     self.skipped_invalid += 1
                     continue
-                key = f"{self.name}:{one['id']}"
+                src = one.get("ingest_source") if self.name == "stream" else None
+                key = f"{self.name}:{str(src).replace(':', '_')[:64]}:{one['id']}" if src else f"{self.name}:{one['id']}"
                 if self.checkpoint.seen(key):
                     self.skipped_duplicates += 1
                     continue
                 begin = getattr(self.checkpoint, "begin", None)
-                if callable(begin) and not begin(key):
+                if callable(begin) and not begin(key, one):
                     self.skipped_invalid += 1
                     continue
                 self.yielded += 1

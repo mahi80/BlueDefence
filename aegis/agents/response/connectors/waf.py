@@ -88,7 +88,12 @@ class ImpervaWafConnector(Connector):
         return f"{self.base_url}/api/prov/v2/sites/{self.site_id}/rules" + (f"/{rule_id}" if rule_id else "")
 
     def _do_apply(self, action: Any, key: str, ttl_sec: Optional[int]) -> tuple[str, str, str]:
-        addr, _ = _ip_target(action.target)
+        addr, mask = _ip_target(action.target)
+        if mask not in ("255.255.255.255", "128"):
+            # The rule filter matched `ClientIP == <network address>` with the mask dropped: a /24 block covered one
+            # address and was reported applied and verified (review round 4 R4-11). Refused, so it is not "contained".
+            raise ConnectorError(f"Imperva site rules match single client IPs; {action.target} is a network — "
+                                 "block it at a network control (edge ACL, cloud security group) or per address")
         body: dict[str, Any] = {
             "name": f"aegis-{action.action_type}-{key[:8]}",
             "action": IMPERVA_ACTIONS[action.action_type],

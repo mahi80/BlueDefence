@@ -72,23 +72,34 @@ class ZscalerConnector(Connector):
         body = {"configuredName": self.category_name, "urls": [self._entry(target)]}
         return call(self._transport, "PUT", url, json_body=body, headers=self._headers(), expect=(200,))
 
-    def _do_apply(self, action: Any, key: str, ttl_sec: Optional[int]) -> tuple[str, str, str]:
-        self._category_op(action.target, "ADD_TO_LIST")
-        entry = self._entry(action.target)
-        return (f"{self.category_id}:{entry}",
-                f"[zscaler] block egress to {entry} (category {self.category_name})", entry)
-
-    def _do_verify(self, receipt: Receipt) -> bool | None:
+    def _listed(self) -> set[str]:
         res = call(self._transport, "GET", f"{self.base_url}/zia/api/v1/urlCategories/{self.category_id}",
                    headers=self._headers(), expect=(200,))
         # ZIA normalises what it stores (case, scheme, trailing slash): compare the normal forms, or a rule that is
         # there reads as missing and is dropped and re-added (review round 3 G3-1)
-        want = self._entry(receipt.target).lower()
-        return want in {self._entry(u).lower() for u in (res.json().get("urls") or [])}
+        return {self._entry(u).lower() for u in (res.json().get("urls") or [])}
+
+    def _do_apply(self, action: Any, key: str, ttl_sec: Optional[int]) -> tuple[str, str, str]:
+        entry = self._entry(action.target)
+        if entry.lower() in self._listed():
+            # already in the category — the operator's own entry: never removed when AEGIS's TTL ends (round 4 R4-14)
+            return (f"{self.category_id}:{entry}",
+                    f"[zscaler] {entry} already blocked in {self.category_name} — kept as is", KEEP + entry)
+        self._category_op(action.target, "ADD_TO_LIST")
+        return (f"{self.category_id}:{entry}",
+                f"[zscaler] block egress to {entry} (category {self.category_name})", entry)
+
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        return self._entry(receipt.target).lower() in self._listed()
 
     def _do_rollback(self, receipt: Receipt) -> str:
+        if str(receipt.rollback_token).startswith(KEEP):
+            return f"[zscaler] {self._entry(receipt.target)} was already in {self.category_name} before AEGIS — left in place"
         self._category_op(receipt.target, "REMOVE_FROM_LIST")
         return f"[zscaler] removed {self._entry(receipt.target)} from {self.category_name}"
+
+
+KEEP = "keep:"
 
 
 def zscaler_from_env(transport: Optional[Transport] = None) -> Optional[Connector]:

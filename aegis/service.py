@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import errno
-import json
 import logging
 import os
 import signal
@@ -205,6 +204,13 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     audit = AuditLog(audit_path, sink=persist_sink, index=index)
     receipt_log = receipt_log_from_env(audit_path.parent, sink=persist_sink)   # Phase 1.5
     connectors = registry_from_env(on_receipt=[receipt_log] if receipt_log else [])
+    if receipt_log is not None:
+        try:
+            from aegis.agents.response.receipts import ReceiptLog
+            connectors.restore(ReceiptLog.latest_per_receipt(ReceiptLog.read(receipt_log.path)))
+        except Exception as e:  # noqa: BLE001 — a damaged log must not stop the service; say so loudly
+            logger.error("[service] active receipts not restored from %s: %s — enforcement in force before the "
+                         "restart is not tracked (no TTL rollback, no drift check)", receipt_log.path, e)
     response = ResponseAgent(self_healing=SelfHealingPipeline(), hitl=hitl_from_env(), connectors=connectors)
 
     cve_intel = cve_intel_from_env()                     # AEGIS_CVE_INTEL=1 — KEV + NVD + EPSS consumer (cached)
@@ -315,7 +321,7 @@ class CycleStats:
         v = " ".join(f"{k}={n}" for k, n in sorted(self.verdicts.items()))
         lag = f" streamed={self.streamed} lag_ms={self.max_lag_ms} handle_ms={self.max_handle_ms}" if self.streamed else ""
         extra = (f"deferred={self.deferred} " if self.deferred else "") + (f"redelivered={self.redelivered} " if self.redelivered else "") \
-            + (f"LOST={self.lost} " if self.lost else "")
+            + (f"LOST={self.lost} " if self.lost else "") + (f"dead_lettered={self.dead_lettered} " if self.dead_lettered else "")
         return (f"alerts={self.alerts} executed={self.executed} hitl_queued={self.hitl_queued} "
                 f"decisions={self.decisions} rolled_back={self.rolled_back} errors={self.errors} {extra}"
                 f"{self.seconds:.1f}s{lag} {v}".rstrip())
@@ -383,22 +389,9 @@ def _drift_check(p: Any) -> None:
 
 def _dead_letter(alert: dict, err: Exception) -> bool:
     """Set aside an alert that cannot be sealed for a reason that will not clear by itself. Returns True when it
-    was written (``AEGIS_DEAD_LETTER``, default beside the checkpoint)."""
-    path = Path(os.environ.get("AEGIS_DEAD_LETTER", "") or (Path(os.environ.get("AEGIS_CHECKPOINT", ".aegis-ingest.json")).parent
-                                                            / "dead-letter.jsonl"))
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        row = {**alert, "dead_lettered_at": time.time(), "dead_letter_reason": f"{type(err).__name__}: {str(err)[:200]}"}
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, default=str) + "\n")
-        logger.error("[service] alert %s could not be sealed after %s attempts (%s) — set aside in %s for a person",
-                     alert.get("id"), alert.get("audit_attempts", "?"), str(err)[:120], path)
-        return True
-    except OSError as e2:
-        logger.error("[service] alert %s could not be sealed or set aside (%s / %s) — re-send it from its source",
-                     alert.get("id"), str(err)[:80], e2)
-        return False
+    was written (``AEGIS_DEAD_LETTER``; see :mod:`aegis.ops.dead_letter`)."""
+    from .ops import dead_letter
+    return dead_letter.write(alert, f"{type(err).__name__}: {str(err)[:200]} (after {alert.get('audit_attempts', '?')} attempts)")
 
 
 def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: int = 0,
@@ -438,6 +431,10 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
         stats.alerts += 1
         if alert.get("deferred_at") or alert.get("audit_deferred"):
             stats.refed += 1                                 # metered when it first arrived, not again (G4-8)
+        elif alert.get("received_at"):
+            # streamed alerts are metered by the queue's drained count: count every one here, deferred or failed
+            # too, or the licence meter counted those twice exactly during a storm (round 4 I4-12)
+            stats.streamed += 1
         sdnotify.watchdog()
         if storm is not None and storm.active and not alert.get("deferred_at") and not p.orch.is_fast_path(alert):
             if storm.queue.push(alert):
@@ -477,12 +474,18 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             if stats.audit_failures == 1:
                 logger.error("[service] audit log not writable (%s): alerts are parked in the deferred queue and re-fed once it is", e)
             continue
-        except Exception:
+        except Exception as e:
+            # A handler / connector bug: the consumer has already marked the alert seen and the journal will commit
+            # it, so logging and moving on lost it with lost=0 (review round 4 I4-7). Set it aside for a person.
             stats.errors += 1
             logger.exception("[service] alert %s failed", alert.get("id"))
+            from .ops import dead_letter
+            if dead_letter.write(alert, f"handling failed: {type(e).__name__}: {str(e)[:200]}"):
+                stats.dead_lettered += 1
+            else:
+                stats.lost += 1
             continue
         if alert.get("received_at"):
-            stats.streamed += 1
             stats.max_lag_ms = max(stats.max_lag_ms, int(alert.get("ingest_lag_ms") or 0))
             stats.max_handle_ms = max(stats.max_handle_ms, int((time.time() - float(alert["received_at"])) * 1000))
         if p.investigator is not None:

@@ -155,7 +155,7 @@ class PushServer:
     def start(self) -> "PushServer":
         server = self
         handler = type("AegisPushHandler", (_Handler,), {"server_ref": server})
-        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd = _BoundedHTTPServer((self.host, self.port), handler)
         self._httpd.daemon_threads = True
         self.port = self._httpd.server_address[1]
         self.queue.enabled = True
@@ -410,6 +410,62 @@ class PushServer:
             return 0
 
 
+class _BoundedHTTPServer(ThreadingHTTPServer):
+    """At most ``AEGIS_INGEST_MAX_CONNS`` (256) connections handled at once, and a connection that has not
+    finished its request headers within ``AEGIS_INGEST_HEADER_S`` (10 s) is closed. One thread per connection,
+    unbounded and before auth, with a per-read timeout let a client trickling header bytes hold threads
+    indefinitely (review round 4 I4-11)."""
+
+    def __init__(self, *a: Any, **k: Any):
+        super().__init__(*a, **k)
+        try:
+            self.max_conns = max(1, int(os.environ.get("AEGIS_INGEST_MAX_CONNS", "256")))
+        except ValueError:
+            self.max_conns = 256
+        try:
+            self.header_s = max(1.0, float(os.environ.get("AEGIS_INGEST_HEADER_S", "10")))
+        except ValueError:
+            self.header_s = 10.0
+        self._slots = threading.BoundedSemaphore(self.max_conns)
+        self.refused_busy = 0
+        self.header_timers: dict[int, threading.Timer] = {}
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.refused_busy += 1
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        timer = threading.Timer(self.header_s, _close_if_no_headers, args=(request,))
+        timer.daemon = True
+        self.header_timers[id(request)] = timer      # the handler cancels it once the headers are in
+        timer.start()
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            timer.cancel()
+            self.header_timers.pop(id(request), None)
+            self._slots.release()
+
+
+def _close_if_no_headers(sock: Any) -> None:
+    import socket as _socket
+    try:
+        sock.shutdown(_socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_ref: PushServer
     timeout = 30
@@ -431,6 +487,14 @@ class _Handler(BaseHTTPRequestHandler):
         if self.server_ref.limiter.should_log(ip):
             logger.warning("[ingest:http] unauthorized %s %s from %s", self.command, path, ip)
         self._refuse(401, body or {"error": "unauthorized"})
+
+    def parse_request(self) -> bool:
+        ok = super().parse_request()
+        timers = getattr(self.server, "header_timers", None)
+        t = timers.pop(id(self.connection), None) if isinstance(timers, dict) else None
+        if t is not None:
+            t.cancel()                                  # headers are in: the per-read timeout governs the body
+        return ok
 
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
         # unknown methods (PUT, DELETE …) and malformed request lines: the body was never read, so the connection

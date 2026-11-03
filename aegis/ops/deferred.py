@@ -10,6 +10,7 @@ with it; the fragment is logged and counted in ``dropped``.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -25,9 +26,16 @@ class DeferredQueue:
         self.max_bytes = max_bytes
         self._read_pos = 0           # committed (acked) position
         self._inflight_pos = 0       # position after the last pop, committed by ack()
+        self._inflight_rows = 0      # rows in the last pop, subtracted from the count by ack()
+        self._pending: int | None = None   # running count of rows not yet acked (None: count on first ask)
         self.dropped = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         cur = self._cursor_path()
+        drained = self._drained_path()
+        if drained.exists():
+            # a crash inside ack()'s recycle: the cursor belongs to the drained file, not to anything after it
+            cur.unlink(missing_ok=True)
+            drained.unlink(missing_ok=True)
         try:
             self._read_pos = int(cur.read_text().strip())
             # A cursor with no spill file (a crash between ack()'s two unlinks, an operator deleting the file)
@@ -45,6 +53,9 @@ class DeferredQueue:
 
     def _cursor_path(self) -> Path:
         return self.path.with_suffix(".cursor")
+
+    def _drained_path(self) -> Path:
+        return self.path.with_suffix(".drained")
 
     def _trim_torn_tail(self) -> None:
         try:
@@ -88,19 +99,27 @@ class DeferredQueue:
             row["deferred_by"] = reason
             data = (json.dumps(row, separators=(",", ":"), default=str) + "\n").encode()
             flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-            with os.fdopen(os.open(self.path, flags, 0o600), "ab") as fh:
-                start = fh.tell()
+            fd = os.open(self.path, flags, 0o600)
+            try:
+                # a file left by an older build may be 0644, and it now receives unredacted rows (round 4 X4-9)
+                with contextlib.suppress(OSError):
+                    os.fchmod(fd, 0o600)
+                start = os.lseek(fd, 0, os.SEEK_END)
                 try:
-                    fh.write(data)
-                    fh.flush()
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
                 except OSError:
                     # ENOSPC mid-write leaves a fragment; the next push would merge into it and both rows would be
-                    # lost (code review 2026-11-03 E8). Cut the file back to where this row started.
-                    try:
-                        fh.truncate(start)
-                    except OSError:
-                        pass
+                    # lost (code review 2026-11-03 E8). A raw fd has nothing buffered, so this cut really removes
+                    # it (the buffered writer re-flushed and failed again, leaving the fragment: round 4 I4-4).
+                    with contextlib.suppress(OSError):
+                        os.ftruncate(fd, start)
                     raise
+            finally:
+                os.close(fd)
+            if self._pending is not None:
+                self._pending += 1
             return True
         except OSError as e:
             self.dropped += 1
@@ -109,6 +128,13 @@ class DeferredQueue:
             return False
 
     def pending(self) -> int:
+        """Rows not yet acked. Counted from the file once, then kept as a running total: a full scan per call made
+        draining a large spill quadratic (review round 4 I4-14)."""
+        if self._pending is None:
+            self._pending = self._count()
+        return max(0, self._pending)
+
+    def _count(self) -> int:
         try:
             if not self.path.exists():
                 return 0
@@ -128,11 +154,13 @@ class DeferredQueue:
             with self.path.open("rb") as fh:
                 fh.seek(self._read_pos)
                 pos = self._read_pos
+                rows = 0
                 while len(out) < n:
                     line = fh.readline()
                     if not line or not line.endswith(b"\n"):
                         break
                     pos += len(line)
+                    rows += 1 if line.strip() else 0
                     try:
                         out.append(json.loads(line))
                     except ValueError:
@@ -140,6 +168,7 @@ class DeferredQueue:
                         logger.warning("[deferred] unparseable row skipped at offset %d of %s", pos - len(line), self.path.name)
                         continue
                 self._inflight_pos = pos
+                self._inflight_rows = rows
         except OSError as e:
             logger.warning("[deferred] cannot read %s: %s", self.path, e)
         return out
@@ -149,14 +178,21 @@ class DeferredQueue:
         if self._inflight_pos <= self._read_pos:
             return
         self._read_pos = self._inflight_pos
+        if self._pending is not None:
+            self._pending -= self._inflight_rows
+        self._inflight_rows = 0
         try:
             cur = self._cursor_path()
             tmp = cur.with_suffix(".cursor.tmp")
             tmp.write_text(str(self._read_pos))
             os.replace(tmp, cur)
             if self.path.exists() and self._read_pos >= self.path.stat().st_size:   # fully drained: start the file over
-                cur.unlink(missing_ok=True)          # cursor first: a crash in between leaves a file and no cursor (safe)
-                self.path.unlink(missing_ok=True)
+                # Data aside first, then the cursor: resetting the cursor first meant a crash in between re-delivered
+                # the whole handled file (round 4 I4-10). A ``.drained`` file on start says the cursor is stale.
+                drained = self._drained_path()
+                os.replace(self.path, drained)
+                cur.unlink(missing_ok=True)
+                drained.unlink(missing_ok=True)
                 self._read_pos = self._inflight_pos = 0
         except OSError as e:
             logger.warning("[deferred] cursor not persisted: %s — the batch may be re-delivered after a restart", e)

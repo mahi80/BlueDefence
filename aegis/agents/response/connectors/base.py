@@ -516,6 +516,35 @@ class ConnectorRegistry:
     def connectors(self) -> list[Connector]:
         return list(self._connectors) + [self.fallback]
 
+    def restore(self, entries: Iterable[dict]) -> int:
+        """Re-adopt the receipts that were active when the process stopped (the last state of each, from the
+        receipt log). ``_active`` lived only in memory: after a restart TTL rollback, drift checks and the edge
+        blocklist forgot every enforcement in force — a 15-minute block became permanent at the vendor, a breaker
+        hold was never released, the edge lifted approved blocks (review round 4 R4-1). Expired ones are rolled
+        back by the next sweep. Returns how many were restored."""
+        from dataclasses import fields
+        names = {f.name for f in fields(Receipt)}
+        by_name = {c.name: c for c in self.connectors}
+        n = 0
+        for e in entries:
+            if not isinstance(e, dict) or e.get("status") not in ACTIVE_STATUSES:
+                continue
+            c = by_name.get(str(e.get("connector", "")))
+            if c is None:
+                continue
+            try:
+                r = Receipt(**{k: v for k, v in e.items() if k in names})
+            except TypeError:
+                continue
+            with c._lock:
+                if r.idempotency_key and r.idempotency_key not in c._active:
+                    c._active[r.idempotency_key] = r
+                    n += 1
+        if n:
+            logger.warning("[connectors] restored %d active receipt(s) from the receipt log — expired ones are rolled "
+                           "back on the next sweep", n)
+        return n
+
     def route(self, action_type: str) -> Connector:
         for c in self._connectors:
             if c.supports(action_type):
