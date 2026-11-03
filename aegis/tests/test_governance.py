@@ -117,14 +117,15 @@ def test_response_actions_are_governed_and_fail_safe(orch):
         action_type="block", target="203.0.113.7", reasoning="test", requires_hitl=False, confidence=0.9))
 
     governed.begin_alert("a-1")
-    summary = response.execute(chain)
+    alert = {"id": "a-1", "src_ip": "203.0.113.7"}         # unattended targets must be grounded in the alert (#74)
+    summary = response.execute(chain, alert)
     assert [a.action.action_type for a in summary.executed] == ["throttle"]
     assert [a.action.action_type for a in summary.hitl_queue] == ["block"]  # HITL policy unchanged
     tools = [e.data["tool"] for e in _events(governed.guard, "tool_call_start")]
     assert "response.throttle" in tools and "response.block" not in tools  # HITL-queued never reached the guard
 
     governed.guard._paused = True
-    summary = response.execute(chain)
+    summary = response.execute(chain, alert)
     assert summary.executed == []
     assert any("[ACP blocked]" in a.note for a in summary.hitl_queue)  # auto-safe action parked for a human
     approved = response.approve(chain.recommended_actions[1], approver="ciso")
