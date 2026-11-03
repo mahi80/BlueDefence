@@ -85,6 +85,9 @@ class MockImperva(_MockBase):
             return HttpResult(200, {"res": 0, "res_message": "OK"})
         if method == "GET" and not rule:
             return HttpResult(200, {"rules": [{"rule_id": int(k), **v} for k, v in self.rules.items() if v["site_id"] == site]})
+        if method == "GET" and rule:
+            r = self.rules.get(rule)
+            return HttpResult(200, {"rule_id": int(rule), **r}) if r else HttpResult(404, {"message": "rule not found"})
         return HttpResult(405, {"message": "method not allowed"})
 
     def blocked_ips(self) -> set[str]:
@@ -204,6 +207,8 @@ class MockZscaler(_MockBase):
             return HttpResult(404, {"message": "unknown endpoint"})
         action = dict(parse_qsl(q)).get("action", "")
         cur = self.categories.setdefault(m.group("cat"), set())
+        if method == "GET":
+            return HttpResult(200, {"id": m.group("cat"), "urls": sorted(cur)})
         urls = [str(u) for u in (body.get("urls") or [])]
         if method == "PUT" and action == "ADD_TO_LIST":
             cur.update(urls)
@@ -241,6 +246,11 @@ class MockCrowdStrike(_MockBase):
             host = params.get("filter", "").split("hostname:'")[-1].rstrip("'")
             aid = self.hosts.get(host)
             return HttpResult(200, {"resources": [aid] if aid else []})
+        if path.endswith("/devices/entities/devices/v2") and method == "GET":
+            aid = params.get("ids", "")
+            if aid not in self.hosts.values():
+                return HttpResult(200, {"resources": []})
+            return HttpResult(200, {"resources": [{"device_id": aid, "status": "contained" if aid in self.contained else "normal"}]})
         if path.endswith("/devices/entities/devices-actions/v2") and method == "POST":
             ids = body.get("ids") or []
             action = params.get("action_name")

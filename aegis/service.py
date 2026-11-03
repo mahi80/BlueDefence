@@ -330,6 +330,26 @@ def _stream_alerts(p: Pipeline) -> Iterator[dict]:
     yield from StreamConsumer(queue=p.stream, checkpoint=cp).iter_alerts()
 
 
+_last_drift_check = 0.0
+
+
+def _drift_check(p: Any) -> None:
+    """Every AEGIS_VERIFY_EVERY_S (default 300 s; 0 = off) read active enforcement back at the vendors: an
+    action released or removed outside AEGIS is marked drifted instead of being reported as still in force."""
+    global _last_drift_check
+    every = float(os.environ.get("AEGIS_VERIFY_EVERY_S", "300") or 0)
+    if every <= 0 or time.time() - _last_drift_check < every:
+        return
+    _last_drift_check = time.time()
+    try:
+        drifted = p.response.check_drift()
+        if drifted:
+            logger.error("[service] %d action(s) no longer in force at the vendor: %s", len(drifted),
+                         ", ".join(f"{r.action_type} {r.target} ({r.connector})" for r in drifted[:10]))
+    except Exception as e:  # noqa: BLE001 — a read-back failure must not stop the cycle
+        logger.warning("[service] vendor drift check failed: %s", str(e)[:200])
+
+
 def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: int = 0,
               sweep: bool = True, hitl: bool = True, storm: "StormControl | None" = None) -> CycleStats:
     """One pass: new alerts → orchestrator → response; then HITL sync, TTL sweep, flush.
@@ -416,6 +436,7 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
         except Exception as e:  # noqa: BLE001
             stats.errors += 1
             logger.warning("[service] TTL sweep failed: %s", str(e)[:200])
+        _drift_check(p)
     if p.persist_sink is not None:
         p.persist_sink.flush()
     stats.seconds = time.time() - t0

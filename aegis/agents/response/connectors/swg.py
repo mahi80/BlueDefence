@@ -78,6 +78,11 @@ class ZscalerConnector(Connector):
         return (f"{self.category_id}:{entry}",
                 f"[zscaler] block egress to {entry} (category {self.category_name})", entry)
 
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        res = call(self._transport, "GET", f"{self.base_url}/zia/api/v1/urlCategories/{self.category_id}",
+                   headers=self._headers(), expect=(200,))
+        return self._entry(receipt.target) in {str(u) for u in (res.json().get("urls") or [])}
+
     def _do_rollback(self, receipt: Receipt) -> str:
         self._category_op(receipt.target, "REMOVE_FROM_LIST")
         return f"[zscaler] removed {self._entry(receipt.target)} from {self.category_name}"

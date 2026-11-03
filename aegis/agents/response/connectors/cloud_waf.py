@@ -311,6 +311,20 @@ class _MembershipConnector(Connector):
     def _do_renew(self, receipt: Receipt, ttl_sec: int) -> str:
         return f"[{self.name}] {receipt.vendor_ref} kept for another {ttl_sec}s"
 
+    def _read(self, action_type: str) -> list[str] | None:
+        """The list's current addresses, or None when this vendor connector cannot read it back."""
+        return None
+
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        tok = receipt.rollback_token or receipt.vendor_ref
+        if not tok:
+            return None
+        addrs = self._read(receipt.action_type)
+        if addrs is None:
+            return None
+        cidr = _cidr(_network(tok.removeprefix(KEEP)))
+        return cidr in {_cidr(_network(a)) for a in addrs}
+
     @staticmethod
     def _format(net) -> str:
         return _cidr(net)
@@ -463,6 +477,11 @@ class AwsWafConnector(_MembershipConnector):
                 logger.info("[aws-waf] %s transient failure (%s); retrying", op, str(e)[:80])
                 self._sleep(0.5 * (2 ** n))
         raise ConnectorError(f"AWS {op} failed")  # pragma: no cover — loop always returns or raises
+
+    def _read(self, action_type: str) -> list[str] | None:
+        if action_type not in self.ip_sets:
+            return None
+        return self._get(action_type)[0]
 
     def _get(self, action_type: str) -> tuple[list[str], str, str]:
         name, set_id = self.ip_sets[action_type]
