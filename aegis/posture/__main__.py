@@ -9,7 +9,8 @@
     python -m aegis.posture run  --config posture.yaml [--store DIR] [--loop] [--fail-on SEV] [--fail-on-overdue]
     python -m aegis.posture export-aws --out F [--region R]     # run by the bank, with its own read-only creds
 
-Exit codes: 0 ok, 1 a finding at or above ``--fail-on``, 2 bad or missing input. The same command
+Exit codes: 0 ok, 1 a finding at or above ``--fail-on``, 2 bad or missing input (and, for ``run`` with a
+gate, any scan that failed: a gate does not pass on scans that did not run). The same command
 works as a scheduled report and as a pipeline gate.
 """
 
@@ -183,7 +184,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"report: {cfg.store / 'runs' / (r['run_id'] + '.md')}")
             limit = SEVERITY_ORDER.index(args.fail_on) if args.fail_on else -1
             failing = any(SEVERITY_ORDER.index(o["severity"]) <= limit for o in r["open"]) or (args.fail_on_overdue and c["overdue"])
-            return 1 if failing else 0
+            if failing:
+                return 1
+            # a gate cannot pass on scans that did not run: every scan failing used to exit 0 (review C4)
+            errored = [sc["name"] for sc in r["scans"] if sc.get("status") != "ok"]
+            if errored and (args.fail_on or args.fail_on_overdue):
+                print(f"gate: {len(errored)} scan(s) failed ({', '.join(errored[:5])}) — cannot pass", file=sys.stderr)
+                return 2
+            return 0
         if args.scan == "export-azure":
             bundle = sources.collect_azure(args.subscription, require_flag=False)
             Path(args.out).write_text(json.dumps(bundle, indent=1, default=str), encoding="utf-8")

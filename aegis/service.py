@@ -821,6 +821,15 @@ def main(argv: list[str] | None = None) -> int:
     return Service(pipeline, interval=args.interval, max_alerts=args.max_alerts).run(once=args.once)
 
 
+def _why_degraded(h: dict) -> str:
+    d = h.get("degraded")
+    if isinstance(d, (list, tuple)) and d:
+        return ", ".join(map(str, d))[:200]
+    if isinstance(d, str) and d:
+        return d[:200]
+    return str(h.get("error") or ("degraded (details need the read token)" if d else "?"))
+
+
 def status_main(audit: str) -> int:
     """``--status``: one screen for the operator — receiver health (incl. audit + checkpoint state), the audit chain's
     tail, deferred backlog — without touching the running service's state."""
@@ -830,10 +839,20 @@ def status_main(audit: str) -> int:
     host, _, port = bind.rpartition(":")
     url = f"http://{'127.0.0.1' if host in ('', '0.0.0.0') else host}:{port or 8787}/healthz"
     ok = True
+    import urllib.error
     try:
         with urllib.request.urlopen(url, timeout=5) as r:  # noqa: S310 — loopback
             h = json.loads(r.read())
             code = r.status
+    except urllib.error.HTTPError as e:
+        # the service answered: a 503 means DEGRADED (its body says why), not "unreachable" (review C9)
+        code, ok = e.code, False
+        try:
+            h = json.loads(e.read() or b"{}")
+        except (ValueError, OSError):
+            h = {}
+        print(f"receiver   {url}: HTTP {code} — the service is up but reports "
+              f"{'DEGRADED' if code == 503 else 'an error'}: {_why_degraded(h)}")
     except Exception as e:  # noqa: BLE001
         print(f"receiver   {url}: unreachable ({str(e)[:80]}) — service down or AEGIS_INGEST_HTTP off")
         h, code, ok = {}, 0, False

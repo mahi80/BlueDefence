@@ -398,6 +398,7 @@ def cmd_sync(a, *, accepted=None) -> int:
     if accepted is None:
         accepted = _accepted_model_rules if getattr(a, "dashboard", False) else (lambda d: _accepted_local(d, _hitl_dir(a)))
     runs = Path(a.runs).expanduser(); st = State.load(runs)
+    refused = 0
     for rule in accepted(a.dry_run):
         change = rule.get("change") or {}
         run = change.get("run")
@@ -408,13 +409,16 @@ def cmd_sync(a, *, accepted=None) -> int:
         # that was proposed: a rule naming a failed run (or one whose adapter changed since) is refused
         if info.get("stage") not in ("shadowed", "proposed"):
             print(f"  refused {run}: stage {info.get('stage')!r} — only a gated + shadowed run can be promoted")
+            refused += 1
             continue
         if change.get("sha256") and info.get("sha256") and change["sha256"] != info["sha256"]:
             print(f"  refused {run}: adapter digest changed since it was proposed")
+            refused += 1
             continue
         ok, why = verify_adapter(info.get("adapter") or "", info.get("sha256"))
         if not ok:                       # the files on disk must still be the ones that were gated and proposed
             print(f"  refused {run}: {why}")
+            refused += 1
             continue
         if st.current and st.current.get("run") == run:
             continue
@@ -424,7 +428,9 @@ def cmd_sync(a, *, accepted=None) -> int:
     st.save()
     if st.current:
         print(f"  current: {st.current['run']} → AEGIS_MODEL={st.current['adapter']}")
-    return 0
+    # an accepted promotion that was refused is a failure the operator must see: cron reported success while
+    # nothing was promoted (review C10)
+    return 1 if refused else 0
 
 
 def cmd_promote(a) -> int:
