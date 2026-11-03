@@ -171,6 +171,7 @@ class SpillQueue:
         self.primary, self.fallback = primary, fallback
         self._popped: DeferredQueue | None = None
         self.path = primary.path
+        self._warned = False
 
     @property
     def dropped(self) -> int:
@@ -183,7 +184,10 @@ class SpillQueue:
         if self.fallback is None:
             return False
         ok = self.fallback.push(alert, reason)
-        if ok and self.fallback.pending() == 1:
+        if ok and not self._warned:
+            # once, not by counting the fallback's lines on every push — that re-read the whole file each time
+            # (quadratic under the very disk-full storm it exists for; review round 3 G4-10)
+            self._warned = True
             logger.error("[deferred] primary spill %s refused a row — spilling to %s", self.primary.path, self.fallback.path)
         return ok
 
@@ -207,15 +211,40 @@ class SpillQueue:
             self._popped = None
 
 
+def _private_state_dir() -> Path:
+    """A directory only this user can write, that survives a service restart: systemd's ``$STATE_DIRECTORY``, else
+    ``$XDG_STATE_HOME/aegis``, else ``~/.local/state/aegis``. The fallback used to sit at a predictable name in the
+    shared temp dir — another local user could pre-create it as a symlink or inject rows into it, and
+    ``PrivateTmp`` wiped it on every restart (review round 3 G4-9)."""
+    base = (os.environ.get("STATE_DIRECTORY", "").split(":")[0].strip()
+            or os.path.join(os.environ.get("XDG_STATE_HOME", "") or os.path.join(os.path.expanduser("~"), ".local", "state"), "aegis"))
+    d = Path(base)
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if d.is_symlink() or (hasattr(os, "getuid") and d.stat().st_uid != os.getuid()):
+        raise OSError(f"{d} is not a private directory of this user")
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
 def default_spill(audit_path: Path | str) -> SpillQueue:
-    """``AEGIS_DEFERRED_PATH`` (default: beside the audit log) with ``AEGIS_DEFERRED_FALLBACK`` (default: the
-    system temp dir) behind it. Set the fallback to ``off`` to disable it."""
-    import tempfile
+    """``AEGIS_DEFERRED_PATH`` (default: beside the audit log) with ``AEGIS_DEFERRED_FALLBACK`` (default: a private
+    state directory, see :func:`_private_state_dir`) behind it. Set the fallback to ``off`` to disable it."""
     primary = os.environ.get("AEGIS_DEFERRED_PATH", "").strip() or str(Path(audit_path).parent / "deferred.jsonl")
     fb = os.environ.get("AEGIS_DEFERRED_FALLBACK", "").strip()
     if fb.lower() in ("off", "0", "none"):
         return SpillQueue(DeferredQueue(primary))
-    fb = fb or str(Path(tempfile.gettempdir()) / f"aegis-deferred-{os.getuid() if hasattr(os, 'getuid') else 0}.jsonl")
+    if not fb:
+        try:
+            fb = str(_private_state_dir() / "deferred-fallback.jsonl")
+        except OSError as e:
+            logger.warning("[deferred] no private state directory for the fallback spill (%s) — primary only", e)
+            return SpillQueue(DeferredQueue(primary))
+    if Path(fb).is_symlink():
+        logger.warning("[deferred] fallback spill %s is a symlink — refusing it, primary only", fb)
+        return SpillQueue(DeferredQueue(primary))
     if Path(fb).resolve() == Path(primary).resolve():
         return SpillQueue(DeferredQueue(primary))
     try:

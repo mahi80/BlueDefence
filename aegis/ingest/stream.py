@@ -361,11 +361,21 @@ def gunzip_bounded(body: bytes, limit: Optional[int] = None) -> bytes:
             limit = int(_os.environ.get("AEGIS_INGEST_MAX_INFLATE_MB", "")) * 1024 * 1024
         except ValueError:
             limit = MAX_INFLATE
-    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    out = d.decompress(body, limit + 1)
-    if len(out) > limit or d.unconsumed_tail:
-        raise InflateTooLarge(f"decompressed body over {limit} bytes")
-    return out
+    # every member of a multi-member gzip (`cat a.gz b.gz`, what log shippers append): only the first was read
+    # and the rest silently dropped (review round 3 G4-5)
+    out = bytearray()
+    rest = body
+    while rest:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        out += d.decompress(rest, limit + 1 - len(out))
+        if len(out) > limit or d.unconsumed_tail:
+            raise InflateTooLarge(f"decompressed body over {limit} bytes")
+        if not d.eof:
+            raise ValueError("truncated gzip member")
+        rest = d.unused_data
+        if rest[:2] != b"\x1f\x8b":
+            break                                         # trailing padding / garbage after the last member
+    return bytes(out)
 
 
 def lines_from_body(body: bytes) -> list[str]:

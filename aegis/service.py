@@ -298,7 +298,9 @@ class CycleStats:
     lost: int = 0          # alerts that could be neither handled nor parked
     source_errors: list[str] = field(default_factory=list)
     redelivered: int = 0
+    refed: int = 0                      # alerts in this pass that were deferred earlier (already metered)
     seconds: float = 0.0
+    handle_seconds: float = 0.0         # time inside orch.handle — the model-bound work storm mode protects
     investigations: int = 0
     containment_checks: int = 0
     verdicts: dict[str, int] = field(default_factory=dict)
@@ -345,23 +347,35 @@ def _stream_alerts(p: Pipeline) -> Iterator[dict]:
 
 
 _last_drift_check = 0.0
+_drift_thread: threading.Thread | None = None
 
 
 def _drift_check(p: Any) -> None:
     """Every AEGIS_VERIFY_EVERY_S (default 300 s; 0 = off) read active enforcement back at the vendors: an
-    action released or removed outside AEGIS is marked drifted instead of being reported as still in force."""
-    global _last_drift_check
+    action released or removed outside AEGIS is marked drifted instead of being reported as still in force.
+
+    The read-backs run on a background thread, one pass at a time. They ran on the service thread — with HTTP
+    retries, about 84 s per unreachable vendor rule — so a few hundred receipts stalled ingest past systemd's
+    watchdog (review round 3 G3-4)."""
+    global _last_drift_check, _drift_thread
     every = float(os.environ.get("AEGIS_VERIFY_EVERY_S", "300") or 0)
     if every <= 0 or time.time() - _last_drift_check < every:
         return
+    if _drift_thread is not None and _drift_thread.is_alive():
+        return                                           # the previous pass is still reading; skip, don't stack
     _last_drift_check = time.time()
-    try:
-        drifted = p.response.check_drift()
-        if drifted:
-            logger.error("[service] %d action(s) no longer in force at the vendor: %s", len(drifted),
-                         ", ".join(f"{r.action_type} {r.target} ({r.connector})" for r in drifted[:10]))
-    except Exception as e:  # noqa: BLE001 — a read-back failure must not stop the cycle
-        logger.warning("[service] vendor drift check failed: %s", str(e)[:200])
+
+    def run() -> None:
+        try:
+            drifted = p.response.check_drift()
+            if drifted:
+                logger.error("[service] %d action(s) no longer in force at the vendor: %s", len(drifted),
+                             ", ".join(f"{r.action_type} {r.target} ({r.connector})" for r in drifted[:10]))
+        except Exception as e:  # noqa: BLE001 — a read-back failure must not stop the service
+            logger.warning("[service] vendor drift check failed: %s", str(e)[:200])
+
+    _drift_thread = threading.Thread(target=run, name="aegis-drift-check", daemon=True)
+    _drift_thread.start()
 
 
 def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: int = 0,
@@ -396,13 +410,17 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
             # on IPs the sender chose (review round 3 G1-9). The swarm re-derives them from its own history.
             alert = {k: v for k, v in alert.items() if k not in _FORGEABLE}
         stats.alerts += 1
+        if alert.get("deferred_at") or alert.get("audit_deferred"):
+            stats.refed += 1                                 # metered when it first arrived, not again (G4-8)
         sdnotify.watchdog()
         if storm is not None and storm.active and not alert.get("deferred_at") and not p.orch.is_fast_path(alert):
             if storm.queue.push(alert):
                 stats.deferred += 1
                 continue
         try:
+            h0 = time.time()
             chain = p.orch.handle(alert)
+            stats.handle_seconds += time.time() - h0
             summary = p.response.execute(chain, alert)
         except AuditWriteError as e:
             # the evidence could not be written, so nothing was executed for this alert (fail closed). The consumer
@@ -516,7 +534,7 @@ def _meter_license(p: Pipeline, stats: CycleStats) -> None:
             devices = len(getattr(net_det, "_adj", {}) or {})
     except Exception:  # noqa: BLE001
         devices = None
-    over = meter.observe(max(0, stats.alerts - stats.streamed) + delta, time.time(), devices)
+    over = meter.observe(max(0, stats.alerts - stats.streamed - stats.refed) + delta, time.time(), devices)
     if over and state.status == "valid":
         new = licensing.check(over_limit=True)
         if new.status == "over_limit":
@@ -555,7 +573,11 @@ class StormControl:
 
     def update(self, last: "CycleStats | None") -> bool:
         occ = self.occupancy()
-        big = last is not None and (last.alerts >= self.alerts or last.seconds >= self.cycle_s)
+        # time spent analysing alerts, not the whole cycle: a slow dashboard (HITL sync, persistence flush)
+        # lengthened every cycle and kept storm mode on forever with no alert load at all (review round 3 G4-7)
+        busy = getattr(last, "handle_seconds", None) if last is not None else None
+        busy = last.seconds if busy is None and last is not None else busy
+        big = last is not None and (last.alerts >= self.alerts or (busy or 0.0) >= self.cycle_s)
         if not self.active and (occ >= self.pct or big):
             self.active, self.since = True, time.time()
             logger.warning("[service] STORM MODE on: queue %.0f%% full, last cycle %s alerts in %.1fs — model-bound alerts are deferred to %s, "

@@ -238,7 +238,9 @@ def _aws(obj: dict) -> Optional[tuple[dict, Any]]:
         "ja3": obj.get("ja3Fingerprint") or req.get("ja3Fingerprint"),
         "header_order": [str(h.get("name", "")) for h in req.get("headers") or [] if isinstance(h, dict)] or None,
     }
-    return {k: v for k, v in alert.items() if v not in (None, "")}, req.get("requestId") or obj.get("timestamp")
+    # no requestId: no vendor id at all. The millisecond timestamp it fell back to is shared by every request in
+    # that millisecond, and the content hash below tells them apart (review round 3 G4-4)
+    return {k: v for k, v in alert.items() if v not in (None, "")}, req.get("requestId")
 
 
 def _azure(obj: dict) -> Optional[tuple[dict, Any]]:
@@ -377,9 +379,15 @@ class WafConsumer(BaseConsumer):
     @staticmethod
     def _make_id(alert: dict, vendor_id: Any) -> str:
         if vendor_id:
-            return f"WAF-{str(vendor_id)[:48]}"
+            vid = str(vendor_id)
+            if len(vid) <= 48:
+                return f"WAF-{vid}"
+            # cutting at 48 merged two ids that share a long prefix (round 3 G4-4); keep a prefix and a hash of all
+            import hashlib
+            return f"WAF-{vid[:40]}-{hashlib.sha256(vid.encode()).hexdigest()[:12]}"
         import hashlib
-        seed = "|".join(str(alert.get(k, "")) for k in ("source", "source_ip", "url", "timestamp", "signature", "payload"))
+        seed = "|".join(str(alert.get(k, "")) for k in ("source", "source_ip", "url", "timestamp", "signature", "payload",
+                                                       "http_method", "user_agent", "matched_data", "action"))
         return "WAF-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
 
     @staticmethod

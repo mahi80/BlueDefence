@@ -155,7 +155,7 @@ def test_alerts_passthrough_requires_ids(server):
     status, _ = _post(f"{srv.url}/ingest/alerts", b'{"noid": true}')
     assert status == 415
     (a,) = list(StreamConsumer(queue=q, checkpoint=AlertCheckpoint()).iter_alerts())
-    assert a["id"] == "A-1" and a["source"] == "harness" and a["received_at"] > 0
+    assert a["id"] == "push:A-1" and a["source"] == "harness" and a["received_at"] > 0
 
 
 def test_auth_size_and_backpressure(server):

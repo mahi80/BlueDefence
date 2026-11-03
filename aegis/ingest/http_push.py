@@ -94,6 +94,10 @@ class _AuthFailLimiter:
             return True
 
 
+#: keys only AEGIS itself sets on an alert; a pushed alert carrying one is stripped of it
+_INTERNAL_KEYS = ("deferred_at", "deferred_by", "audit_deferred", "campaign_context", "tls_client", "low_and_slow")
+
+
 class PushServer:
     """Threaded HTTP server feeding the shared ``StreamQueue``; ``start()`` returns at once."""
 
@@ -244,12 +248,15 @@ class PushServer:
             req_id = req_id or str(payload.get("requestId", ""))
             records = payload["records"]
             lines: list[str] = []
-            for rec in records:
+            total = 0                                        # running: re-summing every line per record was
+            for rec in records:                              # quadratic — 20k records took 9 s (round 3 G4-2)
                 data = base64.b64decode(rec["data"])
                 if data[:2] == b"\x1f\x8b":
                     data = gunzip_bounded(data)
-                lines.extend(lines_from_body(data))
-                if sum(len(x) for x in lines) > self.max_bytes * 4:
+                got = lines_from_body(data)
+                lines.extend(got)
+                total += sum(len(x) for x in got)
+                if total > self.max_bytes * 4:
                     raise InflateTooLarge("records expand past the receiver's inflate budget")
         except InflateTooLarge as e:
             return 413, {"requestId": req_id, "timestamp": now_ms, "errorMessage": str(e)[:120]}
@@ -276,6 +283,13 @@ class PushServer:
                 bad += 1
                 continue
             if isinstance(obj, dict) and obj.get("id"):
+                # The sender picks the id, and every source shared one dedupe namespace: a pushed alert with a real
+                # alert's id suppressed the real one. Pushed ids live in their own namespace, and AEGIS's internal
+                # keys (deferred_at skips storm deferral, …) are never taken from a feed (review round 3 G4-3).
+                obj["id"] = f"push:{str(obj['id'])[:200]}" if not str(obj["id"]).startswith("push:") else str(obj["id"])[:205]
+                for k in _INTERNAL_KEYS:
+                    obj.pop(k, None)
+                ln = json.dumps(obj, separators=(",", ":"))
                 if obj.get("alert_type") == "network_fault" and isinstance(obj.get("netops"), dict):
                     # a pre-correlated network fault would skip the LLM and go straight to config_rollback / revoke_sessions
                     # proposals; faults are derived here from raw syslog/telemetry (/ingest/netops), never accepted ready-made
@@ -398,6 +412,26 @@ class _Handler(BaseHTTPRequestHandler):
             logger.warning("[ingest:http] unauthorized %s %s from %s", self.command, path, ip)
         self._refuse(401, body or {"error": "unauthorized"})
 
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        # unknown methods (PUT, DELETE …) and malformed request lines: the body was never read, so the connection
+        # must not be reused (review round 3 G4-1)
+        self.close_connection = True
+        super().send_error(code, message, explain)
+
+    def _framing_refused(self) -> bool:
+        """Request framing a proxy and this server could read differently — the request-smuggling shapes
+        (review round 3 G4-1): Content-Length together with Transfer-Encoding, or Content-Length given twice
+        with different values. Refused, connection closed. A GET that carries a body is answered and the
+        connection closed, since that body is never read."""
+        cls = self.headers.get_all("Content-Length") or []
+        te = self.headers.get_all("Transfer-Encoding") or []
+        if (cls and te) or len({c.strip() for c in cls}) > 1 or len(te) > 1:
+            self._refuse(400, {"error": "ambiguous request framing (Content-Length with Transfer-Encoding, or two lengths)"})
+            return True
+        if self.command != "POST" and (te or any(c.strip() not in ("", "0") for c in cls)):
+            self.close_connection = True
+        return False
+
     def _refuse(self, status: int, body: dict) -> None:
         """Reply without reading the body and drop the connection — leftover bytes must not be parsed as the next request."""
         self.close_connection = True
@@ -453,6 +487,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return None
 
     def do_GET(self) -> None:  # noqa: N802 — stdlib naming
+        if self._framing_refused():
+            return
         try:
             self._get()
         except Exception as e:  # noqa: BLE001 — a bad row in a file must answer 500, not a dropped socket + stderr traceback
@@ -541,6 +577,8 @@ class _Handler(BaseHTTPRequestHandler):
         srv = self.server_ref
         parts = urlsplit(self.path)
         path = parts.path
+        if self._framing_refused():
+            return
         if path.startswith("/api/"):
             if not srv.console_authorized(self.headers):
                 if srv.holds_other_token(self.headers):
@@ -566,7 +604,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(status, out)
             return
         if not path.startswith("/ingest/"):
-            self._reply(404, {"error": "not found"})
+            self._refuse(404, {"error": "not found"})          # body unread: close, never parse it as a request
             return
         if not srv.authorized(self.headers):
             self._unauthorized(path, {"error": "unauthorized", "requestId": self.headers.get("X-Amz-Firehose-Request-Id", ""),

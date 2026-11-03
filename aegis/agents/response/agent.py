@@ -371,6 +371,13 @@ class ResponseAgent:
             return done
         v = verify(r)
         if v is False:
+            # one more look after a short wait: vendors propagate a new rule with a lag, and dropping one that is
+            # there orphaned it and re-applied it next time (review round 3 G3-1)
+            wait = max(0.0, min(10.0, float(os.environ.get("AEGIS_VERIFY_RETRY_S", "2") or 0)))
+            if wait:
+                time.sleep(wait)
+                v = verify(r)
+        if v is False:
             self._connectors.forget(r, "applied, but the vendor read-back does not show it")
             return ExecutedAction(action=action, status="queued_for_hitl", receipt=r, reason="connector_failed",
                                   note=f"{done.note} — NOT in place at {r.connector} on read-back; human needed")
