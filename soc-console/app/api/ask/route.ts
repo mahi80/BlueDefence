@@ -7,7 +7,7 @@ import { NextResponse } from "next/server";
 import { getChain } from "../../../lib/api";
 import { answerLocally } from "../../../lib/ask";
 import { getSession } from "../../../lib/auth";
-import { sameOrigin } from "../../../lib/origin";
+import { askUpstream, sameOrigin } from "../../../lib/origin";
 import type { Chain } from "../../../lib/types";
 
 export const runtime = "nodejs";
@@ -35,14 +35,13 @@ export async function POST(req: Request) {
     }
   }
 
-  const upstream = process.env.AEGIS_ASK_URL?.trim();
+  // AEGIS_ASK_KEY only — the console's backend key (AEGIS_API_KEY) can approve actions and never leaves for Q
+  const upstream = askUpstream();
   if (upstream) {
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (process.env.AEGIS_API_KEY) headers["X-API-Key"] = process.env.AEGIS_API_KEY;
-      const r = await fetch(upstream, {
+      const r = await fetch(upstream.url, {
         method: "POST",
-        headers,
+        headers: upstream.headers,
         body: JSON.stringify({ question, alert_id: chain?.alert_id, chain_id: chain?.chain_id, context: chain }),
         signal: AbortSignal.timeout(20000),
       });

@@ -444,6 +444,15 @@ def _rid() -> str:
     return f"rcpt_{uuid.uuid4().hex[:12]}"
 
 
+def _nothing_to_enforce(action_type: str) -> bool:
+    """allow / monitor change nothing at any vendor: recording them IS doing them. In live mode they used to come
+    back ``unsupported`` from the fallback and every benign verdict filed an approval card (review round 4 R4-10).
+    Hand-offs (escalate) are not in this set: they still reach a person."""
+    from ..contracts import Impact, contract
+    c = contract(str(action_type))
+    return c is not None and c.impact == Impact.READ_ONLY and not c.hand_off
+
+
 class LoggingConnector(Connector):
     """Default connector: records the action, touches nothing. This is the
     walking-skeleton ``[mock]`` behaviour, now expressed as a receipt so it
@@ -460,7 +469,7 @@ class LoggingConnector(Connector):
         # As the registry's fallback in LIVE mode, "applied" here meant "enforced" to everyone downstream while
         # no vendor was called at all (review round 3 G3-3). Live mode with no connector for the action is
         # "unsupported": it parks for a human. Shadow and log-only labs keep the walking-skeleton receipt.
-        if self.fallback and enforcement_mode() == MODE_LIVE:
+        if self.fallback and enforcement_mode() == MODE_LIVE and not _nothing_to_enforce(action.action_type):
             return self._record(Receipt(
                 receipt_id=_rid(), connector=self.name, action_type=str(action.action_type), target=str(action.target),
                 idempotency_key=self.idempotency_key(action), status=STATUS_UNSUPPORTED, dry_run=False,

@@ -1,5 +1,6 @@
 import { cookies } from "next/headers";
 import crypto from "node:crypto";
+import { checkLocalSession, claimsCurrent, type SessionClaims } from "./session";
 
 // Roles mirror the dashboard's model. The BACKEND is the enforcement point for
 // every high-impact action (isolate/block/revoke, model promotion) and audits
@@ -35,14 +36,19 @@ export function canDecide(role: Role): boolean {
   return role === "admin" || role === "cio" || role === "ciso" || role === "bu_head";
 }
 
+function epoch(): string {
+  return process.env.AEGIS_SESSION_EPOCH || "";
+}
+
 export function signSession(s: Session): string {
-  const payload = JSON.stringify({ u: s.user, r: s.role, exp: Math.floor(Date.now() / 1000) + SESSION_TTL });
+  const payload = JSON.stringify({ u: s.user, r: s.role, m: authMode(), e: epoch(),
+                                   exp: Math.floor(Date.now() / 1000) + SESSION_TTL });
   const body = Buffer.from(payload).toString("base64url");
   const sig = crypto.createHmac("sha256", secret()).update(body).digest("base64url");
   return `${body}.${sig}`;
 }
 
-function verify(token: string): Session | null {
+function verify(token: string): SessionClaims | null {
   const dot = token.indexOf(".");
   if (dot < 0) return null;
   const body = token.slice(0, dot);
@@ -55,7 +61,8 @@ function verify(token: string): Session | null {
     const p = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
     if (typeof p.exp !== "number" || p.exp < Math.floor(Date.now() / 1000)) return null;
     const role = ROLES.includes(p.r) ? (p.r as Role) : "analyst";
-    return { user: String(p.u || "user"), role };
+    return { user: String(p.u || "user"), role, mode: typeof p.m === "string" ? p.m : undefined,
+             epoch: typeof p.e === "string" ? p.e : undefined };
   } catch {
     return null;
   }
@@ -65,18 +72,14 @@ export async function getSession(): Promise<Session | null> {
   const c = (await cookies()).get(SESSION_COOKIE);
   const s = c ? verify(c.value) : null;
   if (!s) return null;
+  if (!claimsCurrent(s, authMode(), epoch())) return null;
   // Local mode: the session is only as good as the account behind it — a disabled user or a changed role
-  // takes effect on the next request, not at the next login 8 hours later.
+  // takes effect on the next request, not at the next login 8 hours later; an unreadable users file is nobody.
   if (authMode() === "local") {
-    const { loadUsers } = await import("./users");
-    const users = loadUsers();
-    if (users) {
-      const rec = Object.hasOwn(users.users, s.user) ? users.users[s.user] : undefined;
-      if (!rec || rec.disabled) return null;
-      if (rec.role !== s.role) return { user: s.user, role: ROLES.includes(rec.role) ? rec.role : "analyst" };
-    }
+    const { loadUsers, usersFileState, demoAccount, validRole } = await import("./users");
+    return checkLocalSession(s, usersFileState(), loadUsers(), demoAccount(), validRole);
   }
-  return s;
+  return { user: s.user, role: s.role };
 }
 
 // OIDC group → role mapping for production SSO (Entra ID / SAML groups).

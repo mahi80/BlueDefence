@@ -128,6 +128,20 @@ def _target_matches(target: str, patterns: list[str]) -> bool:
     return False
 
 
+def _hitl_max_age_s() -> float | None:
+    """``AEGIS_HITL_MAX_AGE_S`` (default 7 days; ``0``/``off`` = never): a pending approval older than this is
+    settled ``expired`` (never executed). Pending approvals used to live and be polled forever (review round 4
+    R4-13)."""
+    raw = os.environ.get("AEGIS_HITL_MAX_AGE_S", "604800").strip().lower()
+    if raw in ("", "0", "off", "none", "never"):
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        return 604800.0
+    return v if v > 0 and v == v else None
+
+
 class ResponseAgent:
     name = "response"
 
@@ -276,6 +290,7 @@ class ResponseAgent:
         if self._hitl is None:
             return []
         kwargs.setdefault("timeout_policy", self._hitl_timeout)
+        kwargs.setdefault("max_age_sec", _hitl_max_age_s())
         return self._hitl.sync(self, **kwargs)
 
     # ---- decision logic ------------------------------------------------

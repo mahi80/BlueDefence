@@ -114,14 +114,16 @@ class FileHITL(BaseHITL):
         if not rows:
             return None
         d = rows.pop(0)                                  # one decision per poll, in the order they were made
+        from .base import action_text
         from .signing import enabled
-        want = f"{p.action.action_type} -> {p.action.target}"
+        want = action_text(p.action.action_type, p.action.target)
         if d.get("action") is not None and str(d["action"]) != want or (enabled() and d.get("action") is None):
             # the signature binds the decision to the action it approved; a journal edited to point the card at
-            # another target no longer inherits the analyst's approval
+            # another target no longer inherits the analyst's approval. Somebody DID decide something, though:
+            # "contested" holds the card from the timeout instead of reading as "nobody decided" (R4-2).
             logger.error("[hitl:file] decision for %s ignored: it approves %r, the card is %r", p.approval_id,
-                         d.get("action"), want)
-            return None
+                         str(d.get("action"))[:300], want[:300])
+            return "contested", str(d.get("decided_by") or "file"), "decision names a different action"
         status = str(d.get("status", "")).lower()
         if status not in ("approved", "rejected"):
             logger.warning("[hitl:file] decision for %s has unknown status %r; ignored", p.approval_id, status); return None

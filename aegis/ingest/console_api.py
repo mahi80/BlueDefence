@@ -165,6 +165,8 @@ class ConsoleAPI:
         self.audit_path = Path(audit_path) if audit_path else None
         self.hitl_dir = Path(hitl_dir) if hitl_dir else None
         self.index = index                      # aegis.store.IndexStore when configured: SQL instead of a file scan
+        self._full_action: dict[str, str] = {}
+        self._open_ids: set[str] = set()
 
     # ---------- chains ----------
     # The audit file is parsed once and then only the appended delta: a console polling every few seconds
@@ -278,6 +280,8 @@ class ConsoleAPI:
             elif card.get("kind") == "approval":
                 cards.append(card)
         rows: list[dict] = []
+        full_action: dict[str, str] = {}
+        open_ids: set[str] = set()
         for card in cards:
             args = card.get("args") or {}
             cid = str(card.get("id"))
@@ -292,6 +296,9 @@ class ConsoleAPI:
                 d = {"status": "awaiting_second", "decided_by": awaiting[cid], "reason": "a second, different approver is required",
                      "ts": (d or {}).get("ts")}
             status = str(d.get("status", "")).lower() if d else "pending"
+            full_action[cid] = str(card.get("action") or "")
+            if not st:
+                open_ids.add(cid)
             rows.append({
                 "id": cid,
                 "status": status if status in _CARD_STATUSES else "pending",
@@ -307,6 +314,9 @@ class ConsoleAPI:
                 "rationale": str(d.get("reason") or "")[:500] if d else None,
             })
         rows.reverse()
+        # not part of the JSON the console renders: what a decision must bind to, and which cards the service has
+        # not settled yet (an approval still retrying can still be rejected)
+        self._full_action, self._open_ids = full_action, open_ids
         return {"approvals": rows}
 
     _decide_lock = threading.Lock()
@@ -332,11 +342,14 @@ class ConsoleAPI:
             from ..hitl.signing import same_person
             if same_person(decided_by[:120] or "console", cur.get("decided_by") or ""):
                 return 409, {"error": "a second, different approver is required"}
+        elif cur["status"] == "approved" and status == "rejected" and approval_id in self._open_ids:
+            pass        # approved but not run yet (rate cap, vendor error): a rejection still lands (R4-7)
         elif cur["status"] != "pending":
             return 409, {"error": f"already {cur['status']}"}
+        # bind to the card's full `type -> target`, never the 256-char display cut (R4-2)
+        action = self._full_action.get(approval_id) or f"{cur.get('action_type')} -> {cur.get('target')}"
         row = {"approval_id": approval_id, "status": status, "decided_by": decided_by[:120] or "console",
-               "reason": reason[:500], "ts": time.time(), "via": "console",
-               "action": f"{cur.get('action_type')} -> {cur.get('target')}"}
+               "reason": reason[:500], "ts": time.time(), "via": "console", "action": action}
         if corrected_verdict in _VERDICTS:
             row["corrected_verdict"] = corrected_verdict
         from ..hitl.signing import sign

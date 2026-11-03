@@ -129,7 +129,10 @@ class DashboardHITL(BaseHITL):
             return "approved", str(data.get("decided_by") or "dashboard"), ""
         if st == "rejected":
             return "rejected", str(data.get("decided_by") or "dashboard"), str(data.get("reject_reason") or "")
-        if st not in ("", "pending", "pending_hitl", "awaiting", "expired"):
+        if st == "expired":
+            # closed to humans at the dashboard: settle it, never poll it forever or time it out (review round 4 R4-12)
+            return "expired", str(data.get("decided_by") or ""), "expired at the dashboard"
+        if st not in ("", "pending", "pending_hitl", "awaiting"):
             raise RuntimeError(f"dashboard status for {p.approval_id} is {st!r}, which this transport does not know")
         return None
 
