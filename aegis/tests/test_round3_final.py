@@ -148,7 +148,8 @@ def test_swarm_looks_up_only_public_addresses(ip, public):
 def test_edr_records_become_host_alerts():
     from aegis.agents.edr.normalize import to_alert
     a = to_alert({"name": "pack_aegis-host_exec_lolbin_events", "hostIdentifier": "srv-2",
-                  "columns": {"parent": "412", "parent_name": "w3wp.exe", "path": "/bin/sh", "cmdline": "sh -c id"}})
+                  "columns": {"parent": "412", "parent_name": "w3wp.exe", "path": "C:\\Windows\\System32\\cmd.exe",
+                              "cmdline": "cmd /c whoami"}})       # a row a scorer fires on (round 4 S4-8 pre-filter)
     assert a["parent_process"] == "w3wp.exe" and a["parent_pid"] == "412" and a["id"].startswith("edr-")
     assert to_alert({"unrelated": 1}) is None
 
@@ -212,4 +213,4 @@ def test_edge_sender_is_one_bounded_thread():
     s._thread = types.SimpleNamespace(is_alive=lambda: True)          # keep it from sending in the test
     for i in range(10):
         s.submit("http://127.0.0.1:9/x", b"{}", {})
-    assert len(s._q) == 3 and s.dropped == 7
+    assert len(s._hi) + len(s._lo) == 3 and s.dropped == 7

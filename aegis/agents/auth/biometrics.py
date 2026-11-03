@@ -53,7 +53,10 @@ _BIOMETRIC_BASELINES = {
 
 
 def _z_distance(observed: float, baseline: float, *, scale: float) -> float:
-    """Normalized distance — how many `scale` units away from baseline."""
+    """Normalized distance — how many `scale` units away from baseline. Non-finite telemetry (NaN, inf) is the
+    farthest a signal can be, not a value that makes the composite NaN and the drift "low" (round 4 S4-16)."""
+    if not math.isfinite(observed):
+        return 1.0
     if baseline == 0:
         return 0.0
     return abs(observed - baseline) / scale

@@ -75,7 +75,8 @@ _SENSITIVE_RX = {
     "aadhaar":          re.compile(r"\b[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}\b"),
     # PAN: lower-case and the 4th-letter holder types; the old pattern needed upper case
     "pan_in":           re.compile(r"\b[A-Za-z]{3}[ABCFGHLJPTKEabcfghljptke][A-Za-z][0-9]{4}[A-Za-z]\b"),
-    "credit_card":      re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
+    # digit boundaries, not word boundaries: `card_4111…` / `x4111…y` hid the number; dots separate too
+    "credit_card":      re.compile(r"(?<!\d)\d(?:[ .-]?\d){12,18}(?!\d)"),
     "ifsc":             re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b"),
     "account_number":   re.compile(r"\b(?:ACC|ACCT)[-_]?\d{8,12}\b"),
     "swift_bic":        re.compile(r"\b[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b"),
@@ -83,6 +84,9 @@ _SENSITIVE_RX = {
     "aws_key":          re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     "github_token":     re.compile(r"\bghp_[A-Za-z0-9]{36}\b"),
 }
+
+
+_AADHAAR_CONTEXT = re.compile(r"(?i)(?<![a-z])(?:aadhaa?r|uidai|uid(?=[_ ]?(?:no|num)))(?![a-z])")
 
 
 def _luhn(num: str) -> bool:
@@ -129,6 +133,14 @@ def sensitive_data_pattern_check(payload: str | None,
             matches = [m for m in matches if _luhn(m)]
         elif kind == "aadhaar":
             matches = [m for m in matches if _verhoeff(m)]
+            # A 12-digit UPI RRN passes the Verhoeff check one time in ten: a run of bare 12 digits is an Aadhaar
+            # number only where the text names Aadhaar; the written "dddd dddd dddd" form counts on its own
+            # (a 600-row UPI settlement report scored high; round 4 S4-13)
+            if not _AADHAAR_CONTEXT.search(payload):
+                bare = [m for m in matches if m.isdigit()]
+                if bare:
+                    findings["aadhaar_unlabelled"] = len(bare)
+                matches = [m for m in matches if not m.isdigit()]
         if matches:
             findings[kind] = len(matches)
     if not findings:
@@ -137,7 +149,8 @@ def sensitive_data_pattern_check(payload: str | None,
         }, weight="low")
     crit_kinds = {"private_key", "aws_key", "github_token"}
     critical_hit = any(k in findings for k in crit_kinds)
-    pii_count = sum(findings.get(k, 0) for k in ("aadhaar", "pan_in", "credit_card", "ifsc", "account_number"))
+    # IFSC is a public branch code (every NEFT payroll row carries one): reported, never counted as PII (S4-13)
+    pii_count = sum(findings.get(k, 0) for k in ("aadhaar", "pan_in", "credit_card", "account_number"))
     if critical_hit:
         weight = "high"
     elif pii_count >= 50:
@@ -162,10 +175,13 @@ def external_recipient_check(recipients: list[str] | None,
     if not recipients:
         return ToolResult(name="external_recipient", data={"verdict": "no_recipients"}, weight="low")
     external = []
+    from email.utils import parseaddr
     for r in recipients:
-        if "@" not in r:
+        # "Alice <alice@bank.in>" is internal: the display form was split at the first "@" (round 4 S4-16)
+        addr = parseaddr(str(r))[1] or str(r)
+        if "@" not in addr:
             continue
-        domain = r.split("@", 1)[1].lower()
+        domain = addr.rsplit("@", 1)[1].lower().strip().rstrip(">.")
         if not any(domain == d or domain.endswith("." + d) for d in _INTERNAL_DOMAINS):
             external.append(r)
     if not external:
@@ -264,8 +280,9 @@ def run_all_tools(alert: dict) -> list[ToolResult]:
             alert.get("rows_returned"),
             alert.get("queries_per_session"),
         ), "bulk_read_check", ToolResult),
+        # every text field, not only the first present one: a benign query used to hide the attachment's PII
         isolated(lambda: sensitive_data_pattern_check(
-            alert.get("payload") or alert.get("query") or alert.get("attachment_text"),
+            "\n".join(str(alert[k]) for k in ("payload", "query", "attachment_text") if alert.get(k)) or None,
             context=alert.get("source", "data"),
         ), "sensitive_data_pattern_check", ToolResult),
         isolated(lambda: external_recipient_check(

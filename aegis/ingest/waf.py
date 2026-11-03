@@ -408,9 +408,37 @@ class WafConsumer(BaseConsumer):
                 # padding the request past 4,000 characters pushed the attack out of what the specialists saw
                 # (review round 3 G7-10): keep 32 KB, and when cutting keep the head AND the tail
                 v = str(alert[k])
-                alert[k] = v if len(v) <= 32_000 else f"{v[:16_000]} …[{len(v) - 32_000} chars cut]… {v[-16_000:]}"
+                if len(v) > 32_000:
+                    alert[k] = _cut_keeping_attack(v)
+                    alert[f"{k}_truncated_from"] = len(v)       # over-length is itself a signal
         if "user_id" not in alert:
             alert["user_id"] = "anonymous"
         atk = alert.get("attack_type") or alert.get("signature") or "WAF event"
         alert["note"] = f"{atk} from {alert.get('source_ip', '?')} on {alert.get('url', '?')} ({alert['source']})"
         return alert
+
+
+def _cut_keeping_attack(v: str) -> str:
+    """Head and tail of an over-long payload, plus the window around the first exploit primitive wherever it
+    sits: keeping only the first and last 16 KB let a 20 KB pad on each side hide the SQL injection in the middle
+    (review round 4 S4-10). The full value (up to 1 MB) is decoded once to find it."""
+    import urllib.parse
+    head, tail = v[:12_000], v[-12_000:]
+    mid = ""
+    try:
+        from ..agents.perimeter.tools import decode_payload
+        scan = v[:1_000_000]
+        prims = [p for ps in decode_payload(scan).data.get("primitives", {}).values() for p in ps]
+        if prims:
+            for src in (scan, urllib.parse.unquote_plus(scan)):      # original text first: offsets line up
+                low = src.lower()
+                at = min((i for i in (low.find(p.strip() or p) for p in prims) if i >= 0), default=-1)
+                if 12_000 <= at < len(src) - 12_000:
+                    lo = max(12_000, at - 4_000)
+                    mid = src[lo:lo + 8_000]
+                    break
+    except Exception:  # noqa: BLE001 — the cut must happen even if the scan cannot
+        mid = ""
+    cut = len(v) - len(head) - len(tail) - len(mid)
+    return f"{head} …[{cut} chars cut]… {mid}{' …… ' if mid else ''}{tail}"
+

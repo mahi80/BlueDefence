@@ -138,7 +138,7 @@ def test_edge_telemetry_is_redacted_before_it_leaves(monkeypatch):
 
     sent: list[bytes] = []
     # the edge sends through one bounded background sender now (review round 3 I3-18): capture what it is handed
-    monkeypatch.setattr(dt._SENDER, "submit", lambda url, data, headers: sent.append(data))
+    monkeypatch.setattr(dt._SENDER, "submit", lambda url, data, headers, **kw: sent.append(data))
     dt._forward_alert("http://soc/ingest", "tok", {**_alert(), "payload": "u=asha&password=Winter2026!"})
     assert sent and _leaks(json.loads(sent[0])) == []
 

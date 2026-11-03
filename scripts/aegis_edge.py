@@ -449,7 +449,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "mode": self.state.mode, "upstream": self.state.upstream,
                              "inline_waf": self.state.inline_waf, "asset": self.state.asset,
                              "denied": self.state.denied, "forwarded": self.state.forwarded,
-                             "clients": len(self.state.clients), "blocklist": self.state.blocklist.snapshot()})
+                             "clients": len(self.state.clients), "blocklist": self.state.blocklist.snapshot(),
+                             "telemetry": dt._SENDER.stats()})
             return
         self._proxy()
 

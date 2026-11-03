@@ -82,6 +82,9 @@ def objects_in(path: str) -> tuple[str, list[tuple[str, str]]]:
     # one object, many spellings: `/accounts/1002;x`, `/accounts/1002.json`, `/accounts/%31%30%30%32` each looked like
     # a different template or no id at all, so a walk spread over them never reached the threshold (round 3 G7-2)
     segs = [_canon_seg(s) for s in parts.path.split("/")]
+    # `/Accounts//1002/`, `/accounts/./1002` and `/ACCOUNTS/1002` are one template: case, empty and `.` segments
+    # and a trailing slash split one walk over several (round 4 S4-14)
+    segs = [x for x in segs if x and x != "."]
     out: list[tuple[str, str]] = []
     tmpl: list[str] = []
     for i, seg in enumerate(segs):
@@ -90,14 +93,14 @@ def objects_in(path: str) -> tuple[str, list[tuple[str, str]]]:
             out.append((_singular(prev), seg))
             tmpl.append("{id}")
         else:
-            tmpl.append(seg)
+            tmpl.append(seg.lower())
     query: list[tuple[str, str]] = []
     for k, v in parse_qsl(parts.query, keep_blank_values=False):
         kl = k.lower()
         if (kl == "id" or kl.endswith("id") or kl.endswith("_id")) and _is_id(v):
             query.append((_singular(re.sub(r"_?id$", "", kl, flags=re.I) or "object"), v))
     # the deepest *path* object is the primary one (last in the list); query-string ids come first
-    return "/".join(tmpl) or "/", query + out
+    return "/" + "/".join(tmpl), query + out
 
 
 def _singular(t: str) -> str:
@@ -121,9 +124,13 @@ class _Ev:
     foreign: tuple[tuple[str, str], ...]
 
 
+_JUDGE_LAST = 200
+
+
 @dataclass
 class _Principal:
     events: deque = field(default_factory=deque)
+    by_template: dict[str, deque] = field(default_factory=dict)                  # template → its recent events
     emitted: dict[str, tuple[float, str, int]] = field(default_factory=dict)    # template → (ts, level, seq)
     emitted_ips: dict[str, set] = field(default_factory=dict)                     # template → client IPs already reported
 
@@ -172,9 +179,18 @@ class ObjectWalkDetector:
             else:
                 self._p.move_to_end(key)
             st.events.append(e)
+            st.by_template.setdefault(template, deque()).append(e)
             while st.events and (ts - st.events[0].ts > self.window_s or len(st.events) > self.max_events):
-                st.events.popleft()
-            same = [x for x in st.events if x.template == template]
+                old_e = st.events.popleft()
+                q = st.by_template.get(old_e.template)
+                if q and q[0] is old_e:
+                    q.popleft()
+                    if not q:
+                        st.by_template.pop(old_e.template, None)
+            # per-template events are kept incrementally, and judged over the most recent 200 — every event used to
+            # rescan and sort up to 2,000 (2.8 ms an event for one busy principal; round 4 S4-14)
+            q = st.by_template.get(template) or deque()
+            same = list(q)[-_JUDGE_LAST:]
             level, stats = self._judge(same)
             if level is None:
                 return None

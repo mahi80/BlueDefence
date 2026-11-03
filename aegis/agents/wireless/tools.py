@@ -24,6 +24,10 @@ _AUTHORIZED_SSIDS = {
 _AUTHORIZED_AP_OUIS = {"00-1A-1E", "B4-99-BA", "F4-EA-67"}   # Aruba, Cisco, Meraki examples
 
 
+def _mac(v: object) -> str:
+    return "".join(c for c in str(v or "").upper() if c in "0123456789ABCDEF")
+
+
 def rogue_ap_check(ap_record: dict | None) -> ToolResult:
     if not ap_record:
         return ToolResult(name="rogue_ap", data={"verdict": "no_data"}, weight="low")
@@ -55,7 +59,11 @@ def evil_twin_check(ap_record: dict | None) -> ToolResult:
     # Evil-twin shape: identical SSID to authorized but different BSSID,
     # or a captive portal added to a branch SSID (the customer-facing
     # phishing pattern).
-    twin_match = ssid in _AUTHORIZED_SSIDS and bssid not in (ap_record.get("known_bssids") or set())
+    # BSSIDs in one normal form on both sides: `b4:99:ba:…` from the controller vs `B4-99-BA-…` from the sensor
+    # made every authorised PoS AP an evil twin (round 4 S4-16 / G7-12)
+    known = ap_record.get("known_bssids") or ()
+    known = {_mac(k) for k in ([known] if isinstance(known, str) else known)}
+    twin_match = ssid in _AUTHORIZED_SSIDS and _mac(bssid) not in known
     if twin_match and matches_pos:
         weight = "high"
     elif twin_match:
