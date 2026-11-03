@@ -84,8 +84,20 @@ class DeferredQueue:
             row = redact(dict(alert))
             row["deferred_at"] = time.time()
             row["deferred_by"] = reason
+            data = (json.dumps(row, separators=(",", ":"), default=str) + "\n").encode()
             with self.path.open("ab") as fh:
-                fh.write((json.dumps(row, separators=(",", ":"), default=str) + "\n").encode())
+                start = fh.tell()
+                try:
+                    fh.write(data)
+                    fh.flush()
+                except OSError:
+                    # ENOSPC mid-write leaves a fragment; the next push would merge into it and both rows would be
+                    # lost (code review 2026-11-03 E8). Cut the file back to where this row started.
+                    try:
+                        fh.truncate(start)
+                    except OSError:
+                        pass
+                    raise
             return True
         except OSError as e:
             self.dropped += 1
@@ -147,4 +159,70 @@ class DeferredQueue:
             logger.warning("[deferred] cursor not persisted: %s — the batch may be re-delivered after a restart", e)
 
 
-__all__ = ["DeferredQueue"]
+class SpillQueue:
+    """A primary deferred queue plus a fallback on another volume (code review 2026-11-03 E2).
+
+    The default spill sat next to the audit log, so when the audit disk filled up — the very case
+    ``audit_deferred`` parking exists for — the spill failed too and the alert was dropped. A push that the
+    primary refuses goes to the fallback; ``pop`` drains the primary first, then the fallback. Same interface
+    as :class:`DeferredQueue`."""
+
+    def __init__(self, primary: DeferredQueue, fallback: DeferredQueue | None = None):
+        self.primary, self.fallback = primary, fallback
+        self._popped: DeferredQueue | None = None
+        self.path = primary.path
+
+    @property
+    def dropped(self) -> int:
+        """Alerts neither queue could hold (a fallback that took the row means nothing was lost)."""
+        return self.fallback.dropped if self.fallback is not None else self.primary.dropped
+
+    def push(self, alert: dict, reason: str = "storm") -> bool:
+        if self.primary.push(alert, reason):
+            return True
+        if self.fallback is None:
+            return False
+        ok = self.fallback.push(alert, reason)
+        if ok and self.fallback.pending() == 1:
+            logger.error("[deferred] primary spill %s refused a row — spilling to %s", self.primary.path, self.fallback.path)
+        return ok
+
+    def pending(self) -> int:
+        return self.primary.pending() + (self.fallback.pending() if self.fallback is not None else 0)
+
+    def pop(self, n: int) -> list[dict]:
+        for q in (self.primary, self.fallback):
+            if q is None:
+                continue
+            out = q.pop(n)
+            if out:
+                self._popped = q
+                return out
+        self._popped = None
+        return []
+
+    def ack(self) -> None:
+        if self._popped is not None:
+            self._popped.ack()
+            self._popped = None
+
+
+def default_spill(audit_path: Path | str) -> SpillQueue:
+    """``AEGIS_DEFERRED_PATH`` (default: beside the audit log) with ``AEGIS_DEFERRED_FALLBACK`` (default: the
+    system temp dir) behind it. Set the fallback to ``off`` to disable it."""
+    import tempfile
+    primary = os.environ.get("AEGIS_DEFERRED_PATH", "").strip() or str(Path(audit_path).parent / "deferred.jsonl")
+    fb = os.environ.get("AEGIS_DEFERRED_FALLBACK", "").strip()
+    if fb.lower() in ("off", "0", "none"):
+        return SpillQueue(DeferredQueue(primary))
+    fb = fb or str(Path(tempfile.gettempdir()) / f"aegis-deferred-{os.getuid() if hasattr(os, 'getuid') else 0}.jsonl")
+    if Path(fb).resolve() == Path(primary).resolve():
+        return SpillQueue(DeferredQueue(primary))
+    try:
+        return SpillQueue(DeferredQueue(primary), DeferredQueue(fb))
+    except OSError as e:
+        logger.warning("[deferred] fallback spill %s unusable (%s) — primary only", fb, e)
+        return SpillQueue(DeferredQueue(primary))
+
+
+__all__ = ["DeferredQueue", "SpillQueue", "default_spill"]

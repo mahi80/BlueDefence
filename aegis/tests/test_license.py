@@ -12,7 +12,7 @@ import pytest
 
 from aegis import license as L
 
-NOW = 1_793_253_600.0
+NOW = float(int(time.time()))   # was a fixed 2026-10-29 timestamp: tests built on NOW + 5 days broke on 2026-11-03
 
 
 @pytest.fixture(scope="module")

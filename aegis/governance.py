@@ -180,6 +180,30 @@ def blocked_chain(alert: Any, investigated_by: str, exc: Exception) -> EvidenceC
     return chain.finalize()
 
 
+def _post(guard: Any, tool: str, acp_violation: type, **kw: Any) -> Exception | None:
+    """``post_tool_call`` after the work is done. A violation is returned for the caller to act on; any other
+    SDK error (timeout, outage) is logged and swallowed — the work already happened, so raising here dropped
+    the alert or skipped the response it had sealed (code review 2026-11-03 E5)."""
+    try:
+        guard.post_tool_call(tool, **kw)
+    except acp_violation as v:
+        return v
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[acp] post_tool_call(%s) failed: %s: %s — result kept, governance record incomplete",
+                       tool, type(e).__name__, str(e)[:160])
+    return None
+
+
+def _hold_for_humans(chain: Any, why: str) -> Any:
+    """Governance could not be consulted: keep the analysis, but every action waits for a person."""
+    for a in getattr(chain, "recommended_actions", None) or []:
+        a.requires_hitl = True
+    md = getattr(chain, "metadata", None)
+    if isinstance(md, dict):
+        md["governance_unavailable"] = why[:200]
+    return chain
+
+
 def _violation_type():
     from acp import ACPViolation  # local import: the SDK is optional at import time
     return ACPViolation
@@ -196,17 +220,23 @@ def _guard_investigate(specialist: Any, guard: Any, tool: str) -> Callable:
         except acp_violation as v:
             logger.warning("[acp] %s blocked on alert %s: %s", tool, _alert_id(alert), str(v)[:160])
             return blocked_chain(alert, f"acp:{tool}", v)
+        except Exception as e:  # noqa: BLE001 — SDK outage: analyse, hold every action (review E5)
+            logger.error("[acp] governance unavailable for %s on alert %s: %s", tool, _alert_id(alert), str(e)[:160])
+            return _hold_for_humans(original(alert, *args, **kwargs), f"{type(e).__name__}: {str(e)[:160]}")
         try:
             chain = original(alert, *args, **kwargs)
         except Exception as e:  # noqa: BLE001 — record, then let the caller's safety net decide
-            guard.post_tool_call(tool, success=False, error=str(e)[:200], exception=e)
+            _post(guard, tool, acp_violation, success=False, error=str(e)[:200], exception=e)
             raise
-        guard.post_tool_call(
-            tool,
+        v = _post(
+            guard, tool, acp_violation,
             result={"verdict": getattr(chain, "verdict", None),
                     "confidence": getattr(chain, "confidence", None)},
             success=True,
         )
+        if v is not None:
+            logger.warning("[acp] %s result blocked on alert %s: %s", tool, _alert_id(alert), str(v)[:160])
+            return blocked_chain(alert, f"acp:{tool}", v)
         return chain
 
     investigate._acp_wrapped = True  # type: ignore[attr-defined]
@@ -218,25 +248,37 @@ def _guard_handle(orch: Any, governed: GovernedSOC) -> Callable:
     guard = governed.guard
     acp_violation = _violation_type()
 
+    def _blocked(alert: Any, v: Exception) -> Any:
+        logger.warning("[acp] orchestrator blocked on alert %s: %s", _alert_id(alert), str(v)[:160])
+        chain = blocked_chain(alert, "acp:orchestrator", v)
+        # the escalation is a decision like any other: it gets its audit row (code review 2026-11-03 E7 —
+        # during a pause window HITL cards appeared with nothing in the audit log). AuditWriteError propagates.
+        record = getattr(orch, "record", None)
+        if callable(record):
+            record(alert, chain)
+        return chain
+
     @wraps(original)
     def handle(alert, *args, **kwargs):
         governed.begin_alert(_alert_id(alert))
+        unavailable = ""
         try:
             guard.pre_tool_call(TOOL_ORCHESTRATOR, _alert_meta(alert))
         except acp_violation as v:
-            logger.warning("[acp] orchestrator blocked on alert %s: %s", _alert_id(alert), str(v)[:160])
-            return blocked_chain(alert, "acp:orchestrator", v)
+            return _blocked(alert, v)
+        except Exception as e:  # noqa: BLE001 — an ACP outage must not drop the alert (review E5)
+            unavailable = f"{type(e).__name__}: {str(e)[:160]}"
+            logger.error("[acp] governance unavailable for alert %s (%s) — analysing, every action held for a human",
+                         _alert_id(alert), unavailable)
         try:
             chain = original(alert, *args, **kwargs)
         except Exception as e:  # noqa: BLE001
-            guard.post_tool_call(TOOL_ORCHESTRATOR, success=False, error=str(e)[:200], exception=e)
+            _post(guard, TOOL_ORCHESTRATOR, acp_violation, success=False, error=str(e)[:200], exception=e)
             raise
-        guard.post_tool_call(
-            TOOL_ORCHESTRATOR,
-            result={"verdict": getattr(chain, "verdict", None)},
-            success=True,
-        )
-        return chain
+        v = _post(guard, TOOL_ORCHESTRATOR, acp_violation, result={"verdict": getattr(chain, "verdict", None)}, success=True)
+        if v is not None:
+            return _blocked(alert, v)
+        return _hold_for_humans(chain, unavailable) if unavailable else chain
 
     handle._acp_wrapped = True  # type: ignore[attr-defined]
     return handle
@@ -262,12 +304,15 @@ def _guard_response(response: Any, guard: Any) -> None:
         except acp_violation as v:
             return ExecutedAction(action=action, status="queued_for_hitl",
                                   note=f"[ACP blocked] {str(v)[:200]}")
+        except Exception as e:  # noqa: BLE001 — governance unreachable: a human decides (review E5)
+            return ExecutedAction(action=action, status="queued_for_hitl",
+                                  note=f"[ACP unavailable] {type(e).__name__}: {str(e)[:160]}")
         try:
             executed = orig_auto(action, *a, **kw)
         except Exception as e:  # noqa: BLE001
-            guard.post_tool_call(tool, success=False, error=str(e)[:200], exception=e)
+            _post(guard, tool, acp_violation, success=False, error=str(e)[:200], exception=e)
             raise
-        guard.post_tool_call(tool, result={"status": getattr(executed, "status", "")}, success=True)
+        _post(guard, tool, acp_violation, result={"status": getattr(executed, "status", "")}, success=True)
         return executed
 
     @wraps(orig_approve)
@@ -278,12 +323,15 @@ def _guard_response(response: Any, guard: Any) -> None:
         except acp_violation as v:
             return ExecutedAction(action=action, status="skipped", reason="governance",
                                   note=f"[ACP blocked] approved action not executed: {str(v)[:200]}")
+        except Exception as e:  # noqa: BLE001 — not run, and retried by the HITL loop (reason=error)
+            return ExecutedAction(action=action, status="skipped", reason="error",
+                                  note=f"[ACP unavailable] approved action not executed yet: {type(e).__name__}: {str(e)[:160]}")
         try:
             executed = orig_approve(action, approver, *a, **kw)
         except Exception as e:  # noqa: BLE001
-            guard.post_tool_call(tool, success=False, error=str(e)[:200], exception=e)
+            _post(guard, tool, acp_violation, success=False, error=str(e)[:200], exception=e)
             raise
-        guard.post_tool_call(tool, result={"status": getattr(executed, "status", "")}, success=True)
+        _post(guard, tool, acp_violation, result={"status": getattr(executed, "status", "")}, success=True)
         return executed
 
     orig_unattended = getattr(response, "_apply_unattended", None)
@@ -296,12 +344,15 @@ def _guard_response(response: Any, guard: Any) -> None:
             guard.pre_tool_call(tool, {**_args(action), "approver": str(kw.get("approver", ""))[:64]})
         except acp_violation:
             return None
+        except Exception as e:  # noqa: BLE001 — governance unreachable: nothing runs unattended
+            logger.error("[acp] governance unavailable — unattended %s not run: %s", tool, str(e)[:160])
+            return None
         try:
             receipt = orig_unattended(action, *a, **kw)
         except Exception as e:
-            guard.post_tool_call(tool, success=False, error=str(e)[:200], exception=e)
+            _post(guard, tool, acp_violation, success=False, error=str(e)[:200], exception=e)
             raise
-        guard.post_tool_call(tool, result={"status": getattr(receipt, "status", "")}, success=True)
+        _post(guard, tool, acp_violation, result={"status": getattr(receipt, "status", "")}, success=True)
         return receipt
 
     response._execute_auto = _execute_auto

@@ -397,8 +397,14 @@ class SwarmOrchestrator:
                 # the enriched chain is what the ResponseAgent acts on: no audit row, no action —
                 # propagate so the service defers the alert exactly like a failed first seal
                 raise
-            except Exception as e:  # noqa: BLE001 — persistence (dashboard row) is bookkeeping, not the audit
-                logger.warning("[swarm] re-seal of %s failed: %s", chain.alert_id, str(e)[:120])
+            except Exception as e:
+                # record() IS the audit append (plus the dataset snapshot it seals). Any failure means the chain
+                # the ResponseAgent is about to act on has no audit row, so fail closed the same way (code review
+                # 2026-11-03 E4: a UnicodeDecodeError here left the log saying `suspicious` while a `malicious`
+                # block ran).
+                logger.error("[swarm] re-seal of %s failed: %s: %s — no action until it is sealed",
+                             chain.alert_id, type(e).__name__, str(e)[:120])
+                raise AuditWriteError(f"re-seal failed: {type(e).__name__}: {str(e)[:160]}") from e
 
     # ------------------------------------------------------------ internals --
 

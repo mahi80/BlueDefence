@@ -186,7 +186,10 @@ def _remediation_hitl(hitl: Any) -> Any:
         return hitl
     from ..hitl.dashboard import hitl_from_env
     try:
-        return hitl_from_env()
+        h = hitl_from_env()
+        if h is not None:
+            h.scope = "exposure"     # its own journal: never restore or settle the SOC's approvals (review C2)
+        return h
     except Exception as e:  # noqa: BLE001 - no approval channel still leaves the proposals visible
         logger.warning("remediation approval channel unavailable: %s", e)
         return None
