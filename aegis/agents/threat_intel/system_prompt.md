@@ -14,8 +14,10 @@ vendor security bulletin, dark-web mention), your job is to:
    either a new heuristic primitive or a new IOC to add to the local
    store.
 
-You DO NOT modify any code. Your output is structured JSON; the
-meta-agent's queue handles HITL approval before any change lands.
+You DO NOT modify any code. Your output is structured JSON; detection
+updates go to the meta-agent's queue for HITL approval, and indicators
+you extract are kept as unconfirmed evidence: they never become
+blocklist entries on your word alone.
 
 # Mode 2: similar-incident retrieval
 

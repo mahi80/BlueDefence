@@ -292,24 +292,38 @@ def test_ioc_store_invariants() -> tuple[bool, str]:
     from hypothesis import given, settings, strategies as st
 
     from aegis.agents.threat_intel.store import IOC, IOCStore
+    from aegis.agents.threat_intel.validate import normalise
 
     failures: list[str] = []
+    octet = st.integers(min_value=0, max_value=255)
+    valid = {   # well-formed, public values for each kind; the store refuses own / private / malformed ones
+        "ip": st.builds(lambda a, b, c: f"8.{a}.{b}.{c}", octet, octet, octet),
+        "domain": st.builds(lambda a, t: f"{a}.{t}", st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=1,
+                                                                max_size=20), st.sampled_from(["com", "net", "example"])),
+        "hash_md5": st.text(alphabet="0123456789abcdefABCDEF", min_size=32, max_size=32),
+        "cve": st.builds(lambda y, n: f"CVE-{y}-{n}", st.integers(1999, 2030), st.integers(1000, 9999999)),
+    }
 
     @given(
         kind=st.sampled_from(["ip", "domain", "hash_md5", "cve"]),
-        value=st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789.-:", min_size=4, max_size=32),
+        data=st.data(),
         c1=st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
         c2=st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
     )
     @settings(max_examples=200, deadline=None)
-    def _check(kind, value, c1, c2):
+    def _check(kind, data, c1, c2):
+        value = data.draw(st.one_of(valid[kind], st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789.-:",
+                                                          min_size=4, max_size=32)))
         store = IOCStore()
         import time as _t
         store.add(IOC(kind=kind, value=value, confidence=c1, source="A", last_seen=_t.time()))
         store.add(IOC(kind=kind, value=value, confidence=c2, source="B", last_seen=_t.time()))
         active = store.all_active()
-        if len(active) != 1:
-            failures.append(f"dedup failed: kind={kind} v={value!r} -> {len(active)} entries")
+        want = 1 if normalise(kind, value)[0] else 0      # an invalid value is refused, never half-stored
+        if len(active) != want:
+            failures.append(f"dedup failed: kind={kind} v={value!r} -> {len(active)} entries (want {want})")
+            return
+        if not want:
             return
         merged = active[0]
         if abs(merged.confidence - max(c1, c2)) > 1e-9:
@@ -334,10 +348,8 @@ def test_tenant_isolation() -> tuple[bool, str]:
     failures: list[str] = []
 
     tenant_ids = st.text(alphabet="abcdefghijklmnopqrstuvwxyz", min_size=2, max_size=8)
-    ioc_value = st.text(
-        alphabet="abcdefghijklmnopqrstuvwxyz0123456789.-",
-        min_size=4, max_size=20,
-    )
+    octet = st.integers(min_value=0, max_value=255)
+    ioc_value = st.builds(lambda a, b, c: f"8.{a}.{b}.{c}", octet, octet, octet)    # public IPs the store accepts
 
     @given(t1=tenant_ids, t2=tenant_ids, v1=ioc_value, v2=ioc_value)
     @settings(max_examples=100, deadline=None)
