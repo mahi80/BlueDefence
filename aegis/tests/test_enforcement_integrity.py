@@ -259,7 +259,7 @@ def test_failed_or_dry_run_execution_is_not_containment():
                ExecutedAction(action=act, status="skipped")):
         d = Decision("a", "L1", "revoke_sessions", "alice", "approved", "ciso", "", executed=ex)
         assert loop.on_decisions([d]) == []
-    assert src.contained == set()
+    assert not src.contained
 
 
 # ---- the swarm: a raised verdict needs a fresh concur, and the re-seal is audited ---------------

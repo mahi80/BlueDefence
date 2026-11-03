@@ -233,10 +233,13 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     # the async tier updates the HITL card in place (blast radius / plan / twin) once it finishes
     on_done = (lambda alert, chain, summary: hitl.attach_investigation(chain.alert_id, investigation_card(chain))) \
         if hitl is not None and hasattr(hitl, "attach_investigation") else None
+    # plan / re-plan steps are added after execute() has filed the chain's approvals: file them too (review B5)
+    file_actions = lambda alert, chain, acts: response.file_for_review(chain, acts)
     investigator = investigator_from_env(guard=governed.guard if governed else None, record=record if callable(record) else None,
-                                         llm=getattr(orch, "_primary", None), on_done=on_done)
+                                         llm=getattr(orch, "_primary", None), on_done=on_done, file_actions=file_actions)
     containment = (ContainmentLoop(investigator.source, guard=governed.guard if governed else None,
-                                   record=record if callable(record) else None) if investigator is not None else None)
+                                   record=record if callable(record) else None, file_actions=file_actions)
+                   if investigator is not None else None)
     # streaming ingest: receivers start once here (the registry runs every cycle); the blocklist
     # endpoint serves the active enforcement set to any edge enforcer
     from aegis.ingest.stream import get_stream

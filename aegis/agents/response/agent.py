@@ -231,6 +231,20 @@ class ResponseAgent:
             return
         self._print_hitl_card(action, chain)
 
+    def file_for_review(self, chain: EvidenceChain, actions: list[RecommendedAction]) -> int:
+        """File actions added to a chain after ``execute()`` ran (the investigation plan, a containment re-plan)
+        as approvals. They came from a background walk, not from the triage that ``execute()`` judged, so none
+        of them runs unattended — even the 'immediate' throttle/challenge a plan proposes (code review
+        2026-11-03 B5: they were appended and never filed, while the evidence said "N steps queued")."""
+        n = 0
+        for action in actions:
+            action.requires_hitl = True
+            decision = ExecutedAction(action=action, status="queued_for_hitl",
+                                      note="added by the investigation after the first response pass")
+            self._file_hitl(action, chain, decision)
+            n += 1
+        return n
+
     def refresh_policies(self) -> None:
         """Rebuild the env-derived autonomy / breaker / HITL-timeout policies after the environment changed
         (licence drop to over-limit or evaluation forces them to shadow). Explicitly injected policies are kept."""

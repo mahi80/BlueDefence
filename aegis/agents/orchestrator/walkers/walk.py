@@ -23,14 +23,21 @@ SEED_KEYS = {
 }
 
 
-def seeds_from(alert: dict) -> list[tuple[str, str]]:
-    """(id, type) pairs found in the alert (top level and one level of nesting)."""
+MAX_SEEDS = 20
+
+
+def seeds_from(alert: dict, *, top_level_only: bool = False, limit: int = MAX_SEEDS) -> list[tuple[str, str]]:
+    """(id, type) pairs found in the alert (top level and up to two levels of nesting), at most ``limit``
+    (review B6: 400 padded nested ``user`` objects became 402 seeds that bypassed ``max_nodes``). Top-level
+    keys come first. ``top_level_only`` is for anything that becomes an action target: a nested field is
+    whatever the client put in its request body (review B7 — a POST naming the CFO got the CFO challenged)."""
     out: list[tuple[str, str]] = []
+    nested: list[tuple[dict, int]] = []
     def scan(d: dict, depth: int):
         for k, v in d.items():
             if isinstance(v, dict):
-                if depth < 2:
-                    scan(v, depth + 1)
+                if depth < 2 and not top_level_only:
+                    nested.append((v, depth + 1))
                 continue
             if not isinstance(v, (str, int)) or v in ("", None):
                 continue
@@ -38,11 +45,14 @@ def seeds_from(alert: dict) -> list[tuple[str, str]]:
                 if k in keys:
                     out.append((str(v)[:80], typ))
     scan(alert, 0)
+    while nested and len(out) < limit * 4:
+        d, depth = nested.pop(0)
+        scan(d, depth)
     seen = set(); uniq = []
     for s in out:
         if s not in seen:
             seen.add(s); uniq.append(s)
-    return uniq
+    return uniq[:limit]
 
 
 HOST_TYPES = ("host", "server", "device_managed", "device_unmanaged", "jump_host", "file_server", "domain_controller",
@@ -163,6 +173,7 @@ def run_walkers(alert: dict, source: TelemetrySource, *, walkers: dict[str, Walk
                     if "error" not in report[name]:        # first failure per walker is logged; the rest are counted
                         logger.warning("[walker.%s] query failed on %s %s: %s: %s", name, n.type, n.id[:40], type(e).__name__, str(e)[:120])
                     report[name]["error"] = f"{type(e).__name__}: {str(e)[:100]}"; report[name]["errors"] = report[name].get("errors", 0) + 1
+                    g.errors[name] = g.errors.get(name, 0) + 1
             report[name]["elapsed_ms"] += int((time.time() - t1) * 1000)
     for name, w in active.items():
         g.walkers_run.append(name)
@@ -176,4 +187,4 @@ def run_walkers(alert: dict, source: TelemetrySource, *, walkers: dict[str, Walk
     return WalkReport(g, int((time.time() - t0) * 1000), report)
 
 
-__all__ = ["DEFAULT_WALKERS", "SEED_KEYS", "WalkReport", "Walker", "run_walkers", "seeds_from"]
+__all__ = ["DEFAULT_WALKERS", "MAX_SEEDS", "SEED_KEYS", "WalkReport", "Walker", "run_walkers", "seeds_from"]
