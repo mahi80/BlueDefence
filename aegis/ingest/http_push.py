@@ -428,7 +428,7 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
             self.header_s = 10.0
         self._slots = threading.BoundedSemaphore(self.max_conns)
         self.refused_busy = 0
-        self.header_timers: dict[int, threading.Timer] = {}
+        self.header_timeouts = 0
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self._slots.acquire(blocking=False):
@@ -446,16 +446,18 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
             raise
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
-        timer = threading.Timer(self.header_s, _close_if_no_headers, args=(request,))
-        timer.daemon = True
-        self.header_timers[id(request)] = timer      # the handler cancels it once the headers are in
-        timer.start()
         try:
             super().process_request_thread(request, client_address)
         finally:
-            timer.cancel()
-            self.header_timers.pop(id(request), None)
             self._slots.release()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        import sys
+        if isinstance(sys.exc_info()[1], OSError):
+            # a client that went away, or one we closed at the header deadline: not a server error
+            logger.debug("[ingest:http] connection from %s ended: %s", client_address, sys.exc_info()[1])
+            return
+        super().handle_error(request, client_address)
 
 
 def _close_if_no_headers(sock: Any) -> None:
@@ -488,12 +490,37 @@ class _Handler(BaseHTTPRequestHandler):
             logger.warning("[ingest:http] unauthorized %s %s from %s", self.command, path, ip)
         self._refuse(401, body or {"error": "unauthorized"})
 
+    def handle_one_request(self) -> None:
+        """Every request on the connection gets the header deadline, not only the first: on a keep-alive
+        connection a client could send one quick request and then trickle the next one's headers for as long as
+        each read beat the 30 s timeout, holding a slot (review round 5 Y5-6)."""
+        fired = threading.Event()
+
+        def expire() -> None:
+            fired.set()
+            _close_if_no_headers(self.connection)
+        timer = threading.Timer(float(getattr(self.server, "header_s", 10.0)), expire)
+        timer.daemon = True
+        self._header_timer, self._header_fired = timer, fired
+        timer.start()
+        try:
+            super().handle_one_request()
+        finally:
+            timer.cancel()
+
     def parse_request(self) -> bool:
-        ok = super().parse_request()
-        timers = getattr(self.server, "header_timers", None)
-        t = timers.pop(id(self.connection), None) if isinstance(timers, dict) else None
+        ok = super().parse_request()                   # reads the header lines: the deadline covers them
+        t = getattr(self, "_header_timer", None)
         if t is not None:
             t.cancel()                                  # headers are in: the per-read timeout governs the body
+        fired = getattr(self, "_header_fired", None)
+        if fired is not None and fired.is_set():
+            # the deadline passed while the headers were arriving: whatever was read is not a request
+            self.close_connection = True
+            srv = self.server
+            if hasattr(srv, "header_timeouts"):
+                srv.header_timeouts += 1
+            return False
         return ok
 
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:

@@ -123,6 +123,8 @@ class StreamQueue:
         self._base = 0              # logical offset of the journal file's first record
         self._hdr = 0               # length of the journal file's header line
         self.compactions = 0
+        self._compact_after = 0.0       # monotonic time before which compaction is not retried (after a failure)
+        self._compact_backoff = 30.0
         self._last_commit_write = 0.0
         if self.journal is not None:
             self._replay()
@@ -282,10 +284,26 @@ class StreamQueue:
                 # everything handled: drop the file (the cursor already says so; the next one starts at `end`)
                 self.journal.unlink(missing_ok=True)
                 self._base, self._hdr = self._committed, 0
-            elif self._committed - self._base >= self._compact_bytes():
-                self._compact()
+            elif self._committed - self._base >= self._compact_bytes() and time.monotonic() >= self._compact_after:
+                self._try_compact()
         except OSError as e:
             logger.warning("[stream] journal cursor not written (%s) — handled records may be re-queued after a restart", e)
+
+    def _try_compact(self) -> None:
+        """Compact, and on failure (ENOSPC …) remove the partial copy and back off — it used to leave a partial
+        ``.compact`` file and retry the whole tail copy about once a second under the queue lock, blocking every
+        push, while logging that the cursor was not written (review round 5 Y5-13)."""
+        assert self.journal is not None
+        try:
+            self._compact()
+            self._compact_backoff = 30.0
+        except OSError as e:
+            with contextlib.suppress(OSError):
+                self.journal.with_name(self.journal.name + ".compact").unlink(missing_ok=True)
+            self._compact_after = time.monotonic() + self._compact_backoff
+            logger.error("[stream] journal compaction failed (%s) — the journal keeps growing; next try in %.0f s",
+                         e.strerror or e, self._compact_backoff)
+            self._compact_backoff = min(self._compact_backoff * 2, 900.0)
 
     def _compact(self) -> None:
         """Rewrite the uncommitted tail into a fresh file whose header names its logical start. Called under the

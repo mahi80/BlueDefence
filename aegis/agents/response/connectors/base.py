@@ -22,6 +22,7 @@ Rules every connector inherits — vendor code never re-implements them:
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import logging
 import os
@@ -149,6 +150,10 @@ class Connector:
         self._lock = threading.Lock()
         self._active: dict[str, Receipt] = {}
         self.history: list[Receipt] = []
+        # receipts an apply() changed besides the one it returns (an expired one rolled back inline, a shadow one
+        # superseded by a live apply): the registry emits them, so the receipt log records their end too and a
+        # restart does not re-adopt them (review round 5 Y5-3)
+        self._side_events: collections.deque[tuple[str, Receipt]] = collections.deque(maxlen=256)
 
     @property
     def dry_run(self) -> bool:
@@ -285,6 +290,7 @@ class Connector:
             self.rollback(stale, reason="expired; replaced by a new apply")
             if stale.status == STATUS_ROLLED_BACK:
                 stale.status = STATUS_EXPIRED
+            self._side_events.append(("expired", stale))
         with self._lock:
             existing = self._active.get(key)
             still_there = existing is not None and existing.status == STATUS_ROLLBACK_FAILED
@@ -302,6 +308,7 @@ class Connector:
                     return self._renew_locked(existing, ttl, now, approver=approver)
                 existing.status = STATUS_SUPERSEDED
                 self._active.pop(key, None)
+                self._side_events.append(("superseded", existing))
         expires = None if ttl <= 0 else now + ttl
         receipt = Receipt(
             receipt_id=_rid(), connector=self.name, action_type=action.action_type,
@@ -517,28 +524,39 @@ class ConnectorRegistry:
         return list(self._connectors) + [self.fallback]
 
     def restore(self, entries: Iterable[dict]) -> int:
-        """Re-adopt the receipts that were active when the process stopped (the last state of each, from the
-        receipt log). ``_active`` lived only in memory: after a restart TTL rollback, drift checks and the edge
-        blocklist forgot every enforcement in force — a 15-minute block became permanent at the vendor, a breaker
-        hold was never released, the edge lifted approved blocks (review round 4 R4-1). Expired ones are rolled
-        back by the next sweep. Returns how many were restored."""
+        """Re-adopt the receipts that were active when the process stopped, from the receipt log's events in the
+        order they were written. ``_active`` lived only in memory: after a restart TTL rollback, drift checks and
+        the edge blocklist forgot every enforcement in force (review round 4 R4-1).
+
+        Per (connector, idempotency key) the LAST event wins, so a shadow receipt superseded by a live one, or an
+        expired one replaced inside apply(), is never re-adopted over its successor; preview events (auto-block /
+        breaker shadow scoring) never become enforcement (review round 5 Y5-3). Expired ones are rolled back by
+        the next sweep. Returns how many were restored."""
         from dataclasses import fields
         names = {f.name for f in fields(Receipt)}
         by_name = {c.name: c for c in self.connectors}
-        n = 0
-        for e in entries:
-            if not isinstance(e, dict) or e.get("status") not in ACTIVE_STATUSES:
+        last: dict[tuple[str, str], dict] = {}
+        rows = [e for e in entries if isinstance(e, dict)]
+        if any("recorded_at" in e for e in rows):
+            rows.sort(key=lambda e: float(e.get("recorded_at") or 0.0))      # stable: ties keep log order
+        for e in rows:
+            if e.get("event") == "preview":
                 continue
-            c = by_name.get(str(e.get("connector", "")))
-            if c is None:
+            key = (str(e.get("connector", "")), str(e.get("idempotency_key") or ""))
+            if key[1]:
+                last[key] = e
+        n = 0
+        for (cname, ikey), e in last.items():
+            c = by_name.get(cname)
+            if c is None or e.get("status") not in ACTIVE_STATUSES:
                 continue
             try:
                 r = Receipt(**{k: v for k, v in e.items() if k in names})
             except TypeError:
                 continue
             with c._lock:
-                if r.idempotency_key and r.idempotency_key not in c._active:
-                    c._active[r.idempotency_key] = r
+                if ikey not in c._active:
+                    c._active[ikey] = r
                     n += 1
         if n:
             logger.warning("[connectors] restored %d active receipt(s) from the receipt log — expired ones are rolled "
@@ -577,7 +595,13 @@ class ConnectorRegistry:
                 applied_at=time.time(), expires_at=None,
                 alert_id=str(ctx.get("alert_id", "")), approver=str(ctx.get("approver", "")),
                 error=why, detail=f"never-block guard refused {action.action_type} on {action.target}"))
-        return self._emit("apply", self.route_action(action).apply(action, **ctx))
+        c = self.route_action(action)
+        receipt = c.apply(action, **ctx)
+        side = getattr(c, "_side_events", None)
+        while side:
+            ev, r = side.popleft()
+            self._emit(ev, r)
+        return self._emit("apply", receipt)
 
     def preview(self, action: Any, **ctx: Any) -> Receipt:
         return self._emit("preview", self.route_action(action).preview(action, **ctx))
