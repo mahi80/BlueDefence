@@ -48,6 +48,7 @@ STATUS_FAILED = "failed"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_REFUSED = "refused"           # never-block guard: enforcing this would risk own/lab infra
 STATUS_SUPERSEDED = "superseded"     # replaced by a fresh apply (live after shadow, or a human re-approval)
+STATUS_DRIFTED = "drifted"           # the vendor no longer enforces it (released or removed outside AEGIS)
 ACTIVE_STATUSES = (STATUS_APPLIED, STATUS_DRY_RUN, STATUS_RENEWED)
 
 
@@ -74,6 +75,8 @@ class Receipt:
     renewals: int = 0
     error: str = ""
     rolled_back_at: Optional[float] = None
+    verified: bool | None = None        # read back at the vendor: True present, False absent, None not checked
+    verified_at: float | None = None
 
     @property
     def active(self) -> bool:
@@ -131,6 +134,47 @@ class Connector:
     def _do_rollback(self, receipt: Receipt) -> str:
         """Vendor undo. Returns detail. Raise ConnectorError on refusal."""
         raise NotImplementedError
+
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        """Vendor read-back: is this enforcement in place right now? None = this connector cannot tell."""
+        return None
+
+    def verify(self, receipt: Receipt) -> bool | None:
+        """Read the enforcement back at the vendor (idea from AiSOC: every unattended containment is verified,
+        the gap counted rather than hidden). A dry-run or inactive receipt is not checked; a vendor error is
+        "cannot tell" (None), never "present"."""
+        if receipt.dry_run or not receipt.active:
+            return None
+        try:
+            v = self._do_verify(receipt)
+        except Exception as e:  # noqa: BLE001 — a failed read-back is unknown, not success
+            logger.warning("[connector:%s] verify %s %s failed: %s", self.name, receipt.action_type, receipt.target,
+                           str(e)[:160])
+            v = None
+        receipt.verified, receipt.verified_at = v, self._clock()
+        return v
+
+    def forget(self, receipt: Receipt, why: str) -> None:
+        """The vendor does not enforce this receipt: mark it ``drifted`` and drop it from the active set."""
+        receipt.status, receipt.error = STATUS_DRIFTED, why
+        with self._lock:
+            if self._active.get(receipt.idempotency_key) is receipt:
+                self._active.pop(receipt.idempotency_key, None)
+
+    def check_drift(self) -> list[Receipt]:
+        """Re-verify every active live receipt; one the vendor no longer enforces (released or removed outside
+        AEGIS) is marked ``drifted`` and dropped from the active set, so the next approval applies it afresh
+        and nothing reports it as still in force."""
+        with self._lock:
+            live = [r for r in self._active.values() if not r.dry_run]
+        out = []
+        for r in live:
+            if self.verify(r) is False:
+                self.forget(r, "vendor no longer enforces this action (released or removed outside AEGIS)")
+                logger.error("[connector:%s] %s %s is no longer in force at the vendor (receipt %s)", self.name,
+                             r.action_type, r.target, r.receipt_id)
+                out.append(r)
+        return out
 
     def _do_renew(self, receipt: Receipt, ttl_sec: int) -> str:
         """Vendor extend; default re-applies. Returns detail."""
@@ -397,6 +441,25 @@ class ConnectorRegistry:
         out: list[Receipt] = []
         for c in self.connectors:
             out.extend(self._emit("expired", r) for r in c.sweep_expired())
+        return out
+
+    def verify(self, receipt: Receipt) -> bool | None:
+        for c in self.connectors:
+            if c.name == receipt.connector:
+                return c.verify(receipt)
+        return None
+
+    def forget(self, receipt: Receipt, why: str) -> None:
+        for c in self.connectors:
+            if c.name == receipt.connector:
+                c.forget(receipt, why)
+                self._emit("drifted", receipt)
+                return
+
+    def check_drift(self) -> list[Receipt]:
+        out: list[Receipt] = []
+        for c in self.connectors:
+            out.extend(self._emit("drifted", r) for r in c.check_drift())
         return out
 
     @property

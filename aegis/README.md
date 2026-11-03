@@ -305,6 +305,14 @@ auto-safe and always-HITL sets are derived from the contracts. An action that wo
 Each check can only make the answer stricter. The design of the contracts and the confidence × impact ×
 tier gate follows [AiSOC](https://github.com/beenuar/AiSOC) (MIT).
 
+**Read back at the vendor.** After an action is applied live (unattended or approved), the connector reads
+it back where the vendor allows it — Imperva rule, AWS WAF IP set, CrowdStrike containment status, Zscaler
+category. A vendor that does not show it turns "executed" into a human's problem (an approved action is
+retried); the receipt records `verified`. Every `AEGIS_VERIFY_EVERY_S` (default 300 s, 0 = off) the service
+re-reads active enforcement: an action released or removed outside AEGIS is marked `drifted` and logged,
+instead of being reported as still in force, and the next approval applies it afresh. Connectors that cannot
+read back (Cloudflare, Azure, F5, SOAR playbooks) report "not verifiable" on the receipt.
+
 **Never-block guardrail** (`agents/shared/netguard.py`). No connectivity-severing action
 (`block`, `isolate`, `throttle`, `quarantine`, `block_egress`) reaches a connector when the target
 is loopback, link-local, unspecified or multicast / reserved space, or an operator-listed address
@@ -819,7 +827,7 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 | Push / stream | `AEGIS_INGEST_HTTP`, `AEGIS_INGEST_BIND`, `AEGIS_INGEST_TOKEN`, `AEGIS_INGEST_READ_TOKEN` (optional separate token for `GET /ingest/verdicts|blocklist|license` and the console reads), `AEGIS_CONSOLE_TOKEN` (the analyst console's key: reads `/api/soc/*` + `/api/approvals` and may POST decisions — see `aegis/ingest/console_api.py`), `AEGIS_INGEST_MAX_MB`, `AEGIS_INGEST_MAX_INFLATE_MB` (cap on what a gzip body may expand to, default 64), `AEGIS_STREAM_CAPACITY`, `AEGIS_EVENTHUB_CONN`, `AEGIS_EVENTHUB_NAME`, `AEGIS_EVENTHUB_GROUP`, `AEGIS_EVENTHUB_START`, `AEGIS_EVENTHUB_CHECKPOINT` |
 | Investigation | `AEGIS_CAMPAIGN_CONTEXT`, `AEGIS_CAMPAIGN_WINDOW_MIN`, `AEGIS_SWARM`, `AEGIS_SWARM_MAX_WORKERS`, `AEGIS_SWARM_MAX_SECONDS`, `AEGIS_INVESTIGATE`, `AEGIS_INVESTIGATE_MAX_SECONDS`, `AEGIS_INVESTIGATE_WORKERS`, `AEGIS_TWIN`, `AEGIS_TWIN_PERSONAS`, `AEGIS_TWIN_ROUNDS`, `AEGIS_MOCK_SPREAD` |
 | Approvals | `AEGIS_HITL_TRANSPORT`, `AEGIS_HITL_DIR`, `AEGIS_HITL_STATE`, `AEGIS_HITL_TIMEOUT`, `AEGIS_HITL_TIMEOUT_SEC`, `AEGIS_HITL_TIMEOUT_MIN_CONF`, `AEGIS_SLACK_WEBHOOK`, `AEGIS_SERVICENOW_*` |
-| Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_AUTONOMY_TIER`, `AEGIS_AUTONOMY_FLOOR_LOW` / `_MODERATE` / `_HIGH`, `AEGIS_UNATTENDED_DENY_PRINCIPALS`, `AEGIS_PROTECTED_TARGETS`, `AEGIS_NEVER_BLOCK`, `AEGIS_NEVER_BLOCK_HOSTS`, `AEGIS_HIGH_IMPACT_MAX`, `AEGIS_HIGH_IMPACT_WINDOW_SEC`, `AEGIS_APPROVED_TTL_SEC`, `AEGIS_APPROVED_BLOCK_TTL_SEC`, `AEGIS_OUTFLOW_BREAKER`, `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH` |
+| Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_AUTONOMY_TIER`, `AEGIS_AUTONOMY_FLOOR_LOW` / `_MODERATE` / `_HIGH`, `AEGIS_UNATTENDED_DENY_PRINCIPALS`, `AEGIS_VERIFY_EVERY_S`, `AEGIS_PROTECTED_TARGETS`, `AEGIS_NEVER_BLOCK`, `AEGIS_NEVER_BLOCK_HOSTS`, `AEGIS_HIGH_IMPACT_MAX`, `AEGIS_HIGH_IMPACT_WINDOW_SEC`, `AEGIS_APPROVED_TTL_SEC`, `AEGIS_APPROVED_BLOCK_TTL_SEC`, `AEGIS_OUTFLOW_BREAKER`, `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH` |
 | Agentic attackers | `AEGIS_AUTO_BLOCK` (`off` · `shadow` · `live`), `AEGIS_AUTO_BLOCK_MIN_CONF`, `AEGIS_AUTO_BLOCK_TTL`, `AEGIS_AUTO_BLOCK_MAX_PER_HOUR`, `AEGIS_FP_ALLOW`, `AEGIS_ADAPTIVE_MIN_RETRIES`, `AEGIS_ADAPTIVE_MAX_RETRY_S`, `AEGIS_AUTH_BURST_MIN`, `AEGIS_AWS_WAF_RULE_GROUP`, `AEGIS_JA4_DB`, `AEGIS_TLS_SHARED_UAS`, `AEGIS_TLS_LIBRARY_IPS` |
 | Network sensor (NDR) | `NDR_EVENT_FILE`, `AEGIS_INTERNAL_NETS`, `AEGIS_TLS_IOC_FILE`, `AEGIS_AI_REGISTER`, `AEGIS_SHADOW_AI_REGISTER`, `AEGIS_AI_PROVIDERS_EXTRA`, `AEGIS_NDR_RARE_MAX_SRCS`, `AEGIS_NDR_BEACON_MIN_CONN`, `AEGIS_NDR_BEACON_MIN_SPAN_S`, `AEGIS_NDR_BEACON_MAX_JITTER`, `AEGIS_NDR_EXFIL_MIN_MB`, `AEGIS_NDR_EXFIL_WINDOW_S`, `AEGIS_NDR_EXFIL_RATIO`, `AEGIS_NDR_AI_UPLOAD_MB`, `AEGIS_NDR_ALLOW_DOMAINS`, `AEGIS_NDR_ALLOW_HOSTS` |
 | Licence | `AEGIS_LICENSE`, `AEGIS_LICENSE_ENFORCE`, `AEGIS_INSTALL_ID`, `AEGIS_INSTALL_SALT`, `AEGIS_LICENSE_PUBKEYS`, `AEGIS_LICENSE_OVERLIMIT_DAYS` — see the root README § Licensing |

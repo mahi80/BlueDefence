@@ -116,6 +116,13 @@ class ImpervaWafConnector(Connector):
         # the rule is still there; the TTL lives on our side
         return f"[imperva] rule {receipt.vendor_ref} kept for another {ttl_sec}s"
 
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        rule_id = receipt.rollback_token or receipt.vendor_ref
+        if not rule_id:
+            return None
+        res = call(self._transport, "GET", self._rules_url(rule_id), headers=self._headers, expect=(404,))
+        return res.status != 404
+
 
 class F5WafConnector(Connector):
     """F5 BIG-IP Advanced WAF — ASM policy IP-address exception with blockRequests=always."""

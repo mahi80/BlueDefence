@@ -127,6 +127,16 @@ class CrowdStrikeConnector(Connector):
         raise ConnectorError("kill_process cannot be undone — a killed process cannot be restored "
                              "(snapshot_forensic first if evidence is needed)")
 
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        if receipt.action_type != "isolate" or not receipt.vendor_ref:
+            return None                              # a kill is one-shot: nothing stays in force to read back
+        res = call(self._transport, "GET", f"{self.base_url}/devices/entities/devices/v2?ids={receipt.vendor_ref}",
+                   headers=self._headers(), expect=(200,))
+        devs = res.json().get("resources") or []
+        if not devs:
+            return None
+        return str(devs[0].get("status") or "").lower() in ("contained", "containment_pending")
+
     def _do_renew(self, receipt: Receipt, ttl_sec: int) -> str:
         if receipt.action_type == "isolate":
             return f"[crowdstrike] containment on {receipt.target} still active"

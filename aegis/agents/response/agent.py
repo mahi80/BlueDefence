@@ -280,7 +280,7 @@ class ResponseAgent:
                                           note="auto-block refused by governance; routed to a human")
                 if receipt.active:
                     self._autonomy.take()
-                done = self._from_receipt(action, receipt, prefix="auto-block")
+                done = self._checked(action, self._from_receipt(action, receipt, prefix="auto-block"))
                 done.note = f"{done.note} ({why})"
                 return done
         # Outflow circuit breaker: a drain in progress does not wait for an analyst to open a card.
@@ -296,7 +296,7 @@ class ResponseAgent:
                                                  ttl_sec=self._breaker.ttl_sec)
                 if receipt is not None and receipt.active:
                     self._breaker.take()
-                    done = self._from_receipt(action, receipt, prefix="outflow-breaker")
+                    done = self._checked(action, self._from_receipt(action, receipt, prefix="outflow-breaker"))
                     done.note = f"{done.note} ({why})"
                     return done
         # Always-HITL list takes precedence
@@ -331,7 +331,28 @@ class ResponseAgent:
         A failed or unsupported receipt is parked for a human, never
         reported as done."""
         receipt = self._connectors.apply(action, alert_id=alert_id)
-        return self._from_receipt(action, receipt, prefix="auto")
+        return self._checked(action, self._from_receipt(action, receipt, prefix="auto"))
+
+    def _checked(self, action: RecommendedAction, done: ExecutedAction) -> ExecutedAction:
+        """Read an executed action back at the vendor (idea from AiSOC: unattended containment is verified,
+        the gap counted). A vendor that says it is NOT in place turns "executed" into a human's problem: the
+        receipt is dropped as drifted, and the action is queued (unattended) or retried (approved)."""
+        r = done.receipt
+        verify = getattr(self._connectors, "verify", None)
+        if done.status != "executed" or r is None or getattr(r, "dry_run", True) or verify is None:
+            return done
+        v = verify(r)
+        if v is False:
+            self._connectors.forget(r, "applied, but the vendor read-back does not show it")
+            return ExecutedAction(action=action, status="queued_for_hitl", receipt=r, reason="connector_failed",
+                                  note=f"{done.note} — NOT in place at {r.connector} on read-back; human needed")
+        if v is None:
+            done.note = f"{done.note} (not verifiable at {r.connector})"
+        return done
+
+    def check_drift(self) -> list[Receipt]:
+        """Re-verify active enforcement at the vendors (call from the scheduler loop)."""
+        return self._connectors.check_drift()
 
     @staticmethod
     def _from_receipt(action: RecommendedAction, receipt: Receipt, *, prefix: str) -> ExecutedAction:
@@ -424,6 +445,6 @@ class ResponseAgent:
         approved_by = approver if not second_approver else f"{approver}+{second_approver}"
         receipt = self._connectors.apply(action, alert_id=source_alert_id or "", approver=approved_by,
                                          ttl_sec=approved_ttl_sec(action.action_type, approver))
-        executed = self._from_receipt(action, receipt, prefix="approved")
+        executed = self._checked(action, self._from_receipt(action, receipt, prefix="approved"))
         executed.note = f"{executed.note} approved by {approved_by}"
         return executed
