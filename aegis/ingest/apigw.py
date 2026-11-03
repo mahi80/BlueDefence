@@ -96,7 +96,12 @@ def normalize(record: dict, *, principal_field: str = "") -> Optional[dict]:
                "status": _first(src, "responseCode", "ResponseCode"),
                "request_id": _first(src, "correlationId", "CorrelationId", "requestId"),
                "user_agent": _first(src, "userAgent", "UserAgent", "requestHeaders.User-Agent"),
-               "principal": _first(src, *(([extra] if extra else []) + ["userId", "UserId", "apimSubscriptionId", "ApimSubscriptionId"]))}
+               # the subscription key belongs to an APP: every customer of that app shares it. As the principal it
+               # merged them into one "attacker" walking everyone's accounts, and the alert landed on whichever IP
+               # came last (review round 3 G7-1). It is context, not identity: without a user the call is keyed
+               # by its client address, like any unauthenticated call.
+               "principal": _first(src, *(([extra] if extra else []) + ["userId", "UserId"])),
+               "subscription": _first(src, "apimSubscriptionId", "ApimSubscriptionId")}
     elif isinstance(record.get("request"), dict) and isinstance(record.get("response"), dict):
         req, resp = record["request"], record["response"]
         headers = req.get("headers") if isinstance(req.get("headers"), dict) else {}

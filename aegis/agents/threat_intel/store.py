@@ -118,8 +118,21 @@ class IOCStore:
         """Returns how many were accepted."""
         return sum(1 for ioc in iocs if self.add(ioc))
 
-    def lookup(self, value: str, kind: Optional[IocKind] = None) -> Optional[IOC]:
-        """Return the IOC if present and not expired. Honors TTL."""
+    def lookup(self, value: str, kind: IocKind | None = None, *, include_llm: bool | None = None) -> IOC | None:
+        """Return the IOC if present and not expired. Honors TTL.
+
+        LLM-extracted indicators (read from untrusted advisories) are not returned unless ``include_llm`` — the
+        same rule that keeps them out of the hot-path matchers. The NDR detector and the swarm's intel worker
+        looked them up directly, so an advisory naming any domain made traffic to it "known bad" (review round
+        3 G7-3). ``AEGIS_TI_MERGE_LLM_IOCS=1`` restores them everywhere."""
+        if include_llm is None:
+            include_llm = os.environ.get("AEGIS_TI_MERGE_LLM_IOCS", "0") == "1"
+        hit = self._lookup(value, kind)
+        if hit is not None and not include_llm and LLM_TAG in hit.tags:
+            return None
+        return hit
+
+    def _lookup(self, value: str, kind: IocKind | None = None) -> IOC | None:
         now = time.time()
         if kind is not None:
             value = normalise(kind, value)[0] or value          # same canonical form the store keeps

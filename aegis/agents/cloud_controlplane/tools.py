@@ -66,6 +66,44 @@ _SERVICE_PREFIX = {"iam.amazonaws.com": "iam:", "sts.amazonaws.com": "sts:"}
 _WILDCARD_RX = re.compile(r'"(?:Action|NotAction|Resource|actions)"\s*:\s*(?:"\*"|\[[^\]]*"\*"[^\]]*\])', re.IGNORECASE)
 
 
+def _raw_action(event: dict) -> str:
+    raw = event.get("eventName") or event.get("operationName") or event.get("event_type") or ""
+    if isinstance(raw, dict):
+        # Azure Activity Log exports operationName as {"value": "...", "localizedValue": "..."}: str() of the dict
+        # matched nothing, and `.startswith` on it crashed (review round 3 G7-5)
+        raw = raw.get("value") or raw.get("localizedValue") or ""
+    return str(raw).strip()
+
+
+def _action(event: dict, *, prefix: str = "") -> str:
+    """The event's operation in the spelling this module's tables use. Azure and GCP do not keep one case
+    (``MICROSOFT.AUTHORIZATION/ROLEASSIGNMENTS/WRITE`` in Activity Log exports), and every table compared
+    case-sensitively, so the same grant was high risk or invisible depending on the exporter (round 3 G7-5)."""
+    s = _raw_action(event)
+    if prefix and ":" not in s:
+        s = prefix + s
+    return _CANON.get(s.lower(), s)
+
+
+def _params(event: dict) -> dict:
+    """requestParameters / properties, with an Azure ``requestbody`` (a JSON string) merged in: the role
+    definition id and NSG rule of a real Activity Log event live only there."""
+    params = event.get("requestParameters") or event.get("properties") or event.get("payload") or {}
+    if not isinstance(params, dict):
+        return {}
+    body = params.get("requestbody") or params.get("requestBody")
+    if isinstance(body, str) and body.strip().startswith("{"):
+        try:
+            import json as _json
+            parsed = _json.loads(body)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            inner = parsed.get("properties") if isinstance(parsed.get("properties"), dict) else {}
+            return {**params, **parsed, **inner}
+    return params
+
+
 def iam_change_check(event: dict | None) -> ToolResult:
     """Inspect an IAM-domain control-plane event for posture-weakening
     patterns: wildcard policies, dangerous role grants, new long-lived
@@ -75,13 +113,7 @@ def iam_change_check(event: dict | None) -> ToolResult:
         return ToolResult(name="iam_change", data={"verdict": "no_event"}, weight="low")
 
     # OpenStack Keystone events use `event_type` instead of eventName.
-    action = str(event.get("eventName")
-                 or event.get("operationName")
-                 or event.get("event_type")
-                 or "")
-    prefix = _SERVICE_PREFIX.get(str(event.get("eventSource") or "").lower())
-    if prefix and ":" not in action:
-        action = prefix + action
+    action = _action(event, prefix=_SERVICE_PREFIX.get(str(event.get("eventSource") or "").lower(), ""))
     is_iam_action = (
         action in _HIGH_RISK_IAM_ACTIONS
         or "iam" in action.lower()
@@ -93,7 +125,7 @@ def iam_change_check(event: dict | None) -> ToolResult:
             "action": action, "is_iam": False,
         }, weight="low")
 
-    params = event.get("requestParameters") or event.get("properties") or {}
+    params = _params(event)
     # Wildcard scan in policy document
     from urllib.parse import unquote
     doc = params.get("policyDocument") or params.get("roleDefinition") or ""
@@ -136,8 +168,8 @@ def resource_policy_check(event: dict | None) -> ToolResult:
     if not event:
         return ToolResult(name="resource_policy", data={"verdict": "no_event"}, weight="low")
 
-    action = event.get("eventName") or event.get("operationName") or ""
-    params = event.get("requestParameters") or event.get("properties") or {}
+    action = _action(event)
+    params = _params(event)
 
     if action in ("PutBucketPolicy", "s3:PutBucketPolicy",
                   "Microsoft.Storage/storageAccounts/write"):
@@ -181,11 +213,8 @@ def network_change_check(event: dict | None) -> ToolResult:
     if not event:
         return ToolResult(name="network_change", data={"verdict": "no_event"}, weight="low")
 
-    action = (event.get("eventName")
-              or event.get("operationName")
-              or event.get("event_type")
-              or "")
-    params = event.get("requestParameters") or event.get("properties") or event.get("payload") or {}
+    action = _action(event)
+    params = _params(event)
 
     # OpenStack Neutron security-group rule create — equivalent of AWS
     # AuthorizeSecurityGroupIngress / Azure NSG rule write.
@@ -215,24 +244,18 @@ def network_change_check(event: dict | None) -> ToolResult:
             "opens_internet": False,
         }, weight="low")
 
-    if action in ("AuthorizeSecurityGroupIngress",
-                  "Microsoft.Network/networkSecurityGroups/securityRules/write"):
-        cidr = ""
-        for rule_key in ("ipPermissions", "securityRules", "rules"):
-            rules = params.get(rule_key) or []
-            if isinstance(rules, list) and rules:
-                first = rules[0] or {}
-                cidr = (first.get("cidrIp") or first.get("sourceAddressPrefix")
-                        or (first.get("ipRanges") or [{}])[0].get("cidrIp", "")) if isinstance(first, dict) else ""
-                break
-        cidr = cidr or str(params.get("cidrIp") or params.get("sourceAddressPrefix") or "")
-        port = params.get("toPort") or params.get("destinationPortRange") or 0
-        try:
-            port_n = int(port) if str(port).isdigit() else 0
-        except (TypeError, ValueError):
-            port_n = 0
-        opens_internet = _INTERNET_CIDR in cidr or "Internet" in cidr
-        sensitive = port_n in _SENSITIVE_PORTS or str(port) in {"*", "any"}
+    if action in ("AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules",
+                  "Microsoft.Network/networkSecurityGroups/securityRules/write",
+                  "Microsoft.Network/networkSecurityGroups/write"):
+        # every rule of the change, not the first: CloudTrail nests them as ipPermissions.items[].ipRanges.items[]
+        # and the old reader saw no CIDR at all (SSH to the world scored low); Azure writes "*" / "Any" /
+        # "Internet" for the internet and port ranges like "20-30" (review round 3 G7-4)
+        rules = _ingress_rules(params)
+        hits = [(c, lo, hi) for c, lo, hi in rules if _is_internet(c)]
+        opens_internet = bool(hits)
+        sensitive = any(lo <= p <= hi for _, lo, hi in hits for p in _SENSITIVE_PORTS)
+        cidr = hits[0][0] if hits else (rules[0][0] if rules else "")
+        port = (f"{hits[0][1]}-{hits[0][2]}" if hits and hits[0][1] != hits[0][2] else (hits[0][1] if hits else 0))
         if opens_internet and sensitive:
             return ToolResult(name="network_change", data={
                 "action": action, "cidr": cidr, "port": port,
@@ -269,6 +292,19 @@ def network_change_check(event: dict | None) -> ToolResult:
 
 # ---- KMS / secrets change check -------------------------------------
 
+_KMS_HIGH = {
+    "DisableKey", "ScheduleKeyDeletion", "kms:DisableKey", "kms:ScheduleKeyDeletion",
+    "Microsoft.KeyVault/vaults/keys/delete",
+    "Microsoft.KeyVault/vaults/secrets/delete",
+    "DeleteSecret", "secretsmanager:DeleteSecret",
+    "google.cloud.kms.v1.KeyManagementService.DestroyCryptoKeyVersion",
+}
+_KMS_MEDIUM = {
+    "CreateGrant", "kms:CreateGrant",
+    "GetSecretValue",  # only medium because routine — frequency comes from agent's reasoning
+}
+
+
 def secrets_or_kms_change_check(event: dict | None) -> ToolResult:
     """Detects key disable/delete and secret rotation/exfil-shape
     operations on KMS / Key Vault / Secret Manager.
@@ -276,18 +312,9 @@ def secrets_or_kms_change_check(event: dict | None) -> ToolResult:
     if not event:
         return ToolResult(name="secrets_kms_change", data={"verdict": "no_event"}, weight="low")
 
-    action = event.get("eventName") or event.get("operationName") or ""
-    high_risk = action in {
-        "DisableKey", "ScheduleKeyDeletion", "kms:DisableKey", "kms:ScheduleKeyDeletion",
-        "Microsoft.KeyVault/vaults/keys/delete",
-        "Microsoft.KeyVault/vaults/secrets/delete",
-        "DeleteSecret", "secretsmanager:DeleteSecret",
-        "google.cloud.kms.v1.KeyManagementService.DestroyCryptoKeyVersion",
-    }
-    medium_risk = action in {
-        "CreateGrant", "kms:CreateGrant",
-        "GetSecretValue",  # only medium because routine — frequency comes from agent's reasoning
-    }
+    action = _action(event)
+    high_risk = action in _KMS_HIGH
+    medium_risk = action in _KMS_MEDIUM
     if high_risk:
         return ToolResult(name="secrets_kms_change", data={
             "action": action, "high_risk": True,
@@ -307,7 +334,17 @@ _LOG_DISABLE_ACTIONS = {
     "StopLogging", "DeleteTrail",
     "cloudtrail:StopLogging", "cloudtrail:DeleteTrail",
     "PutEventSelectors",  # could be narrowing scope — treat as suspicious
+    "UpdateTrail",        # can point the trail at another bucket or drop regions
+    # the other detective controls an attacker switches off (review round 3 G7-6)
+    "DeleteDetector", "UpdateDetector", "DisassociateFromMasterAccount", "DisassociateMembers",
+    "guardduty:DeleteDetector", "guardduty:UpdateDetector",
+    "StopConfigurationRecorder", "DeleteConfigurationRecorder", "DeleteDeliveryChannel",
+    "config:StopConfigurationRecorder", "config:DeleteConfigurationRecorder",
+    "DeleteFlowLogs", "ec2:DeleteFlowLogs",
+    "DisableSecurityHub", "BatchDisableStandards", "securityhub:DisableSecurityHub",
+    "DeleteLogGroup", "DeleteLogStream",
     "Microsoft.Insights/diagnosticSettings/delete",
+    "Microsoft.OperationalInsights/workspaces/delete",
     "google.cloud.logging.v2.ConfigServiceV2.DeleteSink",
     # Network device parity (Panorama / Checkpoint / Juniper)
     "panorama:disable-log-forwarding",
@@ -327,10 +364,7 @@ def logging_disable_check(event: dict | None) -> ToolResult:
     if not event:
         return ToolResult(name="logging_disable", data={"verdict": "no_event"}, weight="low")
 
-    action = (event.get("eventName")
-              or event.get("operationName")
-              or event.get("event_type")
-              or "")
+    action = _action(event)
     if action in _LOG_DISABLE_ACTIONS:
         return ToolResult(name="logging_disable", data={
             "action": action, "logging_disabled": True,
@@ -366,8 +400,8 @@ def firewall_audit_check(event: dict | None) -> ToolResult:
     if not event:
         return ToolResult(name="firewall_audit", data={"verdict": "no_event"}, weight="low")
 
-    action = event.get("eventName") or event.get("operationName") or ""
-    rule = event.get("requestParameters") or event.get("properties") or {}
+    action = _action(event)
+    rule = _params(event)
     src = str(rule.get("source") or rule.get("src_zone") or "")
     dst = str(rule.get("destination") or rule.get("dst_zone") or "")
     svc = str(rule.get("service") or rule.get("application") or "")
@@ -432,14 +466,26 @@ def k8s_audit_check(event: dict | None) -> ToolResult:
             "tracked": False, "action": event.get("eventName", ""),
         }, weight="low")
 
-    high_risk_combo = (verb, full_resource) in _K8S_HIGH_RISK_VERBS_RESOURCES
+    # kubectl exec over WebSocket is a `get` on pods/exec (the upgrade request), not a `create`
+    high_risk_combo = ((verb, full_resource) in _K8S_HIGH_RISK_VERBS_RESOURCES
+                       or (verb == "get" and full_resource in ("pods/exec", "pods/attach", "pods/portforward")))
 
     # Privileged container creation
     pod_features: list[str] = []
-    if verb == "create" and resource == "pods":
-        spec = ((event.get("requestObject") or {}).get("spec") or {})
+    if verb in ("create", "update", "patch") and resource in ("pods", "deployments", "daemonsets", "statefulsets",
+                                                             "replicasets", "jobs", "cronjobs"):
+        ro = event.get("requestObject") or {}
+        spec = ro.get("spec") or {}
+        for _ in range(3):                                   # Deployment → template → spec (CronJob nests one deeper)
+            tpl = spec.get("template") or (spec.get("jobTemplate") or {}).get("spec", {}).get("template")
+            if not isinstance(tpl, dict):
+                break
+            spec = tpl.get("spec") or {}
         sec = spec.get("securityContext") or {}
-        if sec.get("privileged"):
+        # `privileged` is a CONTAINER setting; the pod-level read never fired (review round 3 G7-6)
+        containers = [c for k in ("containers", "initContainers", "ephemeralContainers")
+                      for c in (spec.get(k) or []) if isinstance(c, dict)]
+        if sec.get("privileged") or any((c.get("securityContext") or {}).get("privileged") for c in containers):
             pod_features.append("privileged")
         if spec.get("hostNetwork"):
             pod_features.append("hostNetwork")
@@ -507,10 +553,7 @@ def resource_burst_check(event: dict | None) -> ToolResult:
     """
     if not event:
         return ToolResult(name="resource_burst", data={"verdict": "no_event"}, weight="low")
-    action = (event.get("eventName")
-              or event.get("operationName")
-              or event.get("event_type")
-              or "")
+    action = _action(event)
     if action not in _RESOURCE_CREATE_ACTIONS:
         return ToolResult(name="resource_burst", data={
             "action": action, "tracked": False,
@@ -561,10 +604,7 @@ def hsm_audit_check(event: dict | None) -> ToolResult:
     """
     if not event:
         return ToolResult(name="hsm_audit", data={"verdict": "no_event"}, weight="low")
-    action = (event.get("eventName")
-              or event.get("operationName")
-              or event.get("event_type")
-              or "")
+    action = _action(event)
     if action in _HSM_HIGH_RISK_OPERATIONS:
         return ToolResult(name="hsm_audit", data={
             "action": action, "high_risk": True,
@@ -576,6 +616,90 @@ def hsm_audit_check(event: dict | None) -> ToolResult:
     return ToolResult(name="hsm_audit", data={
         "action": action, "tracked": False,
     }, weight="low")
+
+
+_EXTRA_NAMES = (
+    "PutBucketPolicy", "s3:PutBucketPolicy", "Microsoft.Storage/storageAccounts/write", "PutBucketEncryption",
+    "DeleteBucketEncryption", "PutBucketPublicAccessBlock", "AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules",
+    "Microsoft.Network/networkSecurityGroups/securityRules/write", "Microsoft.Network/networkSecurityGroups/write",
+    "CreateVpcPeeringConnection", "AcceptVpcPeeringConnection", "CreateVpnConnection", "CreateClientVpnEndpoint",
+    "Microsoft.Network/virtualNetworkGateways/write", "network.security_group_rule.create.end",
+    "network.security_group_rule.created",
+)
+_CANON: dict[str, str] = {n.lower(): n for group in (
+    _HIGH_RISK_IAM_ACTIONS, _KMS_HIGH, _KMS_MEDIUM, _LOG_DISABLE_ACTIONS, _FIREWALL_WEAKENING_ACTIONS,
+    _RESOURCE_CREATE_ACTIONS, _HSM_HIGH_RISK_OPERATIONS, _EXTRA_NAMES) for n in group}
+
+_ANY_SOURCE = {"*", "any", "internet", "0.0.0.0/0", "::/0", "0.0.0.0", "all"}
+
+
+def _is_internet(cidr: str) -> bool:
+    return str(cidr).strip().lower() in _ANY_SOURCE
+
+
+def _items(v) -> list:
+    if isinstance(v, dict) and "items" in v:
+        v = v["items"]
+    if isinstance(v, dict):
+        return [v]
+    return list(v) if isinstance(v, (list, tuple)) else ([] if v in (None, "") else [v])
+
+
+def _ports(lo, hi, proto="") -> tuple[int, int]:
+    if str(proto) in ("-1", "all", "*") or str(lo).strip().lower() in ("*", "any", "-1"):
+        return 0, 65535
+    if isinstance(lo, str) and "-" in lo:
+        a, _, b = lo.partition("-")
+        lo, hi = a, b
+    try:
+        lo_n = int(lo)
+    except (TypeError, ValueError):
+        return (0, 65535) if lo in (None, "") and hi in (None, "") else (0, 0)
+    try:
+        hi_n = int(hi) if hi not in (None, "") else lo_n
+    except (TypeError, ValueError):
+        hi_n = lo_n
+    return (lo_n, hi_n) if lo_n <= hi_n else (hi_n, lo_n)
+
+
+def _ingress_rules(params: dict) -> list[tuple[str, int, int]]:
+    """Every (source, port-low, port-high) a security-group / NSG change opens — CloudTrail
+    (``ipPermissions.items[].ipRanges.items[].cidrIp``, IPv6, the flat ``cidrIp``/``fromPort``/``toPort``
+    form, ``ModifySecurityGroupRules``) and Azure (``securityRules[].properties``, ``sourceAddressPrefix(es)``,
+    ``destinationPortRange(s)``)."""
+    out: list[tuple[str, int, int]] = []
+    perms = _items(params.get("ipPermissions"))
+    for p in perms:
+        if not isinstance(p, dict):
+            continue
+        lo, hi = _ports(p.get("fromPort"), p.get("toPort"), p.get("ipProtocol", ""))
+        cidrs = [r.get("cidrIp") for r in _items(p.get("ipRanges")) if isinstance(r, dict)]
+        cidrs += [r.get("cidrIpv6") for r in _items(p.get("ipv6Ranges")) if isinstance(r, dict)]
+        cidrs += [p.get("cidrIp")] if p.get("cidrIp") else []
+        out += [(str(c), lo, hi) for c in cidrs if c]
+    for r in _items((params.get("ModifySecurityGroupRulesRequest") or {}).get("SecurityGroupRule")) + _items(params.get("securityGroupRules")):
+        if isinstance(r, dict):
+            body = r.get("SecurityGroupRule") if isinstance(r.get("SecurityGroupRule"), dict) else r
+            lo, hi = _ports(body.get("FromPort"), body.get("ToPort"), body.get("IpProtocol", ""))
+            for c in (body.get("CidrIpv4"), body.get("CidrIpv6")):
+                if c:
+                    out.append((str(c), lo, hi))
+    if params.get("cidrIp") and not perms:
+        lo, hi = _ports(params.get("fromPort"), params.get("toPort"), params.get("ipProtocol", ""))
+        out.append((str(params["cidrIp"]), lo, hi))
+    az = [r.get("properties", r) for r in _items(params.get("securityRules")) if isinstance(r, dict)]
+    if params.get("sourceAddressPrefix") or params.get("sourceAddressPrefixes"):
+        az.append(params)
+    for r in az:
+        if str(r.get("direction") or "Inbound").lower() != "inbound" or str(r.get("access") or "Allow").lower() != "allow":
+            continue
+        srcs = [r.get("sourceAddressPrefix")] + list(r.get("sourceAddressPrefixes") or [])
+        ranges = [r.get("destinationPortRange")] + list(r.get("destinationPortRanges") or [])
+        for c in (x for x in srcs if x):
+            for pr in (x for x in ranges if x not in (None, "")):
+                lo, hi = _ports(pr, None)
+                out.append((str(c), lo, hi))
+    return out
 
 
 def run_all_tools(alert: dict) -> list[ToolResult]:
