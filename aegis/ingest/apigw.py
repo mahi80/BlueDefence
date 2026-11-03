@@ -196,7 +196,7 @@ class ApiGatewayConsumer(BaseConsumer):
         self.events += 1
         return self.detector.observe(ev)
 
-    def iter_alerts(self, **kwargs) -> Iterator[dict]:
+    def _iter_alerts(self, **kwargs) -> Iterator[dict]:
         # an event that does not cross a threshold is the normal case, not an invalid record
         for record in self.fetch(**kwargs):
             try:

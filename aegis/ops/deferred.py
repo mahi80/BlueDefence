@@ -79,13 +79,16 @@ class DeferredQueue:
                     logger.error("[deferred] spill file %s at its %d MB cap — %d alert(s) dropped", self.path.name,
                                  self.max_bytes // (1024 * 1024), self.dropped)
                 return False
-            # the spill is a store like any other: credentials are redacted before they touch disk
-            from ..agents.shared.redact import redact
-            row = redact(dict(alert))
+            # The spill is a QUEUE of alerts still to be analysed, not a record: it is written as received. Redacting it
+            # stripped the very credential a re-fed secret-leak alert is about, so it came back with no evidence
+            # (review round 3 G4-12). The file is private to the service user instead (0600, never through a
+            # symlink), and the audit record of the analysis is redacted as always.
+            row = dict(alert)
             row["deferred_at"] = time.time()
             row["deferred_by"] = reason
             data = (json.dumps(row, separators=(",", ":"), default=str) + "\n").encode()
-            with self.path.open("ab") as fh:
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            with os.fdopen(os.open(self.path, flags, 0o600), "ab") as fh:
                 start = fh.tell()
                 try:
                     fh.write(data)

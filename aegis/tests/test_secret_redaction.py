@@ -176,9 +176,16 @@ def test_attack_on_the_same_line_is_still_kept():
     assert FAKE not in out and "' OR 1=1--" in out
 
 
-def test_deferred_spill_is_redacted(tmp_path):
+def test_deferred_spill_is_private_and_keeps_the_evidence(tmp_path):
+    # review round 3 G4-12: the spill is a queue of alerts still to be analysed. Redacting it stripped the very
+    # credential a re-fed secret-leak alert is about. It keeps the alert as received in a 0600 file; the audit
+    # record of the analysis is redacted as always.
+    import os
+    import stat
+
     from aegis.ops.deferred import DeferredQueue
     q = DeferredQueue(tmp_path / "deferred.jsonl")
     q.push({"id": "a1", "body": f"username=ravi&password={FAKE}", "request_headers": {"Authorization": f"Bearer {FAKE}"}})
-    assert FAKE not in (tmp_path / "deferred.jsonl").read_text()
-    assert q.pop(1)[0]["id"] == "a1"
+    assert stat.S_IMODE(os.stat(tmp_path / "deferred.jsonl").st_mode) == 0o600
+    (row,) = q.pop(1)
+    assert row["id"] == "a1" and FAKE in row["body"]

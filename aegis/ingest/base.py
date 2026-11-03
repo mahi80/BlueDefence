@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-import time
+import os
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -62,15 +63,34 @@ class AlertCheckpoint:
         self.max_ids = max_ids
         self._lock = threading.Lock()
         self._state: dict[str, Any] = {"watermark": {}, "seen": []}
-        self._seen: "OrderedDict[str, None]" = OrderedDict()
+        # one LRU per source: a single shared LRU let a noisy feed evict a quiet feed's ids, which were then
+        # re-delivered as new (review round 3 G4-6)
+        self._seen: dict[str, OrderedDict[str, None]] = {}
+        self._dirty = 0
+        self._last_flush = time.monotonic()
+        try:
+            self.flush_s = float(os.environ.get("AEGIS_CHECKPOINT_FLUSH_S", "1") or 1)
+        except ValueError:
+            self.flush_s = 1.0
         if self.path and self.path.exists():
             try:
                 self._state = json.loads(self.path.read_text(encoding="utf-8"))
-                for k in self._state.get("seen", [])[-max_ids:]:
-                    self._seen[k] = None
+                for k in self._state.get("seen", []):
+                    self._lru(k)[k] = None
+                for lru in self._seen.values():
+                    while len(lru) > self.max_ids:
+                        lru.popitem(last=False)
             except Exception as e:  # noqa: BLE001 — a corrupt checkpoint just means a clean start
                 logger.warning("[ingest] checkpoint %s unreadable (%s); starting fresh", self.path, e)
                 self._state = {"watermark": {}, "seen": []}
+                self._seen = {}
+
+    def _lru(self, key: str) -> OrderedDict[str, None]:
+        src = key.split(":", 1)[0] if ":" in key else ""
+        lru = self._seen.get(src)
+        if lru is None:
+            lru = self._seen[src] = OrderedDict()
+        return lru
 
     def watermark(self, source: str) -> Optional[str]:
         return self._state.get("watermark", {}).get(source)
@@ -80,25 +100,87 @@ class AlertCheckpoint:
             cur = self._state.setdefault("watermark", {}).get(source)
             if cur is None or value > cur:
                 self._state["watermark"][source] = value
-            self._flush()
+                self._dirty += 1
+            self._maybe_flush()
 
     def seen(self, key: str) -> bool:
         with self._lock:
-            return key in self._seen
+            return key in self._lru(key)
 
     def mark(self, key: str) -> bool:
         """Record ``key``; returns False when it was already seen."""
         with self._lock:
-            if key in self._seen:
+            lru = self._lru(key)
+            if key in lru:
                 return False
-            self._seen[key] = None
-            while len(self._seen) > self.max_ids:
-                self._seen.popitem(last=False)
-            self._state["seen"] = list(self._seen.keys())
-            self._flush()
+            lru[key] = None
+            while len(lru) > self.max_ids:
+                lru.popitem(last=False)
+            self._dirty += 1
+            self._maybe_flush()
             return True
 
+    # ---- crash loops (review round 3 G4-13) -------------------------------------------------------------------
+    # Ingest is at-least-once: an alert is marked seen only after it was handled. An alert that CRASHES the
+    # process is therefore re-delivered on every restart, forever, and stateful detectors count it again each
+    # time. A tiny side file names the alert being handled; after AEGIS_INGEST_POISON_MAX starts that never
+    # finished, it is skipped and set aside.
+    def _inflight_path(self) -> Path | None:
+        return self.path.with_name(self.path.name + ".inflight") if self.path else None
+
+    def begin(self, key: str) -> bool:
+        """About to hand ``key`` to the caller. False when it has crashed the process too often: skip it."""
+        p = self._inflight_path()
+        if p is None:
+            return True
+        attempts = 0
+        try:
+            prev = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+            if prev.get("key") == key:
+                attempts = int(prev.get("attempts") or 0)
+        except (OSError, ValueError):
+            attempts = 0
+        try:
+            limit = int(os.environ.get("AEGIS_INGEST_POISON_MAX", "3") or 3)
+        except ValueError:
+            limit = 3
+        if attempts >= limit:
+            logger.error("[ingest] %s did not finish in %d attempts (each one ended the process) — skipped; "
+                         "re-send it once the cause is fixed", key, attempts)
+            self.mark(key)
+            self.done()
+            return False
+        try:
+            p.write_text(json.dumps({"key": key, "attempts": attempts + 1}), encoding="utf-8")
+        except OSError:
+            pass
+        return True
+
+    def done(self) -> None:
+        p = self._inflight_path()
+        if p is not None:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def flush(self) -> None:
+        """Write the checkpoint now (end of a batch, shutdown)."""
+        with self._lock:
+            if self._dirty:
+                self._flush()
+
+    def _maybe_flush(self) -> None:
+        # The whole state was re-serialised and renamed into place twice per alert — a ~290 alerts/s ceiling on
+        # ingest (review round 3 G4-6). Now at most every AEGIS_CHECKPOINT_FLUSH_S (1 s) or 500 changes, and at
+        # the end of every consumer pass. A crash re-delivers at most that much (ingest is at-least-once).
+        if self._dirty >= 500 or time.monotonic() - self._last_flush >= self.flush_s:
+            self._flush()
+
     def _flush(self) -> None:
+        self._state["seen"] = [k for lru in self._seen.values() for k in lru]
+        self._dirty = 0
+        self._last_flush = time.monotonic()
         if not self.path:
             return
         try:
@@ -152,6 +234,17 @@ class BaseConsumer:
             self._drop_suppressed = getattr(self, "_drop_suppressed", 0) + 1
 
     def iter_alerts(self, **kwargs) -> Iterator[dict]:
+        try:
+            yield from self._iter_alerts(**kwargs)
+        finally:
+            # closed or finished normally (a caller stopping at max_alerts, a shutdown): not a crash, so the
+            # alert in hand is not counted as one that killed the process
+            for name in ("done", "flush"):
+                fn = getattr(self.checkpoint, name, None)
+                if callable(fn):
+                    fn()
+
+    def _iter_alerts(self, **kwargs) -> Iterator[dict]:
         for record in self.fetch(**kwargs):
             try:
                 alert = self.normalize(record)
@@ -171,6 +264,10 @@ class BaseConsumer:
                 if self.checkpoint.seen(key):
                     self.skipped_duplicates += 1
                     continue
+                begin = getattr(self.checkpoint, "begin", None)
+                if callable(begin) and not begin(key):
+                    self.skipped_invalid += 1
+                    continue
                 self.yielded += 1
                 yield one
                 # Marked only once the caller asks for the next alert, i.e. after it handled this one. Marking before
@@ -178,6 +275,9 @@ class BaseConsumer:
                 # the alert already fetched, lost it for good (code review 2026-11-03 E15). Now at-least-once; the
                 # audit / HITL layers already dedupe on the alert id.
                 self.checkpoint.mark(key)
+                done = getattr(self.checkpoint, "done", None)
+                if callable(done):
+                    done()
                 ts = one.get("timestamp")
                 if ts:
                     self.checkpoint.advance(self.name, str(ts))

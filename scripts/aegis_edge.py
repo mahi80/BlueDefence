@@ -66,6 +66,21 @@ _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
                "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
 _MAX_BODY = 2 * 1024 * 1024
 _MAX_PUSHED = int(os.environ.get("AEGIS_EDGE_MAX_PUSHED", "10000"))     # SOC-pushed targets kept
+
+
+def _enforceable(net: Any) -> bool:
+    """A block the edge will enforce: not the whole internet, not wider than /16 (IPv4) or /48 (IPv6), and not
+    loopback / link-local / unspecified. ``0.0.0.0/0`` pushed with the shared token blacked out every visitor
+    (review round 3 G4-11)."""
+    try:
+        min_v4 = int(os.environ.get("AEGIS_EDGE_MIN_PREFIX_V4", "16"))
+        min_v6 = int(os.environ.get("AEGIS_EDGE_MIN_PREFIX_V6", "48"))
+    except ValueError:
+        min_v4, min_v6 = 16, 48
+    if net.prefixlen < (min_v4 if net.version == 4 else min_v6):
+        return False
+    addr = net.network_address
+    return not (addr.is_loopback or addr.is_link_local or addr.is_unspecified or addr.is_multicast)
 _MAX_CLIENTS = int(os.environ.get("AEGIS_EDGE_MAX_CLIENTS", "50000"))   # per-source state kept (LRU)
 
 
@@ -201,7 +216,9 @@ class Blocklist:
             if str(row.get("action", "")).lower() not in _ENFORCE_ACTIONS:
                 continue
             try:
-                nets.append((ipaddress.ip_network(str(row["target"]), strict=False), _expiry(row.get("expires_at"))))
+                net = ipaddress.ip_network(str(row["target"]), strict=False)
+                if _enforceable(net):
+                    nets.append((net, _expiry(row.get("expires_at"))))
             except (KeyError, ValueError):          # _BadExpiry is a ValueError: a malformed row is skipped
                 continue
         with self._lock:
@@ -213,6 +230,8 @@ class Blocklist:
             net = ipaddress.ip_network(target, strict=False)
             exp = _expiry(expires_at)
         except ValueError:
+            return False
+        if not _enforceable(net):
             return False
         now = time.time()
         with self._lock:
@@ -254,10 +273,11 @@ class Blocklist:
 class EdgeState:
     def __init__(self, *, upstream: str, aegis_url: str | None, token: str | None, asset: str,
                  mode: str, inline_waf: bool, blocklist: Blocklist,
-                 redact_secrets: bool = True) -> None:
+                 redact_secrets: bool = True, control_token: str | None = None) -> None:
         self.upstream = upstream.rstrip("/")
         self.aegis_url = aegis_url
         self.token = token
+        self.control_token = control_token
         self.asset = asset
         self.mode = mode                      # "shadow" | "live"
         self.inline_waf = inline_waf
@@ -361,7 +381,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- SOC → edge push enforcement (token-gated), mirrors demo_target /control/enforce -------- #
     def _control_authorized(self) -> bool:
-        tok = self.state.token
+        # A dedicated control token when one is set: the shared ingest token sits on every edge host (they push
+        # alerts with it), so holding one edge's copy controlled enforcement on all of them (round 3 G4-11).
+        tok = self.state.control_token or self.state.token
         if not tok:
             return False
         got = self.headers.get("Authorization", "")
@@ -606,6 +628,9 @@ def main() -> None:
                     help="AEGIS alerts ingest, e.g. http://127.0.0.1:8787/ingest/alerts (blocklist derived from it)")
     ap.add_argument("--token", default=os.environ.get("AEGIS_INGEST_TOKEN"),
                     help="shared bearer token for AEGIS ingest + /control/enforce (AEGIS_INGEST_TOKEN)")
+    ap.add_argument("--control-token", default=os.environ.get("AEGIS_EDGE_CONTROL_TOKEN"),
+                    help="separate bearer token for /control/enforce (AEGIS_EDGE_CONTROL_TOKEN); without it the "
+                         "shared ingest token is accepted")
     ap.add_argument("--asset", default="edge-shim-01", help="asset name reported in alerts")
     ap.add_argument("--mode", choices=["shadow", "live"], default="shadow",
                     help="shadow: forward everything, log 'would deny'; live: 403 blocked sources at the edge")
@@ -619,7 +644,8 @@ def main() -> None:
 
     bl = Blocklist(_blocklist_url(args.aegis_url) if args.aegis_url else None, args.token, args.poll_interval).start()
     state = EdgeState(upstream=args.upstream, aegis_url=args.aegis_url, token=args.token, asset=args.asset,
-                      mode=args.mode, inline_waf=args.inline_waf, blocklist=bl, redact_secrets=args.redact_secrets)
+                      mode=args.mode, inline_waf=args.inline_waf, blocklist=bl, redact_secrets=args.redact_secrets,
+                      control_token=args.control_token)
     httpd = build_server(args.listen, state)
     print(f"AEGIS Edge Shim  →  http://{args.listen}   (mode: {args.mode})")
     print(f"  protecting   {args.upstream}")

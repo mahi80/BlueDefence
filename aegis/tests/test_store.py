@@ -113,3 +113,17 @@ def test_store_from_env_defaults_and_off(tmp_path):
     s = store_from_env(tmp_path / "audit.jsonl", {"AEGIS_INDEX_URL": f"sqlite:///{tmp_path.as_posix()}/x.sqlite"})
     assert s is not None and s.dialect == "sqlite"
     assert store_from_env(tmp_path / "audit.jsonl", {"AEGIS_INDEX_URL": "postgresql+psycopg2://x:y@127.0.0.1:1/none"}) is None   # unreachable → disabled, not fatal
+
+
+def test_index_stays_stale_after_it_recovers_until_reindex(tmp_path, store, monkeypatch):
+    # review round 3 G4-15: the next good insert cleared `stale` though the failed rows were still missing
+    log = AuditLog(tmp_path / "audit.jsonl", index=store)
+    real = sa.orm.Session.commit
+    def boom(*a, **k): raise sa.exc.OperationalError("insert", {}, Exception("db gone"))
+    monkeypatch.setattr(sa.orm.Session, "commit", boom)
+    log.append(_chain(1))
+    monkeypatch.setattr(sa.orm.Session, "commit", real)
+    log.append(_chain(2))
+    assert store.stale is True
+    store.reindex(tmp_path / "audit.jsonl")
+    assert store.stale is False

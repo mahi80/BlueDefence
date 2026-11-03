@@ -139,9 +139,12 @@ class IndexStore:
                 except IntegrityError:
                     s.rollback()                                  # already indexed (replay / reindex): fine
                     out = "duplicate"
-            if self.stale:
-                self.stale = False
-                logger.info("[store] index writable again")
+            # writable again, but the rows that failed meanwhile are still missing: the index stays stale until
+            # `reindex` fills the gap (review round 3 G4-15 — this cleared the flag on the next good insert)
+            if self.stale and not getattr(self, "_writable_logged", False):
+                self._writable_logged = True
+                logger.warning("[store] index writable again; rows missed while it failed stay missing until "
+                               "`python -m aegis.store reindex`")
             return out
         except SQLAlchemyError as e:
             self._fail("index_chain", e)
@@ -339,6 +342,7 @@ class IndexStore:
 
     def _fail(self, op: str, e: Exception) -> None:
         self.failures += 1
+        self._writable_logged = False
         self.stale = True
         now = time.time()
         if now - self._stale_logged > 300:                      # one line per 5 min, not one per chain
