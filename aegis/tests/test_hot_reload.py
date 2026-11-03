@@ -60,8 +60,9 @@ def test_pointer_key_prefers_sha_then_run_then_adapter():
     assert pointer_key({}) == ""
 
 
-def test_served_name_prefers_explicit_then_run():
-    assert served_name({"served_model": "qwen-v5", "run": "r"}) == "qwen-v5"
+def test_served_name_is_always_the_run():
+    """Round 3 G5-2: a pointer-chosen served_model is never trusted; the GPU register step serves the run."""
+    assert served_name({"served_model": "attacker-lora", "run": "r"}) == "r"
     assert served_name({"run": "retrain-2026"}) == "retrain-2026"
     assert served_name({}) == ""
 
@@ -103,24 +104,25 @@ def test_apply_reload_noop_when_unchanged():
 
 def test_apply_reload_swaps_on_change_vllm():
     inner = FakeVLLM(model="base")
-    ptr = {"run": "retrain-2026-10-29", "adapter": "/runs/x/adapter",
-           "sha256": "newsha", "served_model": "qwen-v5"}
+    ptr = {"run": "retrain-2026-10-29", "adapter": "/runs/x/adapter",          # on the GPU host, registered there
+           "sha256": "newsha", "served_model": "retrain-2026-10-29"}
     r = apply_reload(Wrapper(inner), "oldsha", ptr)
     assert r.changed is True and r.mode == "set_model"
-    assert r.served_model == "qwen-v5" and r.key == "newsha" and r.run == "retrain-2026-10-29"
-    assert inner.swaps == ["qwen-v5"]
+    assert r.served_model == "retrain-2026-10-29" and r.key == "newsha" and r.run == "retrain-2026-10-29"
+    assert inner.swaps == ["retrain-2026-10-29"]
 
 
-def test_apply_reload_served_falls_back_to_run():
+def test_apply_reload_refuses_a_remote_adapter_the_gpu_side_has_not_verified():
     inner = FakeVLLM()
-    ptr = {"run": "retrain-2026-10-29", "sha256": "newsha"}      # no served_model
-    r = apply_reload(Wrapper(inner), "old", ptr)
-    assert r.changed is True and inner.swaps == ["retrain-2026-10-29"]
+    for ptr in ({"run": "retrain-2026-10-29", "sha256": "newsha"},                       # not registered yet
+                {"run": "r", "adapter": "attacker/evil-lora", "sha256": "v2:00", "served_model": "attacker-lora"}):
+        r = apply_reload(Wrapper(inner), "old", ptr)
+        assert r.changed is False and r.mode == "refused" and inner.swaps == []
 
 
 def test_apply_reload_local_is_restart_required():
     local = FakeLocal()
-    ptr = {"run": "r1", "sha256": "newsha", "served_model": "qwen-v5"}
+    ptr = {"run": "r1", "sha256": "newsha", "served_model": "r1"}
     r = apply_reload(Wrapper(local), "old", ptr)
     assert r.changed is False and r.mode == "restart_required" and r.key == "newsha"
 
@@ -138,28 +140,28 @@ def test_pipeline_hot_reload_applies_then_is_idempotent(tmp_path, monkeypatch):
     inner = FakeVLLM(model="base")
     p = _pipeline(Wrapper(inner))
     monkeypatch.setenv("AEGIS_MODEL_POINTER",
-                       _pointer(tmp_path, run="retrain-1", sha256="sha-1", served_model="qwen-v5"))
+                       _pointer(tmp_path, run="retrain-1", sha256="sha-1", served_model="retrain-1"))
 
     r1 = p.hot_reload_from_pointer()
-    assert r1.changed is True and inner.model == "qwen-v5"
-    assert p.model_key == "sha-1" and p.primary_model == "qwen-v5"
+    assert r1.changed is True and inner.model == "retrain-1"
+    assert p.model_key == "sha-1" and p.primary_model == "retrain-1"
 
     r2 = p.hot_reload_from_pointer()        # same pointer → no second swap
-    assert r2.changed is False and r2.mode == "noop" and inner.swaps == ["qwen-v5"]
+    assert r2.changed is False and r2.mode == "noop" and inner.swaps == ["retrain-1"]
 
 
 def test_pipeline_hot_reload_picks_up_a_new_promotion(tmp_path, monkeypatch):
     inner = FakeVLLM(model="base")
     p = _pipeline(Wrapper(inner))
-    ptr_path = _pointer(tmp_path, run="retrain-1", sha256="sha-1", served_model="qwen-v5")
+    ptr_path = _pointer(tmp_path, run="retrain-1", sha256="sha-1", served_model="retrain-1")
     monkeypatch.setenv("AEGIS_MODEL_POINTER", ptr_path)
     p.hot_reload_from_pointer()
 
     # a later approved promotion rewrites the pointer in place
     Path(ptr_path).write_text(json.dumps({"run": "retrain-2", "sha256": "sha-2",
-                                          "served_model": "qwen-v6"}), encoding="utf-8")
+                                          "served_model": "retrain-2"}), encoding="utf-8")
     r = p.hot_reload_from_pointer()
-    assert r.changed is True and inner.model == "qwen-v6" and p.model_key == "sha-2"
+    assert r.changed is True and inner.model == "retrain-2" and p.model_key == "sha-2"
 
 
 def test_reload_result_defaults():

@@ -184,6 +184,7 @@ class HumanDecision:
     rationale: str = ""
     decided_at: Optional[str] = None
     corrected_verdict: str = ""    # on a reject: the verdict the analyst says it should have been
+    decided_by: str = ""           # who — an `aegis:` decider (the HITL-timeout fallback) is not a human label
 
 
 @dataclass
@@ -210,7 +211,9 @@ class TriageRecord:
 
 
 def _label_from_human(model_verdict: str, human: list[HumanDecision]) -> tuple[str, str, bool]:
-    decided = [h for h in human if h.decision in ("approved", "rejected")]
+    # the timeout fallback approving its own model's action is not an analyst confirming it (review round 3 G5-8)
+    decided = [h for h in human if h.decision in ("approved", "rejected")
+               and not str(getattr(h, "decided_by", "") or "").lower().startswith("aegis:")]
     if not decided:
         return model_verdict, "model", False
     rejected = [h for h in decided if h.decision == "rejected"]

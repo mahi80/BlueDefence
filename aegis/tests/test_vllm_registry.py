@@ -85,28 +85,50 @@ def test_http_transport_status_mapping(monkeypatch):
 
 # -- the register bridge -----------------------------------------------------
 
+def _adapter(tmp_path):
+    from aegis.finetune.digest import adapter_digest
+    d = tmp_path / "retrain-1" / "adapter"
+    d.mkdir(parents=True)
+    (d / "adapter_model.safetensors").write_bytes(b"w" * 32)
+    return str(d), adapter_digest(d)
+
+
 def test_register_loads_and_stamps_served_model(tmp_path):
-    ptr = _pointer(tmp_path, run="retrain-1", adapter="/runs/retrain-1/adapter", sha256="s1")
+    ad, sha = _adapter(tmp_path)
+    ptr = _pointer(tmp_path, run="retrain-1", adapter=ad, sha256=sha)
     reg = FakeRegistry((True, "loaded"))
     res = register_promoted_adapter(reg, pointer_path=ptr)
     assert res.ok and res.action == "loaded" and res.served_model == "retrain-1"
-    assert reg.loads == [("retrain-1", "/runs/retrain-1/adapter")]
+    assert reg.loads == [("retrain-1", ad)]
     # served_model is stamped back so hot-reload resolves it
     assert json.loads(Path(ptr).read_text())["served_model"] == "retrain-1"
 
 
 def test_register_is_idempotent_once_stamped(tmp_path):
-    ptr = _pointer(tmp_path, run="retrain-1", adapter="/a", served_model="retrain-1")
+    ad, sha = _adapter(tmp_path)
+    ptr = _pointer(tmp_path, run="retrain-1", adapter=ad, sha256=sha, served_model="retrain-1")
     reg = FakeRegistry()
     res = register_promoted_adapter(reg, pointer_path=ptr)
     assert res.action == "skipped" and reg.loads == []        # already registered → no vLLM call
 
 
 def test_register_force_reregisters(tmp_path):
-    ptr = _pointer(tmp_path, run="retrain-1", adapter="/a", served_model="retrain-1")
+    ad, sha = _adapter(tmp_path)
+    ptr = _pointer(tmp_path, run="retrain-1", adapter=ad, sha256=sha, served_model="retrain-1")
     reg = FakeRegistry((True, "already"))
     res = register_promoted_adapter(reg, pointer_path=ptr, force=True)   # daemon start / vLLM restart
-    assert res.ok and reg.loads == [("retrain-1", "/a")]
+    assert res.ok and reg.loads == [("retrain-1", ad)]
+
+
+def test_register_refuses_remote_or_renamed_adapters(tmp_path):
+    """Round 3 G5-2: a hub repo id is never loaded unchecked, and the served name is the run, not the pointer's."""
+    reg = FakeRegistry((True, "loaded"))
+    ptr = _pointer(tmp_path, run="r", adapter="attacker/evil-lora", sha256="v2:000")
+    assert register_promoted_adapter(reg, pointer_path=ptr).ok is False and reg.loads == []
+    ad, sha = _adapter(tmp_path)
+    ptr = _pointer(tmp_path, run="retrain-1", adapter=ad, sha256=sha, served_model="attacker-lora")
+    res = register_promoted_adapter(reg, pointer_path=ptr)
+    assert res.served_model == "retrain-1" and reg.loads == [("retrain-1", ad)]
 
 
 def test_register_noop_without_pointer(tmp_path, monkeypatch):

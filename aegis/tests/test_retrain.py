@@ -37,7 +37,8 @@ def _fake_sh(calls, *, gate_pass=True, export_rows=60):
             (out / "adapter_config.json").write_text('{"base_model_name_or_path": "x"}')
         elif "aegis.finetune.gate" in cmd:
             out = Path(cmd[cmd.index("--adapter") + 1])
-            (out / "gate.json").write_text(json.dumps({"passes": gate_pass, "summary": "historical 34/37; injection 9/9; " + ("PASS" if gate_pass else "FAIL")}))
+            from aegis.finetune.gate import gate_report_path
+            gate_report_path(out).write_text(json.dumps({"passes": gate_pass, "summary": "historical 34/37; injection 9/9; " + ("PASS" if gate_pass else "FAIL")}))
             return 0 if gate_pass else 1
         return 0
     return runner
@@ -141,7 +142,8 @@ def test_offline_promote_records_approver_and_previous(tmp_path):
     runs = tmp_path / "runs"; st = rt.State(runs / "retrain" / "state.json")
     st.current = {"run": "r0", "adapter": "/a0", "sha256": "0"}
     ad, sha = _adapter(tmp_path / "a1")
-    st.runs["r1"] = {"stage": "shadowed", "adapter": ad, "sha256": sha}; st.runs["r2"] = {"stage": "trained", "adapter": "/a2"}
+    st.runs["r1"] = {"stage": "shadowed", "adapter": ad, "sha256": sha, "stages": {"shadowed": {"verdict": "ready"}}}
+    st.runs["r2"] = {"stage": "trained", "adapter": "/a2"}
     st.save()
     assert rt.main(["promote", "--runs", str(runs), "--run", "r2", "--approved-by", "x", "--rationale", "y"]) == 1   # not gated
     assert rt.main(["promote", "--runs", str(runs), "--run", "r1", "--approved-by", "ciso", "--rationale", "ok"]) == 0

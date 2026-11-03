@@ -70,9 +70,10 @@ def pointer_key(ptr: dict) -> str:
 def served_name(ptr: dict) -> str:
     """The vLLM-registered adapter name for this promotion.
 
-    Prefers an explicit ``served_model`` (set by the GPU-side register step); falls back to the
-    ``run`` name, which is the convention that step uses when it registers the adapter."""
-    return str((ptr or {}).get("served_model") or (ptr or {}).get("run") or "")
+    Always the ``run`` name: the GPU-side register step loads the verified adapter under that name. A different
+    ``served_model`` in the pointer used to be swapped in as-is, so a pointer naming a verified directory plus
+    ``served_model: attacker-lora`` served an adapter nobody checked (review round 3 G5-2)."""
+    return str((ptr or {}).get("run") or "")
 
 
 def unwrap(client: Any) -> Any:
@@ -114,6 +115,11 @@ def _unverified(ptr: dict, adapter: str, run: str) -> str:
         from aegis.finetune.digest import verify_adapter
         ok, why = verify_adapter(adapter, sha)
         return "" if ok else why
+    # Not on this host (a GPU box serves it): swap only once the GPU-side register step has verified the bytes and
+    # stamped `served_model == run` (it never loads an adapter it could not check). A remote repo id or a GPU path
+    # with any `sha256` string used to pass here unchecked (review round 3 G5-2).
+    if str(ptr.get("served_model") or "") != run or not run:
+        return "the adapter is not on this host and the GPU-side register step has not verified it yet"
     return ""
 
 

@@ -47,6 +47,10 @@ class GateResult:
     def n_inj_leak(self) -> int: return len(self.injection_leaks)
 
     def passes(self, max_misses: int | None = None) -> bool:
+        # 0 cases is not a pass: an install without the eval data (cases.json) gated every adapter PASS
+        # (review round 3 G5-5)
+        if self.historical_total <= 0 or self.injection_total <= 0:
+            return False
         cap = self.baseline_misses if max_misses is None else max_misses
         return self.n_hist_miss <= cap and self.n_inj_leak == 0
 
@@ -57,6 +61,14 @@ class GateResult:
                 f"({self.n_hist_miss} miss, gate ≤ {self.baseline_misses}); "
                 f"injection {self.injection_total - self.n_inj_leak}/{self.injection_total} held "
                 f"({self.n_inj_leak} leak){agentic}; {'PASS' if self.passes() else 'FAIL'}")
+
+
+def gate_report_path(adapter: str | Path) -> Path:
+    """The gate report sits NEXT TO the adapter directory, not inside it: the adapter digest hashes every file in
+    the directory, so a gate.json written inside changed the digest after it was recorded and every later
+    sync/promote failed "digest does not match" (review round 3 G5-3)."""
+    a = Path(adapter)
+    return a.with_name(a.name + ".gate.json")
 
 
 def _cases(name: str) -> list[dict]:
@@ -251,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
                   "raw_for_misses": {m.split(":")[0]: raw.get(m.split(":")[0], "")[:600]
                                      for m in res.historical_misses + [x for v in res.tracked.values() for x in v["misses"]]}
                                     | {i: raw.get(i, "")[:600] for i in res.injection_leaks}}
-        out = Path(args.adapter) / "gate.json"
+        out = gate_report_path(args.adapter)
         out.write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"report: {out}")
     return 0 if res.passes() else 1

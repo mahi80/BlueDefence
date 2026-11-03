@@ -115,6 +115,7 @@ def _decisions(hitl_dir: Path | None) -> dict[str, list[HumanDecision]]:
                 rationale=str(d.get("reason") or d.get("rationale") or "")[:500],
                 decided_at=d.get("decided_at") or (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(d["ts"]))) if d.get("ts") else None),
                 corrected_verdict=str(d.get("corrected_verdict") or d.get("verdict") or ""),
+                decided_by=str(d.get("decided_by") or "")[:120],
             ))
     return out
 
@@ -397,8 +398,11 @@ def iter_bundles(folder: Path | str) -> Iterable[tuple[Path, dict]]:
             yield p, json.loads(p.read_text(encoding="utf-8"))
 
 
-def records_from_bundles(folder: Path | str, *, gate: bool = True) -> tuple[list[TriageRecord], dict]:
-    """Every record from every bundle under ``folder``; bundles failing the gate are skipped and reported."""
+def records_from_bundles(folder: Path | str, *, gate: bool = True,
+                         max_per_installation: int | None = None) -> tuple[list[TriageRecord], dict]:
+    """Every usable record from every bundle under ``folder``; bundles failing the gate are skipped and reported."""
+    cap = max_per_installation if max_per_installation is not None else int(
+        os.environ.get("AEGIS_CONTRIB_MAX_PER_INSTALL", "1000") or 1000)
     recs: list[TriageRecord] = []
     report: dict[str, Any] = {"bundles": 0, "skipped_gate": [], "by_installation": {}}
     for path, b in iter_bundles(folder):
@@ -411,16 +415,56 @@ def records_from_bundles(folder: Path | str, *, gate: bool = True) -> tuple[list
                 continue
         report["bundles"] += 1
         inst = str(b.get("installation_id") or "unknown")
+        kept = report["by_installation"].get(inst, 0)
         for row in b.get("records") or []:
+            if kept >= cap:
+                report["capped"] = report.get("capped", 0) + 1
+                continue
             try:
-                row = dict(row)
-                row.setdefault("tags", [])
-                row["tags"] = list(row["tags"]) + [f"inst:{inst[:12]}"]
-                recs.append(TriageRecord(**{k: row.get(k) for k in TriageRecord.__dataclass_fields__ if k in row}))
-            except TypeError as e:
-                logger.warning("[contrib] record skipped (%s)", e)
-        report["by_installation"][inst] = report["by_installation"].get(inst, 0) + len(b.get("records") or [])
+                rec = _community_record(dict(row), inst)
+            except (TypeError, ValueError, KeyError, AttributeError) as e:
+                report["invalid"] = report.get("invalid", 0) + 1
+                logger.warning("[contrib] record skipped (%s: %s)", type(e).__name__, str(e)[:120])
+                continue
+            if rec is None:
+                report["unlabelled"] = report.get("unlabelled", 0) + 1
+                continue
+            recs.append(rec)
+            kept += 1
+        report["by_installation"][inst] = kept
     return recs, report
+
+
+_COMMUNITY_VERDICTS = ("benign", "suspicious", "malicious", "uncertain")
+
+
+def _community_record(row: dict, inst: str) -> TriageRecord | None:
+    """One contributed record, with nothing the contributor asserted taken on trust (review round 3 G5-1).
+
+    A bundle used to be imported with its own ``label`` (``ground_truth``!), ``split`` and ``origin``, so one
+    Community install could label 30 SQLi alerts benign and push them into the fleet model's training set. Now
+    the label is re-derived from the bundled analyst decisions (no decision → not imported: a model's own verdict
+    teaches nothing), never ``ground_truth``; the split is re-derived from the fingerprint; the origin is always
+    ``community_contrib``; and each installation is capped (``AEGIS_CONTRIB_MAX_PER_INSTALL``)."""
+    from .schema import _label_from_human
+    rec = TriageRecord(**{k: row.get(k) for k in TriageRecord.__dataclass_fields__ if k in row})
+    chain = rec.chain if isinstance(rec.chain, dict) else {}
+    model_verdict = str(chain.get("verdict") or "").lower()
+    if model_verdict not in _COMMUNITY_VERDICTS:
+        return None
+    human = []
+    for h in rec.human or []:
+        if isinstance(h, dict):
+            human.append(HumanDecision(**{k: h.get(k) for k in HumanDecision.__dataclass_fields__ if k in h}))
+    verdict, source, disputed = _label_from_human(model_verdict, human)
+    if source == "model" or verdict not in _COMMUNITY_VERDICTS:
+        return None
+    rec.label = {"verdict": verdict, "source": source, **({"disputed": True} if disputed else {})}
+    rec.origin = "community_contrib"
+    rec.split = ""                                    # assigned by the builder from the fingerprint
+    rec.tags = [t for t in (rec.tags or []) if isinstance(t, str) and not t.startswith(("inst:", "eval"))][:20] + [
+        f"inst:{inst[:12]}", "community"]
+    return rec
 
 
 __all__ = ["BUNDLE_SCHEMA", "redact_for_contrib", "build_bundle", "check_bundle", "write_bundle", "push_bundle", "contribute",

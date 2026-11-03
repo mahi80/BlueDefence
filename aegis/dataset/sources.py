@@ -134,6 +134,7 @@ def _human_decisions(raw: Iterable[dict]) -> list[HumanDecision]:
             rationale=str(h.get("rationale") or "")[:500],
             decided_at=h.get("decided_at"),
             corrected_verdict=str(h.get("corrected_verdict") or "")[:20],
+            decided_by=str(h.get("decided_by") or "")[:120],
         ))
     return out
 
