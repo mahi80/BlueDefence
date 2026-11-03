@@ -432,7 +432,7 @@ class EgressDetector:
             out.append(self._check_beacon(p, ts))
         hit = self._check_exfil(p, ts)
         out.append(hit)
-        if hit is None and ip_pair is not None:
+        if hit is None and ip_pair is not None and not p.exfil:      # one finding per upload, not one per view
             out.append(self._check_exfil(ip_pair, ts))
         return out
 
