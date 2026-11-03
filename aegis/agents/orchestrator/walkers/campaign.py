@@ -15,7 +15,6 @@ cheap enough for the hot path (in-memory, O(window)).
 from __future__ import annotations
 
 import contextvars
-
 import logging
 import os
 import re
