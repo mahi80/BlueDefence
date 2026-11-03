@@ -37,7 +37,10 @@ def bulk_read_check(table: str | None, rows_returned: int | None,
                     queries_per_session: int | None = None) -> ToolResult:
     if not table or rows_returned is None:
         return ToolResult(name="bulk_read", data={"verdict": "insufficient_data"}, weight="low")
-    info = _TABLE_SENSITIVITY.get(table, {"sensitivity": "medium", "max_normal_rows_per_session": 1000})
+    # `core.public.customers`, `[dbo].[Customers]`, `"CUSTOMERS"` are all the customers table: only the bare
+    # lower-case name was known, so a schema-qualified read fell to the default "medium" (review round 3 G7-11)
+    key = str(table).strip().split(".")[-1].strip('[]"`').lower()
+    info = _TABLE_SENSITIVITY.get(key, {"sensitivity": "medium", "max_normal_rows_per_session": 1000})
     threshold = info["max_normal_rows_per_session"]
     ratio = rows_returned / threshold if threshold > 0 else 0.0
     sensitivity = info["sensitivity"]
@@ -66,8 +69,10 @@ def bulk_read_check(table: str | None, rows_returned: int | None,
 # Lightweight detectors. Production: regex+ML (Microsoft Purview,
 # Google DLP API) and a centralized taxonomy.
 _SENSITIVE_RX = {
-    "aadhaar":          re.compile(r"\b\d{4}\s\d{4}\s\d{4}\b"),
-    "pan_in":           re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b"),
+    # Aadhaar: 12 digits, first 2-9, written with spaces, dashes or not at all (only "dddd dddd dddd" matched)
+    "aadhaar":          re.compile(r"\b[2-9]\d{3}[ -]?\d{4}[ -]?\d{4}\b"),
+    # PAN: lower-case and the 4th-letter holder types; the old pattern needed upper case
+    "pan_in":           re.compile(r"\b[A-Za-z]{3}[ABCFGHLJPTKEabcfghljptke][A-Za-z][0-9]{4}[A-Za-z]\b"),
     "credit_card":      re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
     "ifsc":             re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b"),
     "account_number":   re.compile(r"\b(?:ACC|ACCT)[-_]?\d{8,12}\b"),
@@ -78,6 +83,37 @@ _SENSITIVE_RX = {
 }
 
 
+def _luhn(num: str) -> bool:
+    d = [int(c) for c in num if c.isdigit()]
+    if not 13 <= len(d) <= 19 or len(set(d)) == 1:
+        return False
+    total = 0
+    for i, x in enumerate(reversed(d)):
+        if i % 2:
+            x *= 2
+            if x > 9:
+                x -= 9
+        total += x
+    return total % 10 == 0
+
+
+_VD = ((0, 1, 2, 3, 4, 5, 6, 7, 8, 9), (1, 2, 3, 4, 0, 6, 7, 8, 9, 5), (2, 3, 4, 0, 1, 7, 8, 9, 5, 6),
+       (3, 4, 0, 1, 2, 8, 9, 5, 6, 7), (4, 0, 1, 2, 3, 9, 5, 6, 7, 8), (5, 9, 8, 7, 6, 0, 4, 3, 2, 1),
+       (6, 5, 9, 8, 7, 1, 0, 4, 3, 2), (7, 6, 5, 9, 8, 2, 1, 0, 4, 3), (8, 7, 6, 5, 9, 3, 2, 1, 0, 4),
+       (9, 8, 7, 6, 5, 4, 3, 2, 1, 0))
+_VP = ((0, 1, 2, 3, 4, 5, 6, 7, 8, 9), (1, 5, 7, 6, 2, 8, 3, 0, 9, 4), (5, 8, 0, 3, 7, 9, 6, 1, 4, 2),
+       (8, 9, 1, 6, 0, 4, 3, 5, 2, 7), (9, 4, 5, 3, 1, 2, 6, 8, 7, 0), (4, 2, 8, 6, 5, 7, 3, 9, 0, 1),
+       (2, 7, 9, 3, 8, 0, 6, 4, 1, 5), (7, 0, 4, 6, 9, 1, 3, 2, 5, 8))
+
+
+def _verhoeff(num: str) -> bool:
+    """Aadhaar's check digit (Verhoeff), so a 12-digit order id is not counted as an Aadhaar number."""
+    c = 0
+    for i, ch in enumerate(reversed([x for x in num if x.isdigit()])):
+        c = _VD[c][_VP[i % 8][int(ch)]]
+    return c == 0
+
+
 def sensitive_data_pattern_check(payload: str | None,
                                  context: str = "data") -> ToolResult:
     if not payload:
@@ -85,6 +121,12 @@ def sensitive_data_pattern_check(payload: str | None,
     findings: dict[str, int] = {}
     for kind, rx in _SENSITIVE_RX.items():
         matches = rx.findall(payload)
+        if kind == "credit_card":
+            # 13-19 digits is also every order id, timestamp and phone list in a CSV: only Luhn-valid numbers
+            # are card numbers (a benign export scored high; review round 3 G7-11)
+            matches = [m for m in matches if _luhn(m)]
+        elif kind == "aadhaar":
+            matches = [m for m in matches if _verhoeff(m)]
         if matches:
             findings[kind] = len(matches)
     if not findings:

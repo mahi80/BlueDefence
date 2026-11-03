@@ -25,26 +25,33 @@ _SUSPICIOUS_PROCESS_PARENTS = {
     "w3wp.exe":        {"cmd.exe", "powershell.exe", "bash"},
     "nginx":           {"sh", "bash", "python", "perl"},
     "apache2":         {"sh", "bash"},
-    # lsass dumping
-    "rundll32.exe":    {"comsvcs.dll"},
+    # lsass dumping through comsvcs.dll is a rundll32 COMMAND LINE, not a child process: it is a cmdline
+    # pattern below (the parent→child rule here could never fire; review round 3 G7-8)
 }
 
+
+def _base(p: str) -> str:
+    """``C:\\Program Files\\Microsoft Office\\WINWORD.EXE`` → ``winword.exe``: telemetry carries full paths."""
+    return str(p or "").replace("\\", "/").rsplit("/", 1)[-1].strip().strip('"').lower()
+
 _SUSPICIOUS_CMDLINE_PATTERNS = [
-    r"-enc[odedcommand]*\s+[A-Za-z0-9+/=]{40,}",       # base64 PowerShell
+    # base64 PowerShell: PowerShell takes any prefix of -EncodedCommand (-e, -ec, -en, -enco …) and / for -
+    r"(?:^|\s)[-/\u2013]e(?:c|n[a-z]{0,12})?\s+[A-Za-z0-9+/=]{40,}",
     r"DownloadString\(",                                 # PS download
-    r"IEX\s*\(",                                          # PS in-memory exec
-    r"\bnc\b.*-e\s+/?bin/sh",                            # netcat reverse shell
+    r"\b(?:iex|invoke-expression)\b",                     # PS in-memory exec: `| iex`, `iex $x`, IEX(…)
+    r"\bnc\b.{0,200}?-e\s+/?bin/sh",                     # netcat reverse shell (bounded: no quadratic scan)
     r"bash\s+-i\s+>&\s+/dev/tcp/",                       # bash reverse shell
     r"mimikatz",
-    r"procdump.*lsass",
+    r"procdump.{0,200}?lsass",
+    r"comsvcs(?:\.dll)?[\s,]+#?(?:minidump|24)\b",        # rundll32 comsvcs.dll MiniDump <lsass pid>
     r"vssadmin\s+delete\s+shadows",                      # ransomware indicator
 ]
 _CMDLINE_RX = re.compile("|".join(_SUSPICIOUS_CMDLINE_PATTERNS), re.IGNORECASE)
 
 
 def parent_process_tree(parent: str | None, child: str | None, cmdline: str | None) -> ToolResult:
-    parent_l = (parent or "").lower()
-    child_l = (child or "").lower()
+    parent_l = _base(parent or "")
+    child_l = _base(child or "")
     cmdline_v = cmdline or ""
     suspicious_parent_child = False
     if parent_l in _SUSPICIOUS_PROCESS_PARENTS:

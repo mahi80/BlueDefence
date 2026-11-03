@@ -405,7 +405,10 @@ class WafConsumer(BaseConsumer):
             alert["payload"] = f"{method} {url}{('?' + qs) if qs and '?' not in str(url) else ''} HTTP/1.1".strip()
         for k in ("payload", "url"):
             if k in alert:
-                alert[k] = str(alert[k])[:4000]
+                # padding the request past 4,000 characters pushed the attack out of what the specialists saw
+                # (review round 3 G7-10): keep 32 KB, and when cutting keep the head AND the tail
+                v = str(alert[k])
+                alert[k] = v if len(v) <= 32_000 else f"{v[:16_000]} …[{len(v) - 32_000} chars cut]… {v[-16_000:]}"
         if "user_id" not in alert:
             alert["user_id"] = "anonymous"
         atk = alert.get("attack_type") or alert.get("signature") or "WAF event"

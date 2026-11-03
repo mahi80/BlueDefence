@@ -19,6 +19,7 @@ a coarse lock since the IOC count is small (thousands, not millions).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -79,8 +80,22 @@ class IOCStore:
             _log.info("[threat_intel] rejected IOC %s %r from %s: %s", ioc.kind, str(ioc.value)[:80], ioc.source,
                       why or "confidence is not a number")
             return False
-        ttl = max(60, min(int(ioc.ttl_seconds or 0) or 86400 * 14, 86400 * 365))
-        ioc = replace(ioc, value=value, confidence=conf, ttl_seconds=ttl)
+        try:
+            ttl = max(60, min(int(ioc.ttl_seconds or 0) or 86400 * 14, 86400 * 365))
+        except (TypeError, ValueError, OverflowError):
+            ttl = 86400 * 14
+        # a peer's timestamps are data: last_seen=inf (or a date in the future) made an entry that never expires
+        # (review round 3 G7-14). Non-finite or future times become "now".
+        t_now = time.time()
+
+        def _ts(v: object) -> float:
+            try:
+                f = float(v or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+            return f if math.isfinite(f) and 0.0 <= f <= t_now + 300 else t_now
+        ioc = replace(ioc, value=value, confidence=conf, ttl_seconds=ttl,
+                      first_seen=_ts(ioc.first_seen), last_seen=_ts(ioc.last_seen))
         with self._lock:
             key = (ioc.kind, ioc.value)
             existing = self._iocs.get(key)

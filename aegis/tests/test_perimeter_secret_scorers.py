@@ -18,7 +18,7 @@ from aegis.agents.perimeter import tools
 @pytest.mark.parametrize("path", [
     "/.env", "/.env.production", "/public/.git/config", "/wp-config.php",
     "/storage/logs/laravel.log", "/app/config/settings.py", "/.aws/credentials",
-    "/id_rsa", "/backup/db.sql", "/export/", "/.htpasswd", "/appsettings.json",
+    "/id_rsa", "/backup/db.sql", "/export/customers.zip", "/.htpasswd", "/appsettings.json",
 ])
 def test_secret_paths_flagged(path):
     r = tools.secret_file_probe({"url": f"https://bank.example{path}"})

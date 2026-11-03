@@ -68,6 +68,53 @@ class AuditLog:
         if repair:
             self._repair_torn_tail()
         self._tail_hash = self._compute_tail_hash()
+        self._appended = 0
+
+    # ------------------------------------------------------------- anchor --
+    @staticmethod
+    def anchor_path() -> Path | None:
+        """``AEGIS_AUDIT_ANCHOR``: an append-only file OUTSIDE the audit volume (another disk, a WORM share, a
+        syslog-shipped file). A hash chain alone cannot see its own tail being cut off — truncating the last N
+        rows leaves a chain that verifies (review round 3 G7-17). Anchored tail hashes can be checked against."""
+        v = os.environ.get("AEGIS_AUDIT_ANCHOR", "").strip()
+        return Path(v) if v and v.lower() not in ("off", "0", "none") else None
+
+    def _maybe_anchor(self) -> None:
+        p = self.anchor_path()
+        if p is None:
+            return
+        try:
+            every = max(1, int(os.environ.get("AEGIS_AUDIT_ANCHOR_EVERY", "100") or 100))
+        except ValueError:
+            every = 100
+        if self._appended % every:
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with p.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": time.time(), "hash": self._tail_hash, "log": str(self.path.resolve())}) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as e:
+            logger.warning("[audit] anchor %s not written: %s", p, e.strerror or e)
+
+    def _anchors(self) -> set[str]:
+        p = self.anchor_path()
+        out: set[str] = set()
+        if p is None or not p.exists():
+            return out
+        try:
+            with p.open("r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict) and row.get("hash") and row.get("log", str(self.path.resolve())) == str(self.path.resolve()):
+                        out.add(str(row["hash"]))
+        except OSError:
+            pass
+        return out
 
     # ------------------------------------------------------------ recovery --
     def _repair_torn_tail(self) -> None:
@@ -180,6 +227,8 @@ class AuditLog:
                 raise AuditWriteError(f"audit log not writable: {e.strerror or e}", e.errno) from e
             prev = self._tail_hash
             self._tail_hash = h
+            self._appended += 1
+            self._maybe_anchor()
             if self.write_failures:
                 logger.info("[audit] %s writable again after %d failure(s)", self.path, self.write_failures)
                 self.write_failures = 0
@@ -264,6 +313,7 @@ class AuditLog:
         previous segment's tail)."""
         prev = GENESIS if all_files else self._live_segment_seed()
         entries, files = 0, set()
+        anchors = self._anchors() if all_files else set()
         try:
             for f, n, entry in self._iter_entries(all_files):
                 files.add(f.name)
@@ -273,7 +323,13 @@ class AuditLog:
                 if actual != claimed:
                     return {"ok": False, "entries": entries, "files": sorted(files), "broken_at": (f.name, n)}
                 prev = claimed
+                anchors.discard(claimed)
                 entries += 1
         except ValueError as e:
             return {"ok": False, "entries": entries, "files": sorted(files), "broken_at": ("<unparseable>", str(e)[:80])}
+        if anchors:
+            # an anchored row is no longer in the chain: the log was cut back past it
+            return {"ok": False, "entries": entries, "files": sorted(files),
+                    "broken_at": ("<anchor>", f"{len(anchors)} anchored entr{'y' if len(anchors) == 1 else 'ies'} missing — the log was truncated"),
+                    "tail": prev}
         return {"ok": True, "entries": entries, "files": sorted(files), "broken_at": None, "tail": prev}

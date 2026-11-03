@@ -405,6 +405,38 @@ class EgressDetector:
             p.starts.append(ts)
         out_b, in_b = max(0, int(ev.get("bytes_out") or 0)), max(0, int(ev.get("bytes_in") or 0))
         p.sizes.append(out_b)
+        self._add_volume(p, ts, out_b, in_b)
+        # The SNI is client-chosen: the same upload spread over a1.evil … a50.evil (one IP) stayed under the
+        # threshold for every name. The destination IP keeps its own running total (review round 3 G7-7).
+        ip_pair = None
+        if key != dst and dst:
+            ip_pair = self._pair(src, f"ip:{dst}", ts)
+            _keep(ip_pair.dsts, dst, 8)
+            ip_pair.dport = ip_pair.dport or p.dport
+            ip_pair.sensor = ip_pair.sensor or p.sensor
+            srcs = self._lru_get(self._prev, f"ip:{dst}", set, self.max_keys)
+            if len(srcs) < 64:
+                srcs.add(src)
+            self._add_volume(ip_pair, ts, out_b, in_b)
+        out: list[dict | None] = []
+        svc = ai_service(p.sni or sni)
+        if svc is not None:
+            status, _ = self.ai.status(src, svc.endpoint)
+            sent = self.usage.add_bytes(src, svc.endpoint, ts, out_b, 3600.0)
+            if status in ("unregistered", "unapproved") and sent >= self.ai_upload:
+                rows = [r for r in self.usage.rows() if r["host"] == src and r["endpoint"] == svc.endpoint]
+                out.append(self._emit("shadow_ai", p, ts, 2, indicator=svc.endpoint,
+                                      shadow_ai={**(rows[0] if rows else {}), "level": "upload", "uploaded_last_hour": sent}))
+            return out
+        if not known:
+            out.append(self._check_beacon(p, ts))
+        hit = self._check_exfil(p, ts)
+        out.append(hit)
+        if hit is None and ip_pair is not None and not p.exfil:      # one finding per upload, not one per view
+            out.append(self._check_exfil(ip_pair, ts))
+        return out
+
+    def _add_volume(self, p: _Pair, ts: float, out_b: int, in_b: int) -> None:
         if len(p.volume) >= _MAX_VOLUME_ROWS:
             # bounded: fold the two oldest rows into one (the window sums stay exact; only the per-connection
             # granularity of the oldest traffic is lost) — 300k tiny connections used to keep 300k rows per pair
@@ -418,20 +450,6 @@ class EgressDetector:
             _, o, i = p.volume.popleft()
             p.out_sum -= o
             p.in_sum -= i
-        out: list[dict | None] = []
-        svc = ai_service(p.sni or sni)
-        if svc is not None:
-            status, _ = self.ai.status(src, svc.endpoint)
-            sent = self.usage.add_bytes(src, svc.endpoint, ts, out_b, 3600.0)
-            if status in ("unregistered", "unapproved") and sent >= self.ai_upload:
-                rows = [r for r in self.usage.rows() if r["host"] == src and r["endpoint"] == svc.endpoint]
-                out.append(self._emit("shadow_ai", p, ts, 2, indicator=svc.endpoint,
-                                      shadow_ai={**(rows[0] if rows else {}), "level": "upload", "uploaded_last_hour": sent}))
-            return out
-        if not known:
-            out.append(self._check_beacon(p, ts))
-        out.append(self._check_exfil(p, ts))
-        return out
 
     # ---------------------------------------------------------- findings --
     def _check_beacon(self, p: _Pair, ts: float) -> dict | None:
@@ -466,7 +484,9 @@ class EgressDetector:
     def _signals(self, p: _Pair) -> list[dict]:
         sig: list[dict] = []
         if p.intel:
-            sig.append({"name": "intel", "weight": "confirmed" if p.intel.get("confirming") else "strong",
+            # a domain hit rests on the client-chosen SNI: strong, never "confirmed" on its own (round 3 G7-7)
+            confirmed = bool(p.intel.get("confirming")) and p.intel.get("kind") != "domain"
+            sig.append({"name": "intel", "weight": "confirmed" if confirmed else "strong",
                         "detail": f"{p.intel['kind']} on the TLS IOC list: {p.intel.get('name') or p.intel.get('source')}"})
         if p.beacon:
             b = p.beacon
