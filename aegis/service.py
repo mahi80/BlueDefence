@@ -833,7 +833,8 @@ class Service:
                 # pushed/streamed vendors are counted from the cumulative queue stats; then
                 # evaluate every armed feed so a source gone quiet raises an alert this cycle
                 try:
-                    self.p.watchdog.sync_stream(stream.stats.by_source if stream is not None else {})
+                    # parsed output per feed, not records received: a feed whose format broke is not "live"
+                    self.p.watchdog.sync_stream(stream.stats.parsed_by_source if stream is not None else {})
                     self.p.watchdog.sweep()
                 except Exception as e:  # noqa: BLE001 — watchdog health must never take the SOC down
                     logger.warning("[service] feed watchdog sweep failed: %s", str(e)[:200])

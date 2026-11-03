@@ -806,15 +806,62 @@ def _forward_alert(aegis_url: str | None, token: str | None, alert: dict[str, An
     headers = {"Content-Type": "application/x-ndjson"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(aegis_url, data=data, method="POST", headers=headers)
+    _SENDER.submit(aegis_url, data, headers)
 
-    def _post() -> None:
-        try:
-            urllib.request.urlopen(req, timeout=2.0).read()
-        except (urllib.error.URLError, OSError, ValueError):
-            pass  # the demo must never stall on the SOC side being down
 
-    threading.Thread(target=_post, daemon=True).start()
+class _AlertSender:
+    """One background sender with a bounded queue. Each alert used to start its own thread with no limit, and a
+    503 (the SOC applying backpressure) dropped the event silently — during a flood the edge grew threads without
+    bound and lost the telemetry the SOC most needed (review round 3 I3-18). A 503 / connection error is retried
+    with backoff; when the queue is full the oldest event goes, and the count is kept."""
+
+    def __init__(self, cap: int = 5000):
+        import collections
+        self._q: collections.deque = collections.deque()
+        self._cap = cap
+        self._cv = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self.dropped = 0
+        self.sent = 0
+
+    def submit(self, url: str, data: bytes, headers: dict[str, str]) -> None:
+        with self._cv:
+            if len(self._q) >= self._cap:
+                self._q.popleft()
+                self.dropped += 1
+            self._q.append((url, data, headers))
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="aegis-alert-sender", daemon=True)
+                self._thread.start()
+            self._cv.notify()
+
+    def _run(self) -> None:
+        import time as _time
+        while True:
+            with self._cv:
+                while not self._q:
+                    self._cv.wait()
+                url, data, headers = self._q.popleft()
+            delay = 0.5
+            for attempt in range(4):
+                try:
+                    urllib.request.urlopen(urllib.request.Request(url, data=data, method="POST", headers=headers),
+                                           timeout=2.0).read()
+                    self.sent += 1
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code not in (429, 502, 503, 504) or attempt == 3:
+                        self.dropped += 1
+                        break
+                except (urllib.error.URLError, OSError, ValueError):
+                    if attempt == 3:
+                        self.dropped += 1         # the demo must never stall on the SOC side being down
+                        break
+                _time.sleep(delay)
+                delay = min(delay * 2, 5.0)
+
+
+_SENDER = _AlertSender()
 
 
 # --------------------------------------------------------------------------- #

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
+
 
 @dataclass
 class ToolResult:
@@ -108,8 +110,8 @@ def wpa_attack_check(wpa_signals: dict | None) -> ToolResult:
 
 def run_all_tools(alert: dict) -> list[ToolResult]:
     return [
-        rogue_ap_check(alert.get("ap_record")),
-        evil_twin_check(alert.get("ap_record")),
-        deauth_burst_check(alert.get("deauth_metrics")),
-        wpa_attack_check(alert.get("wpa_signals")),
+        isolated(lambda: rogue_ap_check(alert.get("ap_record")), "rogue_ap_check", ToolResult),
+        isolated(lambda: evil_twin_check(alert.get("ap_record")), "evil_twin_check", ToolResult),
+        isolated(lambda: deauth_burst_check(alert.get("deauth_metrics")), "deauth_burst_check", ToolResult),
+        isolated(lambda: wpa_attack_check(alert.get("wpa_signals")), "wpa_attack_check", ToolResult),
     ]

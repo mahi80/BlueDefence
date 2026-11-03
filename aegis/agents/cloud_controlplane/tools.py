@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
+
 
 @dataclass
 class ToolResult:
@@ -705,13 +707,13 @@ def _ingress_rules(params: dict) -> list[tuple[str, int, int]]:
 def run_all_tools(alert: dict) -> list[ToolResult]:
     event = alert.get("event") or alert
     return [
-        iam_change_check(event),
-        resource_policy_check(event),
-        network_change_check(event),
-        secrets_or_kms_change_check(event),
-        logging_disable_check(event),
-        firewall_audit_check(event),
-        k8s_audit_check(event),
-        resource_burst_check(event),
-        hsm_audit_check(event),
+        isolated(lambda: iam_change_check(event), "iam_change_check", ToolResult),
+        isolated(lambda: resource_policy_check(event), "resource_policy_check", ToolResult),
+        isolated(lambda: network_change_check(event), "network_change_check", ToolResult),
+        isolated(lambda: secrets_or_kms_change_check(event), "secrets_or_kms_change_check", ToolResult),
+        isolated(lambda: logging_disable_check(event), "logging_disable_check", ToolResult),
+        isolated(lambda: firewall_audit_check(event), "firewall_audit_check", ToolResult),
+        isolated(lambda: k8s_audit_check(event), "k8s_audit_check", ToolResult),
+        isolated(lambda: resource_burst_check(event), "resource_burst_check", ToolResult),
+        isolated(lambda: hsm_audit_check(event), "hsm_audit_check", ToolResult),
     ]

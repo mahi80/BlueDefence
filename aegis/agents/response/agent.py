@@ -280,10 +280,11 @@ class ResponseAgent:
 
     # ---- decision logic ------------------------------------------------
 
-    def _unattended(self, action: RecommendedAction, chain: EvidenceChain) -> tuple[bool, str]:
+    def _unattended(self, action: RecommendedAction, chain: EvidenceChain, *, own_floor: float | None = None
+                    ) -> tuple[bool, str]:
         from .contracts import gate
         from .grounding import chain_entities, unattended_ok
-        ok, why = gate(action, chain, protected=self._is_protected(str(action.target)))
+        ok, why = gate(action, chain, protected=self._is_protected(str(action.target)), own_floor=own_floor)
         if not ok:
             return False, why
         ents = getattr(self, "_entities", None)
@@ -315,7 +316,7 @@ class ResponseAgent:
         if action.action_type == "hold":
             ok, why = self._breaker.check(action, chain)
             if ok:
-                ok, why = self._unattended(action, chain)
+                ok, why = self._unattended(action, chain, own_floor=self._breaker.min_confidence)
             if ok and self._breaker.mode == "shadow":
                 self._connectors.preview(action, alert_id=chain.alert_id, approver="aegis:breaker-shadow",
                                          ttl_sec=self._breaker.ttl_sec, note="outflow breaker shadow")

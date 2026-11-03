@@ -21,6 +21,8 @@ Constraints (never violated even if SAC tries):
 from __future__ import annotations
 
 import random
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -32,6 +34,8 @@ class Asset:
     current_coords: dict   # e.g. {"ip": "10.1.2.3", "port": 8080}
     rotatable: bool = True
     in_compliance_scope: bool = False  # if True, rotations need extra approval
+    active_sessions: int = 0           # in-flight legit sessions: not rotated while > 0
+    tokens_in_flight: int = 0          # non-revoked tokens mid-transaction: not rotated while > 0
 
 
 @dataclass
@@ -93,29 +97,43 @@ def heuristic_policy(observation: dict, state: MTDState) -> list[RotationAction]
 class MTDController:
     name = "mtd"
 
-    def __init__(self, policy: Callable[[dict, MTDState], list[RotationAction]] | None = None):
+    def __init__(self, policy: Callable[[dict, MTDState], list[RotationAction]] | None = None, *,
+                 clock: Callable[[], float] = time.time):
         self._policy = policy or heuristic_policy
         self._state = MTDState()
+        self._clock = clock
+        self._recent: deque[float] = deque()     # rotation times in the last minute
 
     def register(self, asset: Asset) -> None:
         self._state.assets[asset.id] = asset
 
     def reset_rate(self) -> None:
+        self._recent.clear()
         self._state.rotations_this_minute = 0
 
     def step(self, observation: dict) -> list[RotationAction]:
+        # The cap is a sliding minute. It was a counter that only reset_rate() cleared, so with nobody calling that
+        # on a timer the controller stopped rotating for good after the first `rate_cap` rotations — and the session
+        # and token constraints in the module docstring were not checked at all (review round 3 S3-25).
+        now = self._clock()
+        while self._recent and now - self._recent[0] >= 60.0:
+            self._recent.popleft()
+        self._state.rotations_this_minute = len(self._recent)
         actions = self._policy(observation, self._state)
         approved: list[RotationAction] = []
         for action in actions:
-            if self._state.rotations_this_minute >= self._state.rate_cap:
+            if len(self._recent) >= self._state.rate_cap:
                 break
             asset = self._state.assets.get(action.asset_id)
             if asset is None or not asset.rotatable:
                 continue
             if asset.in_compliance_scope:
                 continue   # safety constraint — needs approval
+            if asset.active_sessions > 0 or asset.tokens_in_flight > 0:
+                continue   # safety constraint — never break a live session or a token mid-transaction
             asset.current_coords = action.new_coords
-            self._state.rotations_this_minute += 1
+            self._recent.append(now)
+            self._state.rotations_this_minute = len(self._recent)
             approved.append(action)
         return approved
 

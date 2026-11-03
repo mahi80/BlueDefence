@@ -13,7 +13,6 @@ this module only reshapes fields, it never executes anything from them.
 from __future__ import annotations
 
 import hashlib
-from collections import defaultdict
 from typing import Iterable, Optional
 
 
@@ -106,7 +105,10 @@ def from_osquery(query: str, row: dict) -> dict:
         return {**base, "ssh_key_fingerprint": ssh_fingerprint(row.get("key")),
                 "ssh_key_uid": row.get("uid")}
     if query == "exec_lolbin_events":
-        return {**base, "parent_process": _basename(row.get("parent")),
+        # osquery's `parent` is a PID; the name, when the pack joins it in, is parent_name / parent_path
+        # (the PID was taken for a process name; review round 3 S3-25)
+        parent = row.get("parent_name") or row.get("parent_path") or ""
+        return {**base, "parent_process": _basename(parent), "parent_pid": row.get("parent"),
                 "child_process": _basename(row.get("path")), "cmdline": row.get("cmdline", "")}
     if query == "net_egress_events":
         return {**base, "dest_ip": row.get("remote_address"),
@@ -128,18 +130,21 @@ class BeaconAggregator:
     """Accumulates egress connect timestamps per (host, dest) within a window so
     ``beacon_periodicity`` sees a series instead of a single connect."""
 
-    def __init__(self, window_s: float = 3600.0):
+    def __init__(self, window_s: float = 3600.0, *, max_pairs: int = 50_000, max_points: int = 1_000):
         self.window_s = window_s
-        self._log: dict[tuple, list[float]] = defaultdict(list)
+        # bounded: (host, dest) pairs and points per pair — it grew without limit (review round 3 S3-25)
+        from ..shared.bounded import BoundedDict
+        self._log: BoundedDict = BoundedDict(max_pairs)
+        self.max_points = max_points
 
     def add(self, host: Optional[str], dest: Optional[str], ts: Optional[float]) -> list[float]:
         if dest is None or ts is None:
             return []
         key = (host, dest)
-        series = [t for t in self._log[key] if ts - t <= self.window_s]
+        series = [t for t in self._log.get(key, []) if ts - t <= self.window_s]
         series.append(ts)
-        self._log[key] = series
-        return series
+        self._log[key] = series[-self.max_points:]
+        return self._log[key]
 
     def enrich(self, alert: dict) -> dict:
         """If the alert is an egress connect, fold it into the window and attach
@@ -148,3 +153,40 @@ class BeaconAggregator:
             series = self.add(alert.get("host"), alert["dest_ip"], alert["egress_ts"])
             alert["egress_connect_times"] = series
         return alert
+
+
+_AGG: BeaconAggregator | None = None
+
+
+def to_alert(raw: dict) -> dict | None:
+    """One collector record — a Sysmon event (``EventID`` / ``event_id``) or an osquery result log line (``name`` +
+    ``columns``) — as an EDR alert with an id, or None for a shape this module does not know. This is what wires the
+    normaliser into ingest: it existed but nothing called it (review round 3 S3-25). Egress connects are folded
+    into a bounded per-(host, dest) series for the beacon scorer."""
+    global _AGG
+    if not isinstance(raw, dict):
+        return None
+    if "EventID" in raw or "event_id" in raw:
+        evt = {**(raw.get("EventData") if isinstance(raw.get("EventData"), dict) else {}), **raw}
+        evt.setdefault("event_id", evt.get("EventID"))
+        alert = from_sysmon(evt)
+    elif isinstance(raw.get("columns"), dict) and raw.get("name"):
+        query = str(raw["name"])
+        for known in ("exec_lolbin_events", "net_egress_events", "persistence_authorized_keys", "webshell_webroot_scripts",
+                      *_PERSIST_QUERIES):
+            if query.endswith(known):
+                query = known
+                break
+        row = {**raw["columns"], "_host": raw.get("hostIdentifier")}
+        alert = from_osquery(query, row)
+        alert["timestamp"] = raw.get("unixTime") or raw.get("calendarTime")
+    else:
+        return None
+    if alert.get("dest_ip") is not None:
+        if _AGG is None:
+            _AGG = BeaconAggregator()
+        _AGG.enrich(alert)
+    if len(alert) <= 3:                       # only source/host/host_class: nothing a scorer can use
+        return None
+    digest = hashlib.sha256(repr(sorted(raw.items(), key=lambda kv: str(kv[0])))[:4000].encode()).hexdigest()[:16]
+    return {"id": f"edr-{digest}", "alert_type": "host_endpoint", **alert}

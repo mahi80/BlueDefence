@@ -121,8 +121,14 @@ def floor(impact: Impact) -> float:
         return DEFAULT_FLOOR.get(impact, 1.01)
 
 
-def gate(action: Any, chain: Any, *, protected: bool = False) -> tuple[bool, str]:
-    """May this action run with no human? The strictest of contract, tier and confidence wins."""
+def gate(action: Any, chain: Any, *, protected: bool = False, own_floor: float | None = None) -> tuple[bool, str]:
+    """May this action run with no human? The strictest of contract, tier and confidence wins.
+
+    ``own_floor``: a mechanism the operator switched on separately, with its own confidence floor (the outflow
+    breaker, ``AEGIS_OUTFLOW_BREAKER=live`` + ``AEGIS_OUTFLOW_BREAKER_MIN_CONF``). Its floor replaces the
+    impact floor and the autonomy tier does not apply to it — otherwise the breaker silently needed 0.95 and tier
+    L4 and never tripped at its documented 0.90 (review round 3 G1-18 / R3-11). Contract, impact ceiling
+    (nothing SEVERE runs unattended) and protected targets still apply."""
     at = str(getattr(action, "action_type", ""))
     c = contract(at)
     if c is None:
@@ -137,10 +143,10 @@ def gate(action: Any, chain: Any, *, protected: bool = False) -> tuple[bool, str
     if impact >= Impact.SEVERE:
         return False, f"{at} is {impact.name.lower()} impact — never runs without a human"
     t = tier()
-    if impact > TIER_CEILING[t] and impact > Impact.READ_ONLY:
+    if own_floor is None and impact > TIER_CEILING[t] and impact > Impact.READ_ONLY:
         return False, f"{at} ({impact.name.lower()}) is above the autonomy tier {t} — a human decides"
     conf = float(getattr(chain, "confidence", 0.0) or 0.0)
-    need = floor(impact)
+    need = floor(impact) if own_floor is None else float(own_floor)
     if conf < need:
         return False, f"confidence {conf:.2f} is below the {need:.2f} an unattended {impact.name.lower()} action needs"
     return True, ""

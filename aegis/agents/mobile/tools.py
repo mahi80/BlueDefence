@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
+
 
 @dataclass
 class ToolResult:
@@ -13,13 +15,20 @@ class ToolResult:
 
 # ---- Jailbreak / root detection -------------------------------------
 
+def _flag(v: object) -> bool:
+    """A telemetry flag: bool("false") is True, so a string "false" jailbreak flag scored high (round 3 S3-23)."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(v)
+
+
 def jailbreak_root_check(device_telemetry: dict | None) -> ToolResult:
     if not device_telemetry:
         return ToolResult(name="jailbreak_root", data={"verdict": "no_data"}, weight="low")
-    is_jailbroken = bool(device_telemetry.get("is_jailbroken"))
-    is_rooted = bool(device_telemetry.get("is_rooted"))
-    has_frida = bool(device_telemetry.get("frida_detected"))
-    has_xposed = bool(device_telemetry.get("xposed_detected"))
+    is_jailbroken = _flag(device_telemetry.get("is_jailbroken"))
+    is_rooted = _flag(device_telemetry.get("is_rooted"))
+    has_frida = _flag(device_telemetry.get("frida_detected"))
+    has_xposed = _flag(device_telemetry.get("xposed_detected"))
     weight = "high" if (is_jailbroken or is_rooted or has_frida or has_xposed) else "low"
     return ToolResult(name="jailbreak_root", data={
         "is_jailbroken": is_jailbroken,
@@ -37,7 +46,7 @@ def sdk_integrity_check(sdk_telemetry: dict | None) -> ToolResult:
         return ToolResult(name="sdk_integrity", data={"verdict": "no_data"}, weight="low")
     expected_signature = "ABCD1234EXPECTED"   # mock — production: signed-build registry
     observed = sdk_telemetry.get("sdk_signature", "")
-    pinning_failed = bool(sdk_telemetry.get("ssl_pinning_failed"))
+    pinning_failed = _flag(sdk_telemetry.get("ssl_pinning_failed"))
     repackaged = observed and observed != expected_signature
     weight = "high" if (repackaged or pinning_failed) else "low"
     return ToolResult(name="sdk_integrity", data={
@@ -56,7 +65,7 @@ def sim_swap_check(mno_signals: dict | None,
         return ToolResult(name="sim_swap", data={"verdict": "no_data"}, weight="low")
     last_swap_hours_ago = mno_signals.get("last_sim_swap_hours_ago")
     swap_recent = isinstance(last_swap_hours_ago, (int, float)) and last_swap_hours_ago < 24
-    porting = bool(mno_signals.get("number_porting_in_progress"))
+    porting = _flag(mno_signals.get("number_porting_in_progress"))
     weight = "high" if (swap_recent or porting) else "low"
     return ToolResult(name="sim_swap", data={
         "user_id": user_id,
@@ -105,8 +114,8 @@ def mobile_session_anomaly_check(session: dict | None) -> ToolResult:
 
 def run_all_tools(alert: dict) -> list[ToolResult]:
     return [
-        jailbreak_root_check(alert.get("device_telemetry")),
-        sdk_integrity_check(alert.get("sdk_telemetry")),
-        sim_swap_check(alert.get("mno_signals"), alert.get("user_id")),
-        mobile_session_anomaly_check(alert.get("session")),
+        isolated(lambda: jailbreak_root_check(alert.get("device_telemetry")), "jailbreak_root_check", ToolResult),
+        isolated(lambda: sdk_integrity_check(alert.get("sdk_telemetry")), "sdk_integrity_check", ToolResult),
+        isolated(lambda: sim_swap_check(alert.get("mno_signals"), alert.get("user_id")), "sim_swap_check", ToolResult),
+        isolated(lambda: mobile_session_anomaly_check(alert.get("session")), "mobile_session_anomaly_check", ToolResult),
     ]

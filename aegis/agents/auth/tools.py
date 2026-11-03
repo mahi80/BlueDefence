@@ -11,6 +11,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
+
 
 @dataclass
 class ToolResult:
@@ -186,49 +188,54 @@ def run_all_tools(alert: dict) -> list[ToolResult]:
     # shape so the auth agent's _summarize() picks it up uniformly.
     from .biometrics import privileged_user_baseline_check
     results = [
-        impossible_travel(
+        isolated(lambda: impossible_travel(
             alert.get("prev_geo"),
             alert.get("curr_geo"),
             alert.get("minutes_since_prev_login", 60.0),
-        ),
-        device_fingerprint_diff(alert.get("user_id"), alert.get("device_fingerprint")),
-        peer_baseline(alert.get("user_role"), alert.get("observed", {})),
-        mfa_failure_pattern(alert.get("mfa_failures", [])),
-        privileged_user_baseline_check(
+        ), "impossible_travel", ToolResult),
+        isolated(lambda: device_fingerprint_diff(alert.get("user_id"), alert.get("device_fingerprint")), "device_fingerprint_diff", ToolResult),
+        isolated(lambda: peer_baseline(alert.get("user_role"), alert.get("observed", {})), "peer_baseline", ToolResult),
+        isolated(lambda: mfa_failure_pattern(alert.get("mfa_failures", [])), "mfa_failure_pattern", ToolResult),
+        isolated(lambda: privileged_user_baseline_check(
             alert.get("user_id"),
             alert.get("user_role"),
             alert.get("observed", {}),
-        ),
+        ), "privileged_user_baseline_check", ToolResult),
     ]
     # Behavioral biometrics — only run if telemetry is present in the alert
     if isinstance(alert.get("behavioral_telemetry"), dict):
-        # Production: route through BioCatch (or vendor) when configured;
-        # offline / dev: same call shape via MockBioCatchClient that
-        # internally calls behavioral_baseline_diff.
-        from .biocatch_client import get_client as _bc_client
-        client = _bc_client()
-        telemetry = dict(alert["behavioral_telemetry"])
-        # The mock needs user_id to look up the local baseline; the real
-        # client carries this through session_id mapping on its side.
-        telemetry.setdefault("user_id", alert.get("user_id"))
-        score = client.score(
-            session_id=alert.get("session_id") or alert.get("id", "?"),
-            telemetry=telemetry,
-        )
-        weight = ("high" if score.risk_score >= 0.6 else
-                  "medium" if score.risk_score >= 0.3 else "low")
-        results.append(ToolResult(
-            name="behavioral_biometrics",
-            data={
-                "vendor": client.name,
-                "session_id": score.session_id,
-                "risk_score": score.risk_score,
-                "drift_score": score.risk_score,    # alias for legacy auth-agent summary
-                "drift_severe": score.risk_score >= 0.6,
-                "is_bot_likelihood": score.is_bot_likelihood,
-                "anomalies": score.behavioral_anomalies,
-                "confidence": score.confidence,
-            },
-            weight=weight,
-        ))
+        results.append(isolated(lambda: _biometrics(alert), "behavioral_biometrics", ToolResult))
     return results
+
+
+def _biometrics(alert: dict) -> ToolResult:
+    """Behavioural biometrics — only when telemetry is present in the alert."""
+    # Production: route through BioCatch (or vendor) when configured;
+    # offline / dev: same call shape via MockBioCatchClient that
+    # internally calls behavioral_baseline_diff.
+    from .biocatch_client import get_client as _bc_client
+    client = _bc_client()
+    telemetry = dict(alert["behavioral_telemetry"])
+    # The mock needs user_id to look up the local baseline; the real
+    # client carries this through session_id mapping on its side.
+    telemetry.setdefault("user_id", alert.get("user_id"))
+    score = client.score(
+        session_id=alert.get("session_id") or alert.get("id", "?"),
+        telemetry=telemetry,
+    )
+    weight = ("high" if score.risk_score >= 0.6 else
+              "medium" if score.risk_score >= 0.3 else "low")
+    return ToolResult(
+        name="behavioral_biometrics",
+        data={
+            "vendor": client.name,
+            "session_id": score.session_id,
+            "risk_score": score.risk_score,
+            "drift_score": score.risk_score,    # alias for legacy auth-agent summary
+            "drift_severe": score.risk_score >= 0.6,
+            "is_bot_likelihood": score.is_bot_likelihood,
+            "anomalies": score.behavioral_anomalies,
+            "confidence": score.confidence,
+        },
+        weight=weight,
+    )

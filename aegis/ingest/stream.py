@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import collections
 import json
-import re
 import logging
+import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from .base import CONSUMED, AlertCheckpoint, BaseConsumer
@@ -52,6 +54,7 @@ class StreamItem:
     line: str                   # one raw record (JSON / CEF / F5 kv) or a normalised alert JSON
     received_at: float
     passthrough: bool = False   # already an AEGIS alert dict → no vendor normalisation
+    journal_end: int = -1       # byte offset in the journal just past this record (-1: not journaled)
 
 
 MAX_SOURCES = 256       # distinct feed names tracked; the rest are counted as "other"
@@ -65,22 +68,153 @@ class StreamStats:
     high_water: int = 0
     last_received_at: float = 0.0
     by_source: dict[str, int] = field(default_factory=dict)
+    #: records per source that parsed into an alert (or were consumed by a stateful detector) — what liveness
+    #: counts. Records RECEIVED under a free-text name said nothing about whether the feed still parses: a vendor
+    #: format change that made every record invalid still looked live (review round 3 I3-17).
+    parsed_by_source: dict[str, int] = field(default_factory=dict)
+    _touched: dict[str, float] = field(default_factory=dict)
+
+    def bump(self, table: dict[str, int], source: str, n: int, now: float) -> None:
+        """Count ``n`` under ``source``. At MAX_SOURCES names the one idle longest (over an hour) makes room; only
+        if none is idle does the new name fold into "other". The cap never forgot a name, so 256 junk names
+        pushed early kept every later real feed out of the per-source view (review round 3 R3-15)."""
+        if source not in table and len(table) >= MAX_SOURCES:
+            idle = min((k for k in table if k != "other"), key=lambda k: self._touched.get(k, 0.0), default=None)
+            if idle is not None and now - self._touched.get(idle, 0.0) > 3600:
+                table.pop(idle, None)
+            else:
+                source = "other"
+        table[source] = table.get(source, 0) + n
+        self._touched[source] = now
 
     def to_dict(self) -> dict:
         return {"received": self.received, "rejected_full": self.rejected_full, "drained": self.drained,
-                "high_water": self.high_water, "last_received_at": self.last_received_at, "by_source": dict(self.by_source)}
+                "high_water": self.high_water, "last_received_at": self.last_received_at, "by_source": dict(self.by_source),
+                "parsed_by_source": dict(self.parsed_by_source)}
 
 
 class StreamQueue:
     """Bounded, thread-safe buffer shared by every push receiver and the consumer."""
 
-    def __init__(self, capacity: int = DEFAULT_CAPACITY):
+    def __init__(self, capacity: int = DEFAULT_CAPACITY, *, journal: str | Path | None = None, fsync: bool = False):
         self.capacity = max(1, int(capacity))
         self._q: collections.deque[StreamItem] = collections.deque()
         self._cv = threading.Condition()
         self._full_logged = 0.0
         self.stats = StreamStats()
         self.enabled = False            # a receiver has been started → the registry drains this queue
+        # Optional write-ahead journal (review E15, second half). A pushed batch was answered 200 while it existed
+        # only in memory, so a crash or a restart lost up to the whole queue. With a journal, a batch is on disk
+        # before the vendor gets its 200; what was handled is committed; on start the rest is queued again.
+        self.journal = Path(journal) if journal else None
+        self._fsync = fsync
+        self._committed = 0
+        self._last_commit_write = 0.0
+        if self.journal is not None:
+            self._replay()
+
+    # ---- journal -------------------------------------------------------------------------------------------
+    def _cursor(self) -> Path:
+        assert self.journal is not None
+        return self.journal.with_name(self.journal.name + ".cursor")
+
+    def _replay(self) -> None:
+        assert self.journal is not None
+        self.journal.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._committed = int(self._cursor().read_text().strip() or 0)
+        except (OSError, ValueError):
+            self._committed = 0
+        if not self.journal.exists():
+            self._committed = 0
+            return
+        n = 0
+        with self.journal.open("rb") as fh:
+            fh.seek(self._committed)
+            pos = self._committed
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break                                 # a torn last write: never answered 200
+                pos += len(raw)
+                try:
+                    r = json.loads(raw)
+                    self._q.append(StreamItem(source=str(r["s"]), line=str(r["l"]), received_at=float(r["t"]),
+                                              passthrough=bool(r.get("p")), journal_end=pos))
+                    n += 1
+                except (ValueError, KeyError, TypeError):
+                    continue
+        if n:
+            logger.warning("[stream] re-queued %d pushed record(s) from %s that were accepted but not handled before "
+                           "the last stop", n, self.journal)
+
+    def _append_journal(self, items: list[StreamItem]) -> bool:
+        assert self.journal is not None
+        data = b"".join((json.dumps({"s": it.source, "l": it.line, "t": it.received_at, "p": it.passthrough},
+                                    separators=(",", ":")) + "\n").encode() for it in items)
+        try:
+            fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "ab") as fh:
+                start = fh.tell()
+                try:
+                    fh.write(data)
+                    fh.flush()
+                    if self._fsync:
+                        os.fsync(fh.fileno())
+                except OSError:
+                    fh.truncate(start)
+                    raise
+        except OSError as e:
+            logger.error("[stream] journal %s not writable (%s) — answering 503 so the vendor keeps the batch",
+                         self.journal, e.strerror or e)
+            return False
+        pos = start
+        for it in items:
+            pos += len((json.dumps({"s": it.source, "l": it.line, "t": it.received_at, "p": it.passthrough},
+                                   separators=(",", ":")) + "\n").encode())
+            it.journal_end = pos
+        return True
+
+    def commit(self, item: StreamItem, *, force: bool = False) -> None:
+        """``item`` (and everything queued before it) has been handled."""
+        if self.journal is None or item.journal_end < 0:
+            return
+        with self._cv:
+            self._committed = max(self._committed, item.journal_end)
+            now = time.monotonic()
+            if not force and now - self._last_commit_write < 1.0:
+                return
+            self._last_commit_write = now
+            self._write_cursor()
+
+    def flush_commit(self) -> None:
+        if self.journal is None:
+            return
+        with self._cv:
+            self._write_cursor()
+
+    def _write_cursor(self) -> None:
+        assert self.journal is not None
+        try:
+            if not self._q and self.journal.exists() and self._committed >= self.journal.stat().st_size:
+                # everything handled: start the journal over (cursor first — a crash in between replays nothing)
+                self._cursor().write_text("0")
+                self.journal.unlink(missing_ok=True)
+                self._committed = 0
+                return
+            tmp = self._cursor().with_suffix(".tmp")
+            tmp.write_text(str(self._committed))
+            os.replace(tmp, self._cursor())
+        except OSError as e:
+            logger.warning("[stream] journal cursor not written (%s) — handled records may be re-queued after a restart", e)
+
+    def requeue_front(self, items: list[StreamItem]) -> None:
+        """Drained but not handled (the consumer stopped early): back to the head of the queue, in order."""
+        if not items:
+            return
+        with self._cv:
+            self._q.extendleft(reversed(items))
+            self.stats.drained -= len(items)
+            self._cv.notify_all()
 
     def put_many(self, source: str, lines: list[str], *, passthrough: bool = False) -> bool:
         """Enqueue a batch atomically. ``False`` (and nothing enqueued) when it would not fit —
@@ -97,12 +231,13 @@ class StreamQueue:
                     logger.warning("[stream] queue full (%d/%d): rejected %d %s records (%d total) — vendor will retry",
                                    len(self._q), self.capacity, len(lines), source, self.stats.rejected_full)
                 return False
-            for ln in lines:
-                self._q.append(StreamItem(source=source, line=ln, received_at=now, passthrough=passthrough))
+            batch = [StreamItem(source=source, line=ln, received_at=now, passthrough=passthrough) for ln in lines]
+            if self.journal is not None and not self._append_journal(batch):
+                return False
+            self._q.extend(batch)
             self.stats.received += len(lines)
-            if source not in self.stats.by_source and len(self.stats.by_source) >= MAX_SOURCES:
-                source = "other"            # ?source= / headers are free text: cap the distinct names counted
-            self.stats.by_source[source] = self.stats.by_source.get(source, 0) + len(lines)
+            # ?source= / headers are free text: the distinct names counted are capped (idle ones expire)
+            self.stats.bump(self.stats.by_source, source, len(lines), now)
             self.stats.last_received_at = now
             self.stats.high_water = max(self.stats.high_water, len(self._q))
             self._cv.notify_all()
@@ -146,7 +281,9 @@ def get_stream() -> StreamQueue:
     with _shared_lock:
         if _shared is None:
             import os
-            _shared = StreamQueue(int(os.environ.get("AEGIS_STREAM_CAPACITY", str(DEFAULT_CAPACITY))))
+            _shared = StreamQueue(int(os.environ.get("AEGIS_STREAM_CAPACITY", str(DEFAULT_CAPACITY))),
+                                  journal=os.environ.get("AEGIS_STREAM_JOURNAL", "").strip() or None,
+                                  fsync=os.environ.get("AEGIS_STREAM_JOURNAL_FSYNC", "0").strip() == "1")
         return _shared
 
 
@@ -186,9 +323,31 @@ class StreamConsumer(BaseConsumer):
         self._waf = WafConsumer(checkpoint=self.checkpoint)
 
     def fetch(self, **kwargs) -> Iterator[StreamItem]:
-        yield from self.queue.drain(kwargs.get("max_items", self.max_items))
+        items = self.queue.drain(kwargs.get("max_items", self.max_items))
+        done = 0
+        try:
+            for it in items:
+                yield it
+                done += 1                       # resumed: the caller handled this record
+                self.queue.commit(it)
+        finally:
+            # stopped early (max_alerts, shutdown): what was drained but not handled goes back, not into the void
+            self.queue.requeue_front(items[done:])
+            commit = getattr(self.queue, "flush_commit", None)
+            if callable(commit):
+                commit()
 
     def normalize(self, item: StreamItem) -> Any:
+        out = self._normalize(item)
+        alerts = out if isinstance(out, list) else [out]
+        if out is CONSUMED or any(isinstance(a, dict) and a.get("id") for a in alerts):
+            with self.queue._cv:
+                self.queue.stats.bump(self.queue.stats.parsed_by_source, item.source, 1, time.time())
+        return out
+
+    def _normalize(self, item: StreamItem) -> Any:
+        if item.source.startswith("edr") and not item.passthrough:
+            return self._edr(item)
         if _is_apigw(item):
             return self._apigw(item)
         if _is_ndr(item):
@@ -233,6 +392,20 @@ class StreamConsumer(BaseConsumer):
             alert["ingest_lag_ms"] = max(0, int((item.received_at - ts) * 1000))
         return alert
 
+
+    def _edr(self, item: StreamItem) -> Any:
+        """Host telemetry (Sysmon events, osquery result logs) pushed to ``/ingest/edr``."""
+        from aegis.agents.edr.normalize import to_alert
+        try:
+            obj = json.loads(item.line)
+        except json.JSONDecodeError:
+            return None
+        alert = to_alert(obj)
+        if alert is None:
+            return CONSUMED
+        alert["received_at"] = item.received_at
+        alert["ingest_source"] = item.source
+        return alert
 
     def _ndr(self, item: StreamItem) -> Any:
         """Network sensor events feed the egress detector; most produce no alert."""
@@ -289,7 +462,11 @@ _WAF_SOURCES = ("waf", "cloudflare", "imperva", "f5", "akamai", "aws-waf", "awsw
 # A device syslog header is a run of plain tokens (PRI, sequence number, timestamp, hostname) before the
 # %FACILITY-SEVERITY-MNEMONIC: tag. Tokens may not contain / ? = & quotes or brackets, so a web/WAF log line
 # whose URI carries "/%SYS-5-CONFIG_I:" is not taken for a router's syslog (any 160 characters used to match).
-_SYSLOG_HEAD = re.compile(r"^(?:<\d{1,3}>)?(?:[^\s{}/?=&\"'<>\[\]]+\s+){0,12}%[A-Z0-9_]+-[0-7]-[A-Z0-9_]+:")
+# RFC 5424 lines may carry STRUCTURED-DATA before the message — `[meta sequenceId="1"]` elements (or "-") —
+# which the token rule refused, so those lines stopped reaching netops (review round 3 R3-13).
+_SD_ELEMENT = r'\[[A-Za-z0-9_.@-]{1,32}(?:\s+[A-Za-z0-9_.@-]{1,32}="(?:[^"\\\]]|\\.){0,128}")*\]'
+_SYSLOG_HEAD = re.compile(r"^(?:<\d{1,3}>)?(?:[^\s{}/?=&\"'<>\[\]]+\s+){0,12}(?:(?:" + _SD_ELEMENT + r")+\s+)?"
+                          r"%[A-Z0-9_]+-[0-7]-[A-Z0-9_]+:")
 
 
 def _top_keys(item: StreamItem) -> set[str] | None:

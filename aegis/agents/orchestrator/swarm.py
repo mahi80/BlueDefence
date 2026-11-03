@@ -31,6 +31,7 @@ attacker-simulation twin — and is not what this module does.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 from collections import deque
@@ -58,7 +59,13 @@ _MD5 = re.compile(r"\b[a-fA-F0-9]{32}\b")
 _DOMAIN = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|in|io|ru|cn|xyz|top|info|biz|co|bank)\b", re.I)
 _URL = re.compile(r"https?://[^\s\"'<>]+", re.I)
 _EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
-_PRIVATE_PREFIXES = ("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "127.")
+def _public_ip(ip: str) -> bool:
+    """Worth an intel lookup: a global address. The old string prefixes treated public 172.2.x / 172.200-255 as
+    private and let 100.64/10, 169.254/16 and multicast through (review round 3 O3-19)."""
+    try:
+        return ipaddress.ip_address(ip).is_global
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -102,7 +109,7 @@ def _text_blob(alert: dict) -> str:
 
 def worker_ioc_extract(alert: dict, chain: EvidenceChain, ctx: dict) -> WorkerResult:
     blob = _text_blob(alert)
-    ips = sorted({ip for ip in _IPV4.findall(blob) if not ip.startswith(_PRIVATE_PREFIXES)})
+    ips = sorted({ip for ip in _IPV4.findall(blob) if _public_ip(ip)})
     hashes = sorted(set(_SHA256.findall(blob)) | set(_MD5.findall(blob)))
     urls = sorted(set(_URL.findall(blob)))[:20]
     domains = sorted({d.lower() for d in _DOMAIN.findall(blob) if not d.lower().endswith((".bank.in",))})[:20]

@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from ..shared.tool_guard import isolated
 from .baselines import HOST_BASELINES, norm_autostart
 
 
@@ -359,21 +360,21 @@ def ssh_key_added(fingerprint: str | None, uid: str | None = None,
 def run_all_tools(alert: dict) -> list[ToolResult]:
     hc = alert.get("host_class")  # per-host-class baseline / allowlist; None -> safe default
     return [
-        parent_process_tree(alert.get("parent_process"), alert.get("child_process"), alert.get("cmdline")),
-        lateral_movement_check(
+        isolated(lambda: parent_process_tree(alert.get("parent_process"), alert.get("child_process"), alert.get("cmdline")), "parent_process_tree", ToolResult),
+        isolated(lambda: lateral_movement_check(
             alert.get("src_zone"),
             alert.get("dst_zone"),
             alert.get("dst_port"),
             alert.get("uses_smb_or_winrm", False),
-        ),
-        ioc_match(alert.get("file_hash"), alert.get("dest_domain"), alert.get("dest_ip")),
-        file_integrity_diff(alert.get("file_path"), alert.get("file_hash_current")),
-        dns_exfil_check(alert.get("dns_queries"), alert.get("dns_query_count_5min")),
-        autostart_persistence(alert.get("autostart_entries"), HOST_BASELINES.autostart(hc)),
-        webshell_drop(alert.get("file_path"), alert.get("file_content_tokens")),
-        beacon_periodicity(alert.get("egress_connect_times"), alert.get("dest_ip")),
-        tcc_grant(alert.get("tcc_service"), alert.get("tcc_client"), alert.get("tcc_allowed"),
-                  HOST_BASELINES.tcc_allowlist(hc)),
-        ssh_key_added(alert.get("ssh_key_fingerprint"), alert.get("ssh_key_uid"),
-                      HOST_BASELINES.ssh_keys(hc)),
+        ), "lateral_movement_check", ToolResult),
+        isolated(lambda: ioc_match(alert.get("file_hash"), alert.get("dest_domain"), alert.get("dest_ip")), "ioc_match", ToolResult),
+        isolated(lambda: file_integrity_diff(alert.get("file_path"), alert.get("file_hash_current")), "file_integrity_diff", ToolResult),
+        isolated(lambda: dns_exfil_check(alert.get("dns_queries"), alert.get("dns_query_count_5min")), "dns_exfil_check", ToolResult),
+        isolated(lambda: autostart_persistence(alert.get("autostart_entries"), HOST_BASELINES.autostart(hc)), "autostart_persistence", ToolResult),
+        isolated(lambda: webshell_drop(alert.get("file_path"), alert.get("file_content_tokens")), "webshell_drop", ToolResult),
+        isolated(lambda: beacon_periodicity(alert.get("egress_connect_times"), alert.get("dest_ip")), "beacon_periodicity", ToolResult),
+        isolated(lambda: tcc_grant(alert.get("tcc_service"), alert.get("tcc_client"), alert.get("tcc_allowed"),
+                  HOST_BASELINES.tcc_allowlist(hc)), "tcc_grant", ToolResult),
+        isolated(lambda: ssh_key_added(alert.get("ssh_key_fingerprint"), alert.get("ssh_key_uid"),
+                      HOST_BASELINES.ssh_keys(hc)), "ssh_key_added", ToolResult),
     ]

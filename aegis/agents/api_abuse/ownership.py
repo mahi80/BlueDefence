@@ -129,6 +129,12 @@ class HttpOwnership:
         self._lock = threading.Lock()
         self._last_warn = 0.0
         self.lookups = self.failures = 0
+        # circuit breaker (review round 3 S3-20): while the resolver is down every gateway event waited up to
+        # `timeout` per object on the ingest thread. After 3 failures in a row it is not called for 30 s (doubling
+        # to 5 min); owners are "unknown" meanwhile, exactly as for a single failed lookup.
+        self._fail_streak = 0
+        self._open_until = 0.0
+        self.skipped = 0
 
     def owners_of(self, object_type: str, object_id: str) -> Optional[frozenset[str]]:
         key = (_norm_type(object_type), str(object_id))
@@ -138,6 +144,9 @@ class HttpOwnership:
             if hit and now - hit[0] < self.ttl_s:
                 self._cache.move_to_end(key)
                 return hit[1]
+            if now < self._open_until:
+                self.skipped += 1
+                return None
         self.lookups += 1
         owners: Optional[frozenset[str]] = None
         try:
@@ -149,11 +158,17 @@ class HttpOwnership:
             owners = frozenset(str(o) for o in raw) if raw else None
         except Exception as e:  # noqa: BLE001 — a slow or down resolver means "unknown", never a false mismatch
             self.failures += 1
+            with self._lock:
+                self._fail_streak += 1
+                if self._fail_streak >= 3:
+                    self._open_until = now + min(300.0, 30.0 * 2 ** (self._fail_streak - 3))
             if now - self._last_warn > 60:
                 self._last_warn = now
-                logger.warning("[ownership] lookup failed (%s: %s); treating owners as unknown", type(e).__name__, str(e)[:120])
+                logger.warning("[ownership] lookup failed (%s: %s); treating owners as unknown%s", type(e).__name__,
+                               str(e)[:120], " — resolver paused" if self._fail_streak >= 3 else "")
             return None
         with self._lock:
+            self._fail_streak = 0
             self._cache[key] = (now, owners)
             while len(self._cache) > self.max_entries:
                 self._cache.popitem(last=False)
