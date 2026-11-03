@@ -285,8 +285,25 @@ decision, a *reversible* action (block, block_egress, throttle, challenge) runs 
 the reviewer vote explicitly concurred (`vote_concur` is `True`; a chain with no vote — triage
 `respond`, deterministic detectors — is held) and confidence ≥ the floor. Everything else is held
 for a human. A transport that cannot be read (ServiceNow non-200, a dashboard error) never falls through
-to the timeout path. The timeout path has no target-width check yet (review W3): keep it `off` or
-`shadow` until it does.
+to the timeout path. The same contract gate and width rules as any unattended action apply (below).
+
+**What may run with no human** (`agents/response/contracts.py`, `agents/response/grounding.py`). Every
+action type has a contract — its impact (read-only, low, moderate, high, severe, irreversible), how it is
+undone, and whether a human decides by policy; the test suite fails if an action type has none, and the
+auto-safe and always-HITL sets are derived from the contracts. An action that would run unattended
+(auto-safe, tiered auto-block, outflow breaker, HITL timeout) must clear all of:
+
+| Check | Rule |
+|---|---|
+| Autonomy tier | `AEGIS_AUTONOMY_TIER` L0–L4 caps the impact: L0/L1 read-only, L2 low, L3 moderate, L4 high (default L4 = each switch decides). Severe and irreversible actions never run unattended. |
+| Confidence | the chain's confidence reaches the floor for the impact: low 0.70, moderate 0.85, high 0.95 (`AEGIS_AUTONOMY_FLOOR_LOW` / `_MODERATE` / `_HIGH`). |
+| Protected target | a target on `AEGIS_PROTECTED_TARGETS` raises the impact one rank. |
+| Grounded | the target is one of the alert's entities (or the chain's tool evidence), or a narrow network around one. |
+| Narrow | at most a /24 (IPv4) or /48 (IPv6), never internal or reserved space; a destination with two labels that is not a shared suffix; never a principal on `AEGIS_UNATTENDED_DENY_PRINCIPALS` (admin, root, krbtgt, svc_* …). |
+| No injection | nothing runs unattended on a chain with prompt-injection evidence. |
+
+Each check can only make the answer stricter. The design of the contracts and the confidence × impact ×
+tier gate follows [AiSOC](https://github.com/beenuar/AiSOC) (MIT).
 
 **Never-block guardrail** (`agents/shared/netguard.py`). No connectivity-severing action
 (`block`, `isolate`, `throttle`, `quarantine`, `block_egress`) reaches a connector when the target
@@ -802,7 +819,7 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 | Push / stream | `AEGIS_INGEST_HTTP`, `AEGIS_INGEST_BIND`, `AEGIS_INGEST_TOKEN`, `AEGIS_INGEST_READ_TOKEN` (optional separate token for `GET /ingest/verdicts|blocklist|license` and the console reads), `AEGIS_CONSOLE_TOKEN` (the analyst console's key: reads `/api/soc/*` + `/api/approvals` and may POST decisions — see `aegis/ingest/console_api.py`), `AEGIS_INGEST_MAX_MB`, `AEGIS_INGEST_MAX_INFLATE_MB` (cap on what a gzip body may expand to, default 64), `AEGIS_STREAM_CAPACITY`, `AEGIS_EVENTHUB_CONN`, `AEGIS_EVENTHUB_NAME`, `AEGIS_EVENTHUB_GROUP`, `AEGIS_EVENTHUB_START`, `AEGIS_EVENTHUB_CHECKPOINT` |
 | Investigation | `AEGIS_CAMPAIGN_CONTEXT`, `AEGIS_CAMPAIGN_WINDOW_MIN`, `AEGIS_SWARM`, `AEGIS_SWARM_MAX_WORKERS`, `AEGIS_SWARM_MAX_SECONDS`, `AEGIS_INVESTIGATE`, `AEGIS_INVESTIGATE_MAX_SECONDS`, `AEGIS_INVESTIGATE_WORKERS`, `AEGIS_TWIN`, `AEGIS_TWIN_PERSONAS`, `AEGIS_TWIN_ROUNDS`, `AEGIS_MOCK_SPREAD` |
 | Approvals | `AEGIS_HITL_TRANSPORT`, `AEGIS_HITL_DIR`, `AEGIS_HITL_STATE`, `AEGIS_HITL_TIMEOUT`, `AEGIS_HITL_TIMEOUT_SEC`, `AEGIS_HITL_TIMEOUT_MIN_CONF`, `AEGIS_SLACK_WEBHOOK`, `AEGIS_SERVICENOW_*` |
-| Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_PROTECTED_TARGETS`, `AEGIS_NEVER_BLOCK`, `AEGIS_NEVER_BLOCK_HOSTS`, `AEGIS_HIGH_IMPACT_MAX`, `AEGIS_HIGH_IMPACT_WINDOW_SEC`, `AEGIS_APPROVED_TTL_SEC`, `AEGIS_APPROVED_BLOCK_TTL_SEC`, `AEGIS_OUTFLOW_BREAKER`, `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH` |
+| Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_AUTONOMY_TIER`, `AEGIS_AUTONOMY_FLOOR_LOW` / `_MODERATE` / `_HIGH`, `AEGIS_UNATTENDED_DENY_PRINCIPALS`, `AEGIS_PROTECTED_TARGETS`, `AEGIS_NEVER_BLOCK`, `AEGIS_NEVER_BLOCK_HOSTS`, `AEGIS_HIGH_IMPACT_MAX`, `AEGIS_HIGH_IMPACT_WINDOW_SEC`, `AEGIS_APPROVED_TTL_SEC`, `AEGIS_APPROVED_BLOCK_TTL_SEC`, `AEGIS_OUTFLOW_BREAKER`, `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH` |
 | Agentic attackers | `AEGIS_AUTO_BLOCK` (`off` · `shadow` · `live`), `AEGIS_AUTO_BLOCK_MIN_CONF`, `AEGIS_AUTO_BLOCK_TTL`, `AEGIS_AUTO_BLOCK_MAX_PER_HOUR`, `AEGIS_FP_ALLOW`, `AEGIS_ADAPTIVE_MIN_RETRIES`, `AEGIS_ADAPTIVE_MAX_RETRY_S`, `AEGIS_AUTH_BURST_MIN`, `AEGIS_AWS_WAF_RULE_GROUP`, `AEGIS_JA4_DB`, `AEGIS_TLS_SHARED_UAS`, `AEGIS_TLS_LIBRARY_IPS` |
 | Network sensor (NDR) | `NDR_EVENT_FILE`, `AEGIS_INTERNAL_NETS`, `AEGIS_TLS_IOC_FILE`, `AEGIS_AI_REGISTER`, `AEGIS_SHADOW_AI_REGISTER`, `AEGIS_AI_PROVIDERS_EXTRA`, `AEGIS_NDR_RARE_MAX_SRCS`, `AEGIS_NDR_BEACON_MIN_CONN`, `AEGIS_NDR_BEACON_MIN_SPAN_S`, `AEGIS_NDR_BEACON_MAX_JITTER`, `AEGIS_NDR_EXFIL_MIN_MB`, `AEGIS_NDR_EXFIL_WINDOW_S`, `AEGIS_NDR_EXFIL_RATIO`, `AEGIS_NDR_AI_UPLOAD_MB`, `AEGIS_NDR_ALLOW_DOMAINS`, `AEGIS_NDR_ALLOW_HOSTS` |
 | Licence | `AEGIS_LICENSE`, `AEGIS_LICENSE_ENFORCE`, `AEGIS_INSTALL_ID`, `AEGIS_INSTALL_SALT`, `AEGIS_LICENSE_PUBKEYS`, `AEGIS_LICENSE_OVERLIMIT_DAYS` — see the root README § Licensing |
@@ -849,13 +866,8 @@ Roadmap and decision log: `docs/plans/aegis-production-roadmap.md`.
 ## Honest limits
 
 **Known issues from the 2026-11-03 review** (full report in the project's review doc; fixes in
-progress). Until they are fixed, run these settings in `shadow` or `off`:
+progress):
 
-- **Unattended actions can be steered by the alert.** An action's target comes from the model and
-  is not yet checked against the alert's own entities. Auto-safe actions (throttle, challenge,
-  force_logout, quarantine_message) have no width check, so in `AEGIS_ENFORCEMENT_MODE=live` a
-  crafted alert can throttle `0.0.0.0/0` on AWS WAF or force-log-out an arbitrary account (W1, W2).
-- **`AEGIS_HITL_TIMEOUT=live`** can run a block of any width, including internal ranges (W3).
 - **Blast-radius numbers:** the critical count is capped at 10, a walk whose queries all fail
   reads as a clean radius, and plan steps are not filed as approvals (B1, B3, B5).
 - **Chunked pushes to `/ingest/*` are not read** (C1): configure relays (Fluent Bit, Vector) to

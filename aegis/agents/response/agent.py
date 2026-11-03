@@ -26,17 +26,15 @@ import os
 from ..shared.evidence_chain import EvidenceChain, RecommendedAction
 from ..shared.netguard import enforcement_refused
 from .autonomy import AutonomyPolicy
+from .contracts import always_hitl, auto_safe
 from .breaker import OutflowBreaker
 from .hitl_timeout import HitlTimeoutPolicy
 from .connectors import ConnectorRegistry, Receipt, STATUS_REFUSED, registry_from_env
 
 
-_AUTO_SAFE_ACTIONS = {
-    "allow", "monitor", "challenge", "throttle", "notify_user",
-    "redact",                # DLP: deterministic redaction is safe
-    "force_logout",          # Mobile: forcing re-auth is recoverable
-    "quarantine_message",    # Email: standard ESG behavior, recoverable
-}
+# Derived from the per-action contracts (contracts.py) so the sets cannot drift from ActionType or from each
+# other; change an action's contract, not these lines.
+_AUTO_SAFE_ACTIONS = set(auto_safe())
 
 # How long a human-approved action stays in force. The connector default (1 h) is for automated actions;
 # a person who approved isolating a host or cutting a C2 did not approve it lapsing an hour later. Containment
@@ -55,19 +53,7 @@ def approved_ttl_sec(action_type: str, approver: str) -> int | None:
     return int(os.environ.get("AEGIS_APPROVED_TTL_SEC", "0"))
 
 
-_ALWAYS_HITL_ACTIONS = {
-    "block", "isolate", "lock_account", "revoke_sessions",
-    "trigger_self_heal", "kill_process", "quarantine_file",
-    "escalate_to_fraud_team", "hold",
-    "block_export",          # DLP: irreversible-ish, queue for HITL
-    "block_egress",          # NDR: an egress proxy / firewall change belongs to that team
-    "recall_message",        # Email: visible to recipients, queue
-    "rotate_credential",
-    "escalate_to_hr",        # DLP/insider: HR + legal involvement
-    "snapshot_forensic",     # Self-healing forensic snapshot — auditable
-    "config_rollback",       # Network: a config push to a device — the network team approves, shadow first
-    "interface_shutdown",    # Network: shutting a port takes users off the air; a human confirms
-}
+_ALWAYS_HITL_ACTIONS = set(always_hitl())
 
 
 @dataclass
@@ -267,7 +253,11 @@ class ResponseAgent:
     # ---- decision logic ------------------------------------------------
 
     def _unattended(self, action: RecommendedAction, chain: EvidenceChain) -> tuple[bool, str]:
+        from .contracts import gate
         from .grounding import chain_entities, unattended_ok
+        ok, why = gate(action, chain, protected=self._is_protected(str(action.target)))
+        if not ok:
+            return False, why
         ents = getattr(self, "_entities", None)
         return unattended_ok(action, chain, ents if ents is not None else chain_entities(chain))
 
