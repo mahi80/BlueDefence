@@ -30,7 +30,8 @@ INVESTIGATE_VERDICTS = frozenset({"suspicious", "malicious", "uncertain"})
 
 def investigate(alert: dict, chain: EvidenceChain, source: TelemetrySource, *, guard: Any = None,
                 hops: int = 2, max_seconds: float = 10.0, record: Optional[Callable[[dict, EvidenceChain], Any]] = None,
-                twin: bool = False, twin_personas: int = 60, twin_rounds: int = 12, llm: Any = None) -> dict:
+                twin: bool = False, twin_personas: int = 60, twin_rounds: int = 12, llm: Any = None,
+                file_actions: Callable[[dict, EvidenceChain, list], Any] | None = None) -> dict:
     """Walk, plan the minimum cut, attach both, re-record. Returns the graph summary (+ ``mitigation``).
     Verdict untouched by construction; the plan only adds RecommendedActions under the HITL policy."""
     verdict_before = chain.verdict
@@ -39,29 +40,37 @@ def investigate(alert: dict, chain: EvidenceChain, source: TelemetrySource, *, g
     crit = s["critical_assets_reached"]
     chain.evidence.append(EvidenceItem(
         source="investigation.blast_graph", signal=g.signal(),
-        weight="high" if crit else ("medium" if s["nodes_reached"] > 3 else "low"),
+        # a walk whose queries failed is not "0 critical, low" — it is unknown (review B3)
+        weight="high" if crit else ("medium" if s["nodes_reached"] > 3 or s["query_errors"] else "low"),
         raw_data={"summary": s, "per_walker": rep.per_walker},
     ))
     chain.metadata["blast_graph"] = g.to_dict()
     chain.metadata["investigation"] = {"tier": "async", "elapsed_ms": rep.elapsed_ms, "source": getattr(source, "name", "?"),
-                                       "hops": hops, "critical_reached": len(crit), "choke_edges": s["choke_edges"]}
+                                       "hops": hops, "critical_reached": s["critical_count"], "choke_edges": s["choke_edges"],
+                                       "incomplete": s["incomplete"], "query_errors": s["query_errors"]}
     chain.reasoning.append(ReasoningStep(
         step=len(chain.reasoning) + 1, action="investigate_blast_radius",
         observation=(f"{len(s['walkers'])} walkers, {s['edges']} edges, {s['nodes_reached']} nodes reached in {rep.elapsed_ms} ms"
                      + (f"; time-boxed: {', '.join(s['truncated'])}" if s["truncated"] else "")),
-        conclusion=(f"{len(crit)} critical asset(s) reachable" + (f" — first: {crit[0]['id']} at {crit[0]['distance']} hop(s)" if crit else "")
+        conclusion=(f"{s['critical_count']} critical asset(s) reachable" + (f" — first: {crit[0]['id']} at {crit[0]['distance']} hop(s)" if crit else "")
+                    + (f"; {sum(s['query_errors'].values())} telemetry queries FAILED — reach may be understated" if s["query_errors"] else "")
                     + (f"; top cut candidate: {s['choke_edges'][0]['edge']} (protects {s['choke_edges'][0]['n']})" if s["choke_edges"] else "")
                     + f". Verdict unchanged ({verdict_before}); reach is impact, not likelihood."),
     ))
     plan = plan_mitigation(g)
+    if s["query_errors"]:
+        plan.note = (plan.note + "; " if plan.note else "") + "built on an incomplete walk (telemetry queries failed)"
     from .walk import seeds_from
-    ip_seed = next((nid for nid, t in seeds_from(alert) if t == "ip"), None)
-    acct_seed = next((nid for nid, t in seeds_from(alert) if t == "account"), None)
+    top = seeds_from(alert, top_level_only=True)              # action targets never come from nested client fields
+    ip_seed = next((nid for nid, t in top if t == "ip"), None)
+    acct_seed = next((nid for nid, t in top if t == "account"), None)
+    n0 = len(chain.recommended_actions)
     attach_plan(chain, g, plan, source_ip=ip_seed, principal=acct_seed)
+    added = chain.recommended_actions[n0:]
     s["mitigation"] = plan.to_dict()
     if twin:
         rep = run_twin(alert, chain, g, llm=llm, personas=twin_personas, rounds=twin_rounds, max_seconds=max_seconds / 2, guard=guard,
-                       contained=getattr(source, "contained", None))
+                       contained=_fully_contained(getattr(source, "contained", None)))
         s["twin"] = chain.metadata.get("twin", rep.to_dict())
     assert chain.verdict == verdict_before
     if record is not None:
@@ -69,7 +78,22 @@ def investigate(alert: dict, chain: EvidenceChain, source: TelemetrySource, *, g
             record(alert, chain)
         except Exception as e:  # noqa: BLE001 — never lose the graph over bookkeeping
             logger.warning("[investigation] re-record of %s failed: %s", chain.alert_id, str(e)[:120])
+    # The response agent filed approvals for the chain's actions before this ran, so plan steps appended now
+    # reached nobody while the evidence said "N steps queued" (review B5). Hand them over to be filed.
+    s["actions_added"] = len(added)
+    if added and file_actions is not None:
+        try:
+            s["actions_filed"] = file_actions(alert, chain, added)
+        except Exception as e:  # noqa: BLE001
+            logger.error("[investigation] filing %d plan step(s) for %s failed: %s", len(added), chain.alert_id, str(e)[:160])
     return s
+
+
+def _fully_contained(contained: Any) -> set[str] | None:
+    """Nodes cut off entirely (sources keep target -> relations severed; None = every edge)."""
+    if isinstance(contained, dict):
+        return {k for k, v in contained.items() if v is None}
+    return set(contained) if contained else None
 
 
 class Investigator:
@@ -78,8 +102,10 @@ class Investigator:
     def __init__(self, source: TelemetrySource | None = None, *, guard: Any = None, max_workers: int = 2,
                  hops: int = 2, max_seconds: float = 10.0, record: Optional[Callable[[dict, EvidenceChain], Any]] = None,
                  verdicts: frozenset[str] = INVESTIGATE_VERDICTS, twin: bool = False, twin_personas: int = 60,
-                 twin_rounds: int = 12, llm: Any = None, on_done: Optional[Callable[[dict, EvidenceChain, dict], Any]] = None):
+                 twin_rounds: int = 12, llm: Any = None, on_done: Optional[Callable[[dict, EvidenceChain, dict], Any]] = None,
+                 file_actions: Callable[[dict, EvidenceChain, list], Any] | None = None):
         self.source = source or MockTenant()
+        self.file_actions = file_actions  # files plan steps added after the first HITL pass (aegis.service)
         self.on_done = on_done            # e.g. update the HITL card in place (aegis.service)
         self._guard = guard; self.hops = hops; self.max_seconds = max_seconds; self._record = record
         self.twin = twin; self.twin_personas = twin_personas; self.twin_rounds = twin_rounds; self._llm = llm
@@ -119,7 +145,8 @@ class Investigator:
             self._jobs[aid]["state"] = "running"
         try:
             s = investigate(alert, chain, self.source, guard=self._guard, hops=self.hops, max_seconds=self.max_seconds, record=self._record,
-                            twin=self.twin, twin_personas=self.twin_personas, twin_rounds=self.twin_rounds, llm=self._llm)
+                            twin=self.twin, twin_personas=self.twin_personas, twin_rounds=self.twin_rounds, llm=self._llm,
+                            file_actions=self.file_actions)
             with self._lock:
                 self._jobs[aid].update(state="done", finished=time.time(), summary=s)
             if self.on_done is not None:
@@ -150,7 +177,8 @@ class Investigator:
                 pass
 
 
-def investigator_from_env(*, guard: Any = None, record: Any = None, llm: Any = None, on_done: Any = None) -> Optional[Investigator]:
+def investigator_from_env(*, guard: Any = None, record: Any = None, llm: Any = None, on_done: Any = None,
+                          file_actions: Any = None) -> Optional[Investigator]:
     """``AEGIS_INVESTIGATE=1`` (default off) turns the tier on; ``AEGIS_INVESTIGATE_MAX_SECONDS`` caps a walk;
     ``AEGIS_TWIN=1`` adds the attacker-simulation twin (``AEGIS_TWIN_PERSONAS``, ``AEGIS_TWIN_ROUNDS``)."""
     import os
@@ -161,7 +189,8 @@ def investigator_from_env(*, guard: Any = None, record: Any = None, llm: Any = N
                         max_seconds=float(os.environ.get("AEGIS_INVESTIGATE_MAX_SECONDS", "10")),
                         max_workers=int(os.environ.get("AEGIS_INVESTIGATE_WORKERS", "2")),
                         twin=on("AEGIS_TWIN"), twin_personas=int(os.environ.get("AEGIS_TWIN_PERSONAS", "60")),
-                        twin_rounds=int(os.environ.get("AEGIS_TWIN_ROUNDS", "12")), llm=llm, on_done=on_done)
+                        twin_rounds=int(os.environ.get("AEGIS_TWIN_ROUNDS", "12")), llm=llm, on_done=on_done,
+                        file_actions=file_actions)
 
 
 __all__ = ["INVESTIGATE_VERDICTS", "Investigator", "investigate", "investigator_from_env"]

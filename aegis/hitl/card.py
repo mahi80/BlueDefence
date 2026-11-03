@@ -39,6 +39,9 @@ def investigation_card(chain: Any) -> dict | None:
             "edges": [{"a": e["a"], "r": e.get("relation", ""), "b": e["b"]} for e in bg.get("edges", []) if e.get("a") in keep and e.get("b") in keep][:MAX_EDGES],
             "counts": s.get("counts", {}), "nodes_reached": s.get("nodes_reached", 0),
             "critical": s.get("critical_assets_reached", [])[:10],
+            "critical_count": s.get("critical_count", len(s.get("critical_assets_reached", []))),
+            # failed telemetry queries: the analyst must not read "0 critical" as "nothing reachable" (review B3)
+            "incomplete": bool(s.get("incomplete")), "query_errors": s.get("query_errors", {}),
             "choke_edges": [{"edge": c.get("edge"), "protects": c.get("protects", [])[:5]} if isinstance(c, dict) else {"edge": str(c), "protects": []}
                             for c in s.get("choke_edges", [])[:6]],
             "walkers": s.get("walkers", []), "truncated": s.get("truncated", []),
@@ -58,12 +61,13 @@ def investigation_card(chain: Any) -> dict | None:
                          "with_plan": (twin.get("with_plan") or {}).get("crown_rate"), "plan_effectiveness": twin.get("plan_effectiveness"),
                          "median_rounds": twin.get("median_rounds_to_crown"), "low_sample": bool(twin.get("low_sample")),
                          "by_archetype": twin.get("by_archetype", {}), "top_cuts": twin.get("ranked_cuts", [])[:5],
-                         "persona_source": twin.get("persona_source")})
+                         "persona_source": twin.get("persona_source"), "stale": twin.get("stale"),
+                         "simulated": twin.get("simulated")})
     if cont:
         card["containment"] = [{"step": c.get("step"), "action": c.get("action"), "target": c.get("target"),
                                 "before": len(c.get("critical_before", [])), "after": len(c.get("critical_after", [])),
                                 "shrank": len(c.get("critical_after", [])) < len(c.get("critical_before", [])),
-                                "new_nodes": c.get("new_nodes", [])[:5]} for c in cont[-10:]]
+                                "new_nodes": c.get("new_nodes", [])[:5], "measured": c.get("baseline", True)} for c in cont[-10:]]
     if camp:
         card["campaign"] = {"events": camp.get("events_in_window"), "window_min": camp.get("window_minutes"), "sources": camp.get("sources", [])[:6],
                             "endpoints": (camp.get("enumeration") or {}).get("distinct_endpoints"), "requests_per_min": (camp.get("automation") or {}).get("requests_per_min"),

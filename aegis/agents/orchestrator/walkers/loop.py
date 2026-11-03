@@ -55,6 +55,8 @@ class ContainmentLoop:
     hops: int = 2
     max_seconds: float = 10.0
     record: Optional[Callable[[dict, EvidenceChain], Any]] = None
+    # files re-plan steps with the approval channel (they are added after the first HITL pass — review B5)
+    file_actions: Callable[[dict, EvidenceChain, list], Any] | None = None
     # alerts whose containment is followed: the most recent 5,000 (each holds the alert + chain)
     _tracked: dict[str, tuple[dict, EvidenceChain]] = field(default_factory=lambda: BoundedDict(5000))
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -81,20 +83,40 @@ class ContainmentLoop:
         if pair is None:
             return None
         alert, chain = pair
-        before_graph = chain.metadata.get("blast_graph", {}).get("summary", {})
-        crit_before = [x["id"] for x in before_graph.get("critical_assets_reached", [])]
-        nodes_before = int(before_graph.get("nodes_reached", 0))
+        before_graph = (chain.metadata.get("blast_graph") or {}).get("summary")
         mark = getattr(self.source, "mark_contained", None)
         if callable(mark):
             mark(action_type, target)
         rep = run_walkers(alert, self.source, walkers=DEFAULT_WALKERS, hops=self.hops, max_seconds=self.max_seconds, guard=self.guard)
         g = rep.graph; s = g.summary()
-        crit_after = [x["id"] for x in s["critical_assets_reached"]]
+        crit_after = list(s["critical_ids"])
+        verdict_before = chain.verdict
+        if not before_graph:
+            # the action ran before the investigation finished: there is no pre-action graph to compare with, and
+            # comparing with nothing read as "attacker moved: N new critical" (review B4). Record the post-action
+            # walk as the graph and say plainly that containment could not be measured.
+            entry = LoopEntry(len(chain.metadata.get("containment", [])) + 1, action_type, target, [], crit_after, 0,
+                              s["nodes_reached"])
+            d = entry.to_dict(); d.update(baseline=False, new_nodes=[], shrank=False)
+            chain.metadata.setdefault("containment", []).append(d)
+            self._refresh(chain, g, s)
+            chain.evidence.append(EvidenceItem(
+                source="investigation.containment", weight="low", raw_data=d,
+                signal=f"{action_type}({target}) executed before the blast-radius walk finished — no baseline, so its effect "
+                       f"cannot be measured; {s['critical_count']} critical asset(s) reachable now"))
+            chain.reasoning.append(ReasoningStep(step=len(chain.reasoning) + 1, action="containment_check",
+                                                 observation=f"after {action_type}({target}): {s['nodes_reached']} nodes, {s['edges']} edges",
+                                                 conclusion="no pre-action baseline; effect not measured. Verdict unchanged."))
+            self._record(alert, chain, alert_id)
+            return entry
+        # the full id list, not the 10-item display list (review B1); older chains only have the display list
+        crit_before = list(before_graph.get("critical_ids") or [x["id"] for x in before_graph.get("critical_assets_reached", [])])
+        nodes_before = int(before_graph.get("nodes_reached", 0))
         entry = LoopEntry(len(chain.metadata.get("containment", [])) + 1, action_type, target, crit_before, crit_after,
                           nodes_before, s["nodes_reached"])
         chain.metadata.setdefault("containment", []).append(entry.to_dict())
-        chain.metadata["blast_graph"] = g.to_dict()
-        verdict_before = chain.verdict
+        self._refresh(chain, g, s)
+        new_actions: list[RecommendedAction] = []
         if entry.new_nodes:
             plan = plan_mitigation(g)
             existing = {(a.action_type, a.target) for a in chain.recommended_actions}
@@ -102,9 +124,10 @@ class ContainmentLoop:
             for st in plan.steps:
                 if (st.action_type, st.target) in existing:
                     continue
-                chain.recommended_actions.append(RecommendedAction(
+                ra = RecommendedAction(
                     action_type=st.action_type, target=st.target, requires_hitl=st.requires_hitl, confidence=0.8,
-                    reasoning=f"re-plan after {action_type}({target}): attacker reached {', '.join(entry.new_nodes[:3])}; {st.why}; rollback: {st.rollback}"))
+                    reasoning=f"re-plan after {action_type}({target}): attacker reached {', '.join(entry.new_nodes[:3])}; {st.why}; rollback: {st.rollback}")
+                chain.recommended_actions.append(ra); new_actions.append(ra)
                 existing.add((st.action_type, st.target)); added += 1
             chain.evidence.append(EvidenceItem(
                 source="investigation.containment", weight="high",
@@ -124,12 +147,35 @@ class ContainmentLoop:
                                              observation=f"after {action_type}({target}): {s['nodes_reached']} nodes, {s['edges']} edges",
                                              conclusion=conclusion + " Verdict unchanged."))
         assert chain.verdict == verdict_before
+        self._record(alert, chain, alert_id)
+        if new_actions and self.file_actions is not None:
+            try:
+                self.file_actions(alert, chain, new_actions)
+            except Exception as e:  # noqa: BLE001
+                logger.error("[containment] filing %d re-plan step(s) for %s failed: %s", len(new_actions), alert_id, str(e)[:160])
+        return entry
+
+    def _record(self, alert: dict, chain: EvidenceChain, alert_id: str) -> None:
         if self.record is not None:
             try:
                 self.record(alert, chain)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[containment] re-record of %s failed: %s", alert_id, str(e)[:120])
-        return entry
+
+    @staticmethod
+    def _refresh(chain: EvidenceChain, g: Any, s: dict) -> None:
+        """The re-walk replaces the graph, so everything derived from the old graph goes with it (review B10):
+        the plan is recomputed (executed steps drop out), the choke edges follow, and the twin — simulated on the
+        old graph — is marked stale."""
+        chain.metadata["blast_graph"] = g.to_dict()
+        chain.metadata["mitigation_plan"] = plan_mitigation(g).to_dict()
+        inv = chain.metadata.get("investigation")
+        if isinstance(inv, dict):
+            inv.update(critical_reached=s["critical_count"], choke_edges=s["choke_edges"], incomplete=s["incomplete"],
+                       query_errors=s["query_errors"])
+        twin = chain.metadata.get("twin")
+        if isinstance(twin, dict) and not twin.get("skipped"):
+            twin["stale"] = "simulated before the latest containment step; re-run to refresh"
 
     def on_decisions(self, decisions: list) -> list[LoopEntry]:
         """Feed the HITL sync result: every approved + executed decision triggers a check."""

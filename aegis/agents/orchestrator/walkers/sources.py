@@ -59,13 +59,11 @@ class MockTenant:
     def __init__(self, *, spread: float = 0.5, seed: int = 7):
         self.spread = max(0.0, min(1.0, spread)); self._seed = seed
         self._t0 = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
-        self.contained: set[str] = set()          # targets whose outgoing edges a containment action severed
+        self.contained: dict[str, set[str] | None] = {}   # target -> relations severed (None = every edge)
 
     def mark_contained(self, action_type: str, target: str) -> None:
-        """Reflect an executed action: the walkers stop seeing edges *from* that target."""
-        if action_type in ("revoke_sessions", "lock_account", "isolate", "block", "kill_process", "rotate_credential",
-                           "hold", "block_export", "force_logout"):
-            self.contained.add(str(target))
+        """Reflect an executed action: the walkers stop seeing the edges *from* that target that the action cuts."""
+        _mark(self.contained, action_type, target)
 
     def _r(self, *parts: str) -> random.Random:
         h = hashlib.sha256(("|".join(parts) + f"|{self._seed}").encode()).hexdigest()
@@ -76,7 +74,7 @@ class MockTenant:
 
     def _edges(self, a: str, rel: str, kinds: list[tuple[str, str]], n: int, r: random.Random, src: str) -> list[Edge]:
         out = []
-        if a in self.contained:
+        if _severed(self.contained, a, rel):
             return out
         for i in range(n):
             label, typ = kinds[i % len(kinds)]
@@ -182,6 +180,31 @@ _RELATION = {
 # an executed containment action severs a node's outgoing edges (same set MockTenant honours)
 _CONTAIN_ACTIONS = {"revoke_sessions", "lock_account", "isolate", "block", "kill_process",
                     "rotate_credential", "hold", "block_export", "force_logout"}
+# What an action cuts on its target (review B2). Revoking a user's sessions does not stop the user's other
+# paths (cloud roles, tables, devices): severing *every* edge made "revoke_sessions(u1)" read "confirmed 2 → 0"
+# for paths it never touched, and every later alert on u1 walked one node. None = the target is cut off.
+_SEVERS: dict[str, set[str] | None] = {
+    "revoke_sessions": {"holds_session", "logged_on_from", "touched", "queried", "logged_on"},
+    "force_logout": {"holds_session", "logged_on"},
+    "rotate_credential": {"assumed"},
+    "block_export": {"downloaded_from"},
+    "hold": {"sent_to", "received_from"},
+    "lock_account": None, "isolate": None, "block": None, "kill_process": None,
+}
+
+
+def _mark(contained: dict, action_type: str, target: str) -> None:
+    if action_type not in _SEVERS:
+        return
+    cut, have = _SEVERS[action_type], contained.get(str(target), set())
+    contained[str(target)] = None if (cut is None or have is None) else (have | cut)
+
+
+def _severed(contained: dict, subject: str, relation: str) -> bool:
+    if subject not in contained:
+        return False
+    cut = contained[subject]
+    return cut is None or relation in cut
 
 
 class InventorySource:
@@ -208,7 +231,7 @@ class InventorySource:
     name = "inventory"
 
     def __init__(self, source: Any) -> None:
-        self.contained: set[str] = set()
+        self.contained: dict[str, set[str] | None] = {}
         self._index: dict[tuple[str, str], list[Edge]] = {}
         for rec in _load_estate(source):
             try:
@@ -220,11 +243,10 @@ class InventorySource:
             self._index.setdefault((e.a, e.relation), []).append(e)
 
     def mark_contained(self, action_type: str, target: str) -> None:
-        if action_type in _CONTAIN_ACTIONS:
-            self.contained.add(str(target))
+        _mark(self.contained, action_type, target)
 
     def _q(self, subject: str, method: str) -> list[Edge]:
-        if str(subject) in self.contained:
+        if _severed(self.contained, str(subject), _RELATION[method]):
             return []
         return list(self._index.get((str(subject), _RELATION[method]), ()))
 

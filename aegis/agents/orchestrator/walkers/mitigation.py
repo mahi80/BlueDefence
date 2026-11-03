@@ -100,6 +100,24 @@ def _sever(e: Edge) -> tuple[str, str, float, str]:
     return act, (e.a if end == "a" else e.b), cost, rb
 
 
+_PRINCIPALS = ("account", "account_privileged")
+_HOSTS = ("host", "server", "jump_host", "file_server", "device_managed", "device_unmanaged", "domain_controller", "backup_server")
+# the node types each principal / host action can actually be applied to
+_APPLIES_TO = {"revoke_sessions": _PRINCIPALS, "force_logout": _PRINCIPALS,
+               "lock_account": (*_PRINCIPALS, "admin_role", "cloud_role"), "isolate": _HOSTS}
+
+
+def _fit(g: BlastGraph, act: str, target: str) -> str:
+    """The relation picks the action, but the target's type decides whether it applies: ``touched`` from a
+    cloud role used to plan ``revoke_sessions(role-cloud-admin)`` (review B14). A mismatch falls back to the
+    containment that fits the type; an unknown type keeps the relation's action."""
+    allowed = _APPLIES_TO.get(act)
+    t = g.nodes[target].type if target in g.nodes else "unknown"
+    if allowed is None or t == "unknown" or t in allowed:
+        return act
+    return _fallback_action(g, target)
+
+
 def _candidates(g: BlastGraph, crit: set[str]) -> dict[tuple[str, str], list[Edge]]:
     """Unique (action, target) pairs on some path to a critical node, with the edges each severs.
     One action removes *every* edge it maps to — revoking a user's sessions cuts all of them."""
@@ -110,6 +128,7 @@ def _candidates(g: BlastGraph, crit: set[str]) -> dict[tuple[str, str], list[Edg
         act, target, _cost, _rb = _sever(e)
         if act == "monitor":
             continue
+        act = _fit(g, act, target)
         out.setdefault((act, target), []).append(e)
     return out
 

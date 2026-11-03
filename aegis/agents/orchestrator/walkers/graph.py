@@ -53,6 +53,8 @@ class BlastGraph:
     edges: list[Edge] = field(default_factory=list)
     walkers_run: list[str] = field(default_factory=list)
     truncated: list[str] = field(default_factory=list)      # walkers that hit their time box
+    errors: dict[str, int] = field(default_factory=dict)     # walker -> failed telemetry queries (review B3)
+    _choke_cache: tuple | None = field(default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------ build
     def seed(self, node_id: str, node_type: str) -> Node:
@@ -116,18 +118,34 @@ class BlastGraph:
         """Edges whose removal disconnects the most critical nodes from the seeds — the 2.6
         minimum-cut candidates. Brute-force single-edge removal over the reached subgraph; the
         graphs are small (hundreds of edges) so this is cheap and exact for one-edge cuts."""
+        key = (len(self.edges), len(self.nodes), top)
+        if self._choke_cache is not None and self._choke_cache[0] == key:
+            return self._choke_cache[1]
         crit = {n.id for n in self.critical_reached()}
         if not crit:
             return []
         seeds = {n.id for n in self.nodes.values() if n.distance == 0}
         base = self._reach(seeds, self.edges)
         out = []
+        # only an edge on some seed → critical path can be a cut: skip the rest instead of re-walking the graph
+        # once per edge (review B8 — a 2,000-edge hub took 10 s, three times per investigation)
+        rev: dict[str, list[str]] = {}
         for e in self.edges:
-            rest = [x for x in self.edges if x is not e]
+            rev.setdefault(e.b, []).append(e.a)
+        to_crit = set(crit); stack = list(crit)                 # nodes from which some critical node is reachable
+        while stack:
+            for y in rev.get(stack.pop(), ()):
+                if y not in to_crit:
+                    to_crit.add(y); stack.append(y)
+        for i, e in enumerate(self.edges):
+            if e.a not in base or e.b not in to_crit:
+                continue
+            rest = self.edges[:i] + self.edges[i + 1:]
             lost = (crit & base) - self._reach(seeds, rest)
             if lost:
                 out.append({"edge": f"{e.a} -{e.relation}-> {e.b}", "protects": sorted(lost), "n": len(lost), "source": e.source})
         out.sort(key=lambda d: (-d["n"], d["edge"]))
+        self._choke_cache = (key, out[:top])
         return out[:top]
 
     @staticmethod
@@ -145,8 +163,12 @@ class BlastGraph:
 
     def summary(self) -> dict:
         crit = self.critical_reached()
+        # the display list is capped; the count and the id list are not — they used to be read off the
+        # capped list, so 20 critical assets reported as 10 and a cut of 6 read "10 → 10" (review B1)
         return {"nodes_reached": len(self.reached()), "edges": len(self.edges), "counts": self.counts(),
                 "critical_assets_reached": [{"id": n.id, "type": n.type, "distance": n.distance} for n in crit[:10]],
+                "critical_count": len(crit), "critical_ids": [n.id for n in crit],
+                "query_errors": dict(self.errors), "incomplete": bool(self.errors or self.truncated),
                 "earliest_touch": self.earliest_touch(), "walkers": self.walkers_run, "truncated": self.truncated,
                 "top_nodes": [{"id": n.id, "type": n.type, "distance": n.distance, "score": n.score}
                               for n in sorted(self.reached(), key=lambda n: -n.score)[:10]],
@@ -160,8 +182,11 @@ class BlastGraph:
     def signal(self) -> str:
         s = self.summary(); c = s["counts"]
         crit = s["critical_assets_reached"]
+        failed = sum(s["query_errors"].values())
         return (f"Blast radius: {c.get('accounts', 0)} account(s), {c.get('hosts', 0)} host(s), {c.get('sessions', 0)} session/token(s), "
                 f"{c.get('data', 0)} data store(s), {c.get('money', 0)} money node(s); "
-                f"{len(crit)} critical asset(s) reached" + (f" ({', '.join(x['id'] for x in crit[:3])})" if crit else "") +
+                f"{s['critical_count']} critical asset(s) reached" + (f" ({', '.join(x['id'] for x in crit[:3])})" if crit else "") +
                 (f"; earliest touch {s['earliest_touch']}" if s["earliest_touch"] else "") +
-                (f"; {len(s['truncated'])} walker(s) time-boxed" if s["truncated"] else ""))
+                (f"; {len(s['truncated'])} walker(s) time-boxed" if s["truncated"] else "") +
+                (f"; INCOMPLETE: {failed} telemetry quer{'y' if failed == 1 else 'ies'} failed "
+                 f"({', '.join(sorted(s['query_errors']))}) — the radius may be larger" if failed else ""))

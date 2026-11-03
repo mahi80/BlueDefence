@@ -114,16 +114,19 @@ class TwinReport:
     by_archetype: dict[str, dict] = field(default_factory=dict)
     elapsed_ms: int = 0
     truncated: bool = False
+    simulated: int = -1        # personas actually run (-1 = all); a time-boxed run stops early (review B13)
 
     def crown_rate(self) -> float:
-        return round(len(self.time_to_crown) / max(1, self.personas), 2)
+        n = self.personas if self.simulated < 0 else self.simulated
+        return round(len(self.time_to_crown) / max(1, n), 2)
 
     def ranked_cuts(self, top: int = 5) -> list[dict]:
         """Edges by the number of simulated futures that crossed them on the way to a critical node."""
         return [{"edge": e, "futures_killed": n} for e, n in sorted(self.edge_traffic.items(), key=lambda kv: -kv[1])[:top]]
 
     def to_dict(self) -> dict:
-        return {"personas": self.personas, "rounds": self.rounds, "crown_rate": self.crown_rate(),
+        return {"personas": self.personas, "simulated": self.personas if self.simulated < 0 else self.simulated,
+                "rounds": self.rounds, "crown_rate": self.crown_rate(),
                 "median_rounds_to_crown": (sorted(self.time_to_crown)[len(self.time_to_crown) // 2] if self.time_to_crown else None),
                 "critical_hit": dict(sorted(self.critical_hit.items(), key=lambda kv: -kv[1])[:10]),
                 "heat": dict(sorted(self.reached.items(), key=lambda kv: -kv[1])[:15]),
@@ -157,9 +160,9 @@ def simulate(g: BlastGraph, personas: list[Persona], *, rounds: int = 12, seed: 
     for i, p in enumerate(personas):
         r = random.Random(f"{seed}:{i}:{p.name}")      # common random numbers: the with-plan run shares draws until it diverges
         arche = rep.by_archetype.setdefault(p.archetype, {"n": 0, "crown": 0})
-        arche["n"] += 1
         if time.time() - t0 > max_seconds:
-            rep.truncated = True; break
+            rep.truncated = True; rep.simulated = i; break
+        arche["n"] += 1
         here = r.choice(seeds); visited = {here}; crowned = False; path: list[str] = []
         for k in range(rounds):
             if here in contained:
