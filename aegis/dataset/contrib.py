@@ -62,7 +62,7 @@ def redact_for_contrib(obj: Any, salt: str) -> Any:
     bank, not outside it) is replaced with salted tokens before anything leaves: ``email-…``, ``ip-…``,
     ``host-…``. Consistent within one installation, so correlation survives; unlinkable across installations."""
     if isinstance(obj, dict):
-        return {k: redact_for_contrib(v, salt) for k, v in obj.items()}
+        return {(redact_for_contrib(k, salt) if isinstance(k, str) else k): redact_for_contrib(v, salt) for k, v in obj.items()}
     if isinstance(obj, list):
         return [redact_for_contrib(v, salt) for v in obj]
     if isinstance(obj, str):
@@ -273,6 +273,12 @@ def build_bundle(audit_path: Path | str, *, installation_id: str, license_id: st
     rows = [redact_for_contrib(asdict(r), salt) for r in records]
     for r in rows:
         r["source_system"] = installation_id                 # the only identity the bundle carries: the installation's
+        for h in r.get("human") or []:
+            # who decided, and in what words, stays in the bank: logins (`ciso:r.verma`) and colleagues named in a
+            # rationale left in clear and the gate found nothing (review round 4 D4-12); the role is kept
+            if isinstance(h, dict):
+                h["decided_by"] = ""
+                h["rationale"] = ""
     counts = {
         "records": len(rows),
         "with_alert": sum(1 for r in rows if r.get("alert")),
@@ -404,7 +410,9 @@ def records_from_bundles(folder: Path | str, *, gate: bool = True,
     cap = max_per_installation if max_per_installation is not None else int(
         os.environ.get("AEGIS_CONTRIB_MAX_PER_INSTALL", "1000") or 1000)
     recs: list[TriageRecord] = []
+    total_cap = int(os.environ.get("AEGIS_CONTRIB_MAX_TOTAL", "20000") or 20000)
     report: dict[str, Any] = {"bundles": 0, "skipped_gate": [], "by_installation": {}}
+    seen_fp: set[str] = set()
     for path, b in iter_bundles(folder):
         if b.get("schema") != BUNDLE_SCHEMA:
             continue
@@ -417,11 +425,13 @@ def records_from_bundles(folder: Path | str, *, gate: bool = True,
         inst = str(b.get("installation_id") or "unknown")
         kept = report["by_installation"].get(inst, 0)
         for row in b.get("records") or []:
-            if kept >= cap:
+            if kept >= cap or len(recs) >= total_cap:
+                # the installation id is the bundle's own claim, so the per-install cap alone was bypassed by
+                # rotating ids; the total cap bounds what any number of bundles can add (review round 4 D4-1)
                 report["capped"] = report.get("capped", 0) + 1
                 continue
             try:
-                rec = _community_record(dict(row), inst)
+                rec = _community_record(dict(row), inst, report)
             except (TypeError, ValueError, KeyError, AttributeError) as e:
                 report["invalid"] = report.get("invalid", 0) + 1
                 logger.warning("[contrib] record skipped (%s: %s)", type(e).__name__, str(e)[:120])
@@ -429,6 +439,10 @@ def records_from_bundles(folder: Path | str, *, gate: bool = True,
             if rec is None:
                 report["unlabelled"] = report.get("unlabelled", 0) + 1
                 continue
+            if rec.fingerprint in seen_fp:
+                report["duplicate"] = report.get("duplicate", 0) + 1
+                continue
+            seen_fp.add(rec.fingerprint)
             recs.append(rec)
             kept += 1
         report["by_installation"][inst] = kept
@@ -438,7 +452,7 @@ def records_from_bundles(folder: Path | str, *, gate: bool = True,
 _COMMUNITY_VERDICTS = ("benign", "suspicious", "malicious", "uncertain")
 
 
-def _community_record(row: dict, inst: str) -> TriageRecord | None:
+def _community_record(row: dict, inst: str, report: dict | None = None) -> TriageRecord | None:
     """One contributed record, with nothing the contributor asserted taken on trust (review round 3 G5-1).
 
     A bundle used to be imported with its own ``label`` (``ground_truth``!), ``split`` and ``origin``, so one
@@ -446,8 +460,18 @@ def _community_record(row: dict, inst: str) -> TriageRecord | None:
     the label is re-derived from the bundled analyst decisions (no decision → not imported: a model's own verdict
     teaches nothing), never ``ground_truth``; the split is re-derived from the fingerprint; the origin is always
     ``community_contrib``; and each installation is capped (``AEGIS_CONTRIB_MAX_PER_INSTALL``)."""
-    from .schema import _label_from_human
+    from ..agents.shared.redact import looks_like_attack
+    from .schema import _label_from_human, fingerprint
+    if str(row.get("kind") or "triage") != "triage":
+        # proposal / injection / verdict_only rows carry content the contributor wrote (a rule change, a constraint):
+        # never imported from another installation (review round 4 D4-1)
+        _bump(report, "wrong_kind")
+        return None
     rec = TriageRecord(**{k: row.get(k) for k in TriageRecord.__dataclass_fields__ if k in row})
+    rec.kind = "triage"
+    if not isinstance(rec.alert, dict) or not rec.alert:
+        return None
+    rec.fingerprint = fingerprint(rec.alert)          # recomputed: the bundle's own value is a claim
     chain = rec.chain if isinstance(rec.chain, dict) else {}
     model_verdict = str(chain.get("verdict") or "").lower()
     if model_verdict not in _COMMUNITY_VERDICTS:
@@ -459,12 +483,27 @@ def _community_record(row: dict, inst: str) -> TriageRecord | None:
     verdict, source, disputed = _label_from_human(model_verdict, human)
     if source == "model" or verdict not in _COMMUNITY_VERDICTS:
         return None
+    # The decisions are the contributor's word, not signed analyst rows this side can check (review round 4
+    # D4-1: forged `rejected + corrected_verdict: benign` turned SQLi into human_corrected benign SFT rows).
+    # A correction or dispute from outside is never imported; a confirmation is, but a "benign" label on an
+    # attack-shaped alert is dropped whoever confirmed it.
+    if source in ("human_corrected", "human_disputed"):
+        _bump(report, "unverified_correction")
+        return None
+    if verdict == "benign" and looks_like_attack(json.dumps(rec.alert, default=str)):
+        _bump(report, "benign_on_attack")
+        return None
     rec.label = {"verdict": verdict, "source": source, **({"disputed": True} if disputed else {})}
     rec.origin = "community_contrib"
     rec.split = ""                                    # assigned by the builder from the fingerprint
     rec.tags = [t for t in (rec.tags or []) if isinstance(t, str) and not t.startswith(("inst:", "eval"))][:20] + [
         f"inst:{inst[:12]}", "community"]
     return rec
+
+
+def _bump(report: dict | None, key: str) -> None:
+    if report is not None:
+        report[key] = report.get(key, 0) + 1
 
 
 __all__ = ["BUNDLE_SCHEMA", "redact_for_contrib", "build_bundle", "check_bundle", "write_bundle", "push_bundle", "contribute",

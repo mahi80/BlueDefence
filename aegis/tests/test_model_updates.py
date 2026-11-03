@@ -119,11 +119,14 @@ def test_publish_dry_run_builds_a_manifest(tmp_path, capsys):
     ad = tmp_path / "adapter"; ad.mkdir()
     (ad / "adapter_config.json").write_text(json.dumps({"base_model_name_or_path": "Qwen/Qwen3-8B"}))
     (ad / "adapter_model.safetensors").write_bytes(b"w" * 100)
-    (ad / "gate.json").write_text(json.dumps({"passes": True}))
+    from aegis.finetune.digest import adapter_digest
+    from aegis.finetune.gate import gate_report_path
+    rep = gate_report_path(ad)                 # beside the adapter, carrying the digest it judged (round 4 D4-4)
+    rep.write_text(json.dumps({"passes": True, "adapter_digest": adapter_digest(ad)}))
     assert publish.main(["--adapter", str(ad), "--version", "2026.11.1", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "base=Qwen/Qwen3-8B" in out and '"rollout_pct": 100' in out
-    (ad / "gate.json").write_text(json.dumps({"passes": False}))
+    rep.write_text(json.dumps({"passes": False, "adapter_digest": adapter_digest(ad)}))
     with pytest.raises(SystemExit):
         publish.main(["--adapter", str(ad), "--version", "2026.11.1", "--dry-run"])
 

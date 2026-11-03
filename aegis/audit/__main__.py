@@ -17,8 +17,19 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--all", action="store_true", help="include rotated segments (audit.jsonl.<ts>) as one chain")
     v.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
-    log = AuditLog(Path(args.audit), repair=False)
+    path = Path(args.audit)
+    if not path.exists() and not any(path.parent.glob(path.name + ".*")):
+        # a typo'd path or a cron with the wrong cwd printed "intact: 0 entries" and exited 0 (review round 4 D4-13)
+        print(f"no audit log at {path} — nothing was verified", file=sys.stderr)
+        return 2
+    log = AuditLog(path, repair=False)
     rep = log.verify_report(all_files=args.all)
+    if rep["ok"] and not args.all and AuditLog.anchor_path() is not None:
+        # anchors are only checked against the whole chain: without --all a log cut back past its anchors
+        # verified "intact" (review round 4 D4-13)
+        whole = log.verify_report(all_files=True)
+        if not whole["ok"]:
+            rep = whole
     if args.json:
         print(json.dumps(rep))
     elif rep["ok"]:

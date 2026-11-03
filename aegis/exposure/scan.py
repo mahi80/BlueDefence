@@ -84,13 +84,22 @@ def run_scan(o: dict) -> tuple[list[PostureFinding], list[str], dict]:
         raise PostureSourceError(f"exposure scan: the vulnerability export(s) {', '.join(str(f) for f in files)} "
                                  "contain no findings — refusing to treat that as a clean estate (allow_empty: true to accept)")
     notes = loaders.apply_intel(vulns, kev=o.get("kev"), epss=o.get("epss"))
-    groups = [loaders.assets_from_aws(load_json(b)) for b in o.get("aws_bundles") or []]
-    groups += [assets_from_azure(load_json(b)) for b in o.get("azure_bundles") or []]
+    sourced: list[tuple[str, Any]] = [(f"aws bundle {b}", loaders.assets_from_aws(load_json(b))) for b in o.get("aws_bundles") or []]
+    sourced += [(f"azure bundle {b}", assets_from_azure(load_json(b))) for b in o.get("azure_bundles") or []]
     for spec in o.get("k8s_exports") or []:
         name, _, path = str(spec).rpartition("=") if "=" in str(spec) else ("", "", str(spec))
-        groups.append(assets_from_k8s(load_json(path), cluster=name or "k8s", public_nodes=bool(o.get("public_nodes"))))
+        sourced.append((f"k8s export {path}", assets_from_k8s(load_json(path), cluster=name or "k8s",
+                                                              public_nodes=bool(o.get("public_nodes")))))
     if o.get("inventory"):
-        groups.append(loaders.assets_from_inventory(o["inventory"]))
+        sourced.append((f"inventory {o['inventory']}", loaders.assets_from_inventory(o["inventory"])))
+    empty = [what for what, g in sourced if not g]
+    if empty:
+        # One broken source (an AWS bundle that came back "{}", a kubectl run against the wrong context) dropped
+        # that account's assets; the scan still said ok because the others had assets, and approved remediations
+        # on the dropped assets were marked verified_closed (review round 4 D4-5). Fail the scan: the runner
+        # carries the previous findings forward as stale.
+        raise PostureSourceError(f"exposure scan: {', '.join(empty)} gave no assets — refusing to treat its estate as clean")
+    groups = [g for _w, g in sourced]
     if not groups:
         raise PostureSourceError("exposure scan needs an asset model: aws_bundles / azure_bundles / k8s_exports / inventory")
     assets = loaders.merge_assets(*groups)

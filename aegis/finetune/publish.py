@@ -25,18 +25,33 @@ import urllib.request
 from pathlib import Path
 
 
+def _hf_blob(real: Path) -> bool:
+    """A Hugging Face cache weight blob (``…/huggingface/hub/<repo>/blobs/<sha>``) — never a token or config."""
+    parts = real.parts
+    return ("huggingface" in parts and "hub" in parts and len(parts) >= 2 and parts[-2] == "blobs")
+
+
+def check_links(adapter: Path) -> None:
+    """Every symlink anywhere under the adapter must resolve inside it, or to an HF cache weight blob. Only
+    top-level entries were checked, and any path through a ``huggingface`` directory was allowed: a nested
+    ``checkpoint-10/trainer_state.json -> ~/.aws/credentials`` or a link to ``~/.cache/huggingface/token``
+    shipped in the release archive to every installation (review round 4 D4-3)."""
+    root = adapter.resolve()
+    for p in sorted(adapter.rglob("*")):
+        if not p.is_symlink():
+            continue
+        real = p.resolve()
+        if not (real.is_relative_to(root) or _hf_blob(real)):
+            raise SystemExit(f"{p.relative_to(adapter)} links outside the adapter directory ({real}) — refusing to publish it")
+
+
 def _tar_adapter(adapter: Path, out: Path) -> tuple[str, int]:
     # dereference: HF caches symlink weight files, and every installation's extractor refuses link members
+    check_links(adapter)
     with tarfile.open(out, "w:gz", dereference=True) as tar:
-        root = adapter.resolve()
         for p in sorted(adapter.iterdir()):
             if p.name in ("gate.json", ".complete") or p.name.startswith("."):
                 continue
-            # dereferencing follows symlinks anywhere: a stray link would ship host files to every installation.
-            # Links are followed only when they resolve inside the adapter dir or the HF cache (review round 3).
-            real = p.resolve()
-            if p.is_symlink() and not (real.is_relative_to(root) or "huggingface" in real.parts):
-                raise SystemExit(f"{p.name} links outside the adapter directory ({real}) — refusing to publish it")
             tar.add(p, arcname=p.name)
     # self-check: the archive must pass exactly the member test the installations apply
     with tarfile.open(out, "r:gz") as tar:
@@ -102,6 +117,13 @@ def main(argv: list[str] | None = None) -> int:
         g = json.loads(gate.read_text())
         if not (g.get("passes") or g.get("passed") or g.get("ok")):
             ap.error("gate.json says the adapter did NOT pass — refusing to publish")
+        from .digest import adapter_digest
+        recorded = str(g.get("adapter_digest") or "")
+        if not recorded:
+            ap.error("the gate report records no adapter digest (written by an older gate) — re-run "
+                     "python -m aegis.finetune.gate on these weights")
+        if recorded != adapter_digest(adapter):
+            ap.error("the adapter changed since the gate ran (digest mismatch) — re-run the gate before publishing")
     with tempfile.TemporaryDirectory() as td:
         archive = Path(td) / f"{a.version}.tar.gz"
         sha, size = _tar_adapter(adapter, archive)

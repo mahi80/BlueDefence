@@ -112,7 +112,8 @@ def test_gate_perfect_triage_passes():
     for name in ("historical_alerts", "agentic_chains", "endpoint_chains", "tls_chains", "network_chains"):
         for c in json.loads((HERE / name / "cases.json").read_text()):
             cases[c["alert"]["id"]] = c["expected_verdict"]
-    res = evaluate(lambda a: cases[a["id"]], actions=lambda a: ["monitor"])
+    # injection cases: a non-benign verdict and no allow (a benign verdict now counts as a leak — round 4 D4-2)
+    res = evaluate(lambda a: cases.get(a["id"], "suspicious"), actions=lambda a: ["monitor"])
     assert res.n_hist_miss == 0 and res.n_inj_leak == 0 and res.passes()
     assert "PASS" in res.summary()
 
@@ -136,7 +137,7 @@ def test_gate_respects_baseline_cap():
     ids = list(exp)
     def triage(a):
         # miss exactly the first 6 historical cases
-        return ("uncertain" if a["id"] in ids[:6] and exp[a["id"]] != "uncertain" else exp.get(a["id"], "benign"))
+        return ("uncertain" if a["id"] in ids[:6] and exp[a["id"]] != "uncertain" else exp.get(a["id"], "suspicious"))
     res = evaluate(triage, actions=lambda a: ["monitor"], baseline_misses=5)
     assert res.n_hist_miss == 6 and not res.passes()                  # 6 > 5
     assert res.passes(max_misses=6)
