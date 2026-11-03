@@ -38,8 +38,20 @@ def test_within_window_holds():
 def test_reversible_majority_concur_executes_live():
     p = HitlTimeoutPolicy(mode="live", wait_sec=120, min_confidence=0.6)
     for atype in ("block", "block_egress", "throttle", "challenge"):
-        d, why = p.evaluate(_action(atype), _chain(concur=True), age_sec=200)
+        d, why = p.evaluate(_action(atype, target="evil-c2.example" if atype == "block_egress" else "203.0.113.5"),
+                            _chain(conf=0.97, concur=True), age_sec=200)
         assert d == EXECUTE, (atype, why)
+
+
+def test_confidence_floor_follows_the_action_impact():
+    """Per-impact floors from the action contracts (AiSOC's approval-matrix idea): the timeout's own 0.6 floor
+    is not enough for a moderate block (0.85) or a high-impact egress block (0.95)."""
+    p = HitlTimeoutPolicy(mode="live", wait_sec=120, min_confidence=0.6)
+    assert p.evaluate(_action("throttle"), _chain(conf=0.75), age_sec=200)[0] == EXECUTE          # low: 0.70
+    assert p.evaluate(_action("block"), _chain(conf=0.75), age_sec=200)[0] == HOLD                # moderate: 0.85
+    assert p.evaluate(_action("block"), _chain(conf=0.9), age_sec=200)[0] == EXECUTE
+    egress = _action("block_egress", target="evil-c2.example")
+    assert p.evaluate(egress, _chain(conf=0.9), age_sec=200)[0] == HOLD                           # high: 0.95
 
 
 def test_irreversible_always_holds_even_past_window():
@@ -62,7 +74,7 @@ def test_low_confidence_holds():
 
 def test_shadow_is_eligible_but_record_only():
     p = HitlTimeoutPolicy(mode="shadow", wait_sec=120)
-    assert p.evaluate(_action("block"), _chain(concur=True), age_sec=200)[0] == SHADOW
+    assert p.evaluate(_action("block"), _chain(conf=0.9, concur=True), age_sec=200)[0] == SHADOW
 
 
 def test_from_env_defaults_off(monkeypatch):
@@ -103,7 +115,7 @@ def _file_aged(h: _StubHITL, action, chain, age_sec: float) -> str:
 
 def test_sync_auto_executes_reversible_on_timeout():
     h, ra = _StubHITL(), _StubResp()
-    _file_aged(h, _action("block"), _chain(concur=True), age_sec=300)
+    _file_aged(h, _action("block"), _chain(conf=0.9, concur=True), age_sec=300)
     decs = h.sync(ra, timeout_policy=HitlTimeoutPolicy(mode="live", wait_sec=120))
     assert len(ra.approved) == 1 and ra.approved[0][0].action_type == "block"
     assert ra.approved[0][1] == "aegis:hitl-timeout"

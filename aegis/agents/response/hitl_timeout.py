@@ -98,7 +98,11 @@ class HitlTimeoutPolicy:
 
         # nobody approved it, so the same width rules as any unattended action apply: no internal ranges, no
         # wide CIDR, no top-level / shared-suffix destination, no privileged principal (review 2026-11-03 W3)
+        from .contracts import gate
         from .grounding import injection_flagged, narrow
+        ok, why = gate(action, chain)
+        if not ok:
+            return HOLD, f"{why} — holds for a human"
         ok, why = narrow(atype, str(getattr(action, "target", "")))
         if not ok:
             return HOLD, f"{why} — holds for a human"
