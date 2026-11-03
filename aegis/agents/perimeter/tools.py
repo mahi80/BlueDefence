@@ -17,6 +17,8 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
 
+from ..shared.bounded import BoundedDict
+
 
 @dataclass
 class ToolResult:
@@ -433,7 +435,9 @@ _RECON_PATHS_HIGH = int(os.environ.get("AEGIS_RECON_PATHS_HIGH", "20"))
 _RECON_PATHS_MED = int(os.environ.get("AEGIS_RECON_PATHS_MED", "10"))
 _RECON_MAX_IPS = int(os.environ.get("AEGIS_RECON_MAX_IPS", "20000"))
 _recon_lock = threading.Lock()
-_recon_seen: "dict[str, collections.deque]" = collections.defaultdict(collections.deque)
+# least-recently-written source evicted past the cap: O(1) per call (the old cleanup scanned the whole map
+# under the global lock on every call once it passed the cap)
+_recon_seen: "dict[str, collections.deque]" = BoundedDict(_RECON_MAX_IPS)
 
 
 def recon_sweep(source_ip: str, alert: dict, *, now: Optional[float] = None) -> ToolResult:
@@ -448,15 +452,15 @@ def recon_sweep(source_ip: str, alert: dict, *, now: Optional[float] = None) -> 
     ts = now if now is not None else time.time()
     cutoff = ts - _RECON_WINDOW_SEC
     with _recon_lock:
-        dq = _recon_seen[ip]
+        dq = _recon_seen.get(ip)
+        if dq is None:
+            dq = _recon_seen[ip] = collections.deque(maxlen=1024)
+        else:
+            _recon_seen.move_to_end(ip)
         dq.append((ts, path))
         while dq and dq[0][0] < cutoff:
             dq.popleft()
         n = len({p for _t, p in dq})
-        # bound memory: drop sources that have gone quiet, then the whole map if still too large
-        if len(_recon_seen) > _RECON_MAX_IPS:
-            for k in [k for k, v in _recon_seen.items() if not v or v[-1][0] < cutoff]:
-                _recon_seen.pop(k, None)
     if n >= _RECON_PATHS_HIGH:
         return ToolResult(name="recon_sweep",
                           data={"distinct_paths": n, "window_sec": _RECON_WINDOW_SEC}, weight="high")
@@ -478,7 +482,7 @@ _IDENUM_WINDOW_SEC = int(os.environ.get("AEGIS_IDENUM_WINDOW_SEC", "120"))
 _IDENUM_HIGH = int(os.environ.get("AEGIS_IDENUM_HIGH", "15"))
 _IDENUM_MED = int(os.environ.get("AEGIS_IDENUM_MED", "6"))
 _idenum_lock = threading.Lock()
-_idenum_seen: "dict[tuple, collections.deque]" = collections.defaultdict(collections.deque)
+_idenum_seen: "dict[tuple, collections.deque]" = BoundedDict(_RECON_MAX_IPS)
 
 
 def _id_params_from(alert: dict, raw_payload: str) -> "list[tuple[str, str]]":
@@ -514,16 +518,18 @@ def id_enumeration(source_ip: str, alert: dict, raw_payload: str = "", *,
     best, best_param = 0, ""
     with _idenum_lock:
         for key, value in ids:
-            dq = _idenum_seen[(actor, path, key)]
+            k = (actor, path, key)
+            dq = _idenum_seen.get(k)
+            if dq is None:
+                dq = _idenum_seen[k] = collections.deque(maxlen=1024)
+            else:
+                _idenum_seen.move_to_end(k)
             dq.append((ts, value))
             while dq and dq[0][0] < cutoff:
                 dq.popleft()
             n = len({v for _t, v in dq})
             if n > best:
                 best, best_param = n, key
-        if len(_idenum_seen) > _RECON_MAX_IPS:
-            for k in [k for k, v in _idenum_seen.items() if not v or v[-1][0] < cutoff]:
-                _idenum_seen.pop(k, None)
     data = {"actor": actor[:40], "path": path, "param": best_param,
             "distinct_ids": best, "window_sec": _IDENUM_WINDOW_SEC}
     if best >= _IDENUM_HIGH:

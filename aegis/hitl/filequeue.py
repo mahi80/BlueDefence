@@ -90,7 +90,10 @@ class FileHITL(BaseHITL):
                 logger.warning("[hitl:file] malformed decision line skipped: %s", line[:80]); continue
             if isinstance(d, dict) and d.get("approval_id"):
                 out[str(d["approval_id"])] = d
-        self._buffered = {**getattr(self, "_buffered", {}), **out}
+        # keep only decisions for approvals still pending here: a row for an unknown or already-settled id
+        # (a typo, a forged line, a decision for another host) used to be kept forever
+        merged = {**getattr(self, "_buffered", {}), **out}
+        self._buffered = {k: v for k, v in merged.items() if k in self._pending}
         return self._buffered
 
     def _poll(self, p: PendingApproval) -> Optional[tuple[str, str, str]]:

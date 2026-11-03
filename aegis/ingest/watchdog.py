@@ -49,6 +49,7 @@ except Exception:  # noqa: BLE001 — observability is optional plumbing; the wa
 logger = logging.getLogger("aegis.ingest.watchdog")
 
 #: sources that are drain placeholders / demo, never liveness-watched
+_MAX_FEEDS = 256                    # distinct feed names watched; the rest fold into "other"
 _IGNORED_SOURCES = frozenset({"stream", "sample"})
 
 DEFAULT_SILENCE_SECONDS = 900.0
@@ -150,6 +151,10 @@ class FeedWatchdog:
         source = str(source).strip().lower()
         if not source or source in _IGNORED_SOURCES or n <= 0:
             return
+        if source not in self._count and len(self._count) >= _MAX_FEEDS:
+            # feed names come from free-text ?source= / headers; an unbounded set of armed feeds would each
+            # later page "SILENT" and grow memory and metric cardinality without limit
+            source = "other"
         now = self._clock() if now is None else now
         self._count[source] = self._count.get(source, 0) + n
         self._last_event_at[source] = now
@@ -166,6 +171,8 @@ class FeedWatchdog:
         for source, total in (by_source or {}).items():
             src = str(source).strip().lower()
             if src in _IGNORED_SOURCES:
+                continue
+            if src not in self._stream_seen and len(self._stream_seen) >= _MAX_FEEDS:
                 continue
             prev = self._stream_seen.get(src, 0)
             delta = int(total) - prev

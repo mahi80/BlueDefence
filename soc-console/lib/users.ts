@@ -76,7 +76,23 @@ export function validUsername(u: string): boolean {
 
 // ---- failed-attempt lockout (per process; the console is a single instance) ----
 const WINDOW_MS = 15 * 60 * 1000, MAX_FAILS = 5, LOCK_MS = 15 * 60 * 1000;
+// Keys are usernames/IPs an attacker chooses, so the map is capped: past MAX_KEYS, expired entries are
+// swept, then the oldest entry that is not currently locked goes (flooding new names cannot unlock a victim).
+const MAX_KEYS = 10_000;
 const fails = new Map<string, { n: number; first: number; until: number }>();
+
+function makeRoom(now: number): void {
+  if (fails.size < MAX_KEYS) return;
+  for (const [k, f] of fails) {
+    if (f.until <= now && now - f.first > WINDOW_MS) fails.delete(k);
+  }
+  if (fails.size < MAX_KEYS) return;
+  for (const [k, f] of fails) {
+    if (f.until <= now) { fails.delete(k); return; }
+  }
+  const oldest = fails.keys().next();
+  if (!oldest.done) fails.delete(oldest.value);
+}
 
 export function lockedUntil(key: string): number {
   const f = fails.get(key);
@@ -90,6 +106,7 @@ export function noteFailure(key: string): void {
   const now = Date.now();
   const f = fails.get(key);
   if (!f || now - f.first > WINDOW_MS) {
+    if (!f) makeRoom(now);
     fails.set(key, { n: 1, first: now, until: 0 });
     return;
   }

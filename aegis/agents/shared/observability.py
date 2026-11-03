@@ -36,7 +36,7 @@ import logging
 import os
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -206,7 +206,7 @@ class _SpanRecord:
     duration_ms: float | None = None
 
 
-_SPAN_LOG: list[_SpanRecord] = []
+_SPAN_LOG: deque[_SpanRecord] = deque(maxlen=int(os.environ.get("AEGIS_SPAN_LOG_MAX", "10000")))   # was unbounded (~1 GB/day at 1M alerts)
 _SPAN_LOG_LOCK = threading.Lock()
 
 
@@ -238,7 +238,7 @@ def span(name: str, **attributes: Any):
 
 def recent_spans(limit: int = 50) -> list[_SpanRecord]:
     with _SPAN_LOG_LOCK:
-        return list(_SPAN_LOG[-limit:])
+        return list(_SPAN_LOG)[-limit:]
 
 
 # ---- Convenience helpers used by the agent layer ----------------------
