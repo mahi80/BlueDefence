@@ -443,12 +443,15 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
         stats.decisions = len(decisions)
         if p.containment is not None and decisions:
             try:
-                entries = p.containment.on_decisions(decisions)
-                stats.containment_checks = len(entries)
-                hitl = getattr(p.response, "_hitl", None)
-                if entries and hitl is not None and hasattr(hitl, "attach_investigation"):
-                    for aid, chain in p.containment.tracked_chains(d.alert_id for d in decisions):
-                        hitl.attach_investigation(aid, investigation_card(chain))     # containment timeline onto the card
+                hitl_t = getattr(p.response, "_hitl", None)
+                aids = [d.alert_id for d in decisions]
+
+                def _cards(entries: list, _aids=aids, _h=hitl_t) -> None:
+                    if _h is not None and hasattr(_h, "attach_investigation"):
+                        for aid, chain in p.containment.tracked_chains(_aids):
+                            _h.attach_investigation(aid, investigation_card(chain))   # containment timeline onto the card
+                # the re-walk + planner run on the loop's own worker, not on the ingest thread (review B12)
+                stats.containment_checks = p.containment.submit_decisions(decisions, on_done=_cards)
             except Exception as e:  # noqa: BLE001
                 logger.warning("[service] containment loop failed: %s", e)
     except Exception as e:  # noqa: BLE001

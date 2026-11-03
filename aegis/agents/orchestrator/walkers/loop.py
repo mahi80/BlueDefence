@@ -25,6 +25,19 @@ from .walk import DEFAULT_WALKERS, run_walkers
 
 logger = logging.getLogger("aegis.containment")
 
+# One lock per alert, shared by the investigation tier and the containment loop: both rewrite the same chain's
+# metadata from different threads, and a pre-containment graph could be written last (review B11).
+_CHAIN_LOCKS: BoundedDict = BoundedDict(5000)
+_CHAIN_LOCKS_GUARD = threading.Lock()
+
+
+def chain_lock(alert_id: str) -> threading.Lock:
+    with _CHAIN_LOCKS_GUARD:
+        lk = _CHAIN_LOCKS.get(str(alert_id))
+        if lk is None:
+            lk = _CHAIN_LOCKS[str(alert_id)] = threading.Lock()
+        return lk
+
 
 @dataclass
 class LoopEntry:
@@ -60,6 +73,7 @@ class ContainmentLoop:
     # alerts whose containment is followed: the most recent 5,000 (each holds the alert + chain)
     _tracked: dict[str, tuple[dict, EvidenceChain]] = field(default_factory=lambda: BoundedDict(5000))
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _pool: Any = None
 
     def track(self, alert: dict, chain: EvidenceChain) -> None:
         with self._lock:
@@ -82,6 +96,36 @@ class ContainmentLoop:
             pair = self._tracked.get(str(alert_id))
         if pair is None:
             return None
+        with chain_lock(alert_id):
+            return self._after_action(pair, alert_id, action_type, target)
+
+    def submit_decisions(self, decisions: list, on_done: Callable[[list], Any] | None = None) -> int:
+        """``on_decisions`` on a background worker: a re-walk plus planner per approval used to run on the ingest
+        thread, so a few approvals stalled ingest for a minute (review B12). One worker keeps checks in order.
+        Returns how many decisions were handed over."""
+        todo = [d for d in decisions if getattr(d, "status", "") == "approved"]
+        if not todo:
+            return 0
+        if self._pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aegis-containment")
+
+        def run() -> None:
+            try:
+                entries = self.on_decisions(todo)
+                if on_done is not None and entries:
+                    on_done(entries)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[containment] background check failed: %s", str(e)[:200])
+        self._pool.submit(run)
+        return len(todo)
+
+    def drain(self, timeout: float = 30.0) -> None:
+        """Wait for queued containment checks (tests, graceful shutdown)."""
+        if self._pool is not None:
+            self._pool.submit(lambda: None).result(timeout=timeout)
+
+    def _after_action(self, pair: tuple, alert_id: str, action_type: str, target: str) -> LoopEntry | None:
         alert, chain = pair
         before_graph = (chain.metadata.get("blast_graph") or {}).get("summary")
         mark = getattr(self.source, "mark_contained", None)
@@ -199,4 +243,4 @@ class ContainmentLoop:
         return out
 
 
-__all__ = ["ContainmentLoop", "LoopEntry"]
+__all__ = ["ContainmentLoop", "LoopEntry", "chain_lock"]
