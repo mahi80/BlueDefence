@@ -76,6 +76,9 @@ class ExecutedAction:
     status: str   # "executed" | "queued_for_hitl" | "skipped"
     note: str = ""
     receipt: Optional[Receipt] = None   # Phase 1.1 — the connector's receipt when one was produced
+    # why it did not run, for the HITL settle logic: never_block | rate_cap | needs_second_approver |
+    # connector_failed | governance | "" (ran, or not classified)
+    reason: str = ""
 
 
 @dataclass
@@ -297,7 +300,7 @@ class ResponseAgent:
         if receipt.status == STATUS_REFUSED:
             # never-block guard refused it — terminal, do not re-queue for a human
             return ExecutedAction(
-                action=action, status="skipped", receipt=receipt,
+                action=action, status="skipped", receipt=receipt, reason="never_block",
                 note=f"[{prefix}:never-block] {receipt.error or 'refused: own/infra target'}",
             )
         if receipt.active:
@@ -306,7 +309,7 @@ class ResponseAgent:
                 note=f"[{prefix}:{receipt.connector}:{receipt.status}] {receipt.detail or action.action_type}",
             )
         return ExecutedAction(
-            action=action, status="queued_for_hitl", receipt=receipt,
+            action=action, status="queued_for_hitl", receipt=receipt, reason="connector_failed",
             note=f"[{prefix}:{receipt.connector}:{receipt.status}] {receipt.error or receipt.detail}; human needed",
         )
 
@@ -348,11 +351,11 @@ class ResponseAgent:
         # bypasses the connector registry): a human approval can't block loopback/own infra.
         refuse, why = enforcement_refused(action.action_type, str(action.target))
         if refuse:
-            return ExecutedAction(action=action, status="skipped",
+            return ExecutedAction(action=action, status="skipped", reason="never_block",
                                   note=f"never-block guard refused {action.action_type} on {action.target}: {why}")
         if self._high_impact_counter >= self._high_impact_max:
             return ExecutedAction(
-                action=action, status="skipped",
+                action=action, status="skipped", reason="rate_cap",
                 note=f"Rate-limit reached ({self._high_impact_max} high-impact actions in window); "
                      "blast-radius cap activated",
             )
@@ -360,7 +363,7 @@ class ResponseAgent:
         if self.two_person_required(action):
             if not second_approver or second_approver == approver:
                 return ExecutedAction(
-                    action=action, status="queued_for_hitl",
+                    action=action, status="queued_for_hitl", reason="needs_second_approver",
                     note=f"{action.action_type} on protected target {action.target} needs a second "
                          f"approver (first: {approver})",
                 )

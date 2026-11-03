@@ -66,21 +66,25 @@ def test_execution_outcome():
     assert execution_outcome({"error": "EDR 503"}) == (False, "EDR 503")
 
 
-def test_approval_whose_action_did_not_run_settles_failed_not_approved(caplog):
-    """Two-person rule on a protected target: approve() returns queued_for_hitl. It used to settle as approved."""
+def test_protected_target_waits_for_a_second_approver_then_runs(caplog):
+    """Two-person rule: the first approval keeps the card pending (it used to settle `failed` and be lost);
+    the same person again changes nothing; a different approver executes it."""
     srv, dash = MockImperva(), Dash()
     hitl = DashboardHITL("https://d", "k", transport=dash, state_path="off")
     agent = _agent(hitl, srv, protected_targets=["10.0.0.0/8"])
     agent.execute(_chain("P1", "10.1.2.3"))
-    dash.statuses[hitl.pending[0].approval_id] = {"status": "approved", "decided_by": "ciso"}
-    with caplog.at_level(logging.ERROR, logger="aegis.hitl"):
-        (d,) = agent.sync_hitl()
-    assert d.status == "failed" and "second approver" in d.reason
-    assert srv.blocked_ips() == set()
-    assert "NOT executed" in caplog.text
+    aid = hitl.pending[0].approval_id
+    dash.statuses[aid] = {"status": "approved", "decided_by": "ciso"}
+    with caplog.at_level(logging.WARNING, logger="aegis.hitl"):
+        assert agent.sync_hitl() == []
+    assert "second, different approver" in caplog.text and hitl.pending[0].first_approver == "ciso"
+    assert agent.sync_hitl() == [] and srv.blocked_ips() == set()          # same approver again: still waiting
+    dash.statuses[aid] = {"status": "approved", "decided_by": "soc-lead"}
+    (d,) = agent.sync_hitl()
+    assert d.status == "approved" and d.decided_by == "ciso+soc-lead" and srv.blocked_ips() == {"10.1.2.3"}
 
 
-def test_vendor_failure_on_approval_is_failed_not_approved():
+def test_vendor_failure_on_approval_is_retried_then_failed_not_approved(caplog):
     srv, dash = MockImperva(), Dash()
     hitl = DashboardHITL("https://d", "k", transport=dash, state_path="off")
     agent = _agent(hitl, srv)
@@ -90,8 +94,24 @@ def test_vendor_failure_on_approval_is_failed_not_approved():
     def boom(*a, **k):
         raise RuntimeError("connector exploded")
     agent.approve = boom          # approve() raising is the other failure shape
+    assert agent.sync_hitl() == [] and agent.sync_hitl() == []          # kept and retried, not lost
+    with caplog.at_level(logging.ERROR, logger="aegis.hitl"):
+        (d,) = agent.sync_hitl()
+    assert d.status == "failed" and "connector exploded" in d.reason and "gave up after 3" in d.reason
+    assert "NOT executed" in caplog.text
+
+
+def test_rate_capped_approval_runs_once_the_window_clears():
+    srv, dash = MockImperva(), Dash()
+    hitl = DashboardHITL("https://d", "k", transport=dash, state_path="off")
+    agent = _agent(hitl, srv)
+    agent._high_impact_max = 0                                          # cap reached
+    agent.execute(_chain("R1"))
+    dash.statuses[hitl.pending[0].approval_id] = {"status": "approved", "decided_by": "ciso"}
+    assert agent.sync_hitl() == [] and len(hitl.pending) == 1
+    agent._high_impact_max = 10                                         # window cleared
     (d,) = agent.sync_hitl()
-    assert d.status == "failed" and "connector exploded" in d.reason
+    assert d.status == "approved" and srv.blocked_ips()
 
 
 def test_decision_channel_down_never_triggers_the_timeout_auto_execute():

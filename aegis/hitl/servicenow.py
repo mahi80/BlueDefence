@@ -105,7 +105,10 @@ class ServiceNowHITL(BaseHITL):
                                     "sysparm_display_value": "true"})
         status, data = self._transport("GET", self._api(f"/{p.external_id}?{q}"), None, self._headers(), self.timeout)
         if status != 200:
-            self.last_error = f"HTTP {status}"; return None
+            # an unreadable ticket is not "no decision yet": the analyst may have rejected it. Raise so sync()
+            # holds the approval instead of letting the timeout policy auto-execute it.
+            self.last_error = f"HTTP {status}"
+            raise RuntimeError(f"ServiceNow poll for {p.external_id} returned HTTP {status}")
         rec = data.get("result") or {}
         decision = str(rec.get("u_aegis_decision") or "").strip().lower()
         who = _display(rec.get("u_aegis_decided_by")) or _display(rec.get("resolved_by")) or _display(rec.get("closed_by")) or _display(rec.get("assigned_to"))

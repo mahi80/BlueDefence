@@ -45,6 +45,10 @@ class PendingApproval:
     chain: Any
     requested_at: float = field(default_factory=time.time)
     external_id: str = ""              # ticket sys_id / row id on the other side
+    first_approver: str = ""           # two-person rule: the approval already given, waiting for a second
+    approved_by: str = ""              # a human approval the service is still trying to execute (retry)
+    second_by: str = ""                # ... and its second approver, when the two-person rule applied
+    attempts: int = 0                  # execution attempts of that approval
 
 
 @dataclass
@@ -53,7 +57,7 @@ class Decision:
     alert_id: str
     action_type: str
     target: str
-    status: str                 # approved | rejected | expired
+    status: str                 # approved | rejected | expired | failed (approved, could not run)
     decided_by: str = ""
     reason: str = ""
     executed: Optional[Any] = None   # ExecutedAction when approved
@@ -93,6 +97,28 @@ def execution_outcome(executed: Any) -> tuple[bool, str]:
     if isinstance(executed, dict) and executed.get("error"):
         return False, str(executed["error"])[:300]
     return True, ""
+
+
+# A rate cap or a vendor/transport error is temporary: the approval stays pending and is executed again on
+# the next sync (up to these limits) instead of being settled ``failed`` and lost.
+_RETRY_LIMIT = {"rate_cap": 60, "connector_failed": 3, "error": 3}
+
+
+def _retry_kind(executed: Any) -> str:
+    """'' (do not retry), or the reason an approval that did not run may run on a later attempt."""
+    reason = str(getattr(executed, "reason", "") or "")
+    if reason in _RETRY_LIMIT:
+        return reason
+    if isinstance(executed, dict) and executed.get("error"):
+        return "error"
+    return ""
+
+
+def _with_why(executed: Any, why: str) -> Any:
+    if hasattr(executed, "note"):
+        executed.note = why
+        return executed
+    return {"error": why}
 
 
 def _state_path(explicit: Optional[str | Path], transport_dir: Optional[Path]) -> Optional[Path]:
@@ -154,6 +180,9 @@ class BaseHITL:
                     live[str(row["approval_id"])] = row
                 elif row.get("op") == "settled":
                     live.pop(str(row.get("approval_id")), None)
+                elif row.get("op") == "progress" and str(row.get("approval_id")) in live:
+                    live[str(row["approval_id"])].update({k: row[k] for k in ("first_approver", "approved_by", "second_by", "attempts")
+                                                          if k in row})
         except OSError as e:
             logger.warning("[hitl:%s] approvals journal %s unreadable (%s); starting with none pending", self.name, self._journal, e)
             return
@@ -183,7 +212,10 @@ class BaseHITL:
         chain.metadata["restored_from_journal"] = True
         return PendingApproval(approval_id=str(row["approval_id"]), alert_id=str(row.get("alert_id") or chain.alert_id),
                                action=action, chain=chain, requested_at=float(row.get("requested_at") or time.time()),
-                               external_id=str(row.get("external_id") or ""))
+                               external_id=str(row.get("external_id") or ""),
+                               first_approver=str(row.get("first_approver") or ""),
+                               approved_by=str(row.get("approved_by") or ""), second_by=str(row.get("second_by") or ""),
+                               attempts=int(row.get("attempts") or 0))
 
     def _journal_append(self, row: dict) -> None:
         if self._journal is None:
@@ -220,7 +252,10 @@ class BaseHITL:
                           # the timeout policy reads these; without them a restored card looked like a concurring vote
                           "metadata": {k: (getattr(p.chain, "metadata", None) or {}).get(k)
                                        for k in _JOURNALED_METADATA
-                                       if k in (getattr(p.chain, "metadata", None) or {})}}}
+                                       if k in (getattr(p.chain, "metadata", None) or {})}},
+                # progress survives journal compaction too
+                "first_approver": p.first_approver, "approved_by": p.approved_by, "second_by": p.second_by,
+                "attempts": p.attempts}
 
     # ---- contract
     @property
@@ -278,6 +313,12 @@ class BaseHITL:
             # Preserve the original path exactly when the timeout policy is not in use.
             if expired and timeout_policy is None:
                 made.append(self._settle(p, "expired", "", f"no decision within {int(max_age_sec)} s")); continue
+            # 0) an approval already given that has not run yet (rate cap, vendor error): try it again
+            if p.approved_by:
+                d = self._execute_approved(p, response_agent, p.approved_by, second=p.second_by or None)
+                if d is not None:
+                    made.append(d)
+                continue
             # 1) a human decision always wins
             try:
                 res = self._poll(p)
@@ -293,11 +334,16 @@ class BaseHITL:
             if res:
                 status, decided_by, reason = res
                 if status == "approved":
-                    try:
-                        executed = response_agent.approve(p.action, approver=decided_by or self.name, source_alert_id=p.alert_id)
-                    except Exception as e:  # noqa: BLE001 — one connector failure must not stall every other pending decision
-                        executed = {"error": str(e)[:200]}
-                    made.append(self._settle_approved(p, decided_by or self.name, "", executed)); continue
+                    who = decided_by or self.name
+                    if p.first_approver:
+                        if who == p.first_approver:
+                            continue                          # the same person again: still waiting for a second
+                        d = self._execute_approved(p, response_agent, p.first_approver, second=who)
+                    else:
+                        d = self._execute_approved(p, response_agent, who, second=None)
+                    if d is not None:
+                        made.append(d)
+                    continue
                 if status == "rejected":
                     made.append(self._settle(p, "rejected", decided_by or self.name, reason)); continue
             # 2) no human decision — timeout auto-execute policy (opt-in)
@@ -354,6 +400,49 @@ class BaseHITL:
         return False
 
     # ---- helpers
+    def _execute_approved(self, p: PendingApproval, response_agent: Any, approver: str, *,
+                          second: str | None) -> Decision | None:
+        """Run a human-approved action. Returns the settled Decision, or None while it stays pending: waiting
+        for a second approver (two-person rule), or a temporary failure (rate cap, vendor error) that the
+        next sync retries. Before, both settled ``failed`` at once and the approval was lost."""
+        kw = {"second_approver": second} if second else {}
+        try:
+            executed = response_agent.approve(p.action, approver=approver, source_alert_id=p.alert_id, **kw)
+        except Exception as e:  # noqa: BLE001 — one connector failure must not stall every other pending decision
+            executed = {"error": str(e)[:200]}
+        if getattr(executed, "reason", "") == "needs_second_approver" and not second:
+            if p.first_approver != approver:
+                p.first_approver, p.approved_by, p.second_by = approver, "", ""
+                self._journal_append({"op": "progress", "approval_id": p.approval_id, "first_approver": approver,
+                                      "approved_by": "", "second_by": "", "attempts": p.attempts})
+                logger.warning("[hitl:%s] %s -> %s on alert %s approved by %s; a second, different approver is "
+                               "required (protected target)", self.name, p.action.action_type, p.action.target,
+                               p.alert_id, approver)
+                try:
+                    self._record_awaiting_second(p, approver)
+                except Exception as e:  # noqa: BLE001 — the console marker is best-effort
+                    logger.debug("[hitl:%s] awaiting marker not written for %s: %s", self.name, p.approval_id, str(e)[:120])
+            return None
+        decided_by = approver if not second else f"{approver}+{second}"
+        ok, why = execution_outcome(executed)
+        kind = "" if ok else _retry_kind(executed)
+        if kind:
+            p.attempts += 1
+            if p.attempts < _RETRY_LIMIT[kind]:
+                if not p.approved_by:
+                    logger.warning("[hitl:%s] %s -> %s on alert %s approved by %s did not run yet (%s); retrying "
+                                   "on the next cycle", self.name, p.action.action_type, p.action.target, p.alert_id,
+                                   decided_by, why[:160])
+                p.approved_by, p.second_by = approver, second or ""
+                self._journal_append({"op": "progress", "approval_id": p.approval_id, "first_approver": p.first_approver,
+                                      "approved_by": p.approved_by, "second_by": p.second_by, "attempts": p.attempts})
+                return None
+            why = f"{why} (gave up after {p.attempts} attempt(s))"
+        return self._settle_approved(p, decided_by, "", executed if ok else _with_why(executed, why))
+
+    def _record_awaiting_second(self, p: PendingApproval, first: str) -> None:
+        """Transport hook: show that the first of two approvals has been given."""
+
     def _settle_approved(self, p: PendingApproval, decided_by: str, reason: str, executed: Any) -> Decision:
         """Settle an approval by what actually happened. ``approved`` only when the action ran; a skipped
         action (rate cap, ACP block, never-block guard), a connector failure, or a two-person rule still

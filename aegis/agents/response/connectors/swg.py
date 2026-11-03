@@ -40,6 +40,7 @@ class ZscalerConnector(Connector):
     """Zscaler ZIA forward-proxy egress block via a custom URL category."""
 
     name = "zscaler"
+    reapply_on_human_approval = True
     actions = frozenset({"block_egress"})
 
     def __init__(self, *, base_url: str, category_id: str, category_name: str = "AEGIS_BLOCK",
