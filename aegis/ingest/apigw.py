@@ -45,6 +45,13 @@ _PRINCIPAL_KEYS = ("sub", "principal", "principalId", "principal_id", "user_id",
                    "cif", "consumer_id", "authenticated_user")
 
 
+
+def _as_utc(d: datetime) -> datetime:
+    """A timestamp with no zone is UTC (what log shippers mean), not this host's local time — an IST host read
+    every naive vendor time 5 h 30 min off, which broke windows and lag (review round 3 I3-16)."""
+    from datetime import UTC
+    return d if d.tzinfo is not None else d.replace(tzinfo=UTC)
+
 def _dig(obj: Any, dotted: str) -> Any:
     cur = obj
     for part in dotted.split("."):
@@ -59,7 +66,7 @@ def _ts(v: Any) -> Optional[float]:
         return float(v) / (1000.0 if v > 1e11 else 1.0)
     if isinstance(v, str) and v:
         try:
-            return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+            return _as_utc(datetime.fromisoformat(v.replace("Z", "+00:00"))).timestamp()
         except ValueError:
             pass
         for fmt in ("%d/%b/%Y:%H:%M:%S %z",):      # AWS $context.requestTime

@@ -45,6 +45,13 @@ logger = logging.getLogger("aegis.ingest.ndr")
 _TS_MIN, _TS_MAX = 946_684_800.0, 4_102_444_800.0        # 2000-01-01 … 2100-01-01
 
 
+
+def _as_utc(d: datetime) -> datetime:
+    """A timestamp with no zone is UTC (what log shippers mean), not this host's local time — an IST host read
+    every naive vendor time 5 h 30 min off, which broke windows and lag (review round 3 I3-16)."""
+    from datetime import UTC
+    return d if d.tzinfo is not None else d.replace(tzinfo=UTC)
+
 def _ts(v: Any) -> float | None:
     """Epoch (s or ms) or ISO text → epoch seconds; ``None`` when absent, unreadable or absurd."""
     t = _ts_raw(v)
@@ -61,7 +68,7 @@ def _ts_raw(v: Any) -> float | None:
         if len(s) >= 5 and s[-5] in "+-" and s[-3] != ":":             # Suricata +0000 → +00:00
             s = s[:-2] + ":" + s[-2:]
         try:
-            return datetime.fromisoformat(s).timestamp()
+            return _as_utc(datetime.fromisoformat(s)).timestamp()
         except ValueError:
             try:
                 return float(s)

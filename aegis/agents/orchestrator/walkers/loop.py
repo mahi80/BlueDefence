@@ -27,7 +27,14 @@ logger = logging.getLogger("aegis.containment")
 
 # One lock per alert, shared by the investigation tier and the containment loop: both rewrite the same chain's
 # metadata from different threads, and a pre-containment graph could be written last (review B11).
-_CHAIN_LOCKS: BoundedDict = BoundedDict(5000)
+def _held(key: str) -> bool:
+    # a lock someone holds is never evicted: a fresh lock for the same alert would let a second writer in while
+    # the first still writes (review round 3 R3-16)
+    lk = dict.get(_CHAIN_LOCKS, key)
+    return lk is not None and lk.locked()
+
+
+_CHAIN_LOCKS: BoundedDict = BoundedDict(5000, pinned=_held)
 _CHAIN_LOCKS_GUARD = threading.Lock()
 
 

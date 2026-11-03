@@ -39,6 +39,13 @@ logger = logging.getLogger("aegis.ingest.stream")
 DEFAULT_CAPACITY = 50_000
 
 
+
+def _as_utc(d: datetime) -> datetime:
+    """A timestamp with no zone is UTC (what log shippers mean), not this host's local time — an IST host read
+    every naive vendor time 5 h 30 min off, which broke windows and lag (review round 3 I3-16)."""
+    from datetime import UTC
+    return d if d.tzinfo is not None else d.replace(tzinfo=UTC)
+
 @dataclass
 class StreamItem:
     source: str                 # cloudflare | firehose | waf | alerts | azure-eventhub | …
@@ -157,7 +164,7 @@ def _vendor_ts(alert: dict) -> Optional[float]:
             return float(v) / (1000.0 if v > 1e11 else 1.0)       # epoch ms vs s
         if isinstance(v, str) and v:
             try:
-                return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+                return _as_utc(datetime.fromisoformat(v.replace("Z", "+00:00"))).timestamp()
             except ValueError:
                 continue
     return None
