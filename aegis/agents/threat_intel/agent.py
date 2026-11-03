@@ -11,6 +11,7 @@ LLM surface (advisory analyst):
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +25,7 @@ from ..shared.injection_defense import SYSTEM_PROMPT_PREAMBLE, wrap_untrusted
 from ..shared.llm_client import LLMClient, parse_json
 
 from . import feeds
-from .store import IOC, IOCStore
+from .store import IOC, LLM_TAG, IOCStore
 
 logger = logging.getLogger("aegis.threat_intel")
 
@@ -175,27 +176,35 @@ class ThreatIntelAgent:
             ))
             return chain.finalize()
 
-        # Merge any extracted indicators into the store
-        added = 0
-        for ind in parsed.get("indicators", []) or []:
+        # Merge extracted indicators into the store. They come from an LLM reading untrusted advisory text, so
+        # they are validated (no own / private ranges, no unknown kinds — IOCStore.add), confidence-capped,
+        # short-lived and tagged: the store keeps them as evidence, but they reach the blocklist-style matchers
+        # only if the operator opts in (AEGIS_TI_MERGE_LLM_IOCS=1).
+        added = rejected = 0
+        cap = float(os.environ.get("AEGIS_TI_LLM_MAX_CONFIDENCE", "0.6"))
+        indicators = parsed.get("indicators", []) or []
+        for ind in indicators[:200] if isinstance(indicators, list) else []:
             try:
+                tags = tuple(str(t)[:40] for t in (ind.get("tags") or ())[:8]) + (LLM_TAG,)
                 ioc = IOC(
-                    kind=ind.get("kind"),
+                    kind=str(ind.get("kind") or ""),
                     value=str(ind.get("value", "")),
-                    confidence=float(ind.get("confidence", 0.7)),
+                    confidence=min(cap, float(ind.get("confidence", 0.5))),
                     source=f"advisory:{advisory_id}",
-                    tags=tuple(ind.get("tags") or ()),
+                    tags=tags,
+                    ttl_seconds=int(os.environ.get("AEGIS_TI_LLM_TTL_SEC", str(3 * 86400))),
                 )
-                if ioc.kind and ioc.value:
-                    self._store.add(ioc)
+                if self._store.add(ioc):
                     added += 1
+                else:
+                    rejected += 1
             except Exception as exc:  # noqa: BLE001 — one malformed IOC from the LLM is skipped, the rest are kept
                 logger.debug("[threat_intel] skipped malformed IOC from LLM: %s", exc)
                 continue
         chain.reasoning.append(ReasoningStep(
             step=len(chain.reasoning) + 1,
             action="LLM extracted indicators",
-            observation=f"{added} indicator(s) merged into IOC store",
+            observation=f"{added} indicator(s) merged into IOC store as unconfirmed ({rejected} rejected)",
             conclusion=parsed.get("classification", "unclassified"),
         ))
 

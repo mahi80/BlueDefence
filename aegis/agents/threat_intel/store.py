@@ -18,10 +18,16 @@ a coarse lock since the IOC count is small (thousands, not millions).
 """
 from __future__ import annotations
 
+import logging
+import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Literal, Optional
+
+from .validate import clamp_confidence, normalise
+
+_log = logging.getLogger("aegis.threat_intel")
 
 
 IocKind = Literal[
@@ -50,12 +56,31 @@ class IOCStoreStats:
     total: int = 0
 
 
+LLM_TAG = "llm-extracted"
+
+
 class IOCStore:
     def __init__(self):
         self._iocs: dict[tuple[str, str], IOC] = {}
         self._lock = threading.Lock()
+        self.rejected = 0
+        # what this store pushed into the peer agents' matchers, so expired / removed entries can be taken back
+        # out (the seed entries those modules ship with are never touched)
+        self._pushed_perimeter: set[str] = set()
+        self._pushed_edr: dict[str, set[str]] = {"hash_md5": set(), "domain": set(), "ip": set()}
 
-    def add(self, ioc: IOC) -> None:
+    def add(self, ioc: IOC) -> bool:
+        """Validate, normalise and store. Returns False (and stores nothing) for a rejected indicator: an
+        unknown kind, a malformed value, or the bank's own address space / domains — see ``validate.py``."""
+        value, why = normalise(ioc.kind, ioc.value)
+        conf = clamp_confidence(ioc.confidence)
+        if value is None or conf is None:
+            self.rejected += 1
+            _log.info("[threat_intel] rejected IOC %s %r from %s: %s", ioc.kind, str(ioc.value)[:80], ioc.source,
+                      why or "confidence is not a number")
+            return False
+        ttl = max(60, min(int(ioc.ttl_seconds or 0) or 86400 * 14, 86400 * 365))
+        ioc = replace(ioc, value=value, confidence=conf, ttl_seconds=ttl)
         with self._lock:
             key = (ioc.kind, ioc.value)
             existing = self._iocs.get(key)
@@ -80,17 +105,17 @@ class IOCStore:
                     last_seen=ioc.last_seen or now,
                     tags=ioc.tags, ttl_seconds=ioc.ttl_seconds,
                 )
+        return True
 
     def add_many(self, iocs: Iterable[IOC]) -> int:
-        n = 0
-        for ioc in iocs:
-            self.add(ioc)
-            n += 1
-        return n
+        """Returns how many were accepted."""
+        return sum(1 for ioc in iocs if self.add(ioc))
 
     def lookup(self, value: str, kind: Optional[IocKind] = None) -> Optional[IOC]:
         """Return the IOC if present and not expired. Honors TTL."""
         now = time.time()
+        if kind is not None:
+            value = normalise(kind, value)[0] or value          # same canonical form the store keeps
         with self._lock:
             if kind is not None:
                 ioc = self._iocs.get((kind, value))
@@ -138,37 +163,65 @@ class IOCStore:
 
     # ---- distribution to peer agents -----------------------------------
 
+    def _distributable(self) -> list[IOC]:
+        """Active IOCs that may reach the hot-path matchers. LLM-extracted indicators (read from untrusted
+        advisory text) stay in the store as evidence for lookups but are not pushed into blocklist-style
+        matchers unless the operator opts in with ``AEGIS_TI_MERGE_LLM_IOCS=1``."""
+        allow_llm = os.environ.get("AEGIS_TI_MERGE_LLM_IOCS", "0") == "1"
+        self.prune()
+        return [i for i in self.all_active() if allow_llm or LLM_TAG not in i.tags]
+
     def merge_into_perimeter(self) -> int:
-        """Push 'ip' IOCs into perimeter/tools._KNOWN_BAD so the
-        perimeter agent's hot-path matcher sees fresh IPs without needing
-        to call back here. Returns count merged.
-        """
+        """Sync 'ip' IOCs into perimeter/tools._KNOWN_BAD so the perimeter agent's hot-path matcher sees
+        fresh IPs without calling back here. Entries this store pushed earlier that have since expired are
+        removed again. Returns count added."""
         from aegis.agents.perimeter import tools as p
 
+        want = {i.value: i for i in self._distributable() if i.kind == "ip"}
         merged = 0
-        for ioc in self.all_active():
-            if ioc.kind == "ip" and ioc.value not in p._KNOWN_BAD:
-                p._KNOWN_BAD[ioc.value] = {
-                    "abuse_score": int(ioc.confidence * 100),
-                    "categories": list(ioc.tags) or ["threat-intel"],
-                    "tor_exit": False,
-                }
+        for ip in list(self._pushed_perimeter - set(want)):
+            p._KNOWN_BAD.pop(ip, None)
+            self._pushed_perimeter.discard(ip)
+        for ip, ioc in want.items():
+            if ip in p._KNOWN_BAD and ip not in self._pushed_perimeter:
+                continue                                     # a seed / operator entry: leave it alone
+            if ip not in p._KNOWN_BAD:
                 merged += 1
+            p._KNOWN_BAD[ip] = {
+                "abuse_score": int(ioc.confidence * 100),
+                "categories": [t for t in ioc.tags if t != LLM_TAG] or ["threat-intel"],
+                "tor_exit": False,
+            }
+            self._pushed_perimeter.add(ip)
         return merged
 
     def merge_into_edr(self) -> int:
-        """Push hash + domain + ip IOCs into edr/tools.* matchers."""
+        """Sync hash + domain + ip IOCs into edr/tools.* matchers, removing ones this store pushed that have
+        since expired. Returns count added."""
         from aegis.agents.edr import tools as e
 
+        want: dict[str, dict[str, IOC]] = {"hash_md5": {}, "domain": {}, "ip": {}}
+        for ioc in self._distributable():
+            if ioc.kind in want:
+                want[ioc.kind][ioc.value] = ioc
+        targets = {"hash_md5": e._IOC_HASHES, "domain": e._IOC_DOMAINS, "ip": e._IOC_IPS}
         merged = 0
-        for ioc in self.all_active():
-            if ioc.kind == "hash_md5" and ioc.value not in e._IOC_HASHES:
-                e._IOC_HASHES[ioc.value] = ", ".join(ioc.tags) or ioc.source
-                merged += 1
-            elif ioc.kind == "domain" and ioc.value not in e._IOC_DOMAINS:
-                e._IOC_DOMAINS.add(ioc.value)
-                merged += 1
-            elif ioc.kind == "ip" and ioc.value not in e._IOC_IPS:
-                e._IOC_IPS.add(ioc.value)
-                merged += 1
+        for kind, target in targets.items():
+            pushed = self._pushed_edr[kind]
+            for v in list(pushed - set(want[kind])):
+                if isinstance(target, dict):
+                    target.pop(v, None)
+                else:
+                    target.discard(v)
+                pushed.discard(v)
+            for v, ioc in want[kind].items():
+                if v in target and v not in pushed:
+                    continue
+                if v not in target:
+                    merged += 1
+                if isinstance(target, dict):
+                    target[v] = ", ".join(t for t in ioc.tags if t != LLM_TAG) or ioc.source
+                else:
+                    target.add(v)
+                pushed.add(v)
         return merged

@@ -571,8 +571,16 @@ frontier baseline's 32/37.
 
 ## Threat intelligence
 
-- **IOC store** (`agents/threat_intel/`) — STIX 2.1, MISP, Recorded Future, Tenable, mock seed;
-  distributed into the perimeter and EDR matchers.
+- **IOC store** (`agents/threat_intel/`) — STIX 2.1, MISP, Recorded Future, Tenable, peer sync,
+  mock seed; distributed into the perimeter and EDR matchers. Every indicator passes a gate
+  (`validate.py`): unknown kinds and malformed values are refused, and so is the bank's own space
+  (RFC 1918, CGNAT, loopback / reserved, `AEGIS_INTERNAL_NETS`, `AEGIS_NEVER_BLOCK*`,
+  `AEGIS_INTERNAL_DOMAINS`). Values are normalised and confidence clamped to 0–1. Expired
+  indicators are taken back out of the matchers on the next sync (seed entries are never touched).
+  Indicators the LLM extracts from an advisory are untrusted: confidence ≤
+  `AEGIS_TI_LLM_MAX_CONFIDENCE` (0.6), expiry `AEGIS_TI_LLM_TTL_SEC` (3 days), tagged
+  `llm-extracted`, kept as lookup evidence, and pushed into the matchers only with
+  `AEGIS_TI_MERGE_LLM_IOCS=1`.
 - **CISA KEV + NVD 2.0 + EPSS** (`cve_feeds.py`, `AEGIS_CVE_INTEL=1`) — cached, incremental,
   rate-limited (`NVD_API_KEY` raises the limit); KEV entries become CVE IOCs tagged with vendor,
   product, due date and ransomware use; NVD CPE ranges give `vuln_discovery.dependency_scan`
