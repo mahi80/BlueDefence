@@ -49,11 +49,19 @@ STATUS_UNSUPPORTED = "unsupported"
 STATUS_REFUSED = "refused"           # never-block guard: enforcing this would risk own/lab infra
 STATUS_SUPERSEDED = "superseded"     # replaced by a fresh apply (live after shadow, or a human re-approval)
 STATUS_DRIFTED = "drifted"           # the vendor no longer enforces it (released or removed outside AEGIS)
+STATUS_ROLLBACK_FAILED = "rollback_failed"   # the undo failed: the vendor still enforces it; retried by the sweep
 ACTIVE_STATUSES = (STATUS_APPLIED, STATUS_DRY_RUN, STATUS_RENEWED)
 
 
 class ConnectorError(RuntimeError):
     """Raised by ``_do_apply`` / ``_do_rollback`` when the vendor refused."""
+
+
+class CannotUndo(ConnectorError):
+    """``_do_rollback`` for an action with no undo (a killed process, a playbook with no reverse): retrying is pointless."""
+
+
+MAX_ROLLBACK_ATTEMPTS = 10
 
 
 @dataclass
@@ -77,6 +85,8 @@ class Receipt:
     rolled_back_at: Optional[float] = None
     verified: bool | None = None        # read back at the vendor: True present, False absent, None not checked
     verified_at: float | None = None
+    rollback_attempts: int = 0
+    retry_rollback_at: float | None = None
 
     @property
     def active(self) -> bool:
@@ -92,6 +102,22 @@ class Receipt:
 def enforcement_mode() -> str:
     mode = os.environ.get("AEGIS_ENFORCEMENT_MODE", MODE_SHADOW).strip().lower()
     return MODE_LIVE if mode == MODE_LIVE else MODE_SHADOW
+
+
+def canonical_target(target: str) -> str:
+    """One spelling per target for the idempotency key: ``198.18.7.4``, ``198.18.7.4/32`` and
+    ``::ffff:198.18.7.4`` are one address, and a host is case- and trailing-dot-insensitive. Two spellings used to
+    get two keys over ONE vendor entry, so the first one's TTL deleted the entry the other still reported active
+    (review W6)."""
+    import ipaddress
+
+    from aegis.agents.shared.netguard import unwrap
+    t = str(target).strip().lower()
+    try:
+        net = unwrap(ipaddress.ip_network(t.strip("[]"), strict=False))
+        return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+    except ValueError:
+        return t.rstrip(".")
 
 
 class Connector:
@@ -193,7 +219,7 @@ class Connector:
         return True
 
     def idempotency_key(self, action: Any) -> str:
-        raw = f"{self.name}:{action.action_type}:{str(action.target).strip().lower()}"
+        raw = f"{self.name}:{action.action_type}:{canonical_target(str(action.target))}"
         return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
     def apply(self, action: Any, *, alert_id: str = "", approver: str = "",
@@ -217,7 +243,13 @@ class Connector:
             ))
         with self._lock:
             existing = self._active.get(key)
-            if existing is not None and existing.active and not existing.expired(now):
+            still_there = existing is not None and existing.status == STATUS_ROLLBACK_FAILED
+            if still_there:
+                # the undo failed, so the vendor still enforces it: this apply keeps that rule instead of creating a
+                # second one and orphaning the first (review W5)
+                existing.status, existing.retry_rollback_at = (STATUS_DRY_RUN if existing.dry_run else STATUS_APPLIED), None
+                existing.error, existing.rollback_attempts = "", 0
+            if existing is not None and existing.active and (still_there or not existing.expired(now)):
                 human = bool(approver) and not approver.startswith("aegis:")
                 fresh = ((existing.dry_run and not self.dry_run)          # shadow receipt, now live: enforce it
                          or (self.reapply_on_human_approval and human and not existing.dry_run
@@ -269,15 +301,38 @@ class Connector:
 
     def rollback(self, receipt: Receipt, *, reason: str = "") -> Receipt:
         now = self._clock()
-        if not receipt.active:
+        if not (receipt.active or receipt.status == STATUS_ROLLBACK_FAILED):
             return receipt
         if not receipt.dry_run:
             try:
                 receipt.detail = str(self._do_rollback(receipt)) or receipt.detail
-            except Exception as e:  # noqa: BLE001
+            except CannotUndo as e:
                 receipt.status = STATUS_FAILED
                 receipt.error = f"rollback {type(e).__name__}: {str(e)[:200]}"
-                logger.error("[connector:%s] rollback of %s failed: %s", self.name, receipt.receipt_id, receipt.error, exc_info=True)
+                logger.error("[connector:%s] %s %s cannot be rolled back: %s", self.name, receipt.action_type,
+                             receipt.target, receipt.error)
+                return self._record(receipt)
+            except Exception as e:  # noqa: BLE001
+                # The rule is still at the vendor. It used to become `failed` — inactive, never retried, and the next
+                # apply orphaned it (an Imperva 503 on DELETE left rule 1001 in place for good — review W5). Keep it
+                # tracked and retry with backoff (1 min, 2, 4 … capped at 1 h).
+                receipt.status = STATUS_ROLLBACK_FAILED
+                receipt.rollback_attempts += 1
+                if receipt.rollback_attempts >= MAX_ROLLBACK_ATTEMPTS:
+                    receipt.retry_rollback_at = None            # stop retrying; it stays listed for a human
+                    receipt.error = f"rollback gave up after {receipt.rollback_attempts} attempts: {type(e).__name__}: {str(e)[:160]}"
+                    logger.error("[connector:%s] rollback of %s %s abandoned after %d attempts — remove it at the vendor: %s",
+                                 self.name, receipt.action_type, receipt.target, receipt.rollback_attempts, receipt.error)
+                    with self._lock:
+                        self._active[receipt.idempotency_key] = receipt
+                    return self._record(receipt)
+                receipt.retry_rollback_at = now + min(3600.0, 60.0 * 2 ** (receipt.rollback_attempts - 1))
+                receipt.error = f"rollback {type(e).__name__}: {str(e)[:200]}"
+                logger.error("[connector:%s] rollback of %s %s failed (attempt %d, next in %.0fs): %s", self.name,
+                             receipt.action_type, receipt.target, receipt.rollback_attempts,
+                             receipt.retry_rollback_at - now, receipt.error)
+                with self._lock:
+                    self._active[receipt.idempotency_key] = receipt
                 return self._record(receipt)
         else:
             receipt.detail = f"[shadow] would roll back {receipt.action_type} {receipt.target}"
@@ -292,7 +347,8 @@ class Connector:
     def sweep_expired(self) -> list[Receipt]:
         now = self._clock()
         with self._lock:
-            due = [r for r in self._active.values() if r.expired(now)]
+            due = [r for r in self._active.values() if r.expired(now) or (
+                r.status == STATUS_ROLLBACK_FAILED and r.retry_rollback_at is not None and now >= r.retry_rollback_at)]
         out = []
         for r in due:
             rb = self.rollback(r, reason="ttl expired")

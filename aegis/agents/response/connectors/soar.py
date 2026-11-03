@@ -33,7 +33,7 @@ import logging
 import os
 from typing import Any, Optional
 
-from .base import Connector, ConnectorError, Receipt
+from .base import CannotUndo, Connector, ConnectorError, Receipt
 from .http import Transport, call, httpx_transport
 
 logger = logging.getLogger("aegis.connectors.soar")
@@ -83,7 +83,7 @@ class _PlaybookConnector(Connector):
     def _do_rollback(self, receipt: Receipt) -> str:
         undo = self.playbooks.get(f"{receipt.action_type}.undo")
         if not undo:
-            raise ConnectorError(f"{receipt.action_type} has no undo playbook — a human must reverse run {receipt.vendor_ref}")
+            raise CannotUndo(f"{receipt.action_type} has no undo playbook — a human must reverse run {receipt.vendor_ref}")
         ref, detail = self._run(undo, _ActionView(receipt.action_type, receipt.target), receipt.idempotency_key,
                                 undo_of=receipt)
         return f"{detail} (undo run {ref})"
