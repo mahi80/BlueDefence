@@ -36,11 +36,13 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 import os
 import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,36 @@ from aegis.agents.perimeter.tools import secret_exfil_probe  # noqa: E402
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
                "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
 _MAX_BODY = 2 * 1024 * 1024
+_MAX_PUSHED = int(os.environ.get("AEGIS_EDGE_MAX_PUSHED", "10000"))     # SOC-pushed targets kept
+_MAX_CLIENTS = int(os.environ.get("AEGIS_EDGE_MAX_CLIENTS", "50000"))   # per-source state kept (LRU)
+
+
+class _BadExpiry(ValueError):
+    pass
+
+
+def _expiry(v: Any) -> float | None:
+    """``expires_at`` as epoch seconds (None = permanent). Accepts a number or an ISO-8601 string; anything
+    else raises. ``is_blocked`` compares it with a float on every request, so a string stored as-is (one
+    push of ``"2026-11-02T12:00:00Z"``) used to raise TypeError for every later request and take the edge down."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        raise _BadExpiry("boolean expires_at")
+    if isinstance(v, (int, float)):
+        f = float(v)
+    else:
+        from datetime import UTC, datetime
+        try:
+            dtv = datetime.fromisoformat(str(v).strip())
+        except ValueError as e:
+            raise _BadExpiry(f"expires_at {str(v)[:40]!r} is not a time") from e
+        if dtv.tzinfo is None:
+            dtv = dtv.replace(tzinfo=UTC)
+        f = dtv.timestamp()
+    if not math.isfinite(f):
+        raise _BadExpiry("expires_at is not finite")
+    return f
 _ENFORCE_ACTIONS = {"block"}            # a plain HTTP edge can hard-deny; challenge/throttle are advisory here
 
 
@@ -134,7 +166,8 @@ class Blocklist:
         self._poll_failures = 0
         self._lock = threading.Lock()
         self._nets: list[tuple[Any, float | None]] = []    # (ip_network, expires_at|None) from the SOC poll
-        self._pushed: dict[str, float | None] = {}         # target -> expires_at|None from /control/enforce
+        # target -> (network, expires_at|None) from /control/enforce; capped (oldest evicted, expired first)
+        self._pushed: dict[str, tuple[Any, float | None]] = {}
         self._last_ok = 0.0
 
     def start(self) -> "Blocklist":
@@ -168,20 +201,28 @@ class Blocklist:
             if str(row.get("action", "")).lower() not in _ENFORCE_ACTIONS:
                 continue
             try:
-                nets.append((ipaddress.ip_network(str(row["target"]), strict=False), row.get("expires_at")))
-            except (KeyError, ValueError):
+                nets.append((ipaddress.ip_network(str(row["target"]), strict=False), _expiry(row.get("expires_at"))))
+            except (KeyError, ValueError):          # _BadExpiry is a ValueError: a malformed row is skipped
                 continue
         with self._lock:
             self._nets = nets
             self._last_ok = time.time()
 
-    def push(self, target: str, expires_at: float | None) -> bool:
+    def push(self, target: str, expires_at: Any) -> bool:
         try:
-            ipaddress.ip_network(target, strict=False)
+            net = ipaddress.ip_network(target, strict=False)
+            exp = _expiry(expires_at)
         except ValueError:
             return False
+        now = time.time()
         with self._lock:
-            self._pushed[target] = expires_at
+            self._pushed.pop(target, None)                 # re-insert: the newest push is the last evicted
+            if len(self._pushed) >= _MAX_PUSHED:
+                for t in [t for t, (_n, e) in self._pushed.items() if e is not None and e <= now]:
+                    self._pushed.pop(t, None)
+                while len(self._pushed) >= _MAX_PUSHED:
+                    self._pushed.pop(next(iter(self._pushed)))
+            self._pushed[target] = (net, exp)
         return True
 
     def is_blocked(self, ip: str | None) -> bool:
@@ -196,15 +237,12 @@ class Blocklist:
             for net, exp in self._nets:
                 if (exp is None or exp > now) and addr in net:
                     return True
-            for target, exp in list(self._pushed.items()):
+            for target, (net, exp) in list(self._pushed.items()):
                 if exp is not None and exp <= now:
                     self._pushed.pop(target, None)
                     continue
-                try:
-                    if addr in ipaddress.ip_network(target, strict=False):
-                        return True
-                except ValueError:
-                    continue
+                if addr.version == net.version and addr in net:
+                    return True
         return False
 
     def snapshot(self) -> dict[str, Any]:
@@ -225,7 +263,7 @@ class EdgeState:
         self.inline_waf = inline_waf
         self.redact_secrets = redact_secrets  # live mode: withhold a response body carrying a secret
         self.blocklist = blocklist
-        self.clients: dict[str, dt.ClientState] = {}
+        self.clients: OrderedDict[str, dt.ClientState] = OrderedDict()     # LRU, capped at _MAX_CLIENTS
         self.denied = 0
         self.forwarded = 0
         self._lock = threading.Lock()
@@ -235,6 +273,10 @@ class EdgeState:
             st = self.clients.get(ip)
             if st is None:
                 st = self.clients[ip] = dt.ClientState()
+                while len(self.clients) > _MAX_CLIENTS:
+                    self.clients.popitem(last=False)
+            else:
+                self.clients.move_to_end(ip)
             return st
 
 
@@ -259,12 +301,47 @@ class Handler(BaseHTTPRequestHandler):
     def _headers_lc(self) -> dict[str, str]:
         return {k.lower(): v for k, v in self.headers.items()}
 
-    def _read_body(self) -> bytes:
+    def _read_body(self) -> bytes | None:
+        """The whole request body, or None after replying 400/413. A chunked body used to be skipped
+        entirely (never inspected, and forwarded empty) and an over-size one silently truncated."""
+        te = self.headers.get("Transfer-Encoding", "").lower()
+        if "chunked" in te:
+            return self._read_chunked()
         try:
             n = int(self.headers.get("Content-Length", 0))
         except ValueError:
-            n = 0
-        return self.rfile.read(min(n, _MAX_BODY)) if n > 0 else b""
+            self._reply_close(400, b"bad Content-Length")
+            return None
+        if n > _MAX_BODY:
+            self._reply_close(413, b"request body too large for the edge to inspect")
+            return None
+        return self.rfile.read(n) if n > 0 else b""
+
+    def _read_chunked(self) -> bytes | None:
+        out = bytearray()
+        while True:
+            line = self.rfile.readline(1024)
+            try:
+                size = int(line.split(b";", 1)[0].strip() or b"x", 16)
+            except ValueError:
+                self._reply_close(400, b"malformed chunked body")
+                return None
+            if size == 0:
+                while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):   # trailers
+                    pass
+                return bytes(out)
+            if len(out) + size > _MAX_BODY:
+                self._reply_close(413, b"request body too large for the edge to inspect")
+                return None
+            out += self.rfile.read(size)
+            self.rfile.readline(1024)                          # CRLF after the chunk
+
+    def _local_peer(self) -> bool:
+        return self.client_address[0] in ("127.0.0.1", "::1")
+
+    def _reply_close(self, code: int, msg: bytes) -> None:
+        self.close_connection = True                           # the rest of the body is still on the socket
+        self._reply(code, msg, "text/plain", {"Connection": "close"})
 
     def _reply(self, code: int, body: bytes, ctype: str, extra: dict[str, str] | None = None) -> None:
         self.send_response(code)
@@ -327,13 +404,20 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self) -> None:
         route = urlsplit(self.path).path
         if route == "/control/enforce" and self.command == "POST":
-            self._handle_control(self._read_body())
+            body = self._read_body()
+            if body is not None:
+                self._handle_control(body)
             return
         if route == "/__edge/health":
+            # liveness for anyone; the details (mode, upstream, the blocklist) only with the shared token or
+            # from the box itself — they tell an attacker whether blocks are enforced and which IPs to avoid
+            if not (self._control_authorized() or self._local_peer()):
+                self._json(200, {"ok": True})
+                return
             self._json(200, {"ok": True, "mode": self.state.mode, "upstream": self.state.upstream,
                              "inline_waf": self.state.inline_waf, "asset": self.state.asset,
                              "denied": self.state.denied, "forwarded": self.state.forwarded,
-                             "blocklist": self.state.blocklist.snapshot()})
+                             "clients": len(self.state.clients), "blocklist": self.state.blocklist.snapshot()})
             return
         self._proxy()
 
@@ -344,6 +428,8 @@ class Handler(BaseHTTPRequestHandler):
         hl = self._headers_lc()
         ua = hl.get("user-agent", "")
         body = self._read_body()
+        if body is None:                       # already answered 400 / 413
+            return
 
         # HANDS: a source the SOC has blocked is denied here before anything reaches the app.
         if self.state.blocklist.is_blocked(ip):
