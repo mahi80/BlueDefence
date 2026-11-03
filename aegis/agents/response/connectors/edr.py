@@ -33,7 +33,7 @@ import time
 from typing import Any, Callable, Optional
 
 from ...shared.fingerprint import is_fingerprint_target
-from .base import Connector, ConnectorError, Receipt
+from .base import CannotUndo, Connector, ConnectorError, Receipt
 from .http import RawBody, Transport, call, httpx_transport
 
 logger = logging.getLogger("aegis.connectors.edr")
@@ -124,7 +124,7 @@ class CrowdStrikeConnector(Connector):
         if receipt.action_type == "isolate":
             self._device_action(receipt.vendor_ref or self._device_id(receipt.target), "lift_containment")
             return f"[crowdstrike] lifted containment on {receipt.target}"
-        raise ConnectorError("kill_process cannot be undone — a killed process cannot be restored "
+        raise CannotUndo("kill_process cannot be undone — a killed process cannot be restored "
                              "(snapshot_forensic first if evidence is needed)")
 
     def _do_verify(self, receipt: Receipt) -> bool | None:

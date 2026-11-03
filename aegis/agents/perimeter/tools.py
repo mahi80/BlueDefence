@@ -198,9 +198,36 @@ _INTERNAL_NAMES = {"meta", "metadata", "metadata-server", "localhost", "internal
 _SSRF_SCHEMES = ("file://", "gopher://", "dict://", "ldap://", "ftp://")
 
 
+def _inet_aton(h: str) -> ipaddress.IPv4Address | None:
+    """IPv4 the way a resolver / curl reads it: ``2852039166``, ``0xa9fea9fe``, ``127.1``, ``0177.0.0.1`` are all
+    addresses (code review 2026-11-03 W12 — the literal check scored every one of them as an external host)."""
+    parts = h.split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+    nums = []
+    for p in parts:
+        try:
+            if p.startswith(("0x", "0X")):
+                nums.append(int(p[2:] or "0", 16))
+            elif len(p) > 1 and p.startswith("0"):
+                nums.append(int(p, 8))
+            else:
+                nums.append(int(p, 10))
+        except ValueError:
+            return None
+    *head, last = nums
+    if any(n > 255 for n in head) or last >= 256 ** (4 - len(head)) or any(n < 0 for n in nums):
+        return None
+    v = 0
+    for n in head:
+        v = v * 256 + n
+    v = v * 256 ** (4 - len(head)) + last
+    return ipaddress.IPv4Address(v)
+
+
 def _host_is_internal(host: str) -> tuple[bool, str]:
     """Classify a URL host as an SSRF target by what it *resolves to*, not a literal match."""
-    h = (host or "").strip().strip("[]").lower()
+    h = (host or "").strip().strip("[]").lower().rstrip(".")
     if not h:
         return False, ""
     if h in _METADATA_HOSTS or h in _INTERNAL_NAMES:
@@ -208,7 +235,16 @@ def _host_is_internal(host: str) -> tuple[bool, str]:
     if h.endswith((".internal", ".local", ".svc", ".cluster.local")):
         return True, "internal DNS suffix"
     try:
-        ip = ipaddress.ip_address(h)
+        from ..shared.netguard import unwrap
+        try:
+            ip = ipaddress.ip_address(h)
+        except ValueError:
+            ip = _inet_aton(h)
+            if ip is None:
+                raise
+        ip = unwrap(ip)                                                # ::ffff:a.b.c.d, NAT64, 6to4
+        if str(ip) in _METADATA_HOSTS:
+            return True, "cloud-metadata address"
         if ip.is_loopback:
             return True, "loopback address"
         if ip.is_link_local:

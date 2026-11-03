@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -75,6 +77,14 @@ def httpx_transport(method: str, url: str, json_body: Optional[dict], headers: d
     return HttpResult(status=resp.status_code, body=body, headers=dict(resp.headers))
 
 
+def max_retry_after() -> float:
+    """Longest ``Retry-After`` a vendor call will sleep (``AEGIS_HTTP_MAX_RETRY_AFTER``, default 30 s)."""
+    try:
+        return max(0.0, float(os.environ.get("AEGIS_HTTP_MAX_RETRY_AFTER", "30")))
+    except ValueError:
+        return 30.0
+
+
 def call(transport: Transport, method: str, url: str, *, json_body: Optional[dict] = None,
          headers: Optional[dict] = None, timeout: float = DEFAULT_TIMEOUT, retries: int = 3,
          backoff_s: float = 0.5, sleep: Optional[Callable[[float], None]] = None,
@@ -99,9 +109,16 @@ def call(transport: Transport, method: str, url: str, *, json_body: Optional[dic
             wait = backoff_s * (2 ** attempt)
             if last is not None and last.status == 429:
                 try:
-                    wait = max(wait, float(last.headers.get("retry-after") or last.headers.get("Retry-After") or 0))
+                    asked = float(last.headers.get("retry-after") or last.headers.get("Retry-After") or 0)
                 except ValueError:
-                    pass
+                    asked = 0.0
+                cap = max_retry_after()
+                if asked > cap or math.isnan(asked):
+                    # sleeping a vendor's `Retry-After: 86400` stalled the response agent and the TTL sweep
+                    # (code review 2026-11-03 W13): fail this call now; the caller's own retry picks it up later
+                    raise ConnectorError(f"HTTP 429 on {method} {_short(url)}: vendor asked to wait {asked:.0f}s "
+                                         f"(over the {cap:.0f}s cap, AEGIS_HTTP_MAX_RETRY_AFTER)")
+                wait = max(wait, asked)
             sleep(wait)
     if last is not None:
         raise ConnectorError(f"HTTP {last.status} on {method} {_short(url)} after {retries + 1} attempts: {_message(last)}")
