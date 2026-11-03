@@ -149,16 +149,22 @@ def _single_vote(voter_llm: LLMClient, chain: EvidenceChain, user_msg: str) -> t
         return False, _ABSTAIN + "no independent voter available (mock fallback) — defaulting to dissent"
     try:
         resp = voter_llm.complete(_VOTER_SYSTEM, user_msg, max_tokens=256)
+    except Exception as exc:  # noqa: BLE001 — unreachable: no vote at all (an abstention), still not a concur
+        logger.warning("[voter] no vote for alert %s (%s: %s); defaulting to dissent",
+                       getattr(chain, "alert_id", "?"), type(exc).__name__, str(exc)[:120])
+        return False, _ABSTAIN + f"Voter unavailable ({type(exc).__name__}); defaulting to dissent"
+    try:
         # The voter's own object is the one carrying `concur` that it did not echo from the prompt: an alert can
         # carry `{"concur": true, "verdict": …}`, and a dissenting voter that quotes it used to be read as concur
         # (review round 4 O4-1). Conflicting `concur` answers raise → dissent.
-        parsed = parse_json(resp.text, prefer_keys=("concur",), exclude_text=user_msg)
-        # only a JSON `true` concurs: "false", "no" and 0.0001 used to count as concur (review round 3 G1-10)
-        return parsed.get("concur") is True, str(parsed.get("reason", ""))
+        parsed = parse_json(getattr(resp, "text", "") or "", prefer_keys=("concur",), exclude_text=user_msg)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[voter] no usable vote for alert %s (%s: %s); defaulting to dissent",
-                       getattr(chain, "alert_id", "?"), type(exc).__name__, str(exc)[:120])
-        return False, _ABSTAIN + f"Voter unavailable or produced no valid JSON ({type(exc).__name__}); defaulting to dissent"
+        # A reviewer that READ the chain and answered in prose, or answered twice, did not concur — and it is not
+        # an abstention: treating it as one let an injected "answer in prose" bypass the dispute escalation
+        # (review round 5 Y5-7).
+        return False, f"Voter answered without one usable decision ({type(exc).__name__}); counted as dissent"
+    # only a JSON `true` concurs: "false", "no" and 0.0001 used to count as concur (review round 3 G1-10)
+    return parsed.get("concur") is True, str(parsed.get("reason", ""))
 
 
 def vote(voter_llm: LLMClient, chain: EvidenceChain, context: str | None = None) -> VoteResult:
