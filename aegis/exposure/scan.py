@@ -94,6 +94,11 @@ def run_scan(o: dict) -> tuple[list[PostureFinding], list[str], dict]:
     if not groups:
         raise PostureSourceError("exposure scan needs an asset model: aws_bundles / azure_bundles / k8s_exports / inventory")
     assets = loaders.merge_assets(*groups)
+    if not assets:
+        # every exposure needs an asset to land on: with none, all of them were dropped, the scan said "ok", and
+        # approved remediation proposals were marked verified_closed (review round 3 G6-2)
+        raise PostureSourceError("exposure scan: the asset model is empty (bundles / exports / inventory gave no assets) "
+                                 "— refusing to treat that as a clean estate")
     settings = loaders.with_coverage(loaders.load_settings(o.get("settings")), o.get("waf_coverage") or [])
     exposures, more = assess(vulns, assets, settings)
     meta = {"funnel": funnel(exposures, len(vulns)), "tiers": summarize(exposures), "assets": len(assets),

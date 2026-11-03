@@ -191,8 +191,17 @@ def main() -> int:
     args = p.parse_args()
 
     audit_path = Path(args.audit)
-    integrity = AuditLog(audit_path, repair=False).verify() if audit_path.exists() else True
-    entries = _load_entries(audit_path)
+    if not audit_path.exists():
+        # a typo'd path reported "integrity PASS" over zero decisions — a clean-looking report of nothing
+        # (review round 3 G6-3)
+        print(f"audit log {audit_path} does not exist — no report", file=sys.stderr)
+        return 2
+    log = AuditLog(audit_path, repair=False)
+    # the whole chain, rotated segments included: only the live segment was checked, so a rewritten older
+    # segment still read PASS
+    rep = log.verify_report(all_files=True)
+    integrity = bool(rep.get("ok"))
+    entries = [e for f in [*log.rotated_files(), audit_path] for e in _load_entries(f)]
 
     since = _parse_date(args.since) if args.since else None
     until = _parse_date(args.until) if args.until else None

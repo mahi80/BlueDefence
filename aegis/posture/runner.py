@@ -101,6 +101,17 @@ def load_config(path: str | Path, *, store: str | Path | None = None) -> RunnerC
 
 # ---- executing one scan ---------------------------------------------------------------------------
 
+def _require_input(scan: ScanConfig, data: Any, keys: tuple[str, ...], what: str) -> None:
+    """An export with none of the sections a scan reads is not a clean result. An empty file or one from the
+    wrong command used to scan `ok` with 0 findings — and every open finding of that scan was then "resolved"
+    (review round 3 G6-1). It is a failed scan: its findings carry forward as stale."""
+    if isinstance(data, dict) and any(k in data for k in keys):
+        return
+    raise sources.PostureSourceError(
+        f"{scan.type} scan {scan.name!r}: the input has none of {', '.join(keys[:6])} — not {what}; refusing to "
+        "report it clean")
+
+
 def execute(scan: ScanConfig) -> tuple[list[PostureFinding], list[str]] | tuple[list[PostureFinding], list[str], dict]:
     o = scan.opts
     if scan.type == "exposure":
@@ -116,19 +127,27 @@ def execute(scan: ScanConfig) -> tuple[list[PostureFinding], list[str]] | tuple[
                 raise sources.PostureSourceError("iam scan needs auth_details (or live: true)")
             details = sources.load_json(o["auth_details"])
             report = sources.load_credential_report(o["credential_report"]) if o.get("credential_report") else None
+        _require_input(scan, details, ("UserDetailList", "RoleDetailList", "GroupDetailList", "Policies"),
+                       "an `aws iam get-account-authorization-details` export")
         note = iam_review.coverage_note(report)
         return iam_review.review(details, report, trusted_accounts=o.get("trusted_accounts") or ()), [note] if note else []
     if scan.type == "cspm":
         bundle = sources.collect_aws_cspm(o.get("region")) if o.get("live") else sources.load_json(_need(o, "bundle", scan))
+        _require_input(scan, bundle, tuple(cspm.BUNDLE_KEYS), "an AEGIS AWS CSPM bundle")
         gaps = cspm.coverage_gaps(bundle)
         meta = {"unchecked_sections": cspm.unchecked_sections(bundle)}
         return cspm.scan(bundle), ([f"not in bundle, not checked: {', '.join(gaps)}"] if gaps else []), meta
     if scan.type == "azure":
         bundle = sources.collect_azure(o.get("subscription")) if o.get("live") else sources.load_json(_need(o, "bundle", scan))
+        _require_input(scan, bundle, tuple(azure_cspm.BUNDLE_KEYS), "an AEGIS Azure bundle")
         return (azure_cspm.scan(bundle), [f"not in bundle, not checked: {', '.join(azure_cspm.coverage_gaps(bundle))}"],
                 {"unchecked_sections": azure_cspm.unchecked_sections(bundle)})
     if scan.type == "k8s":
         export = sources.collect_k8s(o.get("context")) if o.get("live") else sources.load_json(_need(o, "export", scan))
+        items = export.get("items") if isinstance(export, dict) else export
+        if not isinstance(items, list) or not items:
+            raise sources.PostureSourceError(f"k8s scan {scan.name!r}: the export has no objects (`kubectl get ... -o json` "
+                                             "gives a List with items) — refusing to report it clean")
         inc = bool(o.get("include_system"))
         return k8s_posture.scan(export, include_system=inc), k8s_posture.notes(export, include_system=inc)
     # iac

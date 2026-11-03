@@ -98,7 +98,7 @@ export default function AskAgentQ({
       const r = await fetch("/api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: q, chain }),
+        body: JSON.stringify({ question: q, chain_id: chain?.chain_id }),
       });
       answer = (await r.json())?.answer ?? "";
     } catch {

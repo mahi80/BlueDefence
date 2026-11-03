@@ -446,6 +446,7 @@ button.pt-row[data-sev="critical"][data-overdue] { background: color-mix(in srgb
 .flag { margin-left: 6px; font-family: var(--sans); font-size: 10px; font-weight: 600; padding: 1px 5px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.03em; }
 .flag-new { background: color-mix(in srgb, var(--swarm) 14%, transparent); color: var(--swarm); }
 .flag-stale { background: var(--surface-2); color: var(--ink-faint); }
+.banner-error { margin: 0 0 14px; padding: 10px 14px; border-radius: 8px; font-size: 13px; color: var(--v-malicious); background: color-mix(in srgb, var(--v-malicious) 10%, transparent); border: 1px solid color-mix(in srgb, var(--v-malicious) 35%, transparent); }
 
 .posture-detail { min-height: 0; overflow: auto; border-left: 1px solid var(--line); background: var(--bg-2); padding: 16px; display: flex; flex-direction: column; gap: 14px; }
 .pd-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; box-shadow: var(--shadow); }

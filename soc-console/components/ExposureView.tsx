@@ -206,6 +206,7 @@ function Card({ f, waived, proposal, canDecide, fixture }: {
         <span className="mono ex-cve">{f.id}</span>
         <span className="ex-title">{x.title}</span>
         {f.new && <span className="flag flag-new">new</span>}
+        {f.stale && <span className="flag flag-stale" title="This scan failed in the latest run; last known state shown">stale</span>}
         {!waived && <span className={`ex-sla mono${f.overdue ? " overdue" : ""}`} suppressHydrationWarning>{f.overdue ? "past SLA" : `SLA ${when(f.sla_due)}`}</span>}
       </header>
       <div className="ex-asset">{f.affected_component} <span className="sub">· {f.scan}{x.source ? ` · ${x.source}` : ""}</span></div>
@@ -262,6 +263,9 @@ export default function ExposureView({ result, session, canDecide = false }: {
 
   const run: PostureRun | null = result.state === "ok" ? result.run : null;
   const scans = useMemo(() => (run?.scans ?? []).filter((s) => s.type === "exposure" && s.meta), [run]);
+  // a failed exposure scan has no meta, so it used to vanish — with all of them failed the page said "no exposure
+  // scan", and the last run's ACT NOW rows (carried forward as stale) showed as current (review round 3 G6-6)
+  const failedScans = useMemo(() => (run?.scans ?? []).filter((s) => s.type === "exposure" && s.status === "error"), [run]);
   const open = useMemo(() => (run?.open ?? []).filter((f) => f.scanner === "exposure" && f.extra), [run]);
   const waived = useMemo(() => (run?.waived ?? []).filter((f) => f.scanner === "exposure" && f.extra), [run]);
   const counts = useMemo(() => Object.fromEntries(TIERS.map((t) => [t, open.filter((f) => f.extra!.tier === t).length])), [open]);
@@ -270,7 +274,8 @@ export default function ExposureView({ result, session, canDecide = false }: {
   const [tier, setTier] = useState<Tier | "WAIVED">("ACT_NOW");
   const shown = tier === "WAIVED" ? waived : open.filter((f) => f.extra!.tier === tier);
 
-  if (!run || !scans.length) {
+  const staleN = open.filter((f) => f.stale).length;
+  if (!run || (!scans.length && !failedScans.length)) {
     const msg = result.state !== "ok" ? result.message
       : "No exposure scan in this run. Add a `type: exposure` scan to posture.yaml (scanner exports, KEV / EPSS, the asset model and WAF coverage).";
     return (
@@ -294,6 +299,13 @@ export default function ExposureView({ result, session, canDecide = false }: {
         </div>
       </TopNav>
       <main className="ex-main">
+        {failedScans.length > 0 && (
+          <div className="banner banner-error" role="alert">
+            {failedScans.length === 1 ? "An exposure scan failed" : `${failedScans.length} exposure scans failed`} in this run:{" "}
+            {failedScans.map((s) => `${s.name} (${s.error ?? "error"})`).join("; ")}.
+            {staleN > 0 && ` ${staleN} finding(s) below are from the last good run and were not re-checked.`}
+          </div>
+        )}
         {scans.map((s) => (
           <Funnel key={s.name} scan={s} waivedNow={waived.filter((w) => w.scan === s.name && w.extra!.tier === "ACT_NOW").length} />
         ))}

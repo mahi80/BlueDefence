@@ -194,11 +194,22 @@ class _CommitmentRecorder:
 # ---- the lifecycle --------------------------------------------------------------------------------
 
 def load(store: Path) -> dict[str, dict]:
-    try:
-        data = json.loads((store / "proposals.json").read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    """The proposal ledger. A missing file is a first run. A file that exists but cannot be read or parsed is
+    NOT an empty ledger: it used to become ``{}``, every approval and its history were lost, and the next save
+    overwrote the evidence (review round 3 G6-5). Refuse, and keep the file for a person to restore."""
+    p = store / "proposals.json"
+    if not p.exists():
         return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        from ..posture.sources import PostureSourceError
+        raise PostureSourceError(f"{p} is unreadable ({type(e).__name__}: {str(e)[:120]}) — refusing to reset the "
+                                 "remediation ledger; restore it or move it aside to start over") from e
+    if not isinstance(data, dict):
+        from ..posture.sources import PostureSourceError
+        raise PostureSourceError(f"{p} is not a JSON object — refusing to reset the remediation ledger")
+    return data
 
 
 def _event(p: dict, now: datetime, status: str, note: str = "") -> None:
