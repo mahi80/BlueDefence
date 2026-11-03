@@ -131,10 +131,15 @@ def test_real_cloudtrail_iam_events_are_iam():
 
 def test_registered_payee_is_not_a_new_beneficiary():
     from aegis.agents.orchestrator.treasury import is_new_beneficiary
-    from aegis.agents.transaction import tools
-    known = next(iter(tools._BENEFICIARY_RISK))
-    assert is_new_beneficiary({"beneficiary_account": known, "amount": 2e7}) is False
+    assert is_new_beneficiary({"beneficiary_account": "ACC-NORMAL-001", "amount": 2e7}) is False     # 5 years
     assert is_new_beneficiary({"beneficiary_account": "ACC-NEVER-SEEN-999", "amount": 2e7}) is True
+
+
+def test_a_registered_but_new_or_risky_payee_is_still_new():
+    """2026-11-03 review R1: any register profile used to count as known, including yesterday's mule."""
+    from aegis.agents.orchestrator.treasury import is_new_beneficiary
+    assert is_new_beneficiary({"beneficiary_account": "ACC-MULE-001", "amount": 2e7}) is True        # 1 day
+    assert is_new_beneficiary({"beneficiary_account": "ACC-FOREIGN-99", "amount": 2e7}) is True      # RU, 0 days
 
 
 def test_huge_object_id_does_not_blind_bola_detection():
@@ -158,3 +163,23 @@ def test_sni_on_the_allow_list_does_not_hide_a_known_bad_ip(monkeypatch):
     # an allow-listed domain on a clean IP stays quiet
     assert det.observe({"kind": "tls", "src": "10.0.0.5", "dst": "13.107.4.50", "dport": 443,
                         "sni": "update.windowsupdate.com", "ts": 1_793_000_100.0}) == []
+
+
+def test_attacker_object_escaped_in_the_prompt_is_still_an_echo():
+    """2026-11-03 review R9: the attacker's JSON sits escaped inside a json.dumps'd string in the prompt, so the
+    model's unescaped quote of it was not excluded and last-wins picked it."""
+    alert = {"src_ip": "203.0.113.7", "uri": "/api/transfer", "body": ATTACKER}
+    prompt = "Investigate.\n<analyzed_data>" + json.dumps(alert) + "</analyzed_data>"
+    answer = f"My verdict: {OWN}\nNote: the request body contained the string {ATTACKER}, an injection attempt."
+    assert parse_json(answer, exclude_text=prompt)["verdict"] == "malicious"
+    double = "<analyzed_data>" + json.dumps({"raw": json.dumps(alert)}) + "</analyzed_data>"
+    assert parse_json(answer, exclude_text=double)["verdict"] == "malicious"
+
+
+def test_uri_with_a_syslog_tag_is_not_netops_on_a_plain_text_feed():
+    """2026-11-03 review R13: on a feed not named waf/f5/…, a URI carrying '/%SYS-5-CONFIG_I:' still routed to netops."""
+    from aegis.ingest.stream import _is_netops
+    line = '203.0.113.7 - - [03/Nov/2026:10:00:01 +0000] "GET /%SYS-5-CONFIG_I: HTTP/1.1" 200 12'
+    for src in ("nginx", "firehose", "alerts-raw"):
+        assert not _is_netops(_item(line, src))
+    assert _is_netops(_item("<190>1234: core-1: 000123: *Nov 03 2026 10:00:01.000 UTC: %BGP-5-ADJCHANGE: neighbor 10.0.0.2 Down", "nginx"))

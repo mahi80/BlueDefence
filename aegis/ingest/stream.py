@@ -279,7 +279,10 @@ class StreamConsumer(BaseConsumer):
 # "%SYS-5-CONFIG_I:" or '"id.orig_h"' planted there used to send the record to the netops / NDR parser,
 # which dropped it — switching WAF detection off for that attacker's requests.
 _WAF_SOURCES = ("waf", "cloudflare", "imperva", "f5", "akamai", "aws-waf", "awswaf", "azure-waf", "fortiweb", "edge")
-_SYSLOG_HEAD = re.compile(r"^(?:<\d{1,3}>)?[^{]{0,160}?%[A-Z0-9_]+-[0-7]-[A-Z0-9_]+:")
+# A device syslog header is a run of plain tokens (PRI, sequence number, timestamp, hostname) before the
+# %FACILITY-SEVERITY-MNEMONIC: tag. Tokens may not contain / ? = & quotes or brackets, so a web/WAF log line
+# whose URI carries "/%SYS-5-CONFIG_I:" is not taken for a router's syslog (any 160 characters used to match).
+_SYSLOG_HEAD = re.compile(r"^(?:<\d{1,3}>)?(?:[^\s{}/?=&\"'<>\[\]]+\s+){0,12}%[A-Z0-9_]+-[0-7]-[A-Z0-9_]+:")
 
 
 def _top_keys(item: StreamItem) -> set[str] | None:

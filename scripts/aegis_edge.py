@@ -321,11 +321,12 @@ class Handler(BaseHTTPRequestHandler):
         out = bytearray()
         while True:
             line = self.rfile.readline(1024)
-            try:
-                size = int(line.split(b";", 1)[0].strip() or b"x", 16)
-            except ValueError:
+            size_txt = line.split(b";", 1)[0].strip()
+            # hex digits only: int(b"-1", 16) is -1, and rfile.read(-1) reads to EOF with no cap
+            if not size_txt or len(size_txt) > 8 or any(c not in b"0123456789abcdefABCDEF" for c in size_txt):
                 self._reply_close(400, b"malformed chunked body")
                 return None
+            size = int(size_txt, 16)
             if size == 0:
                 while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):   # trailers
                     pass

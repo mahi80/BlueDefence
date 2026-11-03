@@ -122,6 +122,12 @@ def register_promoted_adapter(registry: VLLMAdapterRegistry, *, pointer_path: Op
     adapter = str(ptr.get("adapter") or "")
     if not name or not adapter:
         return RegisterResult(ok=False, action="error", detail="pointer has no run/adapter")
+    if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") != "1" and os.path.isdir(adapter):
+        from aegis.finetune.digest import verify_adapter
+        ok, why = verify_adapter(adapter, ptr.get("sha256"))
+        if not ok:                     # the GPU side is where a remote adapter's bytes can be checked
+            return RegisterResult(ok=False, action="error", served_model=name, adapter=adapter,
+                                  detail=f"adapter refused: {why}")
     if ptr.get("served_model") == name and not force:
         return RegisterResult(ok=True, action="skipped", served_model=name, adapter=adapter,
                               detail="already registered")

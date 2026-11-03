@@ -21,21 +21,47 @@ class BoundedDict(OrderedDict, Generic[K, V]):
 
     ``on_evict(key, value)`` (optional) runs for each evicted entry — e.g. to adjust a running total."""
 
-    def __init__(self, maxlen: int, *, on_evict: Callable[[K, V], None] | None = None):
+    def __init__(self, maxlen: int, *, on_evict: Callable[[K, V], None] | None = None,
+                 keep_established: bool = False, pinned: Callable[[K], bool] | None = None):
+        """``keep_established``: when full, evict the newest *arrival* instead of the least recently written
+        key. For per-device liveness state an LRU is wrong: a real device that goes silent stops being written
+        and becomes the first evicted — so a flood of spoofed names erases the very device whose silence is
+        the alert. Established keys stay; the churn happens among the newcomers.
+        ``pinned(key)``: never evicted (e.g. devices in the operator's inventory)."""
         super().__init__()
         self.maxlen = max(1, int(maxlen))
         self.evicted = 0
         self._on_evict = on_evict
+        self._keep_established = keep_established
+        self._pinned = pinned
 
     def __setitem__(self, key: K, value: V) -> None:
         if key in self:
-            self.move_to_end(key)
+            if not self._keep_established:
+                self.move_to_end(key)
+            super().__setitem__(key, value)
+            return
         super().__setitem__(key, value)
-        while len(self) > self.maxlen:
-            old_key, old_value = self.popitem(last=False)
+        if len(self) > self.maxlen:
+            self._evict(exclude=key)
+
+    def _evict(self, *, exclude: K) -> None:
+        order = reversed(list(self.keys())) if self._keep_established else iter(list(self.keys()))
+        for k in order:
+            if len(self) <= self.maxlen:
+                return
+            if k == exclude or (self._pinned is not None and self._pinned(k)):
+                continue
+            v = super().pop(k)
             self.evicted += 1
             if self._on_evict is not None:
-                self._on_evict(old_key, old_value)
+                self._on_evict(k, v)
+        # only the new key or pinned keys left to evict: the new key goes (pinned keys are bounded by config)
+        if len(self) > self.maxlen and exclude in self and not (self._pinned is not None and self._pinned(exclude)):
+            v = super().pop(exclude)
+            self.evicted += 1
+            if self._on_evict is not None:
+                self._on_evict(exclude, v)
 
     def setdefault(self, key: K, default: V | None = None) -> V:  # type: ignore[override]
         if key in self:

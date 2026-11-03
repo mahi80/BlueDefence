@@ -222,7 +222,12 @@ def download_and_install(res: dict, *, dest_root: Path, keys: dict | None = None
 def write_pointer(rel: dict, *, pointer: Path, previous: str = "") -> dict:
     """The promotion pointer ``aegis.finetune.hot_reload`` reads. ``served_model`` = the version, which is also the
     name the vLLM register step uses for the LoRA."""
-    ptr = {"run": str(rel["version"]), "adapter": rel["adapter"], "sha256": rel["sha256"], "served_model": str(rel["version"]),
+    # sha256 in the pointer is the ADAPTER digest that load and hot-reload re-check (finetune/digest.py); the
+    # release archive's sha256 (already checked against the signed manifest) is kept as archive_sha256. Writing
+    # the archive hash here made every signed release fail the adapter check after #66.
+    from aegis.finetune.digest import adapter_digest
+    ptr = {"run": str(rel["version"]), "adapter": rel["adapter"], "sha256": adapter_digest(rel["adapter"]),
+           "archive_sha256": rel["sha256"], "served_model": str(rel["version"]),
            "base_model": rel["base_model"], "channel": rel["channel"], "promoted_at": int(time.time()), "approved_by": "bluedefence-release",
            "notes": rel.get("notes", ""), "previous": previous}
     pointer.parent.mkdir(parents=True, exist_ok=True)

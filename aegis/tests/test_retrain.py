@@ -159,10 +159,15 @@ def test_dry_run_touches_nothing_on_the_gpu(tmp_path, capsys):
 
 def test_model_pointer_resolves_promoted_adapter(tmp_path, monkeypatch):
     from aegis.agents.shared import llm_client as lc
-    ad = tmp_path / "ad"; ad.mkdir()
-    ptr = tmp_path / "current.json"; ptr.write_text(json.dumps({"run": "r1", "adapter": str(ad), "approved_by": "ciso"}))
+    ad, sha = _adapter(tmp_path / "ad")
+    ptr = tmp_path / "current.json"; ptr.write_text(json.dumps({"run": "r1", "adapter": ad, "sha256": sha, "approved_by": "ciso"}))
     monkeypatch.setenv("AEGIS_MODEL_POINTER", str(ptr))
-    assert lc._promoted_model() == str(ad)
+    assert lc._promoted_model() == ad
+    ptr.write_text(json.dumps({"run": "r1", "adapter": ad, "approved_by": "ciso"}))
+    assert lc._promoted_model() is None                       # no digest: never loaded (2026-11-03 review R12)
+    monkeypatch.setenv("AEGIS_ALLOW_UNVERIFIED_MODEL", "1")
+    assert lc._promoted_model() == ad                         # explicit lab override
+    monkeypatch.delenv("AEGIS_ALLOW_UNVERIFIED_MODEL")
     ptr.write_text(json.dumps({"run": "r1", "adapter": str(tmp_path / "gone")}))
     assert lc._promoted_model() is None                       # missing dir → fall back to AEGIS_MODEL
     ptr.write_text("not json")
@@ -203,3 +208,17 @@ def test_legacy_digest_still_verifies(tmp_path):
         h.update(f.name.encode()); h.update(f.read_bytes()[: 4 << 20])
     assert verify_adapter(ad, h.hexdigest()[:16]) == (True, "")
     assert not verify_adapter(ad, "deadbeefdeadbeef")[0]
+
+
+def test_hot_reload_refuses_a_pointer_without_a_digest(tmp_path, monkeypatch):
+    """2026-11-03 review R12: a pointer with its sha256 removed swapped in unverified."""
+    from types import SimpleNamespace
+
+    from aegis.finetune.hot_reload import apply_reload
+    monkeypatch.delenv("AEGIS_ALLOW_UNVERIFIED_MODEL", raising=False)
+    swapped = []
+    primary = SimpleNamespace(set_model=swapped.append)
+    res = apply_reload(primary, "", {"run": "r9", "served_model": "r9", "adapter": "/gpu/side/path"})
+    assert res.mode == "refused" and swapped == []
+    ad, sha = _adapter(tmp_path / "ad")
+    assert apply_reload(primary, "", {"run": "r9", "served_model": "r9", "adapter": ad, "sha256": sha}).changed

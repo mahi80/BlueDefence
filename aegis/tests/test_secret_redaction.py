@@ -147,3 +147,38 @@ def test_edge_telemetry_is_redacted_before_it_leaves(monkeypatch):
     monkeypatch.setattr(dt.threading, "Thread", lambda target, daemon=True: type("T", (), {"start": lambda self: target()})())
     dt._forward_alert("http://soc/ingest", "tok", {**_alert(), "payload": "u=asha&password=Winter2026!"})
     assert sent and _leaks(json.loads(sent[0])) == []
+
+
+FAKE = "Zx9-fake-not-a-real-secret"
+
+
+@pytest.mark.parametrize("text", [
+    str({"user": "ravi", "password": FAKE}),                                   # Python repr of a dict
+    f"GET /v1/acct\nX-Api-Key: {FAKE}\nHost: bank",                            # header line
+    f"Authorization: ApiKey {FAKE}",
+    f"{{'client_secret' : '{FAKE}'}}",
+    f"password=select one from many {FAKE}",                                   # SQL-ish passphrase
+    f"password=`{FAKE}`",
+    f"user=ravi password={FAKE} uri=/search?q=' OR 1=1-- ua=sqlmap",           # credential + attack on one line
+    f'{{"userPassword": "{FAKE}", "githubToken": "{FAKE}"}}',
+])
+def test_review_2026_11_03_redaction_gaps(text):
+    assert FAKE not in redact_text(text)
+
+
+@pytest.mark.parametrize("key", ["Password ", "userPassword", "x-api-key", "AccessToken", "clientSecret", "db_password"])
+def test_credential_key_spellings(key):
+    assert FAKE not in json.dumps(redact({key: FAKE}))
+
+
+def test_attack_on_the_same_line_is_still_kept():
+    out = redact_text(f"user=ravi password={FAKE} uri=/search?q=' OR 1=1--")
+    assert FAKE not in out and "' OR 1=1--" in out
+
+
+def test_deferred_spill_is_redacted(tmp_path):
+    from aegis.ops.deferred import DeferredQueue
+    q = DeferredQueue(tmp_path / "deferred.jsonl")
+    q.push({"id": "a1", "body": f"username=ravi&password={FAKE}", "request_headers": {"Authorization": f"Bearer {FAKE}"}})
+    assert FAKE not in (tmp_path / "deferred.jsonl").read_text()
+    assert q.pop(1)[0]["id"] == "a1"

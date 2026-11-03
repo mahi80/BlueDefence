@@ -85,6 +85,13 @@ class IOCStore:
             key = (ioc.kind, ioc.value)
             existing = self._iocs.get(key)
             now = time.time()
+            new_llm, old_llm = LLM_TAG in ioc.tags, existing is not None and LLM_TAG in existing.tags
+            if existing is not None and new_llm and not old_llm:
+                # an LLM-extracted copy adds nothing to a feed indicator — and merging its tag used to take the
+                # feed entry out of the matchers (an attacker's advisory naming their own C2 de-listed it)
+                return True
+            if existing is not None and old_llm and not new_llm:
+                existing = None                    # a feed now vouches for it: the feed entry replaces the LLM one
             if existing is not None:
                 # Merge: keep the higher confidence + extend last_seen
                 merged = IOC(

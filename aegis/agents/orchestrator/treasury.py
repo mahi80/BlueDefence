@@ -97,10 +97,13 @@ def _beneficiary_known(alert: dict) -> bool | None:
                 known = r.data.get("known")
                 if known is not None:
                     return bool(known)
-                # the register only sets known=False for an account it has never seen; a registered payee comes
-                # back with its profile (first_seen_days …) and no "known" key — it used to read as "unknown → new"
-                if "first_seen_days" in r.data:
-                    return True
+                # the register only sets known=False for an account it has never seen; a registered payee comes back
+                # with its profile and no "known" key. Being in the register is not enough: a payee first seen within
+                # the register's new-payee window (7 days), a sanctioned one or one in a high-risk geography still
+                # counts as new, so the gate stays closed for a mule added yesterday (#62 had let any profile pass).
+                if "is_new_beneficiary" in r.data:
+                    risky = bool(r.data.get("is_new_beneficiary") or r.data.get("sanctioned") or r.data.get("is_high_risk_geo"))
+                    return not risky
                 return None
     except Exception:  # noqa: BLE001 — a toolkit failure must not open the gate
         return None

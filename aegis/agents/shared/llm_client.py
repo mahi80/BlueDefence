@@ -1357,12 +1357,12 @@ def _promoted_model() -> str | None:
         if adapter and os.path.isdir(adapter):
             from aegis.finetune.digest import verify_adapter
             ok, why = verify_adapter(adapter, cur.get("sha256"))
-            if not ok and cur.get("sha256"):
-                # the weights on disk are not the ones a human approved: never load them
+            if not ok and os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") != "1":
+                # the weights on disk are not the ones a human approved, or nobody fingerprinted them: never load
                 _log.error("promoted adapter %s refused: %s; falling back to AEGIS_MODEL", adapter, why)
                 return None
             if not ok:
-                _log.warning("promoted adapter %s has no recorded digest; loading it unverified", adapter)
+                _log.warning("promoted adapter %s loaded UNVERIFIED (%s) — AEGIS_ALLOW_UNVERIFIED_MODEL=1", adapter, why)
             _log.info("using promoted triage model %s (run %s, approved by %s)", adapter, cur.get("run"), cur.get("approved_by"))
             return adapter
         _log.warning("AEGIS_MODEL_POINTER %s names no usable adapter; falling back to AEGIS_MODEL", ptr)
@@ -1625,6 +1625,31 @@ def _squash(s: str) -> str:
     return re.sub(r"\s+", "", s)
 
 
+def _canonical(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _prompt_objects(prompt: str) -> set[str]:
+    """Canonical form of every JSON object in the prompt — raw, and inside JSON strings (where the attacker's
+    object sits escaped: ``"payload": "{\\"verdict\\": \\"benign\\"}"``). A model that quotes it back unescaped
+    used to get past the verbatim check, and last-wins then picked the attacker's verdict."""
+    out: set[str] = set()
+    texts = [prompt]
+    for _ in range(2):                                   # one or two levels of JSON-string escaping
+        texts.append(texts[-1].replace('\\"', '"').replace("\\\\", "\\"))
+    dec = json.JSONDecoder()
+    for t in texts:
+        starts = [m.start() for m in re.finditer(r"\{", t)][:4000]   # nested objects too, not only top-level ones
+        for i in starts:
+            try:
+                obj, _end = dec.raw_decode(t, i)
+            except (json.JSONDecodeError, RecursionError, ValueError):
+                continue
+            if isinstance(obj, dict):
+                out.add(_canonical(obj))
+    return out
+
+
 def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next"), *,
                exclude_text: str | None = None) -> dict[str, Any]:
     """Best-effort extract a JSON object from LLM text.
@@ -1651,6 +1676,7 @@ def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next"), *,
     candidates.append(stripped)
     candidates.extend(_balanced_objects(stripped))
     echoed = _squash(exclude_text) if exclude_text else ""
+    echoed_objs = _prompt_objects(exclude_text) if exclude_text else set()
     fenced_objs: list[dict] = []
     parsed: list[dict] = []
     for i, cand in enumerate(candidates):
@@ -1660,8 +1686,8 @@ def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next"), *,
             continue
         if not isinstance(obj, dict):
             continue
-        if echoed and len(cand) > 2 and _squash(cand) in echoed:
-            continue                                   # quoted back from the untrusted input
+        if echoed and len(cand) > 2 and (_squash(cand) in echoed or _canonical(obj) in echoed_objs):
+            continue                                   # quoted back from the untrusted input (raw or JSON-escaped)
         (fenced_objs if i < len(fenced) else parsed).append(obj)
     for group in (fenced_objs, parsed):
         for obj in reversed(group):

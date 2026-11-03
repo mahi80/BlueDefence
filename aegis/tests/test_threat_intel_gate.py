@@ -85,3 +85,25 @@ def test_expired_indicators_are_taken_back_out_of_the_matchers(monkeypatch):
     finally:
         perim._KNOWN_BAD.pop("198.51.100.88", None); edr._IOC_IPS.discard("198.51.100.88")
         edr._IOC_DOMAINS.discard("gone.example")
+
+
+def test_llm_copy_of_a_feed_indicator_does_not_delist_it():
+    """2026-11-03 review R5: the merged llm-extracted tag took the feed entry out of the matchers."""
+    st = IOCStore()
+    st.add(IOC(kind="ip", value="198.51.100.99", confidence=0.9, source="feed", tags=("c2",)))
+    st.add(IOC(kind="domain", value="c2-real.example", confidence=0.9, source="feed", tags=("c2",)))
+    try:
+        st.merge_into_perimeter(); st.merge_into_edr()
+        st.add(IOC(kind="ip", value="198.51.100.99", confidence=0.5, source="advisory:X", tags=(LLM_TAG,)))
+        st.add(IOC(kind="domain", value="c2-real.example", confidence=0.5, source="advisory:X", tags=(LLM_TAG,)))
+        st.merge_into_perimeter(); st.merge_into_edr()
+        assert "198.51.100.99" in perim._KNOWN_BAD and "c2-real.example" in edr._IOC_DOMAINS
+        assert LLM_TAG not in st.lookup("198.51.100.99", "ip").tags
+        # and a feed confirming an LLM-only indicator promotes it
+        st.add(IOC(kind="ip", value="198.51.100.98", confidence=0.5, source="advisory:Y", tags=(LLM_TAG,)))
+        st.add(IOC(kind="ip", value="198.51.100.98", confidence=0.8, source="feed", tags=("c2",)))
+        assert LLM_TAG not in st.lookup("198.51.100.98", "ip").tags
+    finally:
+        for ip in ("198.51.100.99", "198.51.100.98"):
+            perim._KNOWN_BAD.pop(ip, None); edr._IOC_IPS.discard(ip)
+        edr._IOC_DOMAINS.discard("c2-real.example")
