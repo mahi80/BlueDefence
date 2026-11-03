@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { PostureFinding, PostureResult, PostureRun, Severity } from "../lib/posture";
 
@@ -39,9 +40,9 @@ export function TopNav({ active, session, children }: { active: "incidents" | "p
         <span className="logo"><b>AEGIS</b> SOC</span>
       </div>
       <nav className="tabs" aria-label="Views">
-        <a href="/" aria-current={active === "incidents" ? "page" : undefined}>Incidents</a>
-        <a href="/posture" aria-current={active === "posture" ? "page" : undefined}>Posture</a>
-        <a href="/exposure" aria-current={active === "exposure" ? "page" : undefined}>Exposures</a>
+        <Link href="/" aria-current={active === "incidents" ? "page" : undefined}>Incidents</Link>
+        <Link href="/posture" aria-current={active === "posture" ? "page" : undefined}>Posture</Link>
+        <Link href="/exposure" aria-current={active === "exposure" ? "page" : undefined}>Exposures</Link>
       </nav>
       {children}
       <div className="whoami">

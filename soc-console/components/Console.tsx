@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Chain, Approval, Proposal, RecommendedAction, EvidenceItem } from "../lib/types";
 import { VERDICT_RANK } from "../lib/graph";
@@ -150,9 +151,9 @@ export default function Console({
           <span className="tag">autonomous defense · human-in-the-loop</span>
         </div>
         <nav className="tabs" aria-label="Views">
-          <a href="/" aria-current="page">Incidents</a>
-          <a href="/posture">Posture</a>
-          <a href="/exposure">Exposures</a>
+          <Link href="/" aria-current="page">Incidents</Link>
+          <Link href="/posture">Posture</Link>
+          <Link href="/exposure">Exposures</Link>
         </nav>
         <div className="live">
           <span className="pulse-dot" aria-hidden style={backendError ? { background: "var(--v-malicious)" } : undefined} />{" "}

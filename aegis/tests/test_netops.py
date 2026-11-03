@@ -394,8 +394,12 @@ def test_topology_learned_after_the_fault_keeps_the_root_cause():
         d.observe({"kind": "topology", "device": a, "neighbor": b, "iface": ai, "neighbor_iface": bi, "ts": T + 2})
     link = d._iface_link[("DIST-01", "Ethernet1/49")]
     assert link.state == "down" and link.b == "CORE-01"
-    # the access switch's alarm is a symptom of the known-down uplink, not a new fault
-    assert d.observe(_down("ACC-01", "GigabitEthernet1/0/49", T + 3)) == [] or d.stats["link_down"] <= 1
+    # ACC-01's uplink is a different cable: DIST-01 losing its core uplink does not take it down, so a
+    # link-down on it is a second, real fault and is raised (review T5: the old `== [] or count <= 1`
+    # could not fail). The inherited state survives it.
+    (b,) = d.observe(_down("ACC-01", "GigabitEthernet1/0/49", T + 3))
+    assert b["netops"]["peer"] == "DIST-01" and b["netops"]["fault"] == "link_down"
+    assert d._iface_link[("DIST-01", "Ethernet1/49")].state == "down"
 
 
 def test_stale_ticket_does_not_shield_a_new_push():
