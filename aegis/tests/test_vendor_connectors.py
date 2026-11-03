@@ -196,6 +196,7 @@ def test_registry_from_env_mock_vendors_shadow_then_live(monkeypatch, tmp_path):
     chain = EvidenceChain(alert_id="A-7", investigated_by="perimeter", verdict="malicious", confidence=0.9,
                           recommended_actions=[_act("throttle", "203.0.113.9"), _act("block", "203.0.113.9"),   # not flagged HITL: auto-block scores it
                                                _act("isolate", "host-1", hitl=True)])
+    chain.metadata["vote_concur"] = True          # a model chain needs a concurring vote before autonomy scores it
     summary = agent.execute((_c := chain), alert_for(_c))
     assert [e.action.action_type for e in summary.executed] == ["throttle"]
     assert summary.receipts[0].connector == "imperva" and summary.receipts[0].status == "applied"

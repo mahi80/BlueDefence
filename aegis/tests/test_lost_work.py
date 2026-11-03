@@ -233,7 +233,7 @@ def test_unfiled_approval_never_times_out_into_an_execution(tmp_path, monkeypatc
     act = RecommendedAction(action_type="block", target="203.0.113.5", reasoning="r", requires_hitl=True, confidence=0.9)
     chain = EvidenceChain(alert_id="A8", investigated_by="t", verdict="malicious", confidence=0.99)
     chain.metadata["vote_concur"] = True
-    h.request(act, chain)
+    h.request(act, chain, timeout_ok=True)
     agent = types.SimpleNamespace(approve=lambda *a, **k: pytest.fail("timed out into an execution"))
     h.pending[0].requested_at -= 10_000
     made = h.sync(agent, max_age_sec=3600, timeout_policy=HitlTimeoutPolicy(mode="live", wait_sec=0))

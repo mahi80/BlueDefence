@@ -250,7 +250,11 @@ class ConsoleAPI:
             except (json.JSONDecodeError, RecursionError):
                 continue
             if isinstance(d, dict) and d.get("approval_id"):
-                out[str(d["approval_id"])] = d
+                # only rows the service would honour: a forged row used to show "approved" here and lock the real
+                # analyst out with 409 (review round 3 G1-6)
+                from ..hitl.signing import trusted_approver, verify
+                if verify(d)[0] and trusted_approver(d.get("decided_by"))[0]:
+                    out[str(d["approval_id"])] = d
         return out
 
     def approvals(self) -> dict:
@@ -325,12 +329,14 @@ class ConsoleAPI:
             return 404, {"error": "unknown approval"}
         cur = cards[approval_id]
         if cur["status"] == "awaiting_second":
-            if (decided_by[:120] or "console") == (cur.get("decided_by") or ""):
+            from ..hitl.signing import same_person
+            if same_person(decided_by[:120] or "console", cur.get("decided_by") or ""):
                 return 409, {"error": "a second, different approver is required"}
         elif cur["status"] != "pending":
             return 409, {"error": f"already {cur['status']}"}
         row = {"approval_id": approval_id, "status": status, "decided_by": decided_by[:120] or "console",
-               "reason": reason[:500], "ts": time.time(), "via": "console"}
+               "reason": reason[:500], "ts": time.time(), "via": "console",
+               "action": f"{cur.get('action_type')} -> {cur.get('target')}"}
         if corrected_verdict in _VERDICTS:
             row["corrected_verdict"] = corrected_verdict
         from ..hitl.signing import sign

@@ -6,6 +6,8 @@ the agent decide what it decided'.
 """
 from __future__ import annotations
 
+import math
+
 from datetime import datetime, timezone
 from typing import Literal, Optional, get_args
 
@@ -65,6 +67,8 @@ def _clamp_confidence(v: object) -> object:
         v = f / 100.0 if pct else f
     if isinstance(v, (int, float)):
         f = float(v)
+        if not math.isfinite(f):
+            return 0.0                      # min(1.0, nan) is 1.0: a model writing NaN got full confidence (G1-13)
         if f > 1.0:
             f = f / 100.0 if f <= 100.0 else 1.0
         return max(0.0, min(1.0, f))

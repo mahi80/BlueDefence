@@ -68,7 +68,7 @@ class HitlTimeoutPolicy:
                    wait_sec=int(_flag("AEGIS_HITL_TIMEOUT_SEC", "120")),
                    min_confidence=float(_flag("AEGIS_HITL_TIMEOUT_MIN_CONF", "0.6")))
 
-    def evaluate(self, action: Any, chain: Any, *, age_sec: float) -> tuple[str, str]:
+    def evaluate(self, action: Any, chain: Any, *, age_sec: float, protected: bool = False) -> tuple[str, str]:
         """Return ``(decision, reason)`` — decision is HOLD, SHADOW or EXECUTE.
 
         HOLD means keep waiting for a human (and, on hard expiry, escalate); the action
@@ -100,12 +100,19 @@ class HitlTimeoutPolicy:
         # wide CIDR, no top-level / shared-suffix destination, no privileged principal (review 2026-11-03 W3)
         from .contracts import gate
         from .grounding import injection_flagged, narrow
-        ok, why = gate(action, chain)
+        ok, why = gate(action, chain, protected=protected)
         if not ok:
             return HOLD, f"{why} — holds for a human"
         ok, why = narrow(atype, str(getattr(action, "target", "")))
         if not ok:
             return HOLD, f"{why} — holds for a human"
+        if atype == "block":
+            # the same external-target rules as tiered auto-block: a bare TLS fingerprint is shared by every
+            # customer on that browser (review round 3 G1-5)
+            from .autonomy import _narrow_external
+            ok, why = _narrow_external(str(getattr(action, "target", "")))
+            if not ok:
+                return HOLD, f"{why} — holds for a human"
         if injection_flagged(chain):
             return HOLD, "prompt-injection evidence on this chain — holds for a human"
 

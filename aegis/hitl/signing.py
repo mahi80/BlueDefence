@@ -28,7 +28,7 @@ from typing import Any
 logger = logging.getLogger("aegis.hitl.signing")
 
 _FIELDS = ("approval_id", "proposal_id", "status", "decision", "decided_by", "reason", "rationale",
-           "corrected_verdict", "ts")
+           "corrected_verdict", "ts", "action")   # `action` ("type -> target") binds the decision to what it approves
 _warned = False
 
 
@@ -78,6 +78,14 @@ def verify(row: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def same_person(a: Any, b: Any) -> bool:
+    """One person, whatever role prefix or case they decided under (``ciso:Alice`` == ``admin:alice``). The
+    two-person rule compared whole strings, so a role change counted as a second person (review round 3 G1-16)."""
+    def who(x: Any) -> str:
+        return str(x or "").split(":", 1)[-1].strip().lower()
+    return bool(who(a)) and who(a) == who(b)
+
+
 def trusted_approver(decided_by: Any) -> tuple[bool, str]:
     """A human decision cannot claim to be the service itself (``aegis:hitl-timeout`` and friends)."""
     who = str(decided_by or "")
@@ -86,4 +94,4 @@ def trusted_approver(decided_by: Any) -> tuple[bool, str]:
     return True, ""
 
 
-__all__ = ["enabled", "sign", "trusted_approver", "verify"]
+__all__ = ["enabled", "same_person", "sign", "trusted_approver", "verify"]

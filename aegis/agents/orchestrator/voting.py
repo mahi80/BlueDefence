@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from typing import Any
 
 from ..shared.evidence_chain import EvidenceChain
 from ..shared.injection_defense import wrap_untrusted
@@ -94,13 +95,28 @@ def _vote_user_msg(chain: EvidenceChain) -> str:
     )
 
 
+def _is_mock(llm: Any) -> bool:
+    seen = 0
+    while llm is not None and seen < 5:
+        if type(llm).__name__ == "MockClient":
+            return True
+        llm = getattr(llm, "_inner", None) or getattr(llm, "inner", None)
+        seen += 1
+    return False
+
+
 def _single_vote(voter_llm: LLMClient, chain: EvidenceChain, user_msg: str) -> tuple[bool, str]:
     """One reviewer's concur/dissent. A failed or unreachable voter is a
     dissent, not a dropped verdict — fail safe toward HITL."""
+    if _is_mock(voter_llm) and os.environ.get("LLM_BACKEND", "").strip().lower() != "mock":
+        # the voter fell back to the mock (no voter backend reachable): it concurs on almost anything, so it is not
+        # a second opinion — autonomy and the HITL timeout must not treat it as one (review round 3 G1-11)
+        return False, "no independent voter available (mock fallback) — defaulting to dissent"
     try:
         resp = voter_llm.complete(_VOTER_SYSTEM, user_msg, max_tokens=256)
         parsed = parse_json(resp.text)
-        return bool(parsed.get("concur", False)), str(parsed.get("reason", ""))
+        # only a JSON `true` concurs: "false", "no" and 0.0001 used to count as concur (review round 3 G1-10)
+        return parsed.get("concur") is True, str(parsed.get("reason", ""))
     except Exception as exc:  # noqa: BLE001
         logger.warning("[voter] no usable vote for alert %s (%s: %s); defaulting to dissent",
                        getattr(chain, "alert_id", "?"), type(exc).__name__, str(exc)[:120])

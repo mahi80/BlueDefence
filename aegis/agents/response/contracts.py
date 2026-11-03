@@ -76,6 +76,12 @@ CONTRACTS: dict[str, ActionContract] = {c.action_type: c for c in (
 )}
 
 
+#: fast-path builders that decide with no model in the loop (no vote is taken on their chains)
+DETERMINISTIC_BUILDERS = frozenset({
+    "adaptive_attacker", "auth_burst", "object_walk", "control_plane", "egress", "low_and_slow", "model_pull",
+    "netops", "privileged", "pxe_firmware", "spoofed_client", "treasury", "deception"})
+
+
 def contract(action_type: str) -> ActionContract | None:
     return CONTRACTS.get(str(action_type))
 
@@ -146,5 +152,5 @@ def missing_contracts() -> list[str]:
     return sorted(set(get_args(ActionType)) - set(CONTRACTS))
 
 
-__all__ = ["CONTRACTS", "TIERS", "ActionContract", "Impact", "always_hitl", "auto_safe", "contract", "floor",
+__all__ = ["CONTRACTS", "DETERMINISTIC_BUILDERS", "TIERS", "ActionContract", "Impact", "always_hitl", "auto_safe", "contract", "floor",
            "gate", "missing_contracts", "tier"]

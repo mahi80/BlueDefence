@@ -17,6 +17,23 @@ from pathlib import Path
 from .signing import enabled, sign, trusted_approver
 
 
+def _card_action(d: Path, approval_id: str) -> str | None:
+    """``type -> target`` of the approval card, so the signed decision names what it approves."""
+    p = d / "cards.jsonl"
+    if not p.exists():
+        return None
+    found = None
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            c = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(c, dict) and c.get("kind") == "approval" and str(c.get("id")) == approval_id:
+            args = c.get("args") or {}
+            found = f"{args.get('action_type')} -> {args.get('target')}" if args.get("action_type") else str(c.get("action"))
+    return found
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m aegis.hitl")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -37,8 +54,13 @@ def main(argv: list[str] | None = None) -> int:
     if not enabled():
         print("warning: no signing key in this environment (AEGIS_CONSOLE_TOKEN / AEGIS_DECISION_KEY); "
               "the row is written unsigned", file=sys.stderr)
+    action = _card_action(Path(a.dir), a.approval_id)
+    if action is None:
+        print(f"error: no approval card {a.approval_id} in {a.dir}/cards.jsonl", file=sys.stderr)
+        return 2
     row = sign({"approval_id": a.approval_id, "status": "approved" if a.status == "approve" else "rejected",
-                "decided_by": a.by[:120], "reason": a.reason[:500], "ts": time.time(), "via": "cli"})
+                "decided_by": a.by[:120], "reason": a.reason[:500], "ts": time.time(), "via": "cli",
+                "action": action})
     path = Path(a.dir) / "decisions.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:

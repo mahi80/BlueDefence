@@ -119,6 +119,23 @@ def _normalise_triage(decision: dict) -> dict:
     return decision
 
 
+
+def _carry_injection(chain: Any, alert: dict, triage: dict) -> None:
+    """Every chain says whether its alert carried prompt-injection text. Only three specialists recorded
+    injection evidence, and triage's flag never reached a specialist's chain, so `injection_flagged()` — the
+    "nothing unattended" check — was blind for the other nine (review round 3 G1-4)."""
+    tm = triage.get("_triage_metadata") if isinstance(triage, dict) else None
+    flagged = bool(isinstance(tm, dict) and tm.get("injection_detected"))
+    if not flagged:
+        try:
+            flagged = wrap_untrusted("alert", json.dumps(alert, default=str)[:200_000]).injection_detected
+        except Exception:  # noqa: BLE001
+            flagged = False
+    if flagged:
+        md = chain.metadata
+        md["injection_detected"] = True
+        md.setdefault("_triage_metadata", {}).update({"injection_detected": True})
+
 class SOCOrchestrator:
     name = "soc_orchestrator"
 
@@ -283,7 +300,11 @@ class SOCOrchestrator:
                 sp.attributes["specialist"] = "spoofed_client"
                 sp.attributes["verdict"] = chain.verdict
             else:
-                chain = self._handle_inner(alert, sp)
+                return self._handle_inner(alert, sp)
+            # A deterministic builder decided this, with no model in the loop, so there is no vote to take.
+            # Autonomy and the outflow breaker require `vote_concur is True` OR this marker (review round 3 G1-15:
+            # a missing vote used to count as consent for any chain).
+            chain.metadata["deterministic"] = True
             return chain
 
     def _degraded_chain(self, alert: dict, exc: Exception) -> EvidenceChain:
@@ -347,6 +368,7 @@ class SOCOrchestrator:
                           alert_id=alert.get("id", "?")):
                 chain = specialist.investigate(alert)
             chain.specialist_invocations.append(specialist.name)
+            _carry_injection(chain, alert, triage)
             obs.record_alert_processed(specialist.name)
             obs.record_verdict(chain.verdict, specialist.name)
             span_record.attributes["specialist"] = specialist.name

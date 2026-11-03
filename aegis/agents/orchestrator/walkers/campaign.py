@@ -435,6 +435,11 @@ def attach_campaign_context(alert: dict, store: EventStore, **kw) -> dict:
     request teaches the model anything), record the alert, then return a copy carrying
     ``campaign_context`` when history warrants it. The original dict is never mutated (it is what
     gets audited as received)."""
+    # these keys are AEGIS's own findings about the alert; a copy already on the incoming alert was written by
+    # whoever sent it — a forged `campaign_context.adaptation.retry_ips` used to become an unattended block on
+    # the IPs the sender chose (review round 3 G1-9)
+    if any(k in alert for k in _DERIVED_KEYS):
+        alert = {k: v for k, v in alert.items() if k not in _DERIVED_KEYS}
     fp = client_fingerprint(alert)
     if fp is not None and fp.kind == "ja4":
         try:
@@ -455,6 +460,9 @@ def attach_campaign_context(alert: dict, store: EventStore, **kw) -> dict:
     if low_slow is not None:
         summary = {**summary, "low_and_slow": low_slow}
     return {**alert, "campaign_context": summary}
+
+
+_DERIVED_KEYS = ("campaign_context", "tls_client", "low_and_slow", "deferred_at", "deferred_by", "audit_deferred")
 
 
 __all__ = ["EventStore", "attach_campaign_context", "campaign_summary", "is_auth_write"]

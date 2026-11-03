@@ -10,7 +10,7 @@ money is gone. The breaker is the narrow exception, built like tiered auto-block
         from one sender inside the window (``metadata.outflow_breaker``) — not a single transfer
     the target is ``outbound:<sender>`` — a hold on the sender's further payments, nothing wider
     verdict ``malicious`` and confidence >= AEGIS_OUTFLOW_BREAKER_MIN_CONF (0.90)
-    the independent voter did not dissent (``metadata.vote_concur`` is not False)
+    the independent voter did not dissent (``metadata.vote_concur`` is True, or the chain came from a deterministic builder with no model to vote on)
     fewer than AEGIS_OUTFLOW_BREAKER_MAX_PER_HOUR (5) breaker holds in the last hour
 
 and it is applied with TTL ``AEGIS_OUTFLOW_BREAKER_TTL`` (3600 s). The human still gets the card —
@@ -37,7 +37,20 @@ def _flag(name: str, default: str) -> str:
     return os.environ.get(name, default).strip()
 
 
+
+def _concurred(chain: Any) -> bool:
+    """The voter concurred, or no model decided this chain (a deterministic fast-path builder). A model chain with
+    no vote on record is not consent (review round 3 G1-15)."""
+    from .contracts import DETERMINISTIC_BUILDERS
+    md = getattr(chain, "metadata", None) or {}
+    if md.get("vote_concur") is True:
+        return True
+    return md.get("vote_concur") is None and (md.get("deterministic") is True
+                                              or str(getattr(chain, "investigated_by", "")) in DETERMINISTIC_BUILDERS)
+
+
 @dataclass
+
 class OutflowBreaker:
     mode: str = "shadow"            # off | shadow | live
     min_confidence: float = 0.90
@@ -69,7 +82,7 @@ class OutflowBreaker:
             return False, "only a hold on a sender's outbound payments is in scope"
         if chain.verdict != "malicious" or chain.confidence < self.min_confidence:
             return False, f"needs malicious ≥ {self.min_confidence:.2f} (got {chain.verdict} {chain.confidence:.2f})"
-        if md.get("vote_concur") is False:
+        if not _concurred(chain):
             return False, "independent reviewer dissented"
         with self._lock:
             self._expire()

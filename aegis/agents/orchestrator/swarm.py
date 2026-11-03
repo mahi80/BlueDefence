@@ -482,8 +482,16 @@ class SwarmOrchestrator:
                 try:
                     v = vote_best(panel, chain)
                     vote_note = v.reason
-                    if v.final_confidence > chain.confidence:
+                    if v.unanimous and v.final_confidence > chain.confidence:
                         chain.confidence = min(1.0, v.final_confidence)
+                    elif not v.unanimous:
+                        # a dissent on the enriched chain counts as much as one on the first pass: cap confidence,
+                        # no concur on record, every action to a human (review round 3 G1-12)
+                        chain.confidence = min(chain.confidence, v.final_confidence)
+                        chain.metadata["vote_concur"] = False
+                        for a in chain.recommended_actions:
+                            if a.action_type not in ("allow", "monitor", "escalate"):
+                                a.requires_hitl = True
                     chain.metadata["swarm_vote_concur"] = v.concur
                     chain.metadata["swarm_vote_tally"] = f"{v.n_concur}/{v.n_voters}"
                     chain.metadata["swarm_vote_unanimous"] = v.unanimous

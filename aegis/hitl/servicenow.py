@@ -111,13 +111,16 @@ class ServiceNowHITL(BaseHITL):
             raise RuntimeError(f"ServiceNow poll for {p.external_id} returned HTTP {status}")
         rec = data.get("result") or {}
         decision = str(rec.get("u_aegis_decision") or "").strip().lower()
-        who = _display(rec.get("u_aegis_decided_by")) or _display(rec.get("resolved_by")) or _display(rec.get("closed_by")) or _display(rec.get("assigned_to"))
+        # who DECIDED — never the assignee: reassigning a ticket used to count as a second approver (review round 3
+        # G1-7). With no named decider the decision is still honoured, but it cannot be a two-person approval.
+        who = _display(rec.get("u_aegis_decided_by")) or _display(rec.get("resolved_by")) or _display(rec.get("closed_by"))
         if decision in ("approved", "rejected"):
             return decision, who, str(rec.get("close_notes") or "")[:500]
         state = str(_display(rec.get("state")) or "").strip().lower()
         if state in _DECISION_STATES:
             code = str(_display(rec.get("close_code")) or "").strip().lower()
-            if "approv" in code:
+            # exact codes only: `"approv" in code` matched "Not Approved", "Unapproved", "Disapproved"
+            if code in _approve_codes():
                 return "approved", who, ""
             return "rejected", who, (str(rec.get("close_notes") or "") or f"closed with code '{code or 'none'}'")[:500]
         return None
@@ -135,6 +138,13 @@ class ServiceNowHITL(BaseHITL):
             lines.append(f"Containment #{c.get('step')}: {c.get('action')} -> {c.get('target')}: critical {c.get('before')} -> {c.get('after')}")
         status, _ = self._transport("PATCH", self._api(f"/{p.external_id}"), {"work_notes": "\n".join(lines)[:4000]}, self._headers(), self.timeout)
         return status == 200
+
+
+def _approve_codes() -> set[str]:
+    """Close codes that mean "approved" (``AEGIS_SNOW_APPROVE_CODES``, comma-separated; default ``approved``).
+    Anything else on a resolved/closed ticket is a rejection."""
+    raw = os.environ.get("AEGIS_SNOW_APPROVE_CODES", "approved")
+    return {c.strip().lower() for c in raw.split(",") if c.strip()}
 
 
 def _display(v: Any) -> str:

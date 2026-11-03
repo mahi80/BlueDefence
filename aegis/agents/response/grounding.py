@@ -97,28 +97,80 @@ def narrow(action_type: str, target: str) -> tuple[bool, str]:
     return True, ""
 
 
+# Grounding uses typed entity fields only. Every scalar anywhere in the alert used to count, plus every IP a regex
+# found in any string, so a URL query (`?next=http://198.51.100.20`), a User-Agent (`curl 8.8.4.4`), a request
+# body (`"q":"priya.sharma"`), the swarm's IOC extract or the triage model's own `reason` could all ground a
+# target the attacker chose (review round 3 G1-3).
+def _norm_key(k: Any) -> str:
+    return str(k).lower().replace("_", "").replace("-", "").replace(".", "")
+
+
+_IP_KEYS = {_norm_key(k) for k in (
+    "src_ip", "source_ip", "sourceip", "client_ip", "clientip", "ip", "ip_client", "remote_addr", "remote_ip",
+    "sourceipaddress", "caller_ip", "callerip", "from_ip", "src", "c_ip", "srcaddr", "src_addr", "ips", "source_ips",
+    "pool", "pool_ips", "members", "retry_ips", "dst_ip", "dest_ip", "destination_ip", "dstaddr", "resp_h", "orig_h", "id.orig_h",
+    "id.resp_h", "peer_ip", "attacker_ip", "offender_ips")}
+_ENTITY_KEYS = _IP_KEYS | {_norm_key(k) for k in (
+    # principals
+    "user", "user_id", "userid", "username", "user_name", "upn", "userprincipalname", "user_upn", "actor", "actor_id",
+    "principal", "principal_id", "caller_id", "accountname", "account", "account_id", "sender", "sender_account",
+    "from_account", "beneficiary_account", "email", "recipient", "operator", "login", "subject",
+    # hosts and devices
+    "host", "hostname", "device", "device_id", "devicename", "endpoint_id", "aid", "src_host", "computer",
+    "computername", "unit_hostname", "agent_id",
+    # sessions
+    "session_id", "session_token_hash", "sid",
+    # destinations (egress / DNS / TLS)
+    "dst_host", "dest_host", "dst_domain", "domain", "sni", "server_name", "query_name", "qname", "destination",
+    # fingerprints and the UA that qualifies them
+    "ja3", "ja4", "ja3_hash", "ja4_hash", "tls_ja3", "tls_ja4", "user_agent", "useragent", "ua")}
+# free text an attacker writes: never descended into
+_TEXT_KEYS = {_norm_key(k) for k in (
+    "payload", "body", "request_body", "requestbody", "args", "query", "query_string", "querystring", "headers",
+    "raw", "raw_payload", "message", "msg", "description", "uri", "url", "path", "request_uri", "referer", "referrer",
+    "rationale", "reason", "note", "notes", "signal", "observation", "conclusion", "analyzed_data", "summary",
+    "memo", "narration", "remarks", "subject_line", "content", "text", "data")}
+_IPISH = re.compile(r"[0-9a-fA-F:.\[\]/]+")
+
+
 def alert_entities(alert: Any, *, depth: int = 4) -> tuple[set[str], list]:
-    """Lower-cased scalar values of the alert (and IPs found inside them), for grounding checks."""
+    """Lower-cased values of the alert's typed entity fields (source IP, user, host, sender, destination,
+    fingerprint …) at any depth up to ``depth``, never inside free-text fields; IPs come only from IP fields."""
     values: set[str] = set()
     ips: list = []
 
-    def walk(o: Any, d: int) -> None:
-        if d < 0 or len(values) > 5000:
+    def add(key: str, v: Any) -> None:
+        if isinstance(v, bool) or not isinstance(v, (str, int)):
             return
-        if isinstance(o, dict):
-            for v in o.values():
-                walk(v, d - 1)
-        elif isinstance(o, (list, tuple)):
-            for v in o[:200]:
-                walk(v, d - 1)
-        elif isinstance(o, (str, int)) and not isinstance(o, bool):
-            s = str(o).strip()
-            if s and len(s) <= 2048:
-                values.add(s.lower())
-                for m in _IP_RX.findall(s)[:20]:
-                    a = _as_net(m)
+        s = str(v).strip()
+        if not s or len(s) > 512 or len(values) > 5000:
+            return
+        values.add(s.lower())
+        if key in _IP_KEYS:
+            for part in re.split(r"[,\s]+", s)[:20]:          # "a, b" lists (never a regex over free text)
+                if part and _IPISH.fullmatch(part):
+                    a = _as_net(part)
                     if a is not None:
                         ips.append(a)
+
+    def walk(o: Any, d: int, key: str = "") -> None:
+        if d < 0:
+            return
+        if isinstance(o, dict):
+            for k, v in list(o.items())[:500]:
+                nk = _norm_key(k)
+                if nk in _TEXT_KEYS:
+                    continue
+                if isinstance(v, (dict, list, tuple)):
+                    walk(v, d - 1, nk)
+                elif nk in _ENTITY_KEYS:
+                    add(nk, v)
+        elif isinstance(o, (list, tuple)):
+            for v in o[:200]:
+                if isinstance(v, (dict, list, tuple)):
+                    walk(v, d - 1, key)
+                elif key in _ENTITY_KEYS:               # a list under an entity key: "ips": [...]
+                    add(key, v)
     walk(alert, depth)
     return values, ips
 
@@ -152,6 +204,8 @@ def injection_flagged(chain: Any) -> bool:
     if any(getattr(e, "source", "") == "injection_defense" for e in getattr(chain, "evidence", None) or []):
         return True
     md = getattr(chain, "metadata", None) or {}
+    if md.get("injection_detected"):                 # orchestrator chains keep triage metadata at the top level
+        return True
     tm = md.get("_triage_metadata") or md.get("triage_metadata") or {}
     return bool(isinstance(tm, dict) and tm.get("injection_detected"))
 
@@ -169,9 +223,15 @@ def unattended_ok(action: Any, chain: Any, entities: tuple[set[str], list] | Non
     return grounded(str(action.target), entities)
 
 
+#: evidence written from model output or payload text — never a grounding source
+_UNGROUNDING_SOURCES = ("ioc_extract", "llm", "orchestrator", "triage", "analyst_brief", "twin", "investigation.")
+
+
 def chain_entities(chain: Any) -> tuple[set[str], list]:
-    """Fallback entity set from the chain's own evidence when the raw alert is not available."""
-    raw: list[Any] = [getattr(e, "raw_data", None) for e in getattr(chain, "evidence", None) or []]
+    """Entity fields from the chain's deterministic tool evidence (a campaign correlator's pool, a decoded
+    payload's own fields) — not from the model's text, the swarm's IOC extract or the investigation graph."""
+    raw: list[Any] = [getattr(e, "raw_data", None) for e in getattr(chain, "evidence", None) or []
+                      if not any(t in str(getattr(e, "source", "")).lower() for t in _UNGROUNDING_SOURCES)]
     return alert_entities(raw)
 
 
