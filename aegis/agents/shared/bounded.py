@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Generic, TypeVar
 
 K = TypeVar("K")
+_NONE = object()
 V = TypeVar("V")
 
 
@@ -45,13 +46,20 @@ class BoundedDict(OrderedDict, Generic[K, V]):
         if len(self) > self.maxlen:
             self._evict(exclude=key)
 
-    def _evict(self, *, exclude: K) -> None:
-        order = reversed(list(self.keys())) if self._keep_established else iter(list(self.keys()))
-        for k in order:
-            if len(self) <= self.maxlen:
-                return
+    def _victim(self, exclude: K) -> object:
+        # walk lazily from the evicting end: the old version copied every key into a list on each insert past the
+        # cap, O(n) per alert (1.4 ms at 20k keys; review round 3 G7-9). Only pinned keys are ever skipped.
+        for k in (reversed(self) if self._keep_established else iter(self)):
             if k == exclude or (self._pinned is not None and self._pinned(k)):
                 continue
+            return k
+        return _NONE
+
+    def _evict(self, *, exclude: K) -> None:
+        while len(self) > self.maxlen:
+            k = self._victim(exclude)
+            if k is _NONE:
+                break
             v = super().pop(k)
             self.evicted += 1
             if self._on_evict is not None:

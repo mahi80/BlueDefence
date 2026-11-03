@@ -17,12 +17,17 @@ class ToolResult:
 def header_auth_check(headers: dict | None) -> ToolResult:
     if not headers:
         return ToolResult(name="header_auth", data={"verdict": "no_headers"}, weight="low")
-    spf = (headers.get("spf") or headers.get("Received-SPF") or "").lower()
-    dkim = (headers.get("dkim") or headers.get("DKIM-Signature") or "").lower()
-    dmarc = (headers.get("dmarc") or headers.get("Authentication-Results") or "").lower()
+    spf = str(headers.get("spf") or headers.get("Received-SPF") or "").lower()
+    auth_results = str(headers.get("Authentication-Results") or "").lower()
+    dmarc = str(headers.get("dmarc") or auth_results).lower()
+    # A DKIM-Signature header is something the SENDER writes; only the receiving gateway's verdict (a `dkim`
+    # field from the mail pipeline, or dkim=… in Authentication-Results) says whether it verified. Any non-empty
+    # signature header used to count as a pass (review round 3 G7-15).
+    m = re.search(r"\bdkim=(\w+)", auth_results)
+    dkim = str(headers.get("dkim") or (m.group(1) if m else "")).lower()
 
     spf_fail = "fail" in spf or "softfail" in spf
-    dkim_fail = "fail" in dkim or (dkim == "")
+    dkim_fail = dkim not in ("pass",)
     dmarc_fail = "fail" in dmarc or "dmarc=fail" in dmarc
     fails = sum([spf_fail, dkim_fail, dmarc_fail])
     if fails >= 2:
@@ -139,8 +144,14 @@ def lookalike_domain_check(from_address: str | None,
 _DANGEROUS_EXTENSIONS = {
     ".exe", ".scr", ".bat", ".cmd", ".com", ".vbs", ".js", ".wsf",
     ".jar", ".lnk", ".iso", ".img", ".chm", ".hta",
+    # the rest of what loaders ship as (review round 3 G7-15)
+    ".ps1", ".psm1", ".msi", ".msp", ".vbe", ".jse", ".wsh", ".wsc", ".pif", ".scf", ".reg", ".dll", ".cpl",
+    ".msc", ".appx", ".msix", ".appinstaller", ".application", ".one", ".xll", ".vhd", ".vhdx", ".url",
+    ".library-ms", ".settingcontent-ms", ".gadget", ".html", ".htm", ".shtml", ".svg", ".xht", ".xhtml",
 }
-_OFFICE_MACRO_EXTENSIONS = {".docm", ".xlsm", ".pptm"}
+_OFFICE_MACRO_EXTENSIONS = {".docm", ".xlsm", ".pptm", ".dotm", ".xltm", ".potm", ".ppsm", ".xlam", ".ppam", ".xlsb", ".sldm"}
+_ARCHIVE_EXTENSIONS = (".zip", ".rar", ".7z", ".cab", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".ace", ".arj", ".lzh", ".z")
+_HIDE_CHARS = dict.fromkeys(map(ord, "\u202e\u202d\u202a\u202b\u202c\u2066\u2067\u2068\u2069\u200b\u200c\u200d\ufeff"))
 
 
 def attachment_risk_check(attachments: list[dict] | None) -> ToolResult:
@@ -150,7 +161,8 @@ def attachment_risk_check(attachments: list[dict] | None) -> ToolResult:
     macro = []
     archive = []
     for a in attachments:
-        name = (a.get("filename") or a.get("name") or "").lower()
+        # "invoice<U+202E>fdp.exe" displays as invoice.pdf; Windows also drops trailing dots and spaces ("x.exe. ")
+        name = str(a.get("filename") or a.get("name") or "").translate(_HIDE_CHARS).lower().rstrip(". \t")
         for ext in _DANGEROUS_EXTENSIONS:
             if name.endswith(ext):
                 dangerous.append(name)
@@ -159,7 +171,7 @@ def attachment_risk_check(attachments: list[dict] | None) -> ToolResult:
             if name.endswith(ext):
                 macro.append(name)
                 break
-        if name.endswith((".zip", ".rar", ".7z")):
+        if name.endswith(_ARCHIVE_EXTENSIONS):
             archive.append(name)
     if dangerous:
         weight = "high"

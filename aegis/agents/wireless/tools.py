@@ -25,10 +25,13 @@ _AUTHORIZED_AP_OUIS = {"00-1A-1E", "B4-99-BA", "F4-EA-67"}   # Aruba, Cisco, Mer
 def rogue_ap_check(ap_record: dict | None) -> ToolResult:
     if not ap_record:
         return ToolResult(name="rogue_ap", data={"verdict": "no_data"}, weight="low")
-    bssid = (ap_record.get("bssid") or "").upper()
+    bssid = str(ap_record.get("bssid") or "").upper()
     ssid = ap_record.get("ssid") or ""
     is_authorized_ssid = ssid in _AUTHORIZED_SSIDS
-    oui = bssid[:8] if len(bssid) >= 8 else ""
+    # controllers write BSSIDs as b4:99:ba:…, B4-99-BA-…, b499.ba… or b499ba…; the table uses dashes. Comparing
+    # the first 8 characters raw flagged every colon-formatted authorised AP as rogue (review round 3 G7-12).
+    hexes = "".join(c for c in bssid if c in "0123456789ABCDEF")
+    oui = "-".join(hexes[i:i + 2] for i in (0, 2, 4)) if len(hexes) >= 6 else ""
     is_authorized_oui = oui in _AUTHORIZED_AP_OUIS
     rogue_announcing_authorized_ssid = is_authorized_ssid and not is_authorized_oui
     weight = "high" if rogue_announcing_authorized_ssid else "low"

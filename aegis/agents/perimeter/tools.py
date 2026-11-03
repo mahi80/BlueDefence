@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import base64
 import collections
+import html
 import ipaddress
 import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass
-from typing import Optional
 
 from ..shared.bounded import BoundedDict
 
@@ -56,6 +57,10 @@ _XXE_PRIMITIVES = ("<!doctype", "<!entity", "<!element", 'system "file:', "syste
                    "file:///", "expect://", "xinclude", "<!entity %")
 
 
+_COMMENT_RX = re.compile(r"/\*(?:[^*]|\*(?!/)){0,4000}\*/")
+_UNION_RX = re.compile(r"union(?:\s|/\*\*/|\+)+(?:all|distinct)(?:\s|/\*\*/|\+)+select")
+
+
 def decode_payload(raw: str) -> ToolResult:
     """Decode URL-encoding and base64, then scan for known exploit primitives.
 
@@ -68,11 +73,21 @@ def decode_payload(raw: str) -> ToolResult:
     """
     layers = [raw]
     try:
-        decoded_url = urllib.parse.unquote_plus(raw)
-        if decoded_url != raw:
-            layers.append(decoded_url)
+        # double (and triple) encoding: %2527 → %27 → '  (only one round was decoded; review round 3 G7-10)
+        cur = raw
+        for _ in range(3):
+            nxt = urllib.parse.unquote_plus(cur)
+            if nxt == cur:
+                break
+            layers.append(nxt)
+            cur = nxt
     except Exception:  # noqa: BLE001, S110 — decode probing: failure is the common case, not an error
         pass
+    # HTML entities (&#39; &lt;script) and full-width / compatibility forms (＇ＯＲ　１＝１) fold to ASCII
+    for layer in list(layers):
+        for alt in (html.unescape(layer), unicodedata.normalize("NFKC", layer)):
+            if alt != layer and alt not in layers:
+                layers.append(alt)
     # Try base64 on substrings that look like base64
     for token in re.findall(r"[A-Za-z0-9+/=]{16,}", raw):
         try:
@@ -83,8 +98,9 @@ def decode_payload(raw: str) -> ToolResult:
             continue
     # Comment-stripping evasion (UNI/**/ON SELECT -> UNION SELECT)
     extra_layers = []
-    for layer in list(layers):
-        no_comments = re.sub(r"/\*.*?\*/", "", layer, flags=re.DOTALL)
+    for layer in layers:
+        # bounded: `.*?` with DOTALL rescanned to the end from every unclosed /* — quadratic on a padded body
+        no_comments = _COMMENT_RX.sub("", layer)
         if no_comments != layer:
             extra_layers.append(no_comments)
         # Whitespace-collapsing evasion (' OR  1 = 1 -> ' OR 1=1)
@@ -94,6 +110,7 @@ def decode_payload(raw: str) -> ToolResult:
     layers.extend(extra_layers)
 
     flat = " ".join(layers).lower()
+    flat = _UNION_RX.sub("union select", flat)        # UNION ALL / DISTINCT SELECT is UNION SELECT
     primitives_found = {
         "sqli": [p for p in _SQLI_PRIMITIVES if p in flat],
         "xss": [p for p in _XSS_PRIMITIVES if p in flat],
@@ -180,7 +197,7 @@ _USER_BASELINES = {
 }
 
 
-def user_baseline(user_id: Optional[str]) -> ToolResult:
+def user_baseline(user_id: str | None) -> ToolResult:
     if not user_id or user_id not in _USER_BASELINES:
         return ToolResult(name="user_baseline", data={"user_id": user_id, "baseline": None}, weight="low")
     return ToolResult(
@@ -345,7 +362,7 @@ def mass_assignment(alert: dict, raw_payload: str = "") -> ToolResult:
         try:
             params = {k: (v[0] if isinstance(v, list) else v)
                       for k, v in urllib.parse.parse_qs(raw_payload, keep_blank_values=True).items()}
-        except Exception:  # noqa: BLE001, S110 — not a form body; nothing to parse
+        except Exception:  # noqa: BLE001 — not a form body; nothing to parse
             params = {}
     posted = {str(k).lower() for k in params}
     form_fields = alert.get("form_fields")
@@ -405,7 +422,7 @@ def host_header_anomaly(alert: dict) -> ToolResult:
 #: backend without ever touching the query string the simpler scanners watch.
 _INJECTABLE_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-real-ip", "true-client-ip",
                        "referer", "referrer", "forwarded", "x-original-url", "x-rewrite-url",
-                       "x-api-version", "x-request-id", "cookie")
+                       "x-api-version", "x-request-id", "cookie", "user-agent")
 _CRLF_MARKERS = ("\r", "\n", "%0d", "%0a", "\\r", "\\n")
 
 
@@ -414,7 +431,9 @@ def header_injection(alert: dict) -> ToolResult:
     header value, or SQLi / XSS / traversal / RCE primitives in a header the app tends to trust
     (XFF, Referer, Cookie, …). Covers the header- and cookie-borne classes the query-only scan
     misses — e.g. SQLi read from a session cookie the app concatenates into a lookup."""
-    req = alert.get("request_headers") if isinstance(alert.get("request_headers"), dict) else {}
+    req = dict(alert.get("request_headers")) if isinstance(alert.get("request_headers"), dict) else {}
+    if alert.get("user_agent") and not any(str(k).lower() == "user-agent" for k in req):
+        req["User-Agent"] = alert["user_agent"]          # the UA is a header too; it was never scanned (G7-10)
     if not req:
         return ToolResult(name="header_injection", data={"applicable": False}, weight="low")
     hits: list[dict] = []
@@ -422,7 +441,7 @@ def header_injection(alert: dict) -> ToolResult:
     for name, value in req.items():
         lname = str(name).lower()
         val = str(value)
-        if any(m in val for m in _CRLF_MARKERS):
+        if any(m in val for m in _CRLF_MARKERS) or any(m in val.lower() for m in ("%0d", "%0a")):   # %0D%0A too
             hits.append({"header": lname, "kind": "crlf"})
         if lname in _INJECTABLE_HEADERS:
             low = urllib.parse.unquote_plus(val).lower()
@@ -480,10 +499,10 @@ _RECON_MAX_IPS = int(os.environ.get("AEGIS_RECON_MAX_IPS", "20000"))
 _recon_lock = threading.Lock()
 # least-recently-written source evicted past the cap: O(1) per call (the old cleanup scanned the whole map
 # under the global lock on every call once it passed the cap)
-_recon_seen: "dict[str, collections.deque]" = BoundedDict(_RECON_MAX_IPS)
+_recon_seen: dict[str, collections.deque] = BoundedDict(_RECON_MAX_IPS)
 
 
-def recon_sweep(source_ip: str, alert: dict, *, now: Optional[float] = None) -> ToolResult:
+def recon_sweep(source_ip: str, alert: dict, *, now: float | None = None) -> ToolResult:
     """Directory / endpoint sweep: one source touching many distinct paths in a short window —
     the shape of a scanner enumerating the app (RECON_SWEEP). Stateful per source IP, in a
     sliding window; thresholds via AEGIS_RECON_PATHS_HIGH / _MED / _WINDOW_SEC."""
@@ -525,10 +544,10 @@ _IDENUM_WINDOW_SEC = int(os.environ.get("AEGIS_IDENUM_WINDOW_SEC", "120"))
 _IDENUM_HIGH = int(os.environ.get("AEGIS_IDENUM_HIGH", "15"))
 _IDENUM_MED = int(os.environ.get("AEGIS_IDENUM_MED", "6"))
 _idenum_lock = threading.Lock()
-_idenum_seen: "dict[tuple, collections.deque]" = BoundedDict(_RECON_MAX_IPS)
+_idenum_seen: dict[tuple, collections.deque] = BoundedDict(_RECON_MAX_IPS)
 
 
-def _id_params_from(alert: dict, raw_payload: str) -> "list[tuple[str, str]]":
+def _id_params_from(alert: dict, raw_payload: str) -> list[tuple[str, str]]:
     pairs: list = []
     q = urllib.parse.urlsplit(str(alert.get("url") or "")).query
     if q:
@@ -546,7 +565,7 @@ def _id_params_from(alert: dict, raw_payload: str) -> "list[tuple[str, str]]":
 
 
 def id_enumeration(source_ip: str, alert: dict, raw_payload: str = "", *,
-                   now: Optional[float] = None) -> ToolResult:
+                   now: float | None = None) -> ToolResult:
     """Object-id enumeration / IDOR probing: one actor requesting many DISTINCT values of an
     object-id parameter on one endpoint in a window — walking ``/account?id=1,2,3…``. Keyed by
     the shim-supplied ``principal`` when present (so authenticated sessions are told apart even
@@ -598,8 +617,11 @@ _SECRET_PATH_SIGNS = (
     "id_rsa", ".pem", ".ppk", ".p12", ".pfx", ".keystore", ".jks",
     ".aws/credentials", "/.aws/", ".npmrc", ".dockercfg", ".docker/config.json",
     ".kube/config", ".htpasswd", ".netrc", ".pgpass", "secrets.yml", "secrets.yaml", "credentials.json",
-    "/export/", "/backup/", "/backups/",
 )
+#: an /export/ or /backup/ directory is a leak only when what is fetched from it is a dump or an archive —
+#: "/statements/export/pdf" is a customer downloading a statement (review round 3 G7-10)
+_DUMP_DIRS = ("/export/", "/backup/", "/backups/")
+_DUMP_EXT = (".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".sql", ".bak", ".dump", ".db", ".sqlite", ".bkp", ".mdb")
 #: Backup / editor-swap suffixes that turn an otherwise-servable file into a source/secret leak
 #: (``index.php.bak``, ``config.php~``, ``database.sql``, ``.env.swp``).
 _SECRET_SUFFIXES = (".bak", ".old", ".save", ".orig", ".swp", ".swo", ".tmp", "~",
@@ -622,7 +644,7 @@ def _decoded_path(alert: dict) -> str:
     return path.lower()
 
 
-def _status_of(alert: dict) -> Optional[int]:
+def _status_of(alert: dict) -> int | None:
     for k in ("status", "status_code", "response_code", "responseCode"):
         v = alert.get(k)
         if v is None:
@@ -645,6 +667,8 @@ def secret_file_probe(alert: dict) -> ToolResult:
     if not path:
         return ToolResult(name="secret_file_probe", data={"applicable": False}, weight="low")
     hit = next((s for s in _SECRET_PATH_SIGNS if s in path), "")
+    if not hit and any(d in path for d in _DUMP_DIRS) and path.endswith(_DUMP_EXT):
+        hit = next(d for d in _DUMP_DIRS if d in path)
     if not hit:
         hit = next((f"*{suf}" for suf in _SECRET_SUFFIXES if path.endswith(suf)), "")
     if not hit:
@@ -677,13 +701,13 @@ def secret_file_probe(alert: dict) -> ToolResult:
 _SECRET_BODY_PATTERNS = (
     ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")),
     ("aws_access_key_id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
-    ("aws_secret", re.compile(r"aws_secret_access_key\s*[=:]", re.I)),
+    ("aws_secret", re.compile(r"aws_secret_access_key\s*[=:]", re.IGNORECASE)),
     ("gcp_sa_key", re.compile(r'"type"\s*:\s*"service_account"')),
     ("slack_token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}")),
     ("github_pat", re.compile(r"\bghp_[0-9A-Za-z]{30,}\b")),
     ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
-    ("bearer_token", re.compile(r"authorization\s*:\s*bearer\s+[0-9A-Za-z._\-]{16,}", re.I)),
-    ("db_dsn", re.compile(r"\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:@/]+:[^\s:@/]+@", re.I)),
+    ("bearer_token", re.compile(r"authorization\s*:\s*bearer\s+[0-9A-Za-z._\-]{16,}", re.IGNORECASE)),
+    ("db_dsn", re.compile(r"\b(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:@/]+:[^\s:@/]+@", re.IGNORECASE)),
     ("env_secret_assign", re.compile(
         r"(?im)^\s*(?:DB_PASSWORD|DB_USERNAME|DATABASE_URL|APP_KEY|SECRET_KEY|JWT_SECRET|"
         r"API_KEY|API_SECRET|PRIVATE_KEY|ENCRYPTION_KEY|STRIPE_SECRET|TWILIO_AUTH_TOKEN)\s*=\s*\S+")),
@@ -724,8 +748,8 @@ def secret_exfil_probe(alert: dict) -> ToolResult:
 
 # ---- Helpers -----------------------------------------------------------
 
-def run_all_tools(raw_payload: str, source_ip: str, user_id: Optional[str],
-                  alert: Optional[dict] = None) -> list[ToolResult]:
+def run_all_tools(raw_payload: str, source_ip: str, user_id: str | None,
+                  alert: dict | None = None) -> list[ToolResult]:
     alert = alert or {}
     return [
         decode_payload(raw_payload),

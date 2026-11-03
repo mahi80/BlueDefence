@@ -164,13 +164,39 @@ class _OutflowBook:
 BOOK = _OutflowBook()
 
 
+def split_floor_inr() -> float:
+    """Transfers from this size up go into the ledger even below the high-value line (default: 1/20 of it)."""
+    return _num(os.environ.get("AEGIS_OUTFLOW_SPLIT_FLOOR_INR")) or high_value_inr() / 20
+
+
+def _txn_id(alert: dict) -> str:
+    """The transfer's id; without one, a digest of what identifies it. Every id-less transfer used to be
+    "unknown", so the ledger counted the first and dropped the rest as duplicates (review round 3 G7-16)."""
+    tid = alert.get("id") or alert.get("txn_id") or alert.get("transaction_id")
+    if tid:
+        return str(tid)
+    import hashlib
+    key = "|".join(str(alert.get(k, "")) for k in ("user_id", "sender_account", "beneficiary_account", "beneficiary",
+                                                      "amount_inr", "timestamp", "event_time", "utr", "reference"))
+    return "anon-" + hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 def is_treasury_outflow(alert: dict) -> bool:
+    """A high-value transfer to a new beneficiary — or a run of smaller ones that adds up to one. Only transfers
+    at or above the line used to enter the ledger, so a drain split into 20 x INR 9 lakh never reached it
+    (review round 3 G7-16). Smaller transfers (from ``split_floor_inr``) are recorded, and the alert fires once
+    the window's total to new beneficiaries crosses the line."""
     if not isinstance(alert, dict):
         return False
     amount = _num(alert.get("amount_inr"))
-    if amount is None or amount < high_value_inr():
+    if amount is None or amount < split_floor_inr():
         return False
-    return is_new_beneficiary(alert)
+    if not is_new_beneficiary(alert):
+        return False
+    if amount >= high_value_inr():
+        return True
+    _n, total = BOOK.add(_sender(alert), _ts(alert), amount, _txn_id(alert), _window_s())
+    return total >= high_value_inr()
 
 
 def _crore(inr: float) -> str:
@@ -179,10 +205,10 @@ def _crore(inr: float) -> str:
 
 def treasury_outflow_chain(alert: dict) -> EvidenceChain:
     amount = _num(alert.get("amount_inr")) or 0.0
-    sender, txn = _sender(alert), str(alert.get("id", "unknown"))
+    sender, txn = _sender(alert), _txn_id(alert)
     treasury = is_treasury_sender(alert)
     count, total = BOOK.add(sender, _ts(alert), amount, txn, _window_s())
-    burst = count >= _burst_n()
+    burst = count >= _burst_n() and total >= high_value_inr()
     s_geo, b_geo = str(alert.get("sender_geo") or ""), str(alert.get("beneficiary_geo") or "")
     offshore = bool(s_geo and b_geo and s_geo != b_geo)
     window_min = _window_s() / 60
@@ -197,6 +223,8 @@ def treasury_outflow_chain(alert: dict) -> EvidenceChain:
     else:
         verdict, conf = "suspicious", 0.75
         why = f"{_crore(amount)} to a new beneficiary"
+    if not burst and amount < high_value_inr():
+        why += f" — one of {count} transfers to new beneficiaries in {window_min:.0f} min totalling {_crore(total)} (split below the high-value line)"
 
     chain = EvidenceChain(alert_id=txn, investigated_by="treasury", verdict=verdict, confidence=conf)
     chain.evidence.append(EvidenceItem(
@@ -241,5 +269,12 @@ def treasury_outflow_chain(alert: dict) -> EvidenceChain:
     return chain.finalize()
 
 
-__all__ = ["BOOK", "high_value_inr", "is_new_beneficiary", "is_treasury_outflow", "is_treasury_sender",
-           "treasury_outflow_chain"]
+__all__ = [
+    "BOOK",
+    "high_value_inr",
+    "is_new_beneficiary",
+    "is_treasury_outflow",
+    "is_treasury_sender",
+    "split_floor_inr",
+    "treasury_outflow_chain",
+]

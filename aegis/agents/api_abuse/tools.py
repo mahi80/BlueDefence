@@ -168,6 +168,25 @@ _RISKY_QUERY_PATTERNS = [
 ]
 
 
+def _is_app_host(ip: str | None) -> bool:
+    import ipaddress
+    import os
+    try:
+        addr = ipaddress.ip_address(str(ip or "").strip())
+    except ValueError:
+        return False
+    for tok in os.environ.get("AEGIS_DB_APP_HOSTS", "").replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            if addr in ipaddress.ip_network(tok, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def db_direct_query_check(client_app: str | None,
                           query: str | None,
                           rows_returned: int | None,
@@ -178,7 +197,11 @@ def db_direct_query_check(client_app: str | None,
     """
     if not query:
         return ToolResult(name="db_direct_query", data={"verdict": "no_query"}, weight="low")
-    is_app_client = bool(client_app and client_app.startswith(("app:", "service:")))
+    # `application_name` is whatever the CLIENT sends: `psql "application_name=app:ledger"` claimed to be the
+    # application and got the milder weight (review round 3 G7-13). A claimed app name counts only from an
+    # address listed as an application host (AEGIS_DB_APP_HOSTS: IPs / CIDRs).
+    claims_app = bool(client_app and client_app.startswith(("app:", "service:")))
+    is_app_client = claims_app and _is_app_host(source_ip)
     is_dba_client = bool(client_app and any(
         c in (client_app or "").lower()
         for c in ("psql", "mysql cli", "dbeaver", "ssms", "pgadmin", "mongo shell")
@@ -198,6 +221,7 @@ def db_direct_query_check(client_app: str | None,
     return ToolResult(name="db_direct_query", data={
         "client_app": client_app,
         "is_app_client": is_app_client,
+        "app_name_unverified": claims_app and not is_app_client,
         "is_dba_client": is_dba_client,
         "risky_patterns": risky_pattern_hits,
         "rows_returned": rows_returned,
