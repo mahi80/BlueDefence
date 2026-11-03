@@ -122,7 +122,9 @@ vulnerable target, Logic App playbooks — is `deploy/sandbox/azure/` (Terraform
 by default (`external`)**: its own Next.js console (`soc-console/`) talks to this host's API — chains
 from the local audit log, approvals through the local queue — with no ACP dashboard and no `acp-sdk`.
 A host that sets `ACP_DASHBOARD_URL` without naming an edition keeps `full`, so integrated installs are
-unchanged.
+unchanged. The default is chosen from `ACP_DASHBOARD_URL` alone: a host with `ACP_GOVERN=1` or the
+`acp` source in `AEGIS_SOURCES` but no dashboard URL now defaults to `external` and refuses to start
+with an `EditionError` (set `AEGIS_EDITION` and `ACP_DASHBOARD_URL` explicitly).
 
 | | `external` (default) | `soc` | `full` |
 |---|---|---|---|
@@ -274,6 +276,18 @@ vendor (`AEGIS_APPROVED_TTL_SEC`, default `0` = until released), and an approved
 challenge on an IP lasts a day (`AEGIS_APPROVED_BLOCK_TTL_SEC`, default `86400`) so WAF rule sets do
 not grow forever. A later automated re-apply of the same action only ever extends it. The
 HITL-timeout path is not a person and keeps the connector TTL.
+Re-approving after a release at the vendor does not re-apply the action yet: the permanent receipt
+is still active in AEGIS, so the approval is recorded as a renewal with no vendor call (review
+2026-11-03, R4). Until that is fixed, re-apply at the vendor console.
+
+**HITL timeout** (`agents/response/hitl_timeout.py`, `AEGIS_HITL_TIMEOUT=off|shadow|live`,
+default `off`; window `AEGIS_HITL_TIMEOUT_SEC`, default 120 s; floor `AEGIS_HITL_TIMEOUT_MIN_CONF`, default 0.6). When an approval waits past its window with no
+decision, a *reversible* action (block, block_egress, throttle, challenge) runs on timeout only if
+the reviewer vote explicitly concurred (`vote_concur` is `True`; a chain with no vote — triage
+`respond`, deterministic detectors — is held) and confidence ≥ the floor. Everything else is held
+for a human. A transport that cannot be read never falls through to the timeout path, except that
+ServiceNow and dashboard polls currently report a 401 / 5xx as "no decision yet" (review R8). The
+timeout path has no target-width check yet (review W3): keep it `off` or `shadow` until it does.
 
 **Never-block guardrail** (`agents/shared/netguard.py`). No connectivity-severing action
 (`block`, `isolate`, `throttle`, `quarantine`, `block_egress`) reaches a connector when the target
@@ -547,9 +561,16 @@ work notes). The verdict is asserted unchanged everywhere in this tier.
 TTL and rollback; shadow mode (`AEGIS_ENFORCEMENT_MODE=shadow`, default) records what *would*
 have happened as a receipt. Auto-safe actions run immediately; `block` / `isolate` / `lock` /
 `revoke` / `rotate` wait for a human (except a narrow, short-TTL block under tiered autonomy,
-above), and on `AEGIS_PROTECTED_TARGETS` need two. A per-minute
-blast-radius cap bounds a compromised agent. `python -m aegis.shadow report` compares receipts
-with what analysts decided and says which actions are ready to flip live.
+above), and on `AEGIS_PROTECTED_TARGETS` need two. Through the approval queue the second approval
+cannot be given yet: the first one settles the card as `failed` (review 2026-11-03, R2), so
+protected actions currently need the offline path. `AEGIS_PROTECTED_TARGETS` matches a CIDR only
+when the target is a bare IP; a `/32` spelling, a `host:` prefix or an EDR device id is not matched
+yet (review W4). A rolling cap of `AEGIS_HIGH_IMPACT_MAX` (default 10) high-impact actions per
+`AEGIS_HIGH_IMPACT_WINDOW_SEC` (default 60) bounds a compromised agent; an approval over the cap
+settles `failed`, not approved. `python -m aegis.shadow report` compares receipts with what
+analysts decided and says which actions are ready to flip live. With `--dashboard` it reads the
+decisions from ACP; standalone (`--receipts` / `--audit`) it has no source of analyst decisions
+yet, so every group stays `unreviewed` (review C8).
 
 ---
 
@@ -580,7 +601,9 @@ frontier baseline's 32/37.
   Indicators the LLM extracts from an advisory are untrusted: confidence ≤
   `AEGIS_TI_LLM_MAX_CONFIDENCE` (0.6), expiry `AEGIS_TI_LLM_TTL_SEC` (3 days), tagged
   `llm-extracted`, kept as lookup evidence, and pushed into the matchers only with
-  `AEGIS_TI_MERGE_LLM_IOCS=1`.
+  `AEGIS_TI_MERGE_LLM_IOCS=1`. Known issue (review 2026-11-03, R5): an LLM copy of an indicator a
+  feed already supplied adds the `llm-extracted` tag to the feed entry, which takes it out of the
+  matchers until the feed refreshes it.
 - **CISA KEV + NVD 2.0 + EPSS** (`cve_feeds.py`, `AEGIS_CVE_INTEL=1`) — cached, incremental,
   rate-limited (`NVD_API_KEY` raises the limit); KEV entries become CVE IOCs tagged with vendor,
   product, due date and ransomware use; NVD CPE ranges give `vuln_discovery.dependency_scan`
@@ -778,14 +801,15 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 | Index | `AEGIS_INDEX_URL` (derived, rebuildable SQL index of the audit chain for the console and reports — `duckdb:///…` default, `sqlite:///…`, `postgresql+psycopg2://…`, `mssql+pyodbc://…`; one SQLAlchemy ORM, pick by URL), `AEGIS_INDEX=0` to disable; `python -m aegis.store reindex | stats` |
 | Push / stream | `AEGIS_INGEST_HTTP`, `AEGIS_INGEST_BIND`, `AEGIS_INGEST_TOKEN`, `AEGIS_INGEST_READ_TOKEN` (optional separate token for `GET /ingest/verdicts|blocklist|license` and the console reads), `AEGIS_CONSOLE_TOKEN` (the analyst console's key: reads `/api/soc/*` + `/api/approvals` and may POST decisions — see `aegis/ingest/console_api.py`), `AEGIS_INGEST_MAX_MB`, `AEGIS_INGEST_MAX_INFLATE_MB` (cap on what a gzip body may expand to, default 64), `AEGIS_STREAM_CAPACITY`, `AEGIS_EVENTHUB_CONN`, `AEGIS_EVENTHUB_NAME`, `AEGIS_EVENTHUB_GROUP`, `AEGIS_EVENTHUB_START`, `AEGIS_EVENTHUB_CHECKPOINT` |
 | Investigation | `AEGIS_CAMPAIGN_CONTEXT`, `AEGIS_CAMPAIGN_WINDOW_MIN`, `AEGIS_SWARM`, `AEGIS_SWARM_MAX_WORKERS`, `AEGIS_SWARM_MAX_SECONDS`, `AEGIS_INVESTIGATE`, `AEGIS_INVESTIGATE_MAX_SECONDS`, `AEGIS_INVESTIGATE_WORKERS`, `AEGIS_TWIN`, `AEGIS_TWIN_PERSONAS`, `AEGIS_TWIN_ROUNDS`, `AEGIS_MOCK_SPREAD` |
-| Approvals | `AEGIS_HITL_TRANSPORT`, `AEGIS_HITL_DIR`, `AEGIS_HITL_STATE`, `AEGIS_SLACK_WEBHOOK`, `AEGIS_SERVICENOW_*` |
-| Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_PROTECTED_TARGETS`, `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH` |
+| Approvals | `AEGIS_HITL_TRANSPORT`, `AEGIS_HITL_DIR`, `AEGIS_HITL_STATE`, `AEGIS_HITL_TIMEOUT`, `AEGIS_HITL_TIMEOUT_SEC`, `AEGIS_HITL_TIMEOUT_MIN_CONF`, `AEGIS_SLACK_WEBHOOK`, `AEGIS_SERVICENOW_*` |
+| Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_PROTECTED_TARGETS`, `AEGIS_NEVER_BLOCK`, `AEGIS_NEVER_BLOCK_HOSTS`, `AEGIS_HIGH_IMPACT_MAX`, `AEGIS_HIGH_IMPACT_WINDOW_SEC`, `AEGIS_APPROVED_TTL_SEC`, `AEGIS_APPROVED_BLOCK_TTL_SEC`, `AEGIS_OUTFLOW_BREAKER`, `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH` |
 | Agentic attackers | `AEGIS_AUTO_BLOCK` (`off` · `shadow` · `live`), `AEGIS_AUTO_BLOCK_MIN_CONF`, `AEGIS_AUTO_BLOCK_TTL`, `AEGIS_AUTO_BLOCK_MAX_PER_HOUR`, `AEGIS_FP_ALLOW`, `AEGIS_ADAPTIVE_MIN_RETRIES`, `AEGIS_ADAPTIVE_MAX_RETRY_S`, `AEGIS_AUTH_BURST_MIN`, `AEGIS_AWS_WAF_RULE_GROUP`, `AEGIS_JA4_DB`, `AEGIS_TLS_SHARED_UAS`, `AEGIS_TLS_LIBRARY_IPS` |
 | Network sensor (NDR) | `NDR_EVENT_FILE`, `AEGIS_INTERNAL_NETS`, `AEGIS_TLS_IOC_FILE`, `AEGIS_AI_REGISTER`, `AEGIS_SHADOW_AI_REGISTER`, `AEGIS_AI_PROVIDERS_EXTRA`, `AEGIS_NDR_RARE_MAX_SRCS`, `AEGIS_NDR_BEACON_MIN_CONN`, `AEGIS_NDR_BEACON_MIN_SPAN_S`, `AEGIS_NDR_BEACON_MAX_JITTER`, `AEGIS_NDR_EXFIL_MIN_MB`, `AEGIS_NDR_EXFIL_WINDOW_S`, `AEGIS_NDR_EXFIL_RATIO`, `AEGIS_NDR_AI_UPLOAD_MB`, `AEGIS_NDR_ALLOW_DOMAINS`, `AEGIS_NDR_ALLOW_HOSTS` |
 | Licence | `AEGIS_LICENSE`, `AEGIS_LICENSE_ENFORCE`, `AEGIS_INSTALL_ID`, `AEGIS_INSTALL_SALT`, `AEGIS_LICENSE_PUBKEYS`, `AEGIS_LICENSE_OVERLIMIT_DAYS` — see the root README § Licensing |
 | Network assurance | `NETOPS_EVENT_FILE`, `AEGIS_NET_FLAP_N`, `AEGIS_NET_FLAP_WINDOW_S`, `AEGIS_NET_CORR_WINDOW_S`, `AEGIS_NET_ERR_PER_MIN`, `AEGIS_NET_UTIL_PCT`, `AEGIS_NET_UTIL_SAMPLES`, `AEGIS_NET_SILENT_S`, `AEGIS_NET_BAD_PUSH_S`, `AEGIS_NET_GOLDEN`, `AEGIS_NET_GOLDEN_FIRST_SEEN`, `AEGIS_NET_INVENTORY` |
 | BOLA | `AEGIS_OWNERSHIP_FILE`, `AEGIS_OWNERSHIP_URL`, `AEGIS_OWNERSHIP_TOKEN`, `AEGIS_BOLA_WINDOW_S`, `AEGIS_BOLA_CROSS_MIN`, `AEGIS_BOLA_ATTEMPT_MIN`, `AEGIS_BOLA_DISTINCT_MIN`, `AEGIS_BOLA_EXEMPT_PRINCIPALS`, `AEGIS_APIGW_PRINCIPAL_FIELD`, `APIGW_EVENT_FILE`, `AEGIS_EVENTHUB_SOURCE` |
-| Intel | `AEGIS_CVE_INTEL`, `NVD_API_KEY`, `AEGIS_TI_CACHE`, `AEGIS_INTEL_MOCK`, `AEGIS_STACKS` |
+| Intel | `AEGIS_CVE_INTEL`, `NVD_API_KEY`, `AEGIS_TI_CACHE`, `AEGIS_INTEL_MOCK`, `AEGIS_STACKS`, `AEGIS_INTERNAL_DOMAINS`, `AEGIS_TI_LLM_MAX_CONFIDENCE`, `AEGIS_TI_LLM_TTL_SEC`, `AEGIS_TI_MERGE_LLM_IOCS` |
+| Edge shim | `AEGIS_EDGE_TRUST_DEMO_SRC`, `AEGIS_EDGE_MAX_PUSHED`, `AEGIS_EDGE_MAX_CLIENTS` |
 | ACP | `ACP_DASHBOARD_URL`, `ACP_API_KEY`, `ACP_GOVERN`, `ACP_AGENT_CODE`, `ACP_BU`, `ACP_RATE_LIMIT`, `AEGIS_PERSIST`, `AEGIS_RULE_FEED`, `AEGIS_ACP_MIN_SEVERITY`, `AEGIS_ACP_KINDS` |
 | Data | `AEGIS_DATASET_CAPTURE`, `AEGIS_DATASET_SALT`, `AEGIS_AUDIT_PATH`, `AEGIS_LOG_LEVEL` |
 
@@ -823,6 +847,22 @@ Roadmap and decision log: `docs/plans/aegis-production-roadmap.md`.
 ---
 
 ## Honest limits
+
+**Known issues from the 2026-11-03 review** (full report in the project's review doc; fixes in
+progress). Until they are fixed, run these settings in `shadow` or `off`:
+
+- **Unattended actions can be steered by the alert.** An action's target comes from the model and
+  is not yet checked against the alert's own entities. Auto-safe actions (throttle, challenge,
+  force_logout, quarantine_message) have no width check, so in `AEGIS_ENFORCEMENT_MODE=live` a
+  crafted alert can throttle `0.0.0.0/0` on AWS WAF or force-log-out an arbitrary account (W1, W2).
+- **`AEGIS_HITL_TIMEOUT=live`** can run a block of any width, including internal ranges (W3).
+- **Blast-radius numbers:** the critical count is capped at 10, a walk whose queries all fail
+  reads as a clean radius, and plan steps are not filed as approvals (B1, B3, B5).
+- **Chunked pushes to `/ingest/*` are not read** (C1): configure relays (Fluent Bit, Vector) to
+  send `Content-Length`.
+- **Do not point the posture runner and the SOC service at the same `AEGIS_HITL_DIR`** (C2): they
+  share one journal and settle each other's cards.
+- **The governance tests do not run in CI** until the repo has the `GH_READ_TOKEN` secret (T1).
 
 - **Blast radius runs on a mock tenant** until a bank's `TelemetrySource` adapter exists.
 - **WAF / SOAR connectors** are built to the public API shapes and tested against mock tenants;

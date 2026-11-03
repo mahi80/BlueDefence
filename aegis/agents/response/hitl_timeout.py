@@ -6,7 +6,7 @@ tuned so a short-staffed SOC keeps moving without a human rubber-stamping the
 irreversible calls:
 
   * a REVERSIBLE action (block / block_egress / throttle / challenge) AND the reviewer
-    panel reached a majority concur (``chain.metadata.vote_concur`` is not ``False``)
+    panel explicitly concurred (``chain.metadata.vote_concur`` is ``True``; a chain with no vote is held)
     AND confidence >= floor  ->  auto-execute on timeout;
   * anything else — an irreversible / high-blast action (isolate, revoke_sessions,
     lock_account, rotate_credential, kill_process, ...), a tie or majority-dissent
