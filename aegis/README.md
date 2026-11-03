@@ -267,6 +267,14 @@ against their decisions before anyone turns it `live`. This is separate from
 `AEGIS_ENFORCEMENT_MODE`, so flipping challenge / throttle live never makes blocks autonomous.
 Containment (isolate, revoke, lock, rotate) is always a human.
 
+**How long an approved action lasts.** Automated actions keep the connector TTL (1 h, renewed while
+the attack continues). An action a person approved does not lapse on that clock: containment
+(isolate, block_egress, lock, revoke, rotate…) stays in force until a person releases it at the
+vendor (`AEGIS_APPROVED_TTL_SEC`, default `0` = until released), and an approved block / throttle /
+challenge on an IP lasts a day (`AEGIS_APPROVED_BLOCK_TTL_SEC`, default `86400`) so WAF rule sets do
+not grow forever. A later automated re-apply of the same action only ever extends it. The
+HITL-timeout path is not a person and keeps the connector TTL.
+
 **Never-block guardrail** (`agents/shared/netguard.py`). No connectivity-severing action
 (`block`, `isolate`, `throttle`, `quarantine`, `block_egress`) reaches a connector when the target
 is loopback, link-local, unspecified or multicast / reserved space, or an operator-listed address

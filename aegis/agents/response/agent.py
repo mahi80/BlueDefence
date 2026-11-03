@@ -37,6 +37,24 @@ _AUTO_SAFE_ACTIONS = {
     "force_logout",          # Mobile: forcing re-auth is recoverable
     "quarantine_message",    # Email: standard ESG behavior, recoverable
 }
+
+# How long a human-approved action stays in force. The connector default (1 h) is for automated actions;
+# a person who approved isolating a host or cutting a C2 did not approve it lapsing an hour later. Containment
+# is permanent until a person releases it (at the vendor, which is where the release is audited); edge
+# actions on IPs (block / throttle / challenge) get a day by default so WAF rule sets do not grow forever.
+# The HITL-timeout path ("aegis:hitl-timeout") is not a person and keeps the connector default.
+_EDGE_ACTIONS = {"block", "throttle", "challenge"}
+
+
+def approved_ttl_sec(action_type: str, approver: str) -> int | None:
+    """TTL for an approved action: None = the connector default, 0 = until a person releases it."""
+    if not approver or approver.startswith("aegis:"):
+        return None
+    if action_type in _EDGE_ACTIONS:
+        return int(os.environ.get("AEGIS_APPROVED_BLOCK_TTL_SEC", "86400"))
+    return int(os.environ.get("AEGIS_APPROVED_TTL_SEC", "0"))
+
+
 _ALWAYS_HITL_ACTIONS = {
     "block", "isolate", "lock_account", "revoke_sessions",
     "trigger_self_heal", "kill_process", "quarantine_file",
@@ -363,7 +381,8 @@ class ResponseAgent:
         # Everything else: the connector registry (vendor APIs in 1.2/1.3;
         # the logging fallback until then). The receipt carries the approver.
         approved_by = approver if not second_approver else f"{approver}+{second_approver}"
-        receipt = self._connectors.apply(action, alert_id=source_alert_id or "", approver=approved_by)
+        receipt = self._connectors.apply(action, alert_id=source_alert_id or "", approver=approved_by,
+                                         ttl_sec=approved_ttl_sec(action.action_type, approver))
         executed = self._from_receipt(action, receipt, prefix="approved")
         executed.note = f"{executed.note} approved by {approved_by}"
         return executed

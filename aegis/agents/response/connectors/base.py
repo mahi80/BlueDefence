@@ -168,7 +168,7 @@ class Connector:
         with self._lock:
             existing = self._active.get(key)
             if existing is not None and existing.active and not existing.expired(now):
-                return self._renew_locked(existing, ttl, now)
+                return self._renew_locked(existing, ttl, now, approver=approver)
         expires = None if ttl <= 0 else now + ttl
         receipt = Receipt(
             receipt_id=_rid(), connector=self.name, action_type=action.action_type,
@@ -251,13 +251,19 @@ class Connector:
 
     # ------------------------------------------------------- internals --
 
-    def _renew_locked(self, receipt: Receipt, ttl: int, now: float) -> Receipt:
+    def _renew_locked(self, receipt: Receipt, ttl: int, now: float, *, approver: str = "") -> Receipt:
         receipt.renewals += 1
-        receipt.expires_at = None if ttl <= 0 else now + ttl
+        # a renewal only ever extends: a later automated re-apply (1 h TTL) must not put an expiry back on
+        # an action a human approved permanently, or pull a longer expiry in
+        if receipt.expires_at is not None:
+            receipt.expires_at = None if ttl <= 0 else max(receipt.expires_at, now + ttl)
+        if approver and not approver.startswith("aegis:") and receipt.approver != approver:
+            receipt.approver = approver if not receipt.approver else f"{receipt.approver}; {approver}"
         receipt.status = STATUS_DRY_RUN if receipt.dry_run else STATUS_RENEWED
         if not receipt.dry_run:
             try:
-                receipt.detail = str(self._do_renew(receipt, ttl))
+                left = 0 if receipt.expires_at is None else max(1, int(receipt.expires_at - now))
+                receipt.detail = str(self._do_renew(receipt, left))
             except Exception as e:  # noqa: BLE001
                 receipt.error = f"renew {type(e).__name__}: {str(e)[:200]}"
         else:

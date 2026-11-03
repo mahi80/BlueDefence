@@ -191,6 +191,8 @@ def test_rate_limit_and_sweep_via_agent():
     assert agent.approve(_action("block", "2.2.2.2"), approver="a").status == "executed"
     assert agent.approve(_action("block", "3.3.3.3"), approver="a").status == "skipped"
     clk.t += 61
+    assert agent.sweep_expired() == []          # human-approved blocks last AEGIS_APPROVED_BLOCK_TTL_SEC (1 day)
+    clk.t += 86400
     assert len(agent.sweep_expired()) == 2 and waf.active_receipts == []
 
 
