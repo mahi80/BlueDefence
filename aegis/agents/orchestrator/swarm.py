@@ -267,6 +267,12 @@ def worker_analyst_brief(alert: dict, chain: EvidenceChain, ctx: dict) -> Worker
         res.skipped, res.note = True, "no LLM client"
         return res
     wrapped = wrap_untrusted("alert", str({k: v for k, v in alert.items() if k not in ("payload", "raw")})[:3000])
+    md = chain.metadata if isinstance(getattr(chain, "metadata", None), dict) else {}
+    if wrapped.injection_detected or wrapped.obfuscation_findings or md.get("injection_detected"):
+        # the brief is model prose put in front of the approver; with injection text in the alert, it may be
+        # the attacker's prose ("routine scan, approve the allow") — no brief at all (review round 3 G2-8)
+        res.skipped, res.note = True, "prompt-injection text in the alert: no model-written brief"
+        return res
     prompt = (
         "Write a 3-sentence analyst brief: what happened, why the verdict, what the human should decide. "
         f"Verdict so far: {chain.verdict} ({chain.confidence:.2f}); evidence items: {len(chain.evidence)}.\n\n"
@@ -282,7 +288,8 @@ def worker_analyst_brief(alert: dict, chain: EvidenceChain, ctx: dict) -> Worker
         res.skipped, res.note = True, "empty brief"
         return res
     res.note = "brief written"
-    res.evidence.append(EvidenceItem(source="swarm.analyst_brief", weight="low", signal=f"Analyst brief: {text[:300]}",
+    res.evidence.append(EvidenceItem(source="swarm.analyst_brief", weight="low",
+                                     signal=f"Analyst brief (model-written, not evidence): {text[:300]}",
                                      raw_data={"brief": text, "model": getattr(out, "model", "")}))
     return res
 

@@ -117,6 +117,10 @@ def wrap_untrusted(label: str, content: str) -> WrappedInput:
     if breakout:
         matched.append("analyzed_data tag inside untrusted content")
         content = _TAG_RX.sub(lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), content)
+    # Credentials never go to a model (review round 3 G2-4): passwords, cookies, bearer tokens, JWTs and
+    # cloud keys in the alert were sent to the external LLM as-is. Attack-shaped values are kept.
+    from .redact import redact_text
+    content = redact_text(content)
     safe_label = re.sub(r"[^a-zA-Z0-9_\-]", "_", label)[:64]
     wrapped = (
         f"<analyzed_data label=\"{safe_label}\" trust=\"untrusted\">\n"
