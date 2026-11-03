@@ -81,7 +81,10 @@ class ZscalerConnector(Connector):
     def _do_verify(self, receipt: Receipt) -> bool | None:
         res = call(self._transport, "GET", f"{self.base_url}/zia/api/v1/urlCategories/{self.category_id}",
                    headers=self._headers(), expect=(200,))
-        return self._entry(receipt.target) in {str(u) for u in (res.json().get("urls") or [])}
+        # ZIA normalises what it stores (case, scheme, trailing slash): compare the normal forms, or a rule that is
+        # there reads as missing and is dropped and re-added (review round 3 G3-1)
+        want = self._entry(receipt.target).lower()
+        return want in {self._entry(u).lower() for u in (res.json().get("urls") or [])}
 
     def _do_rollback(self, receipt: Receipt) -> str:
         self._category_op(receipt.target, "REMOVE_FROM_LIST")

@@ -169,7 +169,10 @@ def soar_from_env(transport: Optional[Transport] = None) -> Optional[Connector]:
                                   "revoke_sessions": "Revoke-Sessions", "kill_process": "Kill-Process",
                                   "quarantine_file": "Quarantine-File", "rotate_credential": "Rotate-Credential",
                                   "force_logout": "Force-Logout", "snapshot_forensic": "Snapshot-Forensic",
-                                  "escalate_to_fraud_team": "Fraud-Escalation", "escalate_to_hr": "HR-Escalation"}
+                                  "escalate_to_fraud_team": "Fraud-Escalation", "escalate_to_hr": "HR-Escalation",
+                                  # a payment hold is a playbook against the bank's payment system; in live mode the
+                                  # logging fallback no longer stands in for it (review round 3 G3-3)
+                                  "hold": "Payment-Hold", "hold.undo": "Payment-Release"}
         return XsoarConnector(base_url="https://xsoar.mock", api_key="mock", playbooks=playbooks,
                               transport=transport or MockXsoar())
     if not playbooks:

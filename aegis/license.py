@@ -523,7 +523,11 @@ class LicenseMeter:
         self.peak_eps_24h = max(self.buckets.values(), default=0) / 3600.0
         if devices is not None:
             self.devices_seen = devices
-        over = (self.eps_limit and self.peak_eps_24h > self.eps_limit) or (self.devices_limit and self.devices_seen > self.devices_limit)
+        # "over" is judged on the most recent hour, not the 24 h peak: the peak stays high for a day after one
+        # busy hour, so a daily batch job kept the meter "over" without a break and tripped over_limit after the
+        # allowance — forcing shadow — though the average stayed well inside the licence (review round 3 G4-8).
+        recent = max(self.buckets.get(hour, 0), self.buckets.get(hour - 1, 0)) / 3600.0
+        over = (self.eps_limit and recent > self.eps_limit) or (self.devices_limit and self.devices_seen > self.devices_limit)
         if over:
             self.over_since = self.over_since or now
         else:

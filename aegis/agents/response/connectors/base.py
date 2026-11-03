@@ -87,6 +87,7 @@ class Receipt:
     verified_at: float | None = None
     rollback_attempts: int = 0
     retry_rollback_at: float | None = None
+    misses: int = 0                     # consecutive read-backs that did not show it (drift needs two)
 
     @property
     def active(self) -> bool:
@@ -97,6 +98,13 @@ class Receipt:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
 
 
 def enforcement_mode() -> str:
@@ -131,6 +139,7 @@ class Connector:
     # active permanent receipt calls the vendor again instead of a no-op renewal. Set where the vendor call is
     # idempotent or re-running it is the point (EDR contain, SOAR playbooks, SWG category add).
     reapply_on_human_approval: bool = False
+    fallback: bool = False               # set on the registry's catch-all connector
 
     def __init__(self, *, dry_run: Optional[bool] = None, default_ttl_sec: int = DEFAULT_TTL_SEC,
                  clock: Callable[[], float] = time.time):
@@ -181,7 +190,21 @@ class Connector:
         return v
 
     def forget(self, receipt: Receipt, why: str) -> None:
-        """The vendor does not enforce this receipt: mark it ``drifted`` and drop it from the active set."""
+        """The vendor does not show this receipt's enforcement: undo whatever of it may still be there, then mark
+        it ``drifted`` and drop it from the active set.
+
+        It used to be dropped with no undo (review round 3 G3-1). A read-back can miss a rule that IS there
+        (read-after-write lag, a vendor that rewrites the entry), and the next approval then created a second rule
+        and the first was orphaned for good. The undo is best effort; one that fails keeps the receipt as
+        ``rollback_failed`` so the sweep retries it, exactly like a failed TTL rollback."""
+        # Only where an apply creates a NEW vendor object (a WAF rule id) can a missed read-back orphan one. Where
+        # the vendor call is idempotent (contain a host, add to a category: `reapply_on_human_approval`), an undo
+        # on a misread would lift a containment that is in fact in force, so nothing is undone there.
+        undo = not receipt.dry_run and not self.reapply_on_human_approval
+        rb = self.rollback(receipt, reason="read-back did not show it") if undo else receipt
+        if rb.status == STATUS_ROLLBACK_FAILED:
+            rb.error = f"{why}; {rb.error}"
+            return
         receipt.status, receipt.error = STATUS_DRIFTED, why
         with self._lock:
             if self._active.get(receipt.idempotency_key) is receipt:
@@ -190,12 +213,25 @@ class Connector:
     def check_drift(self) -> list[Receipt]:
         """Re-verify every active live receipt; one the vendor no longer enforces (released or removed outside
         AEGIS) is marked ``drifted`` and dropped from the active set, so the next approval applies it afresh
-        and nothing reports it as still in force."""
+        and nothing reports it as still in force.
+
+        A receipt younger than ``AEGIS_VERIFY_GRACE_S`` (default 60 s) is not judged — vendors propagate rules
+        with a lag — and it takes two consecutive misses, not one, to call it drifted (review round 3 G3-1)."""
+        now = self._clock()
+        grace = _env_float("AEGIS_VERIFY_GRACE_S", 60.0)
         with self._lock:
-            live = [r for r in self._active.values() if not r.dry_run]
+            live = [r for r in self._active.values() if not r.dry_run and r.active and now - r.applied_at >= grace]
         out = []
         for r in live:
-            if self.verify(r) is False:
+            v = self.verify(r)
+            if v is True:
+                r.misses = 0
+            elif v is False:
+                r.misses += 1
+                if r.misses < 2:
+                    logger.warning("[connector:%s] %s %s not visible on read-back (1st miss; confirming next check)",
+                                   self.name, r.action_type, r.target)
+                    continue
                 self.forget(r, "vendor no longer enforces this action (released or removed outside AEGIS)")
                 logger.error("[connector:%s] %s %s is no longer in force at the vendor (receipt %s)", self.name,
                              r.action_type, r.target, r.receipt_id)
@@ -241,6 +277,14 @@ class Connector:
                 dry_run=self.dry_run, applied_at=now, expires_at=None, alert_id=alert_id,
                 approver=approver, error=f"{self.name} does not support {action.action_type}",
             ))
+        with self._lock:
+            stale = self._active.get(key)
+        if stale is not None and stale.expired(now):
+            # expired but not swept yet: undo it before replacing it. It used to be dropped on the floor and the
+            # vendor kept the rule (Imperva) or a TTL'd entry nothing would ever remove (review round 3 G3-2).
+            self.rollback(stale, reason="expired; replaced by a new apply")
+            if stale.status == STATUS_ROLLED_BACK:
+                stale.status = STATUS_EXPIRED
         with self._lock:
             existing = self._active.get(key)
             still_there = existing is not None and existing.status == STATUS_ROLLBACK_FAILED
@@ -411,6 +455,19 @@ class LoggingConnector(Connector):
     def supports(self, action_type: str) -> bool:
         return True
 
+    def apply(self, action: Any, *, alert_id: str = "", approver: str = "",
+              ttl_sec: int | None = None) -> Receipt:
+        # As the registry's fallback in LIVE mode, "applied" here meant "enforced" to everyone downstream while
+        # no vendor was called at all (review round 3 G3-3). Live mode with no connector for the action is
+        # "unsupported": it parks for a human. Shadow and log-only labs keep the walking-skeleton receipt.
+        if self.fallback and enforcement_mode() == MODE_LIVE:
+            return self._record(Receipt(
+                receipt_id=_rid(), connector=self.name, action_type=str(action.action_type), target=str(action.target),
+                idempotency_key=self.idempotency_key(action), status=STATUS_UNSUPPORTED, dry_run=False,
+                applied_at=self._clock(), expires_at=None, alert_id=alert_id, approver=approver,
+                error=f"live mode, but no vendor connector enforces {action.action_type}; a human must do it"))
+        return super().apply(action, alert_id=alert_id, approver=approver, ttl_sec=ttl_sec)
+
     def _do_apply(self, action: Any, key: str, ttl_sec: Optional[int]) -> tuple[str, str, str]:
         return f"log-{key[:8]}", f"[log] {action.action_type} on {action.target}", key
 
@@ -426,6 +483,7 @@ class ConnectorRegistry:
                  on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()):
         self._connectors: list[Connector] = list(connectors)
         self.fallback = fallback if fallback is not None else LoggingConnector(dry_run=False)
+        self.fallback.fallback = True
         self._subscribers: list[Callable[[str, Receipt], Any]] = list(on_receipt)
 
     def register(self, connector: Connector) -> None:

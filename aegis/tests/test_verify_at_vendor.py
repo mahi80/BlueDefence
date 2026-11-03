@@ -39,7 +39,8 @@ def test_applied_action_is_read_back():
     assert s.executed and s.executed[0].receipt.verified is True
 
 
-def test_vendor_that_does_not_show_it_routes_to_a_human():
+def test_vendor_that_does_not_show_it_routes_to_a_human(monkeypatch):
+    monkeypatch.setenv("AEGIS_VERIFY_RETRY_S", "0")
     class Lossy(MockImperva):                      # accepts the rule, then it is not there (a silent vendor drop)
         def handle(self, method, url, body, headers):
             res = super().handle(method, url, body, headers)
@@ -55,7 +56,8 @@ def test_vendor_that_does_not_show_it_routes_to_a_human():
     assert not conn.active_receipts and s.hitl_queue[0].receipt.status == STATUS_DRIFTED
 
 
-def test_release_at_the_vendor_is_detected_as_drift_and_re_approval_contains_again():
+def test_release_at_the_vendor_is_detected_as_drift_and_re_approval_contains_again(monkeypatch):
+    monkeypatch.setenv("AEGIS_VERIFY_GRACE_S", "0")
     vendor = MockCrowdStrike()
     edr = CrowdStrikeConnector(base_url="https://cs", token_provider=lambda: "mock-cs-token", transport=vendor, dry_run=False)
     agent = ResponseAgent(connectors=ConnectorRegistry([edr]), hitl_stream=io.StringIO())
@@ -63,16 +65,19 @@ def test_release_at_the_vendor_is_detected_as_drift_and_re_approval_contains_aga
     ex = agent.approve(act, approver="ciso")
     assert ex.status == "executed" and ex.receipt.verified is True
     vendor.contained.clear()                                       # someone lifts containment in Falcon
+    assert agent.check_drift() == []                               # one miss is not drift (round 3 G3-1)
     (r,) = agent.check_drift()
     assert r.status == STATUS_DRIFTED and not edr.active_receipts
     assert agent.approve(act, approver="ciso").status == "executed" and vendor.contained
 
 
-def test_zscaler_and_unverifiable_connectors():
+def test_zscaler_and_unverifiable_connectors(monkeypatch):
+    monkeypatch.setenv("AEGIS_VERIFY_GRACE_S", "0")
     zia = MockZscaler()
     z = ZscalerConnector(base_url="https://zia", category_id="C1", token_provider=lambda: "mock", transport=zia, dry_run=False)
     agent = ResponseAgent(connectors=ConnectorRegistry([z]), hitl_stream=io.StringIO())
     ex = agent.approve(_act("block_egress", "evil-c2.example", hitl=True), approver="ciso")
     assert ex.receipt.verified is True
     zia.categories["C1"].clear()
+    assert agent.check_drift() == []
     assert [r.target for r in agent.check_drift()] == ["evil-c2.example"]
