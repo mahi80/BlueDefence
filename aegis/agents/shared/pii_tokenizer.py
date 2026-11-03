@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import secrets
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -40,9 +41,16 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
     ("IFSC",     r"\b[A-Z]{4}0[A-Z0-9]{6}\b"),          # bank routing code
     # Internal IDs — match BEFORE PHONE so digit-runs don't get eaten
     ("ACCOUNT",  r"\bACC-\d{8,12}\b"),                  # internal account format
+    # Bank account numbers carry no shape of their own; take a 9–18 digit run only where a field or label
+    # names it an account (review round 3 G2-4). Only the `v` group is replaced.
+    ("ACCOUNT",  r"(?i)(?:acc(?:oun)?t|a/c|beneficiary)[\w ]{0,20}?[\"']?\s*[:=#]?\s*[\"']?(?P<v>\d{9,18})\b"),
     # Global
     ("PAN_CC",   r"\b(?:\d[ -]*?){13,19}\b"),           # credit-card PAN (Luhn-validated below)
     ("EMAIL",    r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
+    # UPI VPA (name@okhdfcbank, 98xxxxxx@ybl): an e-mail-like handle with no dot in the provider
+    ("UPI_VPA",  r"\b[\w.-]{2,64}@[A-Za-z][A-Za-z0-9]{1,31}\b(?![.@\w-])"),
+    # Indian mobile: 10 digits starting 6–9, optional +91 / 0 prefix
+    ("PHONE_IN", r"(?<![\w+.])(?:\+91[ -]?|0)?[6-9]\d{9}\b"),
     # Phone: require a separator (space/dash) inside so raw digit
     # strings (account numbers, IDs) don't match. Leading "+" allowed
     # without preceding word boundary.
@@ -78,6 +86,7 @@ class TokenMap:
     """
     by_token: "OrderedDict[str, str]"
     by_value: dict[str, str]   # for stable token reuse across the same value
+    nonce: str = ""            # random per map: a token an attacker wrote into the input never matches
 
 
 class PIITokenizer:
@@ -96,35 +105,51 @@ class PIITokenizer:
         with self._lock:
             self._patterns.append((kind, re.compile(regex)))
 
-    def tokenize(self, text: str) -> tuple[str, TokenMap]:
-        """Return (tokenized_text, token_map). Idempotent within a call:
-        the same value always gets the same token in this output.
-        """
-        if not text:
-            return text, TokenMap(OrderedDict(), {})
+    def tokenize(self, text: str, *, into: TokenMap | None = None, nonce: str | None = None) -> tuple[str, TokenMap]:
+        """Return (tokenized_text, token_map). The same value always gets the same token in this output.
 
-        by_token: OrderedDict[str, str] = OrderedDict()
-        by_value: dict[str, str] = {}
+        Tokens carry a per-map random nonce (``<PII:ACCOUNT:1:9f3a2c>``). They used to be ``<PII:ACCOUNT:1>``,
+        which an attacker can write into an alert: the model echoes it and detokenization turns it into the
+        victim's account number in the action target (review round 3 G2-5). A token without the nonce is
+        never detokenized. Pass ``into`` to keep numbering in one map across several texts (system + user
+        used to restart at 1 each, so the two maps collided).
+        """
+        tm = into if into is not None else TokenMap(OrderedDict(), {})
+        if not getattr(tm, "nonce", ""):
+            tm.nonce = nonce or secrets.token_hex(3)
+        if not text:
+            return text, tm
         counters: dict[str, int] = {}
+        for tok in tm.by_token:
+            k = tok.split(":")[1]
+            counters[k] = counters.get(k, 0) + 1
 
         out = text
         for kind, rx in self._patterns:
-            def _replace(match: re.Match[str]) -> str:
-                value = match.group(0)
+            def _replace(match: re.Match[str], kind: str = kind, rx: re.Pattern[str] = rx) -> str:
+                whole = match.group(0)
+                grouped = "v" in rx.groupindex and match.group("v") is not None
+                value = match.group("v") if grouped else whole
                 # Suppress false positives on credit-card-shaped strings
                 if kind == "PAN_CC" and not _luhn_ok(value):
-                    return value
-                if value in by_value:
-                    return by_value[value]
-                idx = counters.get(kind, 0) + 1
-                counters[kind] = idx
-                token = f"<PII:{kind}:{idx}>"
-                by_token[token] = value
-                by_value[value] = token
+                    return whole
+                if "<PII:" in value:
+                    return whole
+                if value in tm.by_value:
+                    token = tm.by_value[value]
+                else:
+                    idx = counters.get(kind, 0) + 1
+                    counters[kind] = idx
+                    token = f"<PII:{kind}:{idx}:{tm.nonce}>"
+                    tm.by_token[token] = value
+                    tm.by_value[value] = token
+                if grouped:
+                    s, e = match.start("v") - match.start(0), match.end("v") - match.start(0)
+                    return whole[:s] + token + whole[e:]
                 return token
             out = rx.sub(_replace, out)
 
-        return out, TokenMap(by_token=by_token, by_value=by_value)
+        return out, tm
 
     def detokenize(self, text: str, token_map: TokenMap) -> str:
         """Replace tokens back with original values. Order: longest token

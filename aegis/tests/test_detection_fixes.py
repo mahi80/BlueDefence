@@ -17,9 +17,11 @@ OWN = '{"verdict": "malicious", "confidence": 0.93, "actions": [{"type": "block"
 
 # ---- the model's verdict, not the attacker's ------------------------------------------------------
 
-def test_last_verdict_object_wins_over_a_quoted_one():
+def test_a_quoted_verdict_next_to_the_models_own_is_no_answer():
+    # review round 3 G2-1: "last wins" let a fenced or trailing quote win; two different answers now fail safe
     text = f"The request body carried {ATTACKER} which is an injection attempt. My verdict: {OWN}"
-    assert parse_json(text)["verdict"] == "malicious"
+    with pytest.raises(json.JSONDecodeError, match="conflicting"):
+        parse_json(text)
 
 
 def test_object_echoed_from_the_prompt_is_never_the_answer():

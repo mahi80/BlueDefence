@@ -20,7 +20,7 @@ import logging
 from typing import Optional
 
 from .llm_client import LLMClient, LLMResponse, TokenBudget
-from .pii_tokenizer import PIITokenizer, TokenMap
+from .pii_tokenizer import PIITokenizer
 
 
 _log = logging.getLogger("aegis.pii")
@@ -72,12 +72,10 @@ class TokenizingLLMClient(LLMClient):
         return resp
 
     def _tokenize_pair(self, system: str, user: str):
-        sys_t, sys_map = self._tokenizer.tokenize(system)
-        user_t, user_map = self._tokenizer.tokenize(user)
-        merged = TokenMap(
-            by_token={**sys_map.by_token, **user_map.by_token},
-            by_value={**sys_map.by_value, **user_map.by_value},
-        )
+        # One map (one counter, one nonce) for both: two maps both started at <PII:EMAIL:1>, so merging them
+        # let the system prompt's value replace the user's on the way back (review round 3 G2-5).
+        sys_t, merged = self._tokenizer.tokenize(system)
+        user_t, merged = self._tokenizer.tokenize(user, into=merged)
         if self._log_kinds and merged.by_token:
             _log.info("PII tokenized for LLM call: %s", self._tokenizer.stats(merged))
         return sys_t, user_t, merged

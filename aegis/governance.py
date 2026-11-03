@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable
@@ -243,10 +244,34 @@ def _guard_investigate(specialist: Any, guard: Any, tool: str) -> Callable:
     return investigate
 
 
+_HOLD = threading.local()
+
+
+def _guard_record(orch: Any) -> None:
+    """While governance is unavailable for the alert being handled, the hold is applied to the chain BEFORE
+    the orchestrator seals it. It used to be applied to the returned chain after `record()` had written the
+    audit row, so the sealed row said `requires_hitl=False` for actions that were in fact held (review
+    round 3 G2-7)."""
+    original = getattr(orch, "record", None)
+    if not callable(original) or getattr(original, "_acp_wrapped", False):
+        return
+
+    @wraps(original)
+    def record(alert, chain, *args, **kwargs):
+        why = getattr(_HOLD, "why", "")
+        if why:
+            _hold_for_humans(chain, why)
+        return original(alert, chain, *args, **kwargs)
+
+    record._acp_wrapped = True  # type: ignore[attr-defined]
+    orch.record = record
+
+
 def _guard_handle(orch: Any, governed: GovernedSOC) -> Callable:
     original = orch.handle
     guard = governed.guard
     acp_violation = _violation_type()
+    _guard_record(orch)
 
     def _blocked(alert: Any, v: Exception) -> Any:
         logger.warning("[acp] orchestrator blocked on alert %s: %s", _alert_id(alert), str(v)[:160])
@@ -260,9 +285,10 @@ def _guard_handle(orch: Any, governed: GovernedSOC) -> Callable:
 
     @wraps(original)
     def handle(alert, *args, **kwargs):
-        governed.begin_alert(_alert_id(alert))
         unavailable = ""
         try:
+            # begin_alert talks to the SDK too: outside the try, an outage there dropped the alert (round 3 G2-10)
+            governed.begin_alert(_alert_id(alert))
             guard.pre_tool_call(TOOL_ORCHESTRATOR, _alert_meta(alert))
         except acp_violation as v:
             return _blocked(alert, v)
@@ -270,11 +296,15 @@ def _guard_handle(orch: Any, governed: GovernedSOC) -> Callable:
             unavailable = f"{type(e).__name__}: {str(e)[:160]}"
             logger.error("[acp] governance unavailable for alert %s (%s) — analysing, every action held for a human",
                          _alert_id(alert), unavailable)
+        prev = getattr(_HOLD, "why", "")
+        _HOLD.why = unavailable
         try:
             chain = original(alert, *args, **kwargs)
         except Exception as e:  # noqa: BLE001
             _post(guard, TOOL_ORCHESTRATOR, acp_violation, success=False, error=str(e)[:200], exception=e)
             raise
+        finally:
+            _HOLD.why = prev
         v = _post(guard, TOOL_ORCHESTRATOR, acp_violation, result={"verdict": getattr(chain, "verdict", None)}, success=True)
         if v is not None:
             return _blocked(alert, v)
@@ -458,12 +488,19 @@ def govern_soc(orch: Any, response: Any | None = None) -> GovernedSOC | None:
 
         @wraps(_orig_build)
         def build_chain(alert, *a, **kw):
+            # same outage handling as the specialists (review round 3 G2-10): an SDK error used to propagate
+            # and drop a honeytoken hit — the one alert that is never a false positive
             try:
                 guard.pre_tool_call(TOOL_DECEPTION, _alert_meta(alert))
             except acp_violation as v:
                 return blocked_chain(alert, "acp:deception", v)
+            except Exception as e:  # noqa: BLE001
+                logger.error("[acp] governance unavailable for deception on alert %s: %s", _alert_id(alert), str(e)[:160])
+                return _hold_for_humans(_orig_build(alert, *a, **kw), f"{type(e).__name__}: {str(e)[:160]}")
             chain = _orig_build(alert, *a, **kw)
-            guard.post_tool_call(TOOL_DECEPTION, result={"verdict": getattr(chain, "verdict", None)}, success=True)
+            v = _post(guard, TOOL_DECEPTION, acp_violation, result={"verdict": getattr(chain, "verdict", None)}, success=True)
+            if v is not None:
+                return blocked_chain(alert, "acp:deception", v)
             return chain
 
         build_chain._acp_wrapped = True  # type: ignore[attr-defined]

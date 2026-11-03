@@ -81,15 +81,28 @@ def ensemble_enabled() -> bool:
 
 
 def _vote_user_msg(chain: EvidenceChain) -> str:
-    summary = (
-        f"verdict={chain.verdict} confidence={chain.confidence}\n"
-        f"evidence_count={len(chain.evidence)}\n"
-        f"actions={[a.action_type for a in chain.recommended_actions]}\n"
-        f"requires_hitl={[a.requires_hitl for a in chain.recommended_actions]}\n"
-    )
-    wrapped = wrap_untrusted("primary_verdict", summary)
+    """What the reviewer sees. It used to be verdict, confidence, an evidence COUNT and the action types —
+    no targets, no signals — so it could not tell `block -> 10.0.0.1` (the bank's own gateway) from
+    `block -> 185.x`, nor a verdict that contradicts its own evidence (review round 3 G2-3). All of it is
+    derived from the alert, so it goes inside the untrusted wrapper."""
+    md = chain.metadata if isinstance(getattr(chain, "metadata", None), dict) else {}
+    lines = [
+        f"alert_id={chain.alert_id} investigated_by={chain.investigated_by}",
+        f"verdict={chain.verdict} confidence={chain.confidence}",
+        f"prompt_injection_flagged={bool(md.get('injection_detected'))}",
+        f"evidence ({len(chain.evidence)} items):",
+    ]
+    for e in list(chain.evidence)[:12]:
+        lines.append(f"  - [{getattr(e, 'weight', '')}] {getattr(e, 'source', '')}: {str(getattr(e, 'signal', ''))[:240]}")
+    lines.append(f"reasoning ({len(chain.reasoning)} steps):")
+    for r in list(chain.reasoning)[:6]:
+        lines.append(f"  - {str(getattr(r, 'conclusion', '') or getattr(r, 'action', ''))[:200]}")
+    lines.append("recommended actions:")
+    for a in list(chain.recommended_actions)[:10]:
+        lines.append(f"  - {a.action_type} -> {str(a.target)[:120]} (confidence={a.confidence}, requires_hitl={a.requires_hitl})")
+    wrapped = wrap_untrusted("primary_verdict", "\n".join(lines))
     return (
-        "Vote on this verdict from the primary agent.\n\n"
+        "Vote on this verdict from the primary agent. Check the targets and the evidence, not only the label.\n\n"
         f"{wrapped.wrapped}\n\n"
         "Concur or dissent?"
     )

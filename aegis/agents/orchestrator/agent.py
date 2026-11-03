@@ -355,6 +355,20 @@ class SOCOrchestrator:
 
         if triage["next"] == "auto_close":
             chain = self._build_auto_close_chain(alert, triage)
+            # Closing is the one decision that skips every specialist, so it is the one an injected
+            # `{"next": "auto_close"}` wants. It had no second opinion (review round 3 G2-2): now the
+            # independent reviewer must concur, or the alert goes to the perimeter specialist instead.
+            v = vote_best([self._voter, *self._extra_voters], chain)
+            chain.metadata["vote_concur"] = v.concur
+            chain.metadata["vote_reason"] = v.reason
+            chain.metadata["vote_tally"] = f"{v.n_concur}/{v.n_voters}"
+            chain.metadata["vote_unanimous"] = v.unanimous
+            if not v.unanimous:
+                md = dict(triage.get("_triage_metadata") or {})
+                md["overridden"] = f"auto_close → dispatch_perimeter (reviewer did not concur: {v.reason[:160]})"
+                triage = {**triage, "next": "dispatch_perimeter", "verdict": None,
+                          "reason": "Reviewer did not concur with auto-close; investigating", "_triage_metadata": md}
+        if triage["next"] == "auto_close":
             obs.record_alert_processed("orchestrator")
             obs.record_verdict(chain.verdict, "orchestrator")
             span_record.attributes["specialist"] = "orchestrator"
@@ -453,18 +467,22 @@ class SOCOrchestrator:
             "model": resp.model,
             "in_tokens": resp.input_tokens,
             "out_tokens": resp.output_tokens,
-            "injection_detected": wrapped.injection_detected,
-            "injection_patterns": wrapped.matched_patterns,
+            # hidden characters (U+3000 padding, RLO, zero-width) are an attack on the reader as much as an
+            # "ignore previous instructions" is — count them, or they unlock the shortcuts (round 3 G2-2)
+            "injection_detected": wrapped.injection_detected or bool(wrapped.obfuscation_findings),
+            "injection_patterns": wrapped.matched_patterns + [f"obfuscation: {f}" for f in wrapped.obfuscation_findings],
         }
         return decision
 
     # ---- chain builders --------------------------------------------------
 
     def _build_auto_close_chain(self, alert: dict, triage: dict) -> EvidenceChain:
+        # Closing means benign: a model that said `auto_close` with verdict "malicious" used to leave a
+        # malicious chain whose only action was `allow` (review round 3 G2-9).
         chain = EvidenceChain(
             alert_id=alert.get("id", "unknown"),
             investigated_by=self.name,
-            verdict=triage.get("verdict", "benign"),
+            verdict="benign",
             confidence=float(triage.get("confidence", 0.85)),
         )
         chain.reasoning.append(

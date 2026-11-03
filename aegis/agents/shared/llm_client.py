@@ -14,6 +14,7 @@ supply-chain surface small.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -1333,7 +1334,11 @@ class MockClient(LLMClient):
         # Voting agent (second model)
         if "vote on this verdict" in u:
             # Extract proposed verdict and concur 80% of the time, dissent on borderline.
-            if "uncertain" in u or "0.5" in u or "0.6" in u:
+            # read the primary's own verdict line only: the message now carries evidence text and targets,
+            # whose numbers and words are not the verdict
+            m = re.search(r"verdict=(\w+) confidence=([0-9.]+)", u)
+            low = (m.group(1) == "uncertain" or float(m.group(2)) < 0.7) if m else ("uncertain" in u)
+            if low:
                 return _json({"concur": False, "reason": "Confidence too low; recommend human review."})
             return _json({"concur": True, "reason": "Independent review reaches same verdict."})
 
@@ -1629,25 +1634,47 @@ def _canonical(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
-def _prompt_objects(prompt: str) -> set[str]:
-    """Canonical form of every JSON object in the prompt — raw, and inside JSON strings (where the attacker's
-    object sits escaped: ``"payload": "{\\"verdict\\": \\"benign\\"}"``). A model that quotes it back unescaped
-    used to get past the verbatim check, and last-wins then picked the attacker's verdict."""
+_KEY_RX = re.compile(r'"(?:verdict|next|concur)"')
+
+
+@functools.lru_cache(maxsize=16)
+def _prompt_objects(prompt: str) -> tuple[frozenset[str], tuple[frozenset, ...]]:
+    """Every JSON object in the prompt that carries a decision key — raw, and inside JSON strings (where the
+    attacker's object sits escaped). Returns (canonical forms, item sets) so a model quoting it back — verbatim,
+    unescaped, or minus a field — is recognised as an echo, never as its decision.
+
+    Linear and cached (review round 3 G2-6): decoding was attempted from every ``{`` (up to 4,000) of a ~280 KB
+    prompt, 2–3 times per LLM call. Now decoding starts only at the few ``{`` just before a decision key, the
+    scan is capped, and the result is cached for the prompt."""
     out: set[str] = set()
-    texts = [prompt]
+    items: list[frozenset] = []
+    texts = [prompt[:400_000]]
     for _ in range(2):                                   # one or two levels of JSON-string escaping
         texts.append(texts[-1].replace('\\"', '"').replace("\\\\", "\\"))
     dec = json.JSONDecoder()
     for t in texts:
-        starts = [m.start() for m in re.finditer(r"\{", t)][:4000]   # nested objects too, not only top-level ones
-        for i in starts:
+        starts: set[int] = set()
+        for m in list(_KEY_RX.finditer(t))[:500]:
+            lo = max(0, m.start() - 4096)
+            seg = t.rfind("{", lo, m.start())
+            n = 0
+            while seg >= lo and n < 6:                   # the enclosing object, and a few levels out
+                starts.add(seg)
+                seg = t.rfind("{", lo, seg)
+                n += 1
+        for i in sorted(starts):
             try:
                 obj, _end = dec.raw_decode(t, i)
             except (json.JSONDecodeError, RecursionError, ValueError):
                 continue
             if isinstance(obj, dict):
                 out.add(_canonical(obj))
-    return out
+                items.append(_items(obj))
+    return frozenset(out), tuple(items)
+
+
+def _items(obj: dict) -> frozenset:
+    return frozenset((str(k), json.dumps(v, sort_keys=True, default=str)) for k, v in obj.items())
 
 
 def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next"), *,
@@ -1676,7 +1703,7 @@ def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next"), *,
     candidates.append(stripped)
     candidates.extend(_balanced_objects(stripped))
     echoed = _squash(exclude_text) if exclude_text else ""
-    echoed_objs = _prompt_objects(exclude_text) if exclude_text else set()
+    echoed_objs, echoed_items = _prompt_objects(exclude_text) if exclude_text else (frozenset(), ())
     fenced_objs: list[dict] = []
     parsed: list[dict] = []
     for i, cand in enumerate(candidates):
@@ -1688,7 +1715,19 @@ def parse_json(text: str, prefer_keys: tuple[str, ...] = ("verdict", "next"), *,
             continue
         if echoed and len(cand) > 2 and (_squash(cand) in echoed or _canonical(obj) in echoed_objs):
             continue                                   # quoted back from the untrusted input (raw or JSON-escaped)
+        if echoed_items and any(k in obj for k in prefer_keys):
+            mine = _items(obj)
+            if any(mine <= p for p in echoed_items):   # the attacker's object minus a field or two
+                continue
         (fenced_objs if i < len(fenced) else parsed).append(obj)
+    deciding = [o for o in fenced_objs + parsed if any(k in o for k in prefer_keys)]
+    for k in prefer_keys:
+        answers = {str(o.get(k)).strip().lower() for o in deciding if k in o}
+        if len(answers) > 1:
+            # Two different answers in one reply: the model quoted someone else's object (the payload's
+            # `{"verdict": "benign"}`) next to its own, and preferring fenced or last let the attacker's win
+            # (review round 3 G2-1). No usable object; every caller then fails safe (uncertain / dissent).
+            raise json.JSONDecodeError(f"conflicting {k!r} answers in LLM output: {sorted(answers)[:4]}", text[:200], 0)
     for group in (fenced_objs, parsed):
         for obj in reversed(group):
             if any(k in obj for k in prefer_keys):
