@@ -113,14 +113,17 @@ def wrap_untrusted(label: str, content: str) -> WrappedInput:
     obf_findings, obf_count = _scan_obfuscation(decoded)
     # The data block must not be closable from inside: an alert containing "</analyzed_data>" used to end
     # the untrusted block and append text that read as trusted instructions. Neutralise any tag of ours.
-    breakout = _TAG_RX.findall(content)
+    # Credentials never go to a model (review round 3 G2-4): passwords, cookies, bearer tokens, JWTs and
+    # cloud keys in the alert were sent to the external LLM as-is. Attack-shaped values are kept.
+    # Redaction runs FIRST: it re-serialises JSON kept in strings, which decodes `<\/analyzed_data>` and
+    # `\u003c/analyzed_data>` into a real closing tag — neutralising before it let the alert close the block
+    # (review round 5 Y5-1).
+    from .redact import redact_text
+    content = redact_text(content)
+    breakout = _TAG_RX.findall(content) or _TAG_RX.findall(decoded)
     if breakout:
         matched.append("analyzed_data tag inside untrusted content")
         content = _TAG_RX.sub(lambda m: m.group(0).replace("<", "&lt;").replace(">", "&gt;"), content)
-    # Credentials never go to a model (review round 3 G2-4): passwords, cookies, bearer tokens, JWTs and
-    # cloud keys in the alert were sent to the external LLM as-is. Attack-shaped values are kept.
-    from .redact import redact_text
-    content = redact_text(content)
     safe_label = re.sub(r"[^a-zA-Z0-9_\-]", "_", label)[:64]
     wrapped = (
         f"<analyzed_data label=\"{safe_label}\" trust=\"untrusted\">\n"

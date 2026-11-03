@@ -68,6 +68,8 @@ class ServiceNowHITL(BaseHITL):
         self._self_names: set[str] = {n.strip().lower() for n in
                                       (self.user, *os.environ.get("AEGIS_SERVICENOW_SELF", "").split(","))
                                       if n and n.strip()}
+        # ServiceNow's own automation (business rules, SLA engine, scheduled jobs) writes as these: never a decider
+        self._self_names |= {"system", "guest", "maint", "admin.system"}
 
     @property
     def enabled(self) -> bool:
@@ -118,6 +120,15 @@ class ServiceNowHITL(BaseHITL):
         rec = data.get("result") or {}
         decision = str(rec.get("u_aegis_decision") or "").strip().lower()
         who = self._decider(rec)
+        if getattr(p, "first_approver", "") and who:
+            # The SECOND approver must have made the decision themselves: the account that last wrote the record
+            # AND the name typed in u_aegis_decided_by must be the same person. `sys_updated_by` alone is whoever
+            # wrote last — a colleague's comment, an SLA business rule — and was read as a fresh approver of a
+            # decision that never changed (review round 5 Y5-2). Unattributed = base waits.
+            from .signing import same_person
+            typed = _display(rec.get("u_aegis_decided_by")).strip()
+            if not typed or not same_person(typed, who):
+                who = ""
         if decision in ("approved", "rejected"):
             return decision, who, str(rec.get("close_notes") or "")[:500]
         state = str(_display(rec.get("state")) or "").strip().lower()
@@ -128,6 +139,18 @@ class ServiceNowHITL(BaseHITL):
                 return "approved", who, ""
             return "rejected", who, (str(rec.get("close_notes") or "") or f"closed with code '{code or 'none'}'")[:500]
         return None
+
+    def _record_awaiting_second(self, p: PendingApproval, first: str) -> None:
+        """Clear the decision fields so the second approval is a decision someone actually makes — the first one's
+        `approved` stayed on the ticket and every later write to it looked like a new approval (Y5-2)."""
+        note = (f"[AEGIS] First approval recorded from {first}. This action needs a second, different approver: set "
+                "u_aegis_decision to 'approved' (or 'rejected') and u_aegis_decided_by to your own user id.")
+        status, _data = self._transport("PATCH", self._api(f"/{p.external_id}"),
+                                         {"u_aegis_decision": "", "u_aegis_decided_by": "", "work_notes": note},
+                                         self._headers(), self.timeout)
+        if status not in (200, 204):
+            logger.warning("[hitl:servicenow] could not reset the decision on %s after the first approval (HTTP %s); "
+                           "the second approver is still required to name themselves", p.external_id, status)
 
     def _learn_self(self, rec: Any) -> None:
         if isinstance(rec, dict):

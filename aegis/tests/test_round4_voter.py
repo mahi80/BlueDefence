@@ -38,7 +38,7 @@ def test_voter_quoting_the_alerts_concur_object_is_read_as_its_own_dissent():
 def test_conflicting_concur_answers_are_a_dissent():
     from aegis.agents.orchestrator.voting import vote
     v = vote(_voter('{"concur": true, "reason": "a"} {"concur": false, "reason": "b"}'), _chain())
-    assert v.concur is False and v.n_abstain == 1 and not v.disputed
+    assert v.concur is False and v.n_abstain == 0 and v.disputed      # a reviewer that read it: a dispute (Y5-7)
 
 
 # ---- O4-8: fields cannot forge lines of the vote message ----------------------------------------------------------------
@@ -92,7 +92,9 @@ def test_dissent_on_benign_escalates(monkeypatch):
 
 def test_unavailable_voter_does_not_escalate_every_benign(monkeypatch):
     monkeypatch.setenv("LLM_BACKEND", "mock")
-    chain = _orch("not json at all")._handle_inner({"id": "B2"}, types.SimpleNamespace(attributes={}))
+    o = _orch("unused")
+    o._voter = types.SimpleNamespace(complete=lambda *a, **k: (_ for _ in ()).throw(TimeoutError("voter down")))
+    chain = o._handle_inner({"id": "B2"}, types.SimpleNamespace(attributes={}))
     assert chain.verdict == "benign" and not any(a.action_type == "escalate" for a in chain.recommended_actions)
 
 

@@ -356,16 +356,21 @@ class SwarmOrchestrator:
         return getattr(self._orch, item)
 
     def handle(self, alert: dict) -> EvidenceChain:
+        attached = False
         if self._events is not None:
             # the last N minutes of the same source / session / user, in the campaign-summary shape
             # the fine-tuned first-pass is trained on; the original dict is left untouched
             try:
                 from .walkers.campaign import attach_campaign_context
                 alert = attach_campaign_context(alert, self._events, min_events=self._campaign_min)
+                attached = True
             except Exception as e:  # noqa: BLE001 — context is a bonus, never a blocker
                 logger.debug("[swarm] campaign context skipped: %s", str(e)[:120])
         from .walkers.campaign import TRUSTED_CONTEXT
-        tok = TRUSTED_CONTEXT.set(alert)
+        # Only an alert that went through the attach step (which strips what the sender wrote first) carries
+        # trusted derived keys. With no event store, or a failed attach, the keys on it are the sender's
+        # (review round 5 Y5-10): the orchestrator strips them.
+        tok = TRUSTED_CONTEXT.set(alert if attached else None)
         try:
             chain = self._orch.handle(alert)
         finally:
