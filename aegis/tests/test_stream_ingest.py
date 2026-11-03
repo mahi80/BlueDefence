@@ -112,7 +112,7 @@ def test_cloudflare_logpush_gzip_batches_become_alerts_with_lag(server):
     c = StreamConsumer(queue=q, checkpoint=alerts and AlertCheckpoint())
     cp = AlertCheckpoint()
     for a in alerts:
-        cp.mark(f"stream:{a['id']}")
+        cp.mark(f"stream:{a['ingest_source']}:{a['id']}")      # per pushed source (round 4 I4-9)
     again = list(StreamConsumer(queue=q, checkpoint=cp).iter_alerts())
     assert again == [] and c is not None
 

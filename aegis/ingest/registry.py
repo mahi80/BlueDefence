@@ -21,6 +21,7 @@ reported and skipped, never fatal — the demo stream is always available.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from pathlib import Path
@@ -29,6 +30,14 @@ from typing import Iterator
 from .base import AlertCheckpoint
 
 logger = logging.getLogger("aegis.ingest")
+
+
+def _file_kw(checkpoint: AlertCheckpoint, files: list[str]) -> dict:
+    """Only what was appended to the export files since the last cycle, in join order (review round 4 I4-3).
+    ``AEGIS_FILE_TAIL=0`` re-reads the whole files every cycle (the old behaviour, for demo replays)."""
+    if os.environ.get("AEGIS_FILE_TAIL", "1").strip().lower() in ("0", "off", "false", "no"):
+        return {"path": ",".join(files)}
+    return {"lines": itertools.chain.from_iterable(checkpoint.tail_lines(f) for f in files)}
 
 
 def sources_from_env() -> list[tuple[str, Iterator[dict]]]:
@@ -58,14 +67,15 @@ def sources_from_env() -> list[tuple[str, Iterator[dict]]]:
                 if not path or not Path(path).exists():
                     logger.warning("[ingest] waf requested but WAF_EVENT_FILE missing; skipped")
                     continue
-                out.append(("waf", WafConsumer(checkpoint=checkpoint).iter_alerts(path=path)))
+                out.append(("waf", WafConsumer(checkpoint=checkpoint).iter_alerts(**_file_kw(checkpoint, [path]))))
             elif name == "apigw":
                 from .apigw import ApiGatewayConsumer, shared_detector
                 path = os.environ.get("APIGW_EVENT_FILE", "")
                 if not path or not Path(path).exists():
                     logger.warning("[ingest] apigw requested but APIGW_EVENT_FILE missing; skipped (push to /ingest/apigw works without it)")
                     continue
-                out.append(("apigw", ApiGatewayConsumer(detector=shared_detector(), checkpoint=checkpoint).iter_alerts(path=path)))
+                out.append(("apigw", ApiGatewayConsumer(detector=shared_detector(), checkpoint=checkpoint).iter_alerts(
+                    **_file_kw(checkpoint, [path]))))
             elif name == "ndr":
                 from .ndr import NdrConsumer
                 from .ndr import shared_detector as ndr_detector
@@ -74,7 +84,7 @@ def sources_from_env() -> list[tuple[str, Iterator[dict]]]:
                 if not files:
                     logger.warning("[ingest] ndr requested but NDR_EVENT_FILE missing; skipped (push to /ingest/ndr works without it)")
                     continue
-                out.append(("ndr", NdrConsumer(detector=ndr_detector(), checkpoint=checkpoint).iter_alerts(path=",".join(files))))
+                out.append(("ndr", NdrConsumer(detector=ndr_detector(), checkpoint=checkpoint).iter_alerts(**_file_kw(checkpoint, files))))
             elif name == "netops":
                 from .netops import NetopsConsumer
                 from .netops import shared_detector as netops_detector
@@ -83,7 +93,8 @@ def sources_from_env() -> list[tuple[str, Iterator[dict]]]:
                 if not files:
                     logger.warning("[ingest] netops requested but NETOPS_EVENT_FILE missing; skipped (push to /ingest/netops works without it)")
                     continue
-                out.append(("netops", NetopsConsumer(detector=netops_detector(), checkpoint=checkpoint).iter_alerts(path=",".join(files))))
+                out.append(("netops", NetopsConsumer(detector=netops_detector(), checkpoint=checkpoint).iter_alerts(
+                    **_file_kw(checkpoint, files))))
             elif name in ("stream", "eventhub"):
                 pass                                         # drained once below, after the loop
             elif name == "acp":

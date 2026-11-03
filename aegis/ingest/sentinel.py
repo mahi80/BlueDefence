@@ -115,7 +115,10 @@ class SentinelConsumer(BaseConsumer):
 
     def fetch(self, *, kql: Optional[str] = None, timespan: Optional[str] = None) -> Iterator[dict]:
         """Run the KQL and yield one dict per row (column name → value)."""
-        payload = json.dumps({"query": kql or self.cfg.kql, "timespan": timespan or self.cfg.timespan}).encode()
+        query = kql or self.cfg.kql
+        if kql is None and self.cfg.kql == DEFAULT_KQL:
+            query = self._since_watermark()
+        payload = json.dumps({"query": query, "timespan": timespan or self.cfg.timespan}).encode()
         url = f"{self.cfg.api_base}/workspaces/{self.cfg.workspace_id}/query"
         status, body = self._request_with_retry("POST", url, payload)
         if status != 200:
@@ -125,6 +128,19 @@ class SentinelConsumer(BaseConsumer):
             cols = [c.get("name") for c in table.get("columns", [])]
             for row in table.get("rows", []):
                 yield dict(zip(cols, row))
+
+    def _since_watermark(self) -> str:
+        """The default query from the last alert handled (5 min overlap), oldest first. It re-read the whole
+        1-hour window every poll, newest first: with more than the 5,000-id dedupe window of unresolved alerts,
+        each poll evicted what it had just marked and re-triaged every alert on every poll (round 4 I4-3)."""
+        from .base import _when
+        wm = self.checkpoint.watermark(self.name) if self.checkpoint is not None else None
+        t = _when(wm) if wm else None
+        if t is None:
+            return DEFAULT_KQL.replace("order by TimeGenerated desc", "order by TimeGenerated asc")
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(0.0, t - 300)))
+        return (DEFAULT_KQL.replace("SecurityAlert", f"SecurityAlert | where TimeGenerated > datetime({since})", 1)
+                .replace("order by TimeGenerated desc", "order by TimeGenerated asc"))
 
     def _request_with_retry(self, method: str, url: str, body: Optional[bytes]) -> tuple[int, str]:
         delay = 1.0

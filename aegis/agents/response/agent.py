@@ -387,13 +387,18 @@ class ResponseAgent:
         if done.status != "executed" or r is None or getattr(r, "dry_run", True) or verify is None:
             return done
         v = verify(r)
+        streaks = self.__dict__.setdefault("_verify_miss_streak", {})
         if v is False:
             # one more look after a short wait: vendors propagate a new rule with a lag, and dropping one that is
-            # there orphaned it and re-applied it next time (review round 3 G3-1)
+            # there orphaned it and re-applied it next time (review round 3 G3-1). Not when this connector's
+            # read-back has missed on its last three actions too: that is a broken read-back (permissions, schema),
+            # and waiting stalled the service thread on every action (review round 4 X4-11).
             wait = max(0.0, min(10.0, float(os.environ.get("AEGIS_VERIFY_RETRY_S", "2") or 0)))
-            if wait:
+            if wait and streaks.get(r.connector, 0) < 3:
                 time.sleep(wait)
                 v = verify(r)
+        if v is not None:
+            streaks[r.connector] = streaks.get(r.connector, 0) + 1 if v is False else 0
         if v is False:
             self._connectors.forget(r, "applied, but the vendor read-back does not show it")
             return ExecutedAction(action=action, status="queued_for_hitl", receipt=r, reason="connector_failed",

@@ -458,7 +458,10 @@ class SwarmOrchestrator:
                 # block ran).
                 logger.error("[swarm] re-seal of %s failed: %s: %s — no action until it is sealed",
                              chain.alert_id, type(e).__name__, str(e)[:120])
-                raise AuditWriteError(f"re-seal failed: {type(e).__name__}: {str(e)[:160]}") from e
+                # keep the errno: a full / read-only snapshot disk clears by itself and must be parked and re-fed,
+                # not dead-lettered as a permanent failure after three tries (review round 4 I4-13)
+                raise AuditWriteError(f"re-seal failed: {type(e).__name__}: {str(e)[:160]}",
+                                      getattr(e, "errno", None) if isinstance(e, OSError) else None) from e
 
     # ------------------------------------------------------------ internals --
 

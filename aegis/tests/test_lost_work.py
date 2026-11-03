@@ -74,21 +74,14 @@ def test_partial_spill_append_is_truncated(tmp_path, monkeypatch):
     import os
     q = DeferredQueue(tmp_path / "d.jsonl")
     assert q.push({"id": "ok-1"})
-    real_fdopen = os.fdopen
+    real_write = os.write
 
-    def failing_fdopen(fd, mode="r", *a, **k):            # the spill opens its file with os.open + fdopen (0600)
-        fh = real_fdopen(fd, mode, *a, **k)
-        if "a" in mode:
-            orig = fh.write
-
-            def write(data):
-                orig(data[:10]); fh.flush()                # half the row lands, then the disk is full
-                raise OSError(28, "No space left on device")
-            fh.write = write
-        return fh
-    monkeypatch.setattr(os, "fdopen", failing_fdopen)
+    def failing_write(fd, data):                           # the spill writes through a raw fd now (round 4 I4-4)
+        real_write(fd, bytes(data[:10]))                   # half the row lands, then the disk is full
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(os, "write", failing_write)
     assert q.push({"id": "torn"}) is False
-    monkeypatch.setattr(os, "fdopen", real_fdopen)
+    monkeypatch.setattr(os, "write", real_write)
     assert q.push({"id": "ok-2"})
     assert [r["id"] for r in q.pop(10)] == ["ok-1", "ok-2"]   # the next row did not merge into a fragment
 

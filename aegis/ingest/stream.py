@@ -23,6 +23,7 @@ time-to-detect benchmark reads.
 from __future__ import annotations
 
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -47,6 +48,16 @@ def _as_utc(d: datetime) -> datetime:
     every naive vendor time 5 h 30 min off, which broke windows and lag (review round 3 I3-16)."""
     from datetime import UTC
     return d if d.tzinfo is not None else d.replace(tzinfo=UTC)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("short write")
+        view = view[n:]
+
 
 @dataclass
 class StreamItem:
@@ -109,14 +120,48 @@ class StreamQueue:
         self.journal = Path(journal) if journal else None
         self._fsync = fsync
         self._committed = 0
+        self._base = 0              # logical offset of the journal file's first record
+        self._hdr = 0               # length of the journal file's header line
+        self.compactions = 0
         self._last_commit_write = 0.0
         if self.journal is not None:
             self._replay()
 
     # ---- journal -------------------------------------------------------------------------------------------
+    # Offsets are LOGICAL: they grow for the life of the deployment. The journal file starts with a header naming the
+    # logical offset of its first record (``base``); the cursor stores the logical committed offset. Compaction (the
+    # handled prefix dropped by rewriting the uncommitted tail into a new file) therefore never invalidates an offset
+    # held by a queued or in-flight item, and a crash at any step replays at most what was not committed. Before,
+    # the file was only reset when the queue was empty AND everything was committed — under steady traffic it never
+    # was, so the journal grew until the disk filled and every push got 503 (review round 4 X4-4 / I4-2).
+    _HDR_KEY = "aegis_journal"
+
     def _cursor(self) -> Path:
         assert self.journal is not None
         return self.journal.with_name(self.journal.name + ".cursor")
+
+    @staticmethod
+    def _header(base: int) -> bytes:
+        return (json.dumps({StreamQueue._HDR_KEY: 1, "base": int(base)}, separators=(",", ":")) + "\n").encode()
+
+    def _read_header(self, fh: Any) -> tuple[int, int]:
+        """(base, header length) of an open journal; an old header-less journal is (0, 0)."""
+        fh.seek(0)
+        first = fh.readline()
+        if first.endswith(b"\n"):
+            try:
+                h = json.loads(first)
+                if isinstance(h, dict) and self._HDR_KEY in h:
+                    return int(h.get("base", 0)), len(first)
+            except (ValueError, TypeError):
+                pass
+        return 0, 0
+
+    def _compact_bytes(self) -> int:
+        try:
+            return max(1, int(float(os.environ.get("AEGIS_STREAM_JOURNAL_COMPACT_MB", "64")) * 1024 * 1024))
+        except ValueError:
+            return 64 * 1024 * 1024
 
     def _replay(self) -> None:
         assert self.journal is not None
@@ -126,51 +171,82 @@ class StreamQueue:
         except (OSError, ValueError):
             self._committed = 0
         if not self.journal.exists():
-            self._committed = 0
+            self._base = self._committed
             return
         n = 0
+        torn_at = -1
         with self.journal.open("rb") as fh:
-            fh.seek(self._committed)
-            pos = self._committed
+            self._base, self._hdr = self._read_header(fh)
+            # a cursor older than the file's first record: everything in this file is unhandled
+            self._committed = max(self._committed, self._base)
+            phys = self._committed - self._base + self._hdr
+            fh.seek(phys)
+            pos = phys
             for raw in fh:
                 if not raw.endswith(b"\n"):
-                    break                                 # a torn last write: never answered 200
+                    torn_at = pos                         # a torn last write: never answered 200
+                    break
                 pos += len(raw)
                 try:
                     r = json.loads(raw)
                     self._q.append(StreamItem(source=str(r["s"]), line=str(r["l"]), received_at=float(r["t"]),
-                                              passthrough=bool(r.get("p")), journal_end=pos))
+                                              passthrough=bool(r.get("p")),
+                                              journal_end=pos - self._hdr + self._base))
                     n += 1
                 except (ValueError, KeyError, TypeError):
                     continue
+        if torn_at >= 0:
+            # cut the fragment now, or the next appended record is glued onto it and lost on the next replay (I4-4)
+            try:
+                os.truncate(self.journal, torn_at)
+            except OSError as e:
+                logger.error("[stream] could not trim the torn tail of %s: %s", self.journal, e)
         if n:
             logger.warning("[stream] re-queued %d pushed record(s) from %s that were accepted but not handled before "
                            "the last stop", n, self.journal)
 
+    def _open_append(self) -> int:
+        assert self.journal is not None
+        fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            if os.fstat(fd).st_size == 0:
+                # a new file: its first record continues the logical stream where the last file ended
+                self._base, self._hdr = self._committed, 0
+                hdr = self._header(self._base)
+                _write_all(fd, hdr)
+                self._hdr = len(hdr)
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
+
     def _append_journal(self, items: list[StreamItem]) -> bool:
         assert self.journal is not None
-        data = b"".join((json.dumps({"s": it.source, "l": it.line, "t": it.received_at, "p": it.passthrough},
-                                    separators=(",", ":")) + "\n").encode() for it in items)
+        recs = [(json.dumps({"s": it.source, "l": it.line, "t": it.received_at, "p": it.passthrough},
+                            separators=(",", ":")) + "\n").encode() for it in items]
+        data = b"".join(recs)
         try:
-            fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            with os.fdopen(fd, "ab") as fh:
-                start = fh.tell()
+            fd = self._open_append()
+            try:
+                start = os.lseek(fd, 0, os.SEEK_END)
                 try:
-                    fh.write(data)
-                    fh.flush()
+                    _write_all(fd, data)
                     if self._fsync:
-                        os.fsync(fh.fileno())
+                        os.fsync(fd)
                 except OSError:
-                    fh.truncate(start)
+                    # raw fd: nothing buffered to flush again, so the cut really removes the partial record (I4-4)
+                    with contextlib.suppress(OSError):
+                        os.ftruncate(fd, start)
                     raise
+            finally:
+                os.close(fd)
         except OSError as e:
             logger.error("[stream] journal %s not writable (%s) — answering 503 so the vendor keeps the batch",
                          self.journal, e.strerror or e)
             return False
-        pos = start
-        for it in items:
-            pos += len((json.dumps({"s": it.source, "l": it.line, "t": it.received_at, "p": it.passthrough},
-                                   separators=(",", ":")) + "\n").encode())
+        pos = start - self._hdr + self._base
+        for it, rec in zip(items, recs):
+            pos += len(rec)
             it.journal_end = pos
         return True
 
@@ -195,17 +271,44 @@ class StreamQueue:
     def _write_cursor(self) -> None:
         assert self.journal is not None
         try:
-            if not self._q and self.journal.exists() and self._committed >= self.journal.stat().st_size:
-                # everything handled: start the journal over (cursor first — a crash in between replays nothing)
-                self._cursor().write_text("0")
-                self.journal.unlink(missing_ok=True)
-                self._committed = 0
-                return
             tmp = self._cursor().with_suffix(".tmp")
             tmp.write_text(str(self._committed))
             os.replace(tmp, self._cursor())
+            if not self.journal.exists():
+                return
+            size = self.journal.stat().st_size
+            end = size - self._hdr + self._base                  # logical end of the file
+            if not self._q and self._committed >= end:
+                # everything handled: drop the file (the cursor already says so; the next one starts at `end`)
+                self.journal.unlink(missing_ok=True)
+                self._base, self._hdr = self._committed, 0
+            elif self._committed - self._base >= self._compact_bytes():
+                self._compact()
         except OSError as e:
             logger.warning("[stream] journal cursor not written (%s) — handled records may be re-queued after a restart", e)
+
+    def _compact(self) -> None:
+        """Rewrite the uncommitted tail into a fresh file whose header names its logical start. Called under the
+        lock, so no append races it. Crash before the replace: the old file and cursor still agree. After it: the
+        new header's base tells replay where the cursor points."""
+        assert self.journal is not None
+        new_base = self._committed
+        tmp = self.journal.with_name(self.journal.name + ".compact")
+        with self.journal.open("rb") as src:
+            src.seek(new_base - self._base + self._hdr)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                hdr = self._header(new_base)
+                _write_all(fd, hdr)
+                while chunk := src.read(1 << 20):
+                    _write_all(fd, chunk)
+                if self._fsync:
+                    os.fsync(fd)
+            finally:
+                os.close(fd)
+        os.replace(tmp, self.journal)
+        self._base, self._hdr = new_base, len(hdr)
+        self.compactions += 1
 
     def requeue_front(self, items: list[StreamItem]) -> None:
         """Drained but not handled (the consumer stopped early): back to the head of the queue, in order."""
@@ -224,7 +327,9 @@ class StreamQueue:
             return True
         now = time.time()
         with self._cv:
-            if len(self._q) + len(lines) > self.capacity:
+            # A batch larger than the whole queue is taken into an EMPTY queue: it could never fit otherwise, and
+            # the vendor (Logpush's 100k-record default, an Event Hub batch) retried it forever (round 4 I4-5).
+            if self._q and len(self._q) + len(lines) > self.capacity:
                 self.stats.rejected_full += len(lines)
                 if now - self._full_logged >= 10:          # one line per 10 s while full, not one per rejected batch
                     self._full_logged = now

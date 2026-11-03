@@ -73,8 +73,10 @@ def test_imperva_block_challenge_throttle_lifecycle():
     r_block = c.apply(_act("block", "203.0.113.9"), alert_id="A-1")
     assert r_block.status == "applied" and r_block.vendor_ref == "1001" and r_block.rollback_token == "1001"
     assert srv.blocked_ips() == {"203.0.113.9"} and "TTL 600s" in r_block.detail
-    r_chal = c.apply(_act("challenge", "198.51.100.0/24"), alert_id="A-2")
-    assert srv.rules[r_chal.vendor_ref]["action"] == "RULE_ACTION_CAPTCHA" and "ClientIP == 198.51.100.0" in srv.rules[r_chal.vendor_ref]["filter"]
+    # a network is refused: the rule filter matches single client IPs (round 4 R4-11 — the mask used to be dropped)
+    assert c.apply(_act("challenge", "198.51.100.0/24"), alert_id="A-2b").status == "failed"
+    r_chal = c.apply(_act("challenge", "198.51.100.7"), alert_id="A-2")
+    assert srv.rules[r_chal.vendor_ref]["action"] == "RULE_ACTION_CAPTCHA" and "ClientIP == 198.51.100.7" in srv.rules[r_chal.vendor_ref]["filter"]
     r_thr = c.apply(_act("throttle", "203.0.113.77"), alert_id="A-3")
     rule = srv.rules[r_thr.vendor_ref]
     assert rule["action"] == "RULE_ACTION_RATE" and rule["rate_limit"] == 30 and rule["rate_context"] == "IP"
