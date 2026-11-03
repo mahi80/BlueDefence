@@ -156,16 +156,20 @@ class NetworkAssurance:
         # per-device state is keyed by the syslog hostname, which anyone who can reach UDP/514 can spoof:
         # capped (least recently written evicted) so a flood of fake hostnames cannot exhaust memory
         _cap = int(os.environ.get("AEGIS_NETOPS_MAX_DEVICES", "20000"))
+        # liveness state keeps established devices and churns newcomers (a spoofed-name flood used to evict a
+        # real device that had gone silent — the one whose silence is the alert); inventory devices are pinned
+        def _inv(d: Any) -> bool:
+            return str(d).lower() in self.inventory
         self._iface_link: dict[tuple[str, str], _Link] = BoundedDict(_cap * 8)
         self._incidents: list[_Incident] = []
-        self._tele: dict[tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=8))   # (ts, counters)
-        self._last_seen: dict[str, float] = BoundedDict(_cap)
-        self._last_tele: dict[str, float] = BoundedDict(_cap)                   # silence is judged only on devices that stream telemetry
+        self._tele: dict[tuple[str, str], deque] = BoundedDict(_cap * 8)      # (device, iface) -> (ts, counters)
+        self._last_seen: dict[str, float] = BoundedDict(_cap, keep_established=True, pinned=_inv)
+        self._last_tele: dict[str, float] = BoundedDict(_cap, keep_established=True, pinned=_inv)  # silence: telemetry devices only
         self._last_silence_check = 0.0
         self._unreachable: set[str] = set()
         self._config_hash: dict[str, str] = BoundedDict(_cap)
         self._recent_config: dict[str, dict] = BoundedDict(_cap)               # device -> last change event (for bad-push correlation)
-        self._err_open: set[tuple[str, str]] = set()
+        self._err_open: set[tuple[str, str]] = set()        # bounded by _tele: keys are dropped with it below
         self._cong_open: set[tuple[str, str]] = set()
         self.stats: dict[str, int] = defaultdict(int)
 
@@ -465,7 +469,14 @@ class NetworkAssurance:
         if not iface or not c:
             return []
         key = (device, iface)
-        hist = self._tele[key]
+        hist = self._tele.get(key)
+        if hist is None:
+            if len(self._tele) >= self._tele.maxlen:                # keep the open-state sets in step with _tele
+                oldest = next(iter(self._tele))
+                self._err_open.discard(oldest); self._cong_open.discard(oldest)
+            hist = self._tele[key] = deque(maxlen=8)
+        else:
+            self._tele.move_to_end(key)
         out: list[dict] = []
         if hist:
             pts, pc = hist[-1]

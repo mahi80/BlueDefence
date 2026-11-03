@@ -186,3 +186,12 @@ def test_cli(capsys):
     assert rep["tiers"]["ACT_NOW"] == 3 and rep["exposures"][0]["reasons"]
     assert cli(["--vulns", str(S / "tenable_vulns.json")]) == 2  # no asset model
     assert "asset model" in capsys.readouterr().err
+
+
+def test_cli_refuses_an_empty_export_unless_allowed(tmp_path, capsys):
+    """2026-11-03 review R14: the CLI reported 0 findings and exited 0 on a broken `[]` export (a gate passed)."""
+    empty = tmp_path / "vulns.json"
+    empty.write_text("[]")
+    args = ["--vulns", str(empty), "--inventory", str(S / "inventory.csv"), "--fail-on-act-now"]
+    assert cli(args) == 2 and "no findings" in capsys.readouterr().err
+    assert cli([*args, "--allow-empty"]) == 0

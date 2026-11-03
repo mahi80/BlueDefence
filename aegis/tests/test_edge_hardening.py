@@ -107,3 +107,17 @@ def test_oversize_body_is_refused_not_truncated(monkeypatch):
                   encode_chunked=True)
         r = c.getresponse(); r.read()
         assert r.status == 413 and up.bodies == []
+
+
+def test_negative_or_signed_chunk_size_is_refused():
+    """2026-11-03 review R10: int(b"-1", 16) == -1 passed the cap and rfile.read(-1) read to EOF."""
+    import socket
+    with _stack() as (port, up, _state, _bl):
+        for size in (b"-1", b"+400", b" 0x10", b"123456789"):
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            s.sendall(b"POST /x HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" + size + b"\r\n" + b"A" * 4096)
+            s.shutdown(socket.SHUT_WR)
+            reply = s.recv(200)
+            s.close()
+            assert reply.startswith((b"HTTP/1.0 400", b"HTTP/1.1 400")), (size, reply[:40])
+        assert up.bodies == []

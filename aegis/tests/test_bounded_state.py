@@ -90,3 +90,29 @@ def test_egress_volume_rows_fold_without_losing_bytes():
 def test_swarm_run_history_is_a_bounded_deque():
     from aegis.agents.orchestrator import swarm
     assert "self.runs: deque[dict] = deque(maxlen=" in Path(swarm.__file__).read_text()
+
+
+def test_spoofed_hostname_flood_does_not_evict_a_real_device(monkeypatch):
+    """2026-11-03 review R11: the LRU evicted the real device that had gone silent; _tele was unbounded."""
+    monkeypatch.setenv("AEGIS_NETOPS_MAX_DEVICES", "50")
+    from aegis.agents.netops.assurance import NetworkAssurance
+    now = [1_000_000.0]
+    na = NetworkAssurance(clock=lambda: now[0], silent_s=180)
+    na.add_link("core-1", "Te1/1", "dist-1", "Te0/1")
+    for d, i in (("core-1", "Te1/1"), ("dist-1", "Te0/1")):
+        na.observe({"kind": "telemetry", "device": d, "iface": i, "ts": now[0], "counters": {"in_errors": 0}})
+    for i in range(2000):
+        na.observe({"kind": "telemetry", "device": f"fake-{i}", "iface": "x", "ts": now[0], "counters": {"in_errors": 0}})
+    assert "core-1" in na._last_tele and len(na._last_tele) <= 50 and len(na._tele) <= 400
+    now[0] += 600
+    out = na.observe({"kind": "telemetry", "device": "dist-1", "iface": "Te0/1", "ts": now[0], "counters": {"in_errors": 0}})
+    assert any("core-1" in json.dumps(a) for a in out)
+
+
+def test_keep_established_and_pinned_eviction():
+    d = BoundedDict(3, keep_established=True, pinned=lambda k: k == "inv")
+    for k in ("inv", "a", "b"):
+        d[k] = 1
+    for i in range(10):
+        d[f"new{i}"] = 1
+    assert "inv" in d and "a" in d and len(d) == 3          # newcomers churn, established keys stay

@@ -99,6 +99,24 @@ def swap_in_place(primary: Any, served: str) -> bool:
     return True
 
 
+def _unverified(ptr: dict, adapter: str, run: str) -> str:
+    """Why this pointer may not be swapped in ("" = it may). The adapter must carry a recorded digest; when its
+    directory is on this host the digest is checked here, otherwise the GPU-side register step checks it
+    (``vllm_registry.register_promoted_adapter``), which loads only an adapter whose digest matches. The
+    pointer file itself must be writable only by the promotion step. ``AEGIS_ALLOW_UNVERIFIED_MODEL=1`` is the
+    explicit operator override for a lab."""
+    if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") == "1":
+        return ""
+    sha = str(ptr.get("sha256") or "")
+    if not sha:
+        return "the promotion pointer carries no adapter digest"
+    if adapter and os.path.isdir(adapter):
+        from aegis.finetune.digest import verify_adapter
+        ok, why = verify_adapter(adapter, sha)
+        return "" if ok else why
+    return ""
+
+
 def apply_reload(primary: Any, prev_key: str, ptr: Optional[dict]) -> ReloadResult:
     """Decide and perform a reload. Pure except for the in-place ``set_model`` on ``primary``.
 
@@ -113,12 +131,10 @@ def apply_reload(primary: Any, prev_key: str, ptr: Optional[dict]) -> ReloadResu
     adapter = str(ptr.get("adapter", ""))
     if key and key == prev_key:
         return ReloadResult(changed=False, mode="noop", run=run, adapter=adapter, key=key, detail="unchanged")
-    if adapter and os.path.isdir(adapter) and ptr.get("sha256"):
-        from aegis.finetune.digest import verify_adapter
-        ok, why = verify_adapter(adapter, str(ptr.get("sha256")))
-        if not ok:                   # tampered or swapped after approval: keep the running model
-            logger.error("[hot_reload] promotion run=%s refused: %s", run, why)
-            return ReloadResult(changed=False, mode="refused", run=run, adapter=adapter, key=key, detail=why)
+    why = _unverified(ptr, adapter, run)
+    if why:                          # tampered, swapped after approval, or never fingerprinted: keep the running model
+        logger.error("[hot_reload] promotion run=%s refused: %s", run, why)
+        return ReloadResult(changed=False, mode="refused", run=run, adapter=adapter, key=key, detail=why)
     served = served_name(ptr)
     if served and swap_in_place(primary, served):
         logger.info("[hot_reload] swapped triage model → run=%s served=%s (no restart)", run, served)

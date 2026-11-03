@@ -1,6 +1,7 @@
 """CLI: score a vulnerability export against the asset model and print the funnel + ACT NOW list.
 
-Exit codes: 0 ok, 1 when ``--fail-on-act-now`` and any ACT_NOW exposure exists, 2 bad input.
+Exit codes: 0 ok, 1 when ``--fail-on-act-now`` and any ACT_NOW exposure exists, 2 bad input (including an
+export with no findings, unless ``--allow-empty``).
 """
 
 from __future__ import annotations
@@ -34,10 +35,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--top", type=int, default=15, help="exposures to print (text mode)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--fail-on-act-now", action="store_true", help="exit 1 if any exposure is ACT_NOW")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="accept vulnerability exports with no findings (refused by default: a broken export is not a clean estate)")
     args = ap.parse_args(argv)
 
     try:
         vulns = [v for p in args.vulns for v in loaders.load_vulns(p)]
+        if not vulns and not args.allow_empty:
+            raise PostureSourceError("the vulnerability export(s) contain no findings — refusing to report a clean estate "
+                                     "from what may be an empty or wrong-format export (--allow-empty to accept)")
         notes = loaders.apply_intel(vulns, kev=args.kev, epss=args.epss)
         groups = [loaders.assets_from_aws(load_json(b)) for b in args.aws_bundle]
         groups += [assets_from_azure(load_json(b)) for b in args.azure_bundle]

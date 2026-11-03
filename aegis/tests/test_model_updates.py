@@ -92,7 +92,10 @@ def test_install_verifies_then_points_then_rolls_back(tmp_path, keys):
         # the pointer is what hot_reload consumes
         from aegis.finetune.hot_reload import pointer_key, read_pointer, served_name
         p = read_pointer(str(mu.pointer_path(env)))
-        assert served_name(p) == "2026.11.1" and pointer_key(p) == r1["sha256"]
+        from aegis.finetune.digest import adapter_digest, verify_adapter
+        assert served_name(p) == "2026.11.1" and p["archive_sha256"] == r1["sha256"]
+        # sha256 is the adapter digest load / hot-reload re-check (the archive hash failed that check after #66)
+        assert pointer_key(p) == adapter_digest(p["adapter"]) and verify_adapter(p["adapter"], p["sha256"])[0]
     finally:
         httpd.shutdown()
 

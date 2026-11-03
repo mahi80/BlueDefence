@@ -79,7 +79,9 @@ class DeferredQueue:
                     logger.error("[deferred] spill file %s at its %d MB cap — %d alert(s) dropped", self.path.name,
                                  self.max_bytes // (1024 * 1024), self.dropped)
                 return False
-            row = dict(alert)
+            # the spill is a store like any other: credentials are redacted before they touch disk
+            from ..agents.shared.redact import redact
+            row = redact(dict(alert))
             row["deferred_at"] = time.time()
             row["deferred_by"] = reason
             with self.path.open("ab") as fh:

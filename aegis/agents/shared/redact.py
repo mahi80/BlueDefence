@@ -36,21 +36,32 @@ SECRET_KEYS: frozenset[str] = frozenset({
     "connection_string", "connectionstring", "sas_token", "sig",
 })
 
+# A credential-field value is kept only when it is an injection that needs to break out of its field: a quote
+# or comment before SQL, a script/handler, JNDI, traversal or shell chaining. A bare "select … from" or a
+# back-ticked word is a plausible passphrase, so it no longer counts (it kept such passwords in clear).
 _ATTACK_RX = re.compile(
     r"(?:'|\"|%27|%22|\)|--|#|/\*)\s*(?:or|and|union|select|insert|update|delete|drop|sleep|benchmark|waitfor)\b"
-    r"|\bunion\b[\s/*]+(?:all\s+)?select\b|\bselect\b.+\bfrom\b|;\s*(?:drop|shutdown|exec)\b"
+    r"|\bunion\b[\s/*]+(?:all\s+)?select\b|;\s*(?:drop|shutdown|exec)\b"
     r"|<\s*script|<\s*img[^>]*\bon\w+\s*=|javascript:|\bon(?:error|load|focus|mouseover)\s*="
     r"|\$\{\s*jndi:|\$\{[^}]*\$\{|(?:\.\./|\.\.\\|%2e%2e%2f){2,}|/etc/passwd|\bwin\.ini\b"
-    r"|(?:;|\|\||&&|\|)\s*(?:cat|curl|wget|bash|sh|nc|id|whoami|powershell|cmd)\b|`[^`]+`|\$\([^)]+\)",
+    r"|(?:;|\|\||&&|\|)\s*(?:cat|curl|wget|bash|sh|nc|id|whoami|powershell|cmd)\b|\$\([^)]+\)",
     re.IGNORECASE)
 
+#: any key ending in one of these is a credential too (db_password, githubToken, stripeSecretKey, …)
+SECRET_SUFFIXES: tuple[str, ...] = ("password", "passwd", "passphrase", "secret", "secret_key", "token",
+                                    "api_key", "apikey", "private_key", "access_key")
 _PAIR_KEYS = "|".join(sorted((re.escape(k).replace("_", "[_-]?") for k in SECRET_KEYS), key=len, reverse=True))
+_PAIR_KEYS = rf"(?:[A-Za-z0-9]*[_-]?)?(?:password|passwd|passphrase|secret(?:[_-]?key)?|token|api[_-]?key|access[_-]?key|private[_-]?key)|{_PAIR_KEYS}"
 # key=value in query strings / form bodies / log lines. The value runs to the next "&" or end of line: a
 # password may contain spaces, quotes or ";" — over-redacting the rest of a log line is the safe direction,
 # and an attack-shaped value (the whole of it) is kept by redact_value.
-_KV_RX = re.compile(rf"(?i)(?<![A-Za-z0-9_-])((?:{_PAIR_KEYS})\s*=\s*)([^&\r\n]+)")
-# "key": "value" inside JSON text carried in a string field
-_JSON_RX = re.compile(rf"(?i)(\"(?:{_PAIR_KEYS})\"\s*:\s*\")((?:[^\"\\]|\\.)*)(\")")
+# The value stops at the next " key=" on the same log line, so one credential followed by an attack string
+# (kept whole) is not stored in clear with it.
+_KV_RX = re.compile(rf"(?i)(?<![A-Za-z0-9_-])((?:{_PAIR_KEYS})\s*=\s*)([^&\r\n]+?)(?=\s+[A-Za-z_][\w.-]*=|&|\r|\n|$)")
+# "key": "value" inside JSON text, and 'key': 'value' in a Python repr of a dict
+_JSON_RX = re.compile(rf"(?i)(([\"'])(?:{_PAIR_KEYS})\2\s*:\s*([\"']))((?:(?!\3)[^\\]|\\.)*)(\3)")
+# header lines: "X-Api-Key: …", "Authorization: ApiKey …", "X-Auth-Token: …"
+_HEADER_RX = re.compile(rf"(?im)^((?:proxy-)?authorization|x[-_]api[-_]key|api[-_]key|x[-_]auth[-_]token|(?:{_PAIR_KEYS}))(\s*:\s*)(.+)$")
 _BEARER_RX = re.compile(r"(?i)\b(bearer|basic|digest|negotiate|token)\s+([A-Za-z0-9._~+/=-]{8,})")
 _JWT_RX = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,}")
 _AWS_KEY_RX = re.compile(r"\b(?:AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}\b")
@@ -59,11 +70,13 @@ _COOKIE_LINE_RX = re.compile(r"(?im)^((?:set-)?cookie\s*:\s*)(.+)$")
 
 
 def _norm(key: Any) -> str:
-    return str(key).strip().lower().replace("-", "_")
+    k = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(key).strip())      # userPassword -> user_Password
+    return k.lower().replace("-", "_").replace(" ", "_")
 
 
 def is_secret_key(key: Any) -> bool:
-    return _norm(key) in SECRET_KEYS
+    k = _norm(key)
+    return k in SECRET_KEYS or k.endswith(SECRET_SUFFIXES)
 
 
 def looks_like_attack(value: str) -> bool:
@@ -95,7 +108,8 @@ def redact_text(text: str) -> str:
         return text
     out = _PEM_RX.sub("[REDACTED:private_key]", text)
     out = _COOKIE_LINE_RX.sub(lambda m: m.group(1) + redact_value("cookie", m.group(2)), out)
-    out = _JSON_RX.sub(lambda m: m.group(1) + redact_value(m.group(1).split('"')[1], m.group(2)) + m.group(3), out)
+    out = _JSON_RX.sub(lambda m: m.group(1) + redact_value(m.group(1).strip("\"' :"), m.group(4)) + m.group(5), out)
+    out = _HEADER_RX.sub(lambda m: m.group(1) + m.group(2) + redact_value(m.group(1), m.group(3)), out)
     out = _KV_RX.sub(lambda m: m.group(1) + redact_value(m.group(1).split("=")[0], m.group(2)), out)
     out = _BEARER_RX.sub(lambda m: m.group(0) if looks_like_attack(m.group(2)) else f"{m.group(1)} {_mark('credential', m.group(2))}", out)
     out = _JWT_RX.sub(lambda m: _mark("jwt", m.group(0)), out)
