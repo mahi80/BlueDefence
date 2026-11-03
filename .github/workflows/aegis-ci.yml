@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'aegis/**'
+      - 'scripts/**'            # the edge shim and live-run scripts are tested from aegis/tests
+      - 'pyproject.toml'
       - '.github/workflows/aegis-ci.yml'
   push:
     branches:
@@ -11,6 +13,8 @@ on:
       - Agentic_Endpoint_AEGIS
     paths:
       - 'aegis/**'
+      - 'scripts/**'            # the edge shim and live-run scripts are tested from aegis/tests
+      - 'pyproject.toml'
       - '.github/workflows/aegis-ci.yml'
 
 jobs:
@@ -160,7 +164,7 @@ jobs:
       - name: Fine-tune pipeline smoke (synthetic data + dry-run plan, no GPU)
         run: |
           python -m aegis.dataset synth --out /tmp/synth-v1 --n 120 --seed 7
-          python -m aegis.dataset verify /tmp/synth-v1 || true
+          python -m aegis.dataset verify /tmp/synth-v1
           python -m aegis.finetune.train --data /tmp/synth-v1 --dry-run --vram 8 --allow-synthetic
           python - <<'PY'
           import sys
@@ -220,9 +224,13 @@ jobs:
           retention-days: 30
 
   governed:
-    name: Governed by ACP (roadmap 0.1) — specialists + response under ACPGuard
+    name: Unit tests + governed eval (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13', '3.14']
     env:
       ACP_HOME: /tmp/acp-home   # per-machine agent registry, isolated from the runner
       # BlueDefence consumes acp-sdk as a pinned package from the private rbi repo. The
@@ -237,7 +245,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
 
       - name: Install base deps (no SDK, no token)
         run: |

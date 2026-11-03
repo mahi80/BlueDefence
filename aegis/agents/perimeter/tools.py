@@ -19,6 +19,9 @@ from typing import Optional
 
 from ..shared.bounded import BoundedDict
 
+_URL_RX = re.compile(r"[a-zA-Z0-9+.\-]{1,64}://[^\s\"'&<>]+")
+_SCHEME_LEAD = re.compile(r"^[^a-zA-Z]+")
+
 
 @dataclass
 class ToolResult:
@@ -235,8 +238,12 @@ def ssrf_probe(raw: str) -> ToolResult:
     low = text.lower()
     hits: list[dict] = []
     seen: set[str] = set()
-    # URLs with an explicit scheme
-    for m in re.findall(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s\"'&<>]+", text):
+    # URLs with an explicit scheme. The scheme part is bounded: an unbounded `[a-z][a-z0-9+.-]*://` retries
+    # from every letter of a long run and was quadratic (a 300 KB payload stalled triage for minutes — code
+    # review 2026-11-03 T4). The bound keeps it linear; leading non-letters are trimmed after the match, so
+    # `1http://…` and a 100-letter prefix before `http://` are still caught.
+    for m in _URL_RX.findall(text):
+        m = _SCHEME_LEAD.sub("", m)
         try:
             host = urllib.parse.urlsplit(m).hostname or ""
         except Exception:  # noqa: BLE001, S112 — malformed URL; skip it

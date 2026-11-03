@@ -280,7 +280,7 @@ def test_corroboration_rule_counts_independent_strong_signals():
     for row in rows:
         a, t, prov = _alert(row), _target(row), row["provenance"]
         per_domain.setdefault(prov["domain"], set()).add(t["verdict"])
-        assert "detection" not in json.dumps(a).lower() or a["source"]          # no rule/detection name field
+        assert not {"detection", "detection_name", "rule_id", "signature", "alert_name", "verdict"} & set(a)  # no label field
         if t["verdict"] == "malicious":
             assert prov["strong"] >= 2 or (prov["strong"] == 1 and prov["weak"] >= 2)
             assert all(x["requires_hitl"] for x in t["recommended_actions"] if x["action_type"] in ("lock_account", "revoke_sessions", "block", "hold", "block_export"))

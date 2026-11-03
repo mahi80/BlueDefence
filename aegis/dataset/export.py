@@ -318,6 +318,43 @@ class DatasetBuilder:
 
 # ------------------------------------------------------------------ verify --
 
+def _verify_sft_only(d: Path, manifest: dict) -> tuple[bool, list[str]]:
+    """``synth`` and ``mixed`` write only ``sft/triage.jsonl`` and a manifest carrying its sha256 (over each
+    row's JSON, newline excluded). ``verify`` used to judge them as a full export and always failed, so CI
+    ran it with ``|| true`` (code review 2026-11-03 T11) and a broken verifier passed."""
+    problems: list[str] = []
+    sft = d / "sft" / "triage.jsonl"
+    if not sft.exists():
+        return False, ["missing file sft/triage.jsonl"]
+    h = hashlib.sha256()
+    n = 0
+    with sft.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            h.update(line.encode())
+            n += 1
+            try:
+                row = json.loads(line)
+                msgs = row.get("messages") or []
+                if [m.get("role") for m in msgs] != ["system", "user", "assistant"]:
+                    problems.append(f"sft row {row.get('id')} is not system/user/assistant")
+                elif json.loads(msgs[2]["content"]).get("verdict") not in ("benign", "suspicious", "malicious", "uncertain"):
+                    problems.append(f"sft row {row.get('id')} has an unknown verdict")
+                json.loads(msgs[1]["content"])
+            except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+                problems.append(f"sft row {n} is not JSON-in/JSON-out")
+            if len(problems) >= 5:
+                break
+    if h.hexdigest() != manifest.get("sft_triage_sha256") and len(problems) < 5:
+        problems.append(f"hash mismatch sft/triage.jsonl: {h.hexdigest()[:12]} != {str(manifest.get('sft_triage_sha256'))[:12]}")
+    want = (manifest.get("counts") or {}).get("sft_triage_rows")
+    if len(problems) < 5 and want != n:
+        problems.append(f"sft/triage.jsonl has {n} rows, manifest says {want}")
+    return not problems, problems
+
+
 def verify_dataset(out_dir: Path | str) -> tuple[bool, list[str]]:
     """Re-hash files against the manifest and re-check the split-leakage invariant."""
     d = Path(out_dir)
@@ -326,6 +363,8 @@ def verify_dataset(out_dir: Path | str) -> tuple[bool, list[str]]:
         manifest = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
     except Exception as e:  # noqa: BLE001
         return False, [f"manifest unreadable: {e}"]
+    if "format" not in manifest and "sft_triage_sha256" in manifest:
+        return _verify_sft_only(d, manifest)
     if manifest.get("format") != DATASET_FORMAT:
         problems.append(f"unknown format {manifest.get('format')!r}")
     for rel, expected in (manifest.get("files") or {}).items():

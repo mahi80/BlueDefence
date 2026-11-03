@@ -107,9 +107,11 @@ def test_plan_prefers_one_cheap_cut_over_many_expensive_ones():
 def test_plan_fallback_isolates_host_when_no_cut_exists_and_empty_when_nothing_critical():
     from aegis.agents.orchestrator.walkers import plan_mitigation
     g = BlastGraph(); g.seed("LT-9", "host")
-    g.add([Edge("LT-9", "resolved", "cbs-db", source="network", b_type="core_banking_db")])   # 'resolved' severs the domain, not the path
+    g.add([Edge("LT-9", "mounted", "cbs-db", source="network", b_type="core_banking_db")])   # no SEVER entry: no cheap cut
     p = plan_mitigation(g)
-    assert any(s.action_type in ("block", "isolate") for s in p.steps) and p.protected == ["cbs-db"] or p.unprotected == ["cbs-db"]
+    # review T6: `A and B or C` never reached the fallback; this now exercises it and nothing else
+    assert [(s.action_type, s.target) for s in p.steps] == [("isolate", "LT-9")]
+    assert p.unprotected == ["cbs-db"] and p.steps[0].requires_hitl
     quiet = BlastGraph(); quiet.seed("u2", "account"); quiet.add([Edge("u2", "logged_on", "LT-1", b_type="host")])
     assert plan_mitigation(quiet).steps == [] and "nothing to cut" in plan_mitigation(quiet).note
 

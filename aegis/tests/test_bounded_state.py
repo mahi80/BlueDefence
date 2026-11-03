@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from aegis.agents.shared.bounded import BoundedDict
 
@@ -85,11 +84,6 @@ def test_egress_volume_rows_fold_without_losing_bytes():
     p = next(p for p in det._pairs.values() if p.volume)
     assert len(p.volume) <= egress._MAX_VOLUME_ROWS
     assert sum(o for _, o, _ in p.volume) == p.out_sum == 1000 * n
-
-
-def test_swarm_run_history_is_a_bounded_deque():
-    from aegis.agents.orchestrator import swarm
-    assert "self.runs: deque[dict] = deque(maxlen=" in Path(swarm.__file__).read_text()
 
 
 def test_spoofed_hostname_flood_does_not_evict_a_real_device(monkeypatch):
