@@ -6,7 +6,7 @@ every request is well-formed and most return 200. This detector keeps a bounded,
 window of gateway events (cheap, in memory) and emits **one AEGIS alert** only when the pattern
 crosses a threshold — gateway logs are every API call, so raw events never reach the LLM.
 
-Per principal (the token's subject; ``anon:<ip>|<ua>`` when unauthenticated) and endpoint
+Per principal (the token's subject; ``anon:<ip>`` when unauthenticated) and endpoint
 template (``/api/v1/accounts/{id}``) inside ``AEGIS_BOLA_WINDOW_S`` (300 s):
 
     confirmed    ≥ ``AEGIS_BOLA_CROSS_MIN`` (2) objects owned by someone else answered 2xx —
@@ -35,7 +35,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .ownership import NoOwnership, OwnershipSource, exempt_principals, is_exempt
 
@@ -61,12 +61,27 @@ def _is_id(seg: str) -> bool:
     return bool(_NUM.match(seg) or _UUID.match(seg) or _TOKENISH.match(seg))
 
 
+_EXT = re.compile(r"\.(?:json|xml|html?|csv|pdf|txt|ya?ml)$", re.IGNORECASE)
+
+
+def _canon_seg(seg: str) -> str:
+    for _ in range(3):                                 # %2531 → %31 → 1
+        d = unquote(seg)
+        if d == seg:
+            break
+        seg = d
+    seg = seg.split(";", 1)[0]                         # matrix parameters
+    return _EXT.sub("", seg).strip()
+
+
 def objects_in(path: str) -> tuple[str, list[tuple[str, str]]]:
     """``/api/v1/customers/770001/accounts/1002?statementId=9001`` →
     (``/api/v1/customers/{id}/accounts/{id}``, [("statement","9001"), ("customer","770001"), ("account","1002")]).
     The last entry is the primary object (deepest in the path)."""
     parts = urlsplit(str(path or ""))
-    segs = [s for s in parts.path.split("/")]
+    # one object, many spellings: `/accounts/1002;x`, `/accounts/1002.json`, `/accounts/%31%30%30%32` each looked like
+    # a different template or no id at all, so a walk spread over them never reached the threshold (round 3 G7-2)
+    segs = [_canon_seg(s) for s in parts.path.split("/")]
     out: list[tuple[str, str]] = []
     tmpl: list[str] = []
     for i, seg in enumerate(segs):
@@ -138,7 +153,9 @@ class ObjectWalkDetector:
         if principal and is_exempt(principal, self.exempt):
             self.exempted += 1
             return None
-        key = principal or f"anon:{ev.get('client_ip', '')}|{ev.get('user_agent', '')}"
+        # unauthenticated callers are keyed by address only: with the User-Agent in the key, rotating it per request
+        # made every request a new "client" (review round 3 G7-2)
+        key = principal or f"anon:{ev.get('client_ip', '')}"
         template, objs = objects_in(ev.get("path") or "")
         if not objs:
             return None

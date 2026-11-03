@@ -28,6 +28,26 @@ _CVE = re.compile(r"^CVE-\d{4}-\d{4,7}$")
 _EMAIL = re.compile(r"^[^@\s]{1,64}@([^@\s]{1,253})$")
 
 
+#: Shared infrastructure an IOC must never name whole (review round 3 G7-3): a "malicious" ``co.in`` or
+#: ``amazonaws.com`` matches half the internet, and 8.8.8.8 is every resolver's fallback. A host *under* one of
+#: these (``evil.s3.amazonaws.com``) is still accepted; the bare suffix or provider apex is not.
+_SHARED_SUFFIXES = frozenset({
+    "com", "net", "org", "in", "io", "co", "info", "biz", "xyz", "app", "dev", "cloud",
+    "co.in", "net.in", "org.in", "gov.in", "nic.in", "ac.in", "edu.in", "firm.in", "gen.in", "ind.in",
+    "co.uk", "org.uk", "com.au", "com.sg", "co.jp",
+    "amazonaws.com", "s3.amazonaws.com", "cloudfront.net", "elb.amazonaws.com", "awsglobalaccelerator.com",
+    "azurewebsites.net", "cloudapp.net", "cloudapp.azure.com", "blob.core.windows.net", "windows.net", "azureedge.net",
+    "azurefd.net", "trafficmanager.net", "microsoft.com", "office.com", "office365.com", "outlook.com", "live.com",
+    "googleapis.com", "appspot.com", "googleusercontent.com", "gstatic.com", "google.com", "withgoogle.com",
+    "cloudflare.com", "workers.dev", "pages.dev", "akamaihd.net", "akamaized.net", "edgekey.net", "edgesuite.net",
+    "fastly.net", "github.com", "githubusercontent.com", "github.io", "herokuapp.com", "vercel.app", "netlify.app",
+    "ngrok.io", "ngrok-free.app", "duckdns.org", "no-ip.com", "dropbox.com", "dropboxusercontent.com",
+})
+_SHARED_IPS = frozenset({"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112",
+                         "208.67.222.222", "208.67.220.220", "2001:4860:4860::8888", "2001:4860:4860::8844",
+                         "2606:4700:4700::1111", "2606:4700:4700::1001"})
+
+
 def _env_list(name: str) -> list[str]:
     return [t.strip().lower() for t in os.environ.get(name, "").replace(";", ",").split(",") if t.strip()]
 
@@ -59,6 +79,8 @@ def _ip(value: str) -> tuple[str | None, str]:
     refuse, why = never_block_target(str(ip))
     if refuse:
         return None, why
+    if str(ip) in _SHARED_IPS:
+        return None, f"{ip} is shared public infrastructure (a public resolver)"
     return str(ip), ""
 
 
@@ -69,6 +91,8 @@ def _domain(value: str) -> tuple[str | None, str]:
         return None, "not a domain name"
     if _own_domain(d):
         return None, f"{d} is the bank's own domain"
+    if d in _SHARED_SUFFIXES or "." not in d:
+        return None, f"{d} is a public suffix or shared provider domain, not an indicator"
     return d, ""
 
 
