@@ -100,8 +100,15 @@ _INTERNAL = [ipaddress.ip_network(n) for n in (
     "0.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4", "::1/128", "::/128", "fc00::/7", "fe80::/10", "ff00::/8")]
 
 
+_AUTOMATION_UA = __import__("re").compile(
+    r"^(?:python-requests|python-urllib|python-httpx|aiohttp|httpx|curl|wget|go-http-client|libwww-perl|lwp::|"
+    r"java/|apache-httpclient|okhttp-bot|node-fetch|axios|undici|got |scrapy|php/|guzzlehttp|ruby|mechanize|"
+    r"powershell|winhttp|masscan|zgrab|nuclei|sqlmap|nikto|gobuster|ffuf|dirbuster|httpie)", __import__("re").IGNORECASE)
+
+
 def _internal(net) -> bool:
-    return any(net.version == n.version and net.subnet_of(n) for n in _INTERNAL)
+    from .grounding import is_internal
+    return is_internal(net)
 
 
 def _narrow_external(target: str) -> tuple[bool, str]:
@@ -116,8 +123,11 @@ def _narrow_external(target: str) -> tuple[bool, str]:
             return False, "a bare TLS fingerprint is shared by real browsers — challenge it, never auto-block"
         if value in allowed_fingerprints():
             return False, "fingerprint on AEGIS_FP_ALLOW"
-        if ua.startswith("Mozilla/"):
-            return False, "browser user agent — a fingerprint block could hit customers"
+        if not _AUTOMATION_UA.search(ua or ""):
+            # only a known scripting / automation client is safe to block by fingerprint: a browser, or a
+            # mobile app's HTTP stack (okhttp, Dalvik, CFNetwork — the bank's own app uses these), would hit
+            # customers. "Not Mozilla/" used to be enough (review 2026-11-03 W8).
+            return False, "not a known automation client — a fingerprint block could hit customers"
         return True, ""
     try:
         net = ipaddress.ip_network(target.strip(), strict=False)

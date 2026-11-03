@@ -359,7 +359,7 @@ def run_cycle(p: Pipeline, alerts: Iterator[dict] | None = None, *, max_alerts: 
                 continue
         try:
             chain = p.orch.handle(alert)
-            summary = p.response.execute(chain)
+            summary = p.response.execute(chain, alert)
         except AuditWriteError as e:
             # the evidence could not be written, so nothing was executed for this alert (fail closed). The consumer
             # has already checkpointed it, so "retry from the source" is not an option: park it in the deferred

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
-from typing import Tuple
+from typing import Any, Tuple
 
 # Never a valid enforcement target, even on human approval. RFC1918 is deliberately absent
 # (isolating a compromised internal host is a core SOC action and must stay possible).
@@ -66,20 +66,66 @@ def never_block_target(target: str) -> Tuple[bool, str]:
     t = str(target or "").strip()
     if not t:
         return False, ""
-    if t.lower() in _never_block_hosts():
-        return True, f"{t} is on AEGIS_NEVER_BLOCK_HOSTS"
-    host = t
-    # strip a :port off a bare IPv4 like 127.0.0.1:8787 (IPv6 has >1 colon, left intact)
+    hosts = _never_block_hosts()
+    if hosts:
+        name = _host_of(t)
+        # the listed host itself, anything under it, or a parent that would cover it ("examplebank.in" or
+        # ".examplebank.in" blocks netbanking.examplebank.in); scheme, path, port, case and a trailing dot
+        # no longer get a listed host past the guard
+        for h in hosts:
+            h = h.rstrip(".")
+            if name and (name == h or name.endswith("." + h) or h.endswith("." + name)):
+                return True, f"{t} covers {h}, which is on AEGIS_NEVER_BLOCK_HOSTS"
+    host = t.strip("[]")
+    # strip a :port off a bare IPv4 like 127.0.0.1:8787 (IPv6 has >1 colon, left intact); [v6]:port too
     if host.count(":") == 1 and "." in host and host.rsplit(":", 1)[1].isdigit():
         host = host.rsplit(":", 1)[0]
+    elif host.startswith("[") or ("]:" in t):
+        host = t.split("]")[0].lstrip("[")
     try:
         net = ipaddress.ip_network(host, strict=False)
     except ValueError:
         return False, ""  # not an IP/CIDR — out of scope here
-    for n in _HARD_NETS + _extra_nets():
-        if net.version == n.version and net.subnet_of(n):
-            return True, f"{t}: loopback/reserved/operator-listed — never blocked (would risk own infra)"
+    for cand in {net, unwrap(net)}:
+        for n in _HARD_NETS + _extra_nets():
+            # overlap, not only subset: a supernet (0.0.0.0/0, 126.0.0.0/7) covers protected space too
+            if cand.version == n.version and cand.overlaps(n):
+                return True, f"{t}: covers loopback/reserved/operator-listed space — never blocked (would risk own infra)"
     return False, ""
+
+
+def unwrap(addr: Any) -> Any:
+    """The IPv4 address hiding in an IPv4-mapped (::ffff:a.b.c.d), 6to4 (2002::/16) or NAT64 (64:ff9b::/96)
+    IPv6 address — otherwise ``addr`` unchanged. Works for addresses and networks."""
+    if isinstance(addr, (ipaddress.IPv6Network,)):
+        inner = unwrap(addr.network_address)
+        if inner is not addr.network_address and isinstance(inner, ipaddress.IPv4Address):
+            if addr.network_address.ipv4_mapped is not None or addr.network_address in _NAT64:
+                bits = max(0, addr.prefixlen - 96)
+            else:                                  # 6to4 carries the v4 address in bits 16..48
+                bits = max(0, min(32, addr.prefixlen - 16))
+            return ipaddress.ip_network(f"{inner}/{bits}", strict=False)
+        return addr
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return addr.ipv4_mapped
+        if addr.sixtofour is not None:
+            return addr.sixtofour
+        if addr in _NAT64:
+            return ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+    return addr
+
+
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _host_of(t: str) -> str:
+    import re as _re
+    h = _re.sub(r"^[a-z][a-z0-9+.-]*://", "", t.strip().lower())
+    h = h.split("/", 1)[0].split("?", 1)[0]
+    if h.count(":") == 1:
+        h = h.split(":", 1)[0]
+    return h.strip(".").lstrip("*.")
 
 
 def enforcement_refused(action_type: str, target: str) -> Tuple[bool, str]:

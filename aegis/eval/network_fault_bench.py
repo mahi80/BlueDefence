@@ -315,7 +315,7 @@ def run(seed: int = 7, *, verbose: bool = False) -> dict:
                     continue
                 for alert in got:
                     chain = p.orch.handle(alert)
-                    p.response.execute(chain)
+                    p.response.execute(chain, alert)
                     n = alert["netops"]
                     rel = ts - now
                     row = {"at_s": round(rel), "fault": n["fault"], "device": alert["device"], "iface": alert.get("iface"),

@@ -226,7 +226,7 @@ def run(seed: int = 11, *, breaker: str = "shadow") -> list[StageResult]:
 
             def handle(stage: StageResult, alert: dict, t_s: float) -> None:
                 chain = p.orch.handle(alert)
-                summary = p.response.execute(chain)
+                summary = p.response.execute(chain, alert)
                 _record(stage, chain, summary, t_s)
 
             handle(by_name["endpoint"], endpoint_alert(), -24 * H)

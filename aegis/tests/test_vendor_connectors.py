@@ -16,6 +16,7 @@ from aegis.agents.response.connectors.mock_vendor import MockF5, MockImperva, Mo
 from aegis.agents.response.receipts import ReceiptLog
 from aegis.agents.shared.evidence_chain import EvidenceChain, RecommendedAction
 from aegis.shadow import build_report
+from aegis.tests.helpers import alert_for
 
 
 @pytest.fixture(autouse=True)
@@ -193,9 +194,9 @@ def test_registry_from_env_mock_vendors_shadow_then_live(monkeypatch, tmp_path):
     assert reg.mode == "live"
     agent = ResponseAgent(connectors=reg)
     chain = EvidenceChain(alert_id="A-7", investigated_by="perimeter", verdict="malicious", confidence=0.9,
-                          recommended_actions=[_act("throttle", "203.0.113.9"), _act("block", "203.0.113.9", hitl=True),
+                          recommended_actions=[_act("throttle", "203.0.113.9"), _act("block", "203.0.113.9"),   # not flagged HITL: auto-block scores it
                                                _act("isolate", "host-1", hitl=True)])
-    summary = agent.execute(chain)
+    summary = agent.execute((_c := chain), alert_for(_c))
     assert [e.action.action_type for e in summary.executed] == ["throttle"]
     assert summary.receipts[0].connector == "imperva" and summary.receipts[0].status == "applied"
     agent.approve(_act("block", "203.0.113.9", hitl=True), approver="ciso@bank.test", source_alert_id="A-7")

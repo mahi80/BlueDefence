@@ -96,6 +96,15 @@ class HitlTimeoutPolicy:
         if conf < self.min_confidence:
             return HOLD, f"confidence {conf:.2f} below the {self.min_confidence:.2f} floor"
 
+        # nobody approved it, so the same width rules as any unattended action apply: no internal ranges, no
+        # wide CIDR, no top-level / shared-suffix destination, no privileged principal (review 2026-11-03 W3)
+        from .grounding import injection_flagged, narrow
+        ok, why = narrow(atype, str(getattr(action, "target", "")))
+        if not ok:
+            return HOLD, f"{why} — holds for a human"
+        if injection_flagged(chain):
+            return HOLD, "prompt-injection evidence on this chain — holds for a human"
+
         if self.mode == "shadow":
             return SHADOW, f"would auto-execute {atype} on timeout ({int(age_sec)}s, no human)"
         return EXECUTE, f"auto-executing reversible {atype} on HITL timeout ({int(age_sec)}s, no human)"
