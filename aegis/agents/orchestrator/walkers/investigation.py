@@ -159,10 +159,12 @@ class Investigator:
         aid = str(chain.alert_id)
         with self._lock:
             self._jobs[aid]["state"] = "running"
+        from .loop import chain_lock
         try:
-            s = investigate(alert, chain, self.source, guard=self._guard, hops=self.hops, max_seconds=self.max_seconds, record=self._record,
-                            twin=self.twin, twin_personas=self.twin_personas, twin_rounds=self.twin_rounds, llm=self._llm,
-                            file_actions=self.file_actions)
+            with chain_lock(aid):          # the containment loop rewrites the same chain (review B11)
+                s = investigate(alert, chain, self.source, guard=self._guard, hops=self.hops, max_seconds=self.max_seconds, record=self._record,
+                                twin=self.twin, twin_personas=self.twin_personas, twin_rounds=self.twin_rounds, llm=self._llm,
+                                file_actions=self.file_actions)
             with self._lock:
                 self._jobs[aid].update(state="done", finished=time.time(), summary=s)
             if self.on_done is not None:
