@@ -17,6 +17,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from ...shared.bounded import BoundedDict
 from ...shared.evidence_chain import EvidenceChain, EvidenceItem, ReasoningStep, RecommendedAction
 from .mitigation import plan_mitigation
 from .sources import TelemetrySource
@@ -54,7 +55,8 @@ class ContainmentLoop:
     hops: int = 2
     max_seconds: float = 10.0
     record: Optional[Callable[[dict, EvidenceChain], Any]] = None
-    _tracked: dict[str, tuple[dict, EvidenceChain]] = field(default_factory=dict)
+    # alerts whose containment is followed: the most recent 5,000 (each holds the alert + chain)
+    _tracked: dict[str, tuple[dict, EvidenceChain]] = field(default_factory=lambda: BoundedDict(5000))
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def track(self, alert: dict, chain: EvidenceChain) -> None:

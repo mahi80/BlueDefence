@@ -44,10 +44,12 @@ import os
 import re
 import threading
 import time
-from pathlib import Path
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from ..shared.bounded import BoundedDict
 
 _ROLE_RX = (
     ("core", re.compile(r"\b(core|cr|spine)\b|^core-|^cr\d|-core\d*$", re.I)),
@@ -151,15 +153,18 @@ class NetworkAssurance:
         self._roles: dict[str, str] = {}
         self._users: dict[str, int] = {}
         self._sites: dict[str, str] = {}
-        self._iface_link: dict[tuple[str, str], _Link] = {}
+        # per-device state is keyed by the syslog hostname, which anyone who can reach UDP/514 can spoof:
+        # capped (least recently written evicted) so a flood of fake hostnames cannot exhaust memory
+        _cap = int(os.environ.get("AEGIS_NETOPS_MAX_DEVICES", "20000"))
+        self._iface_link: dict[tuple[str, str], _Link] = BoundedDict(_cap * 8)
         self._incidents: list[_Incident] = []
         self._tele: dict[tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=8))   # (ts, counters)
-        self._last_seen: dict[str, float] = {}
-        self._last_tele: dict[str, float] = {}                   # silence is judged only on devices that stream telemetry
+        self._last_seen: dict[str, float] = BoundedDict(_cap)
+        self._last_tele: dict[str, float] = BoundedDict(_cap)                   # silence is judged only on devices that stream telemetry
         self._last_silence_check = 0.0
         self._unreachable: set[str] = set()
-        self._config_hash: dict[str, str] = {}
-        self._recent_config: dict[str, dict] = {}               # device -> last change event (for bad-push correlation)
+        self._config_hash: dict[str, str] = BoundedDict(_cap)
+        self._recent_config: dict[str, dict] = BoundedDict(_cap)               # device -> last change event (for bad-push correlation)
         self._err_open: set[tuple[str, str]] = set()
         self._cong_open: set[tuple[str, str]] = set()
         self.stats: dict[str, int] = defaultdict(int)

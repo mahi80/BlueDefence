@@ -47,6 +47,9 @@ class StreamItem:
     passthrough: bool = False   # already an AEGIS alert dict → no vendor normalisation
 
 
+MAX_SOURCES = 256       # distinct feed names tracked; the rest are counted as "other"
+
+
 @dataclass
 class StreamStats:
     received: int = 0
@@ -90,6 +93,8 @@ class StreamQueue:
             for ln in lines:
                 self._q.append(StreamItem(source=source, line=ln, received_at=now, passthrough=passthrough))
             self.stats.received += len(lines)
+            if source not in self.stats.by_source and len(self.stats.by_source) >= MAX_SOURCES:
+                source = "other"            # ?source= / headers are free text: cap the distinct names counted
             self.stats.by_source[source] = self.stats.by_source.get(source, 0) + len(lines)
             self.stats.last_received_at = now
             self.stats.high_water = max(self.stats.high_water, len(self._q))

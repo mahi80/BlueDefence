@@ -30,11 +30,17 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 from datetime import datetime
 from typing import Any
 
-from ..shared.evidence_chain import EvidenceChain, EvidenceItem, ReasoningStep, RecommendedAction
+from ..shared.bounded import BoundedDict
+from ..shared.evidence_chain import (
+    EvidenceChain,
+    EvidenceItem,
+    ReasoningStep,
+    RecommendedAction,
+)
 
 _TREASURY_MARKERS = ("TREASURY", "NOSTRO", "VOSTRO", "SETTLEMENT")
 _SENDER_KEYS = ("sender_account", "debit_account", "from_account", "source_account")
@@ -126,17 +132,26 @@ class _OutflowBook:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._by_sender: dict[str, deque] = defaultdict(deque)
+        # senders with a high-value transfer in the window; the least recently active is evicted past the cap,
+        # and a sender whose window empties is dropped (the defaultdict used to keep every sender ever seen)
+        self._by_sender: BoundedDict = BoundedDict(int(os.environ.get("AEGIS_OUTFLOW_MAX_SENDERS", "100000")))
 
     def add(self, sender: str, ts: float, amount: float, txn_id: str, window: float) -> tuple[int, float]:
         with self._lock:
-            q = self._by_sender[sender]
+            q = self._by_sender.get(sender)
+            if q is None:
+                q = self._by_sender[sender] = deque(maxlen=1000)
+            else:
+                self._by_sender.move_to_end(sender)
             if not any(t == txn_id for _, _, t in q):
                 q.append((ts, amount, txn_id))
             cutoff = max(ts, max((x[0] for x in q), default=ts)) - window
             while q and q[0][0] < cutoff:
                 q.popleft()
-            return len(q), sum(a for _, a, _ in q)
+            n, total = len(q), sum(a for _, a, _ in q)
+            if not q:
+                self._by_sender.pop(sender, None)
+            return n, total
 
     def reset(self) -> None:
         with self._lock:

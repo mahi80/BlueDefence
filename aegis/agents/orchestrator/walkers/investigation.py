@@ -98,8 +98,20 @@ class Investigator:
             if aid in self._jobs and self._jobs[aid]["state"] in ("queued", "running"):
                 return self._jobs[aid]["future"]
             fut = self._pool.submit(self._run, alert, chain)
+            self._jobs.pop(aid, None)                 # re-insert so the newest job is last
             self._jobs[aid] = {"state": "queued", "submitted": time.time(), "future": fut}
+            self._prune_locked()
         return fut
+
+    MAX_JOBS = 5000
+
+    def _prune_locked(self) -> None:
+        """Keep the most recent finished jobs (each holds a graph summary); never drop a queued / running one."""
+        excess = len(self._jobs) - self.MAX_JOBS
+        if excess <= 0:
+            return
+        for aid in [a for a, j in self._jobs.items() if j["state"] in ("done", "failed")][:excess]:
+            del self._jobs[aid]
 
     def _run(self, alert: dict, chain: EvidenceChain) -> dict:
         aid = str(chain.alert_id)

@@ -166,6 +166,9 @@ def beacon_stats(starts: list[float]) -> dict | None:
             "jitter": round(mad / med, 3), "skew": round(skew, 3)}
 
 
+_MAX_VOLUME_ROWS = 4096       # per (source, destination) pair inside the exfil window
+
+
 @dataclass
 class _Pair:
     src: str
@@ -402,6 +405,12 @@ class EgressDetector:
             p.starts.append(ts)
         out_b, in_b = max(0, int(ev.get("bytes_out") or 0)), max(0, int(ev.get("bytes_in") or 0))
         p.sizes.append(out_b)
+        if len(p.volume) >= _MAX_VOLUME_ROWS:
+            # bounded: fold the two oldest rows into one (the window sums stay exact; only the per-connection
+            # granularity of the oldest traffic is lost) — 300k tiny connections used to keep 300k rows per pair
+            _t0, o0, i0 = p.volume.popleft()
+            t1, o1, i1 = p.volume.popleft()
+            p.volume.appendleft((t1, o0 + o1, i0 + i1))
         p.volume.append((ts, out_b, in_b))
         p.out_sum += out_b
         p.in_sum += in_b

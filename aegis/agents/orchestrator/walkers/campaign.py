@@ -25,6 +25,7 @@ from datetime import UTC as _UTC
 from datetime import datetime
 from typing import Any
 
+from ...shared.bounded import BoundedDict
 from ...shared.fingerprint import client_fingerprint
 from ...shared.tls_client import TlsEstate, spoofed_browser
 from .walk import SEED_KEYS
@@ -35,6 +36,8 @@ ADAPT_WINDOW_S = 120
 _EMPTY_VALUES = frozenset({"", "-", "?", "none", "null", "unknown", "anonymous", "n/a"})
 #: vendor actions that mean "let through untouched" — only those events teach the TLS model
 _ALLOW_ACTIONS = frozenset({"allow", "allowed", "pass", "skip", "none", "noaction"})
+
+_MAX_TEXT = 2048          # per-event text kept for campaign matching (a payload can be megabytes)
 
 _RECON_HINTS = (".map", "/.env", "swagger", "openapi", "graphql", "__schema", "/admin", "phpinfo", "/.git", "telescope",
                 "_profiler", "/api/schema", "debug", "actuator", "asset-manifest")
@@ -109,9 +112,16 @@ class EventStore:
     says about each TLS fingerprint (``tls``, outlives the window — see ``shared/tls_client.py``)."""
     window_min: int = 30
     max_per_key: int = 500
+    # distinct keys (source IPs, sessions, users, fingerprints) kept: least-recently-seen evicted first, so a
+    # botnet of a million IPs cannot grow this without limit (50k distinct IPs used to retain ~160 MB forever)
+    max_keys: int = field(default_factory=lambda: int(os.environ.get("AEGIS_CAMPAIGN_MAX_KEYS", "50000")))
     tls: TlsEstate = field(default_factory=TlsEstate.from_env)
-    _rings: dict[str, deque] = field(default_factory=dict)
+    _rings: BoundedDict = field(default=None)  # type: ignore[assignment]
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self) -> None:
+        if self._rings is None:
+            self._rings = BoundedDict(self.max_keys)
 
     def add(self, alert: dict, now: float | None = None) -> list[str]:
         now = now or time.time()
@@ -119,7 +129,7 @@ class EventStore:
             ts=_ts(alert, now), alert_id=str(alert.get("id", "")), source=str(alert.get("source", "")),
             endpoint=str(alert.get("url") or alert.get("endpoint") or alert.get("uri") or alert.get("api") or "")[:120],
             method=str(alert.get("http_method") or alert.get("method") or alert.get("cs-method") or ""),
-            text=_text(alert), waf_sig=str(alert.get("waf_rule") or alert.get("attack_type") or alert.get("rule") or ""),
+            text=_text(alert)[:_MAX_TEXT], waf_sig=str(alert.get("waf_rule") or alert.get("attack_type") or alert.get("rule") or ""),
             blocked=alert.get("blocked") if isinstance(alert.get("blocked"), bool) else None,
             status=alert.get("http_status") if isinstance(alert.get("http_status"), int) else alert.get("response_status") if isinstance(alert.get("response_status"), int) else None,
             owner_mismatch=bool(alert.get("accessed_object_owner") and alert.get("principal_id") and alert["accessed_object_owner"] != alert["principal_id"]),
@@ -131,6 +141,7 @@ class EventStore:
         with self._lock:
             for k in keys:
                 ring = self._rings.setdefault(k, deque(maxlen=self.max_per_key))
+                self._rings.move_to_end(k)          # most recently seen keys are the last evicted
                 ring.append(ev)
         fp = client_fingerprint(alert)
         if fp is not None and fp.kind == "ja4":

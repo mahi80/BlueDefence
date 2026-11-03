@@ -32,6 +32,7 @@ attacker-simulation twin — and is not what this module does.
 from __future__ import annotations
 
 import logging
+from collections import deque
 import re
 import threading
 import time
@@ -329,7 +330,8 @@ class SwarmOrchestrator:
         self._extra_voters = [] if voter is not None else list(getattr(orchestrator, "_extra_voters", None) or [])
         self._pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="aegis-swarm")
         self._lock = threading.Lock()
-        self.runs: list[dict] = []
+        # recent fan-outs for the status page / tests — the last 1,000, not one per alert forever
+        self.runs: deque[dict] = deque(maxlen=1000)
 
     # passthrough so the governance wrapper and callers see one object
     def __getattr__(self, item: str) -> Any:
