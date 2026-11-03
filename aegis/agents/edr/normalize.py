@@ -13,6 +13,7 @@ this module only reshapes fields, it never executes anything from them.
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import Iterable, Optional
 
 
@@ -205,12 +206,13 @@ def to_alert(raw: dict) -> dict | None:
     # Pre-filter: every Sysmon / osquery row used to become an LLM investigation (a notepad launch, one DNS
     # query), and storm mode then deferred real alerts behind them. Only a row a scorer finds something in is an
     # alert; the rest has been folded into the beacon window above and is done (round 4 S4-8).
+    # AEGIS_EDR_PREFILTER=0 sends every row to the specialist (a pilot that wants to see what the scorers miss).
     from .tools import run_all_tools
     try:
         quiet = all(getattr(r, "weight", "low") == "low" for r in run_all_tools(alert))
     except Exception:  # noqa: BLE001 — a scorer that cannot run must not drop the row: let the specialist see it
         quiet = False
-    if quiet:
+    if quiet and os.environ.get("AEGIS_EDR_PREFILTER", "1").strip().lower() not in ("0", "off", "false", "no"):
         return None
     digest = hashlib.sha256(repr(sorted(raw.items(), key=lambda kv: str(kv[0])))[:4000].encode()).hexdigest()[:16]
     return {"id": f"edr-{digest}", "alert_type": "host_endpoint", **alert}

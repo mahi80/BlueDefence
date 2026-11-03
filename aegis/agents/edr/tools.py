@@ -52,22 +52,70 @@ _SUSPICIOUS_CMDLINE_PATTERNS = [
 _CMDLINE_RX = re.compile("|".join(_SUSPICIOUS_CMDLINE_PATTERNS), re.IGNORECASE)
 
 
+# Suspicious spawns by the parent's ROLE (review round 5): a server or document process that starts a shell or a
+# living-off-the-land binary. The table above matched a few exact names by substring (`sh` in `ssh-agent`), and
+# `w3wp.exe → /bin/sh`, `sqlservr.exe → cmd.exe`, `httpd → sh`, `postgres → sh` (COPY … FROM PROGRAM) and
+# `java → bash` (Log4Shell) all scored low — and since the EDR pre-filter (round 4 S4-8) a low row never reaches
+# the model, so a web shell was dropped outright.
+_SERVER_PARENTS = frozenset({
+    "w3wp", "httpd", "apache", "apache2", "nginx", "lighttpd", "php-fpm", "php-cgi", "php", "tomcat", "tomcat8",
+    "tomcat9", "tomcat10", "jboss", "weblogic", "websphere", "iisexpress", "caddy", "haproxy", "envoy",
+    "sqlservr", "mysqld", "mariadbd", "postgres", "postmaster", "oracle", "mongod", "redis-server", "exchange",
+    "umworkerprocess", "msexchangeowaapppool", "ews"})
+_DOCUMENT_PARENTS = frozenset({
+    "winword", "excel", "powerpnt", "outlook", "onenote", "msaccess", "mspub", "visio", "acrord32", "acrobat",
+    "foxitreader", "foxitpdfreader", "hwp", "wps", "et", "wpp"})
+# runtimes that host web apps (Log4Shell, Spring4Shell, prototype-pollution RCE) but also run build tooling: medium
+_RUNTIME_PARENTS = frozenset({"java", "javaw", "node", "dotnet"})
+_SHELL_CHILDREN = frozenset({
+    "cmd", "powershell", "pwsh", "wscript", "cscript", "mshta", "rundll32", "regsvr32", "certutil", "bitsadmin",
+    "msbuild", "installutil", "regasm", "regsvcs", "wmic", "schtasks", "net", "net1", "whoami", "nltest",
+    "sh", "bash", "dash", "zsh", "ksh", "ash", "busybox", "nc", "ncat", "netcat", "socat", "curl", "wget",
+    "python", "python2", "python3", "perl", "ruby", "lua", "telnet", "id", "uname"})
+
+
+def _stem(name: str) -> str:
+    n = _base(name)
+    for ext in (".exe", ".com", ".bat", ".cmd", ".bin"):
+        if n.endswith(ext):
+            n = n[: -len(ext)]
+            break
+    # python3.11 / perl5.36 / tomcat9w → python3 / perl / tomcat9
+    return re.sub(r"(?<=[a-z])(\d+(?:\.\d+)+)$", "", n)
+
+
+def suspicious_spawn(parent: str, child: str) -> str:
+    """'high' (server / document process → shell or LOLBin), 'medium' (an app runtime → shell), or ''."""
+    p, c = _stem(parent), _stem(child)
+    if not p or not c or c not in _SHELL_CHILDREN:
+        return ""
+    if p in _SERVER_PARENTS or p in _DOCUMENT_PARENTS:
+        return "high"
+    if p in _RUNTIME_PARENTS:
+        return "medium"
+    return ""
+
+
 def parent_process_tree(parent: str | None, child: str | None, cmdline: str | None) -> ToolResult:
     parent_l = _base(parent or "")
     child_l = _base(child or "")
     cmdline_v = cmdline or ""
     suspicious_parent_child = False
     if parent_l in _SUSPICIOUS_PROCESS_PARENTS:
-        if any(c in child_l for c in _SUSPICIOUS_PROCESS_PARENTS[parent_l]):
+        if any(c == child_l or c == _stem(child_l) for c in _SUSPICIOUS_PROCESS_PARENTS[parent_l]):
             suspicious_parent_child = True
+    spawn = suspicious_spawn(parent_l, child_l)
+    if spawn == "high":
+        suspicious_parent_child = True
     cmdline_match = bool(_CMDLINE_RX.search(cmdline_v))
-    weight = "high" if (suspicious_parent_child or cmdline_match) else "low"
+    weight = "high" if (suspicious_parent_child or cmdline_match) else "medium" if spawn == "medium" else "low"
     return ToolResult(
         name="parent_process_tree",
         data={
             "parent": parent,
             "child": child,
             "suspicious_pair": suspicious_parent_child,
+            "spawn_role": spawn or None,
             "cmdline_indicators": cmdline_match,
             "cmdline": cmdline_v[:200],
         },
