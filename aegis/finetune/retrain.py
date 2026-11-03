@@ -278,7 +278,16 @@ def _accepted_local(dry_run: bool, hitl_dir: Path) -> list[dict]:
             if isinstance(r, dict):
                 out.append(r)
         return out
-    decided = {str(d.get("proposal_id")): d for d in rows("proposal-decisions.jsonl")}
+    from aegis.hitl.signing import trusted_approver, verify
+    decided: dict[str, dict] = {}
+    for d in rows("proposal-decisions.jsonl"):
+        ok, why = verify(d)
+        if ok:
+            ok, why = trusted_approver(d.get("decided_by"))
+        if not ok:          # a promotion is accepted only by a decision the console signed for a signed-in analyst
+            print(f"  ignored decision for {d.get('proposal_id')}: {why}")
+            continue
+        decided[str(d.get("proposal_id"))] = d
     out = []
     for p in rows("proposals.jsonl"):
         d = decided.get(str(p.get("id")))

@@ -98,6 +98,9 @@ def _decisions(hitl_dir: Path | None) -> dict[str, list[HumanDecision]]:
                 continue
             if not isinstance(d, dict) or not d.get("approval_id"):
                 continue
+            from ..hitl.signing import trusted_approver, verify
+            if not verify(d)[0] or not trusted_approver(d.get("decided_by"))[0]:
+                continue                  # an unsigned / forged row is not an analyst's label either
             card = cards.get(str(d["approval_id"]), {})
             args = card.get("args") or {}
             aid = str(args.get("alert_id") or d.get("alert_id") or "")
