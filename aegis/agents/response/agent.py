@@ -78,8 +78,16 @@ class ResponseSummary:
         return [a.receipt for a in self.executed if a.receipt is not None]
 
 
-# Phase 1.1 — actions that need a second human when they hit a protected target.
-_TWO_PERSON_ACTIONS = {"block", "isolate", "kill_process", "rotate_credential"}
+# Phase 1.1 — actions that need a second human when they hit a protected target: block, plus every action whose
+# contract is SEVERE or worse (takes a host, port or credential out of service, or cannot be undone). The list used
+# to be hand-kept and missed trigger_self_heal / interface_shutdown / config_rollback / recall_message, which then ran
+# on ONE approval against a protected core switch or database host (review round 8 A8-6).
+def _severe_actions() -> set[str]:
+    from .contracts import CONTRACTS, Impact
+    return {a for a, c in CONTRACTS.items() if c.impact >= Impact.SEVERE and not c.hand_off}
+
+
+_TWO_PERSON_ACTIONS = {"block", "isolate", "kill_process", "rotate_credential"} | _severe_actions()
 
 
 def _protected_targets_from_env() -> list[str]:
@@ -95,18 +103,27 @@ _DEVICE_ID = __import__("re").compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|\d{4,24}|[
 def _target_matches(target: str, patterns: list[str]) -> bool:
     """Is ``target`` covered by a protected pattern? IP and CIDR targets match a protected network they
     overlap (``198.51.100.7/32`` or a wider block inside a protected /24 — only a bare IP used to match);
-    ``host:`` / ``device:`` prefixes and case are ignored for name globs; an opaque EDR device id cannot be
-    tied to a hostname here, so it counts as protected whenever any protection is configured."""
+    kind prefixes and case are ignored for name globs; an opaque EDR device id cannot be
+    tied to a hostname here, so it counts as protected whenever any protection is configured.
+
+    Names are canonicalised the way the connectors resolve them (review round 8 A8-3): every kind prefix the
+    connectors accept (``upn:``, ``host:``, ``device:`` …, any case), a trailing dot, and — against a protected
+    SHORT name — the FQDN's first label (``db-core.bank.local`` is ``db-core``), a UPN's local part
+    (``svc-core@cbs.bank.in`` is ``svc-core``) and a ``DOMAIN\\user`` account. ``<device>:<iface>``
+    (interface_shutdown) and ``<host>:<pid>`` (kill_process) match on the device / host part."""
     if not patterns:
         return False
     from ..shared.netguard import strip_prefixes
     t = strip_prefixes(target)                 # every kind prefix, until stable (src:/dst:/ip:… too — round 6 C-6)
     if _matches_one(t, patterns):
         return True
-    # `<host-or-device-id>:<pid>` (kill_process): the host part is what is protected (review round 7 A-1)
-    m = __import__("re").fullmatch(r"(.+?):(\d+)", t)
-    if m and not _is_network(t):
-        return _matches_one(strip_prefixes(m.group(1)), patterns)
+    # `<host-or-device-id>:<pid>` (kill_process) / `<device>:<iface>` (interface_shutdown): the host / device part is
+    # what is protected (review round 7 A-1, round 8 A8-6). Never for an IP / CIDR (IPv6 has colons).
+    if ":" in t and not _is_network(t):
+        for part in {t.split(":", 1)[0], t.rsplit(":", 1)[0]}:
+            part = strip_prefixes(part)
+            if part and part != t and _matches_one(part, patterns):
+                return True
     return False
 
 
@@ -118,18 +135,31 @@ def _is_network(t: str) -> bool:
         return False
 
 
+def _short_forms(low: str) -> set[str]:
+    """What a name is called when protected by its short form: UPN local part, DOMAIN\\user account, FQDN first label."""
+    out = set()
+    if "\\" in low:
+        out.add(low.rsplit("\\", 1)[1])
+    if "@" in low:
+        out.add(low.split("@", 1)[0])
+    if "." in low and not _is_network(low):
+        out.add(low.split(".", 1)[0])
+    return {x for x in out if x}
+
+
 def _matches_one(t: str, patterns: list[str]) -> bool:
     import fnmatch
 
     from .grounding import unwrap
-    low = t.lower()
+    low = t.strip().lower().rstrip(".")
     if _DEVICE_ID.match(low):
         return True
     net = None
     try:
-        net = unwrap(ipaddress.ip_network(t.strip("[]"), strict=False))
+        net = unwrap(ipaddress.ip_network(low.strip("[]"), strict=False))
     except ValueError:
         pass
+    short = _short_forms(low) if net is None else set()
     for pat in patterns:
         if net is not None:
             try:
@@ -139,7 +169,11 @@ def _matches_one(t: str, patterns: list[str]) -> bool:
                 continue
             except ValueError:
                 pass
-        if fnmatch.fnmatch(low, pat.lower()):
+        p = pat.strip().lower().rstrip(".")
+        if fnmatch.fnmatch(low, p):
+            return True
+        # a protected short name (no dot, no @, no domain) covers the FQDN / UPN / DOMAIN\\user spellings of it
+        if not any(ch in p for ch in ".@\\") and any(fnmatch.fnmatch(x, p) for x in short):
             return True
     return False
 
@@ -255,7 +289,7 @@ class ResponseAgent:
             return False
 
     def _file_hitl(self, action: RecommendedAction, chain: EvidenceChain,
-                   decision: ExecutedAction, *, timeout_ok: bool = False) -> None:
+                   decision: ExecutedAction, *, timeout_ok: bool = False) -> str | None:
         """Dashboard approval when a transport is configured and reachable,
         else the stdout card. Never raises — HITL routing must not lose the
         decision record already in ``summary.hitl_queue``."""
@@ -272,8 +306,9 @@ class ResponseAgent:
                       file=self._hitl_stream)
         if approval_id:
             decision.note = f"{decision.note} | dashboard approval {approval_id}"
-            return
+            return str(approval_id)
         self._print_hitl_card(action, chain)
+        return None
 
     def file_for_review(self, chain: EvidenceChain, actions: list[RecommendedAction]) -> int:
         """File actions added to a chain after ``execute()`` ran (the investigation plan, a containment re-plan)
@@ -310,7 +345,7 @@ class ResponseAgent:
         decisions = self._hitl.sync(self, **kwargs)
         for d in decisions:
             if getattr(d, "status", "") == "rejected" and getattr(d, "action_type", "") == "hold":
-                self._release_breaker_hold(str(d.target), str(getattr(d, "decided_by", "") or "a person"))
+                self._release_breaker_hold(d)
         return decisions
 
     def _file_keep_or_release(self, action: RecommendedAction, chain: EvidenceChain, done: ExecutedAction) -> None:
@@ -322,13 +357,39 @@ class ResponseAgent:
             reasoning=(f"The outflow circuit breaker is holding {action.target} for {self._breaker.ttl_sec}s "
                        f"(no human in the loop): {action.reasoning} — approve to KEEP the hold until released, "
                        "reject to RELEASE it now."))
-        self._file_hitl(card, chain, done, timeout_ok=False)
+        approval_id = self._file_hitl(card, chain, done, timeout_ok=False)
+        rid = str(getattr(done.receipt, "receipt_id", "") or "")
+        if rid:
+            # this card — and only this card — may release this receipt (review round 8 A8-1)
+            self.__dict__.setdefault("_breaker_cards", {})[approval_id or f"alert:{chain.alert_id}"] = (
+                str(chain.alert_id), rid)
 
-    def _release_breaker_hold(self, target: str, who: str) -> None:
+    def _release_breaker_hold(self, d) -> None:
+        """A rejected keep-or-release card releases the breaker hold IT was filed for. It used to release every
+        breaker receipt on the same target whatever card was rejected — rejecting an unrelated analyst hold on the
+        account (another alert) lifted the drain hold — and it released a hold a person had since approved,
+        because the receipt still began ``aegis:breaker`` after that approval renewed it (review round 8 A8-1)."""
+        cards = self.__dict__.setdefault("_breaker_cards", {})
+        alert_id, approval_id = str(getattr(d, "alert_id", "")), str(getattr(d, "approval_id", "") or "")
+        who = str(getattr(d, "decided_by", "") or "a person")
+        entry = cards.pop(approval_id, None) or cards.pop(f"alert:{alert_id}", None)
         for r in list(self._connectors.active_receipts):
-            if r.action_type == "hold" and str(r.target) == target and str(r.approver).startswith("aegis:breaker"):
-                rb = self._connectors.rollback(r, reason=f"released by {who} (breaker hold rejected)")
-                print(f"[HITL] outflow-breaker hold on {target} released by {who}: {rb.status}", file=self._hitl_stream)
+            if r.action_type != "hold" or str(r.target) != str(getattr(d, "target", "")):
+                continue
+            if entry is not None and r.receipt_id != entry[1]:
+                continue
+            if str(r.alert_id) != alert_id:
+                continue      # (after a restart) the breaker's card names the alert the breaker held on
+            parts = [p.strip() for p in str(r.approver).split(";") if p.strip()]
+            if not parts or parts[0] != "aegis:breaker":
+                continue
+            humans = [p for p in parts[1:] if not p.startswith("aegis:")]
+            if humans:
+                print(f"[HITL] outflow-breaker card on {r.target} rejected by {who}, but the hold was since approved by "
+                      f"{', '.join(humans)}; it stays in force (release it at the vendor)", file=self._hitl_stream)
+                continue
+            rb = self._connectors.rollback(r, reason=f"released by {who} (breaker hold rejected)")
+            print(f"[HITL] outflow-breaker hold on {r.target} released by {who}: {rb.status}", file=self._hitl_stream)
 
     # ---- decision logic ------------------------------------------------
 

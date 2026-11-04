@@ -37,6 +37,8 @@ _HARD_NETS = [ipaddress.ip_network(n) for n in (
 # not gated here: they do not sever infra, and the last two target a principal, not an IP.
 DENY_ACTIONS = frozenset({
     "block", "block_egress", "isolate", "throttle", "quarantine", "drop", "sinkhole",
+    # SEVERE network / workload actions take a host or a port out of service just as surely (review round 8 A8-6)
+    "trigger_self_heal", "interface_shutdown", "config_rollback",
 })
 
 
@@ -58,7 +60,9 @@ def _never_block_hosts() -> set:
 
 
 _TARGET_PREFIXES = ("host:", "ip:", "src:", "dst:", "url:", "domain:", "device:", "outbound:", "principal:", "user:",
-                    "account:", "session:", "agent:", "sandbox:")
+                    "account:", "session:", "agent:", "sandbox:",
+                    # spellings the connectors also accept (identity `upn:`, EDR host names) — round 8 A8-3
+                    "upn:", "fqdn:", "hostname:", "machine:", "computer:", "endpoint:", "email:", "mail:", "sam:")
 ADDRESS_PREFIXES = ("ip:", "src:", "dst:", "outbound:")
 
 
@@ -98,7 +102,9 @@ def never_block_target(target: str) -> Tuple[bool, str]:
         # no longer get a listed host past the guard
         for h in hosts:
             h = h.rstrip(".")
-            if name and (name == h or name.endswith("." + h) or h.endswith("." + name)):
+            # a short listed name also covers its FQDN: `core-sw1` refuses `core-sw1.bank.local` (round 8 A8-3)
+            if name and (name == h or name.endswith("." + h) or h.endswith("." + name)
+                         or ("." not in h and name.split(".", 1)[0] == h)):
                 return True, f"{t} covers {h}, which is on AEGIS_NEVER_BLOCK_HOSTS"
     host = t.strip("[]")
     # strip a :port off a bare IPv4 like 127.0.0.1:8787 (IPv6 has >1 colon, left intact); [v6]:port too

@@ -66,28 +66,41 @@ def sign(key: bytes, method: str, path: str, ts: str, nonce: str, body: bytes) -
 
 
 class NonceCache:
-    """For the bank's adapter: nonces seen inside the replay window (a reused one is refused)."""
+    """For the bank's adapter: nonces seen inside the replay window (a reused one is refused).
 
-    def __init__(self, window_s: int = 300, max_size: int = 100_000):
-        self.window_s, self.max_size = window_s, max_size
-        self._seen: dict[str, float] = {}
+    A nonce is kept for as long as its request could still pass the timestamp check: until ``ts + max_skew`` (plus
+    a margin), and never less than ``window_s`` after it was first seen. It used to be forgotten ``window_s`` after
+    it was first SEEN, while ``verify_signature`` accepts a timestamp up to ``max_skew`` either side of now — a
+    request stamped ahead of the adapter's clock (or first presented late) stayed timestamp-valid after its nonce
+    was dropped, and the same signed ``DELETE /holds/<id>`` replayed (review round 8 A8-5)."""
 
-    def fresh(self, nonce: str, now: float | None = None) -> bool:
+    def __init__(self, window_s: int = 300, max_size: int = 100_000, margin_s: int = 60):
+        self.window_s, self.max_size, self.margin_s = window_s, max_size, margin_s
+        self._seen: dict[str, float] = {}          # nonce -> forget after (epoch seconds)
+
+    def fresh(self, nonce: str, now: float | None = None, *, valid_until: float | None = None) -> bool:
+        """``valid_until``: the last moment the request carrying this nonce passes the timestamp check."""
         t = now if now is not None else time.time()
         if len(self._seen) > self.max_size:
-            self._seen = {n: s for n, s in self._seen.items() if t - s <= self.window_s}
-        if not nonce or nonce in self._seen and t - self._seen[nonce] <= self.window_s:
+            self._seen = {n: exp for n, exp in self._seen.items() if exp >= t}
+        if not nonce or nonce in self._seen and t <= self._seen[nonce]:
             return False
-        self._seen[nonce] = t
+        if valid_until is None:
+            # timestamp unknown: it may sit a full window ahead of us (± window_s accepted) — keep 2x + margin
+            keep = t + 2 * self.window_s + self.margin_s
+        else:
+            keep = max(t + self.window_s, valid_until + self.margin_s)
+        self._seen[nonce] = keep
         return True
 
 
 def verify_signature(key: bytes, method: str, path: str, ts: str, nonce: str, body: bytes, presented: str, *,
                      nonces: NonceCache | None = None, max_skew_s: int = 300, now: float | None = None) -> bool:
     """For the bank's adapter (and the mock): the signature matches this exact request, the timestamp is fresh, and
-    (with a ``NonceCache``) the nonce was not seen before."""
+    (with a ``NonceCache``) the nonce was not seen before — remembered until the timestamp itself expires."""
     try:
-        if abs((now if now is not None else time.time()) - int(ts)) > max_skew_s:
+        ts_i = int(ts)
+        if abs((now if now is not None else time.time()) - ts_i) > max_skew_s:
             return False
     except ValueError:
         return False
@@ -95,7 +108,7 @@ def verify_signature(key: bytes, method: str, path: str, ts: str, nonce: str, bo
         return False
     if not hmac.compare_digest(sign(key, method, path, ts, nonce, body), presented or ""):
         return False
-    return nonces is None or nonces.fresh(nonce, now)
+    return nonces is None or nonces.fresh(nonce, now, valid_until=ts_i + max_skew_s)
 
 
 def _scope_ref(target: str) -> tuple[str, str]:
