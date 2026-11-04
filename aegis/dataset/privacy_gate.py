@@ -5,7 +5,8 @@ so the sender and the receiver refuse exactly the same things. The ``Scrubber`` 
 pseudonymised identities; this gate looks for what must never appear in derived telemetry at all,
 whatever the scrubber did: raw public IPs (v4 and v6), MAC addresses, e-mail addresses, credentials
 in URLs, Indian PAN / Aadhaar shapes, payment card numbers (Luhn), IBAN-like strings, phone numbers,
-long bare account-number-like digit runs, bearer/API-key shapes and private-key blocks. Anything
+long bare account-number-like digit runs, bearer/API-key shapes and private-key blocks — and (round 8) a raw value
+under an identity- or host-named field, an IAM user in an ARN, and a branch/workstation host name in free text. Anything
 found is a reason the record is NOT sent, with the field path reported so the operator can fix the
 capture.
 
@@ -44,6 +45,98 @@ _SKIP_KEYS = {"integrity_hash", "prev_hash", "fingerprint", "record_id", "token_
 _SID_RX = re.compile(r"\bS-1-5-\d+(?:-\d+)+\b")
 _UUID_RX = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
 _EPOCH_PREFIXES = ("16", "17", "18", "19", "20")
+
+
+# ---- identity fields and host names the scrubber should have tokenised (round 8, T-1 leftovers) -----------------
+# A value under an identity-named key that is not scrubber output is a person's name / login that got through: Okta
+# ``displayName`` / ``alternateId``, Entra ``userDisplayName``, CloudTrail ``principalId``, LDAP ``givenName`` …
+# Keys are compared in snake_case; a person record (has a given name / surname) also covers its ``cn`` / ``sn``.
+_SNAKE1 = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_SNAKE2 = re.compile(r"[\s\-]+")
+_ID_EXACT = frozenset({"user", "username", "user_name", "user_id", "userid", "upn", "user_principal_name", "employee",
+                       "employee_id", "customer", "customer_id", "cif", "principal", "principal_id", "actor_id",
+                       "src_user", "dst_user", "dest_user", "target_user", "subject_user", "samaccountname",
+                       "sam_account_name", "account_name", "accountname", "identity", "mailbox", "sender", "recipient"})
+_ID_SUFFIX = ("display_name", "user_name", "full_name", "first_name", "last_name", "middle_name", "given_name",
+              "family_name", "surname", "employee_name", "alternate_id", "principal_name", "principal_id", "nick_name",
+              "login_name", "logon_name", "customer_name", "holder_name", "owner_name", "manager_name")
+_PERSON_MARKERS = frozenset({"given_name", "surname", "sn", "first_name", "last_name", "display_name", "full_name",
+                             "employee_name", "employee_number"})
+_PERSON_LEAVES = frozenset({"cn", "sn", "name", "uid", "mail", "given_name", "surname", "common_name", "initials"})
+_GENERIC = frozenset({"root", "admin", "administrator", "user", "guest", "test", "system", "service", "default",
+                      "nobody", "anonymous", "operator", "support", "www-data", "ubuntu", "ec2-user", "postgres",
+                      "oracle", "sa", "dba", "backup", "ftp", "www", "web", "unknown", "n/a", "none", "null", "-"})
+_PSEUDO_RX = re.compile(r"^(?:[A-Za-z]{1,10}[_-])?[0-9a-f]{10,16}(?:@[a-z0-9.-]+)?$|^\[redacted[^\]]*\]$", re.IGNORECASE)
+_HOST_FIELDS = frozenset({"host", "hostname", "host_name", "device_name", "computer", "computer_name", "computername",
+                          "workstation", "workstation_name", "src_host", "dst_host", "dest_host", "src_hostname",
+                          "dst_hostname", "machine", "machine_name", "netbios", "fqdn", "endpoint_name"})
+_HOST_PARENTS = frozenset({"device", "host", "src_endpoint", "dst_endpoint", "endpoint", "computer", "machine"})
+_TEXT_FIELDS = frozenset({"message", "msg", "summary", "description", "details", "text", "title", "comment", "note",
+                          "notes", "body", "reason", "reasoning", "rationale", "signal"})
+# branch / workstation names in free text: MUM-TELLER-07, DEL-CASH-11, WIN-3K2J1L9 (upper case, hyphenated, a digit)
+_HOSTNAME_TEXT_RX = re.compile(r"(?<![\w.-])([A-Z]{2,6}(?:-[A-Z0-9]{2,10}){1,3})(?![\w.-])")
+_NOT_HOST_PREFIX = ("CVE-", "CWE-", "GHSA-", "CAPEC-", "TLS-", "AES-", "SHA-", "RSA-", "ECDHE-", "DHE-", "RFC-",
+                    "ISO-", "EVAL-", "INJ-", "MS-", "KB-", "TA-", "AML-", "HMAC-", "UTF-", "HTTP-", "IPV", "PCI-",
+                    "NIST-", "OWASP-", "ATT-", "MITRE-", "AWS-", "GCP-", "AZ-")
+_ARN_PRINCIPAL_RX = re.compile(r"arn:aws[a-z-]*:(?:iam|sts)::[^:\s\"']*:(?:user(?:/[^\s\"',;]+)*|assumed-role/[^/\s\"']+"
+                               r"|federated-user)/([^/\s\"',;]+)")
+
+
+def _snake(k: str) -> str:
+    return _SNAKE2.sub("_", _SNAKE1.sub("_", str(k))).strip("_").lower()
+
+
+def _identity_key(key: str, person: bool) -> bool:
+    k = _snake(key)
+    if k in _ID_EXACT or any(k == s or k.endswith("_" + s) for s in _ID_SUFFIX):
+        return True
+    return person and k in _PERSON_LEAVES
+
+
+def _host_key(key: str, parent: str) -> bool:
+    k = _snake(key)
+    return k in _HOST_FIELDS or (k in ("name", "hostname", "uid") and _snake(parent) in _HOST_PARENTS)
+
+
+def _pseudonymous(v: str) -> bool:
+    t = v.strip()
+    return not t or t.lower() in _GENERIC or bool(_PSEUDO_RX.match(t)) or bool(_TOKEN_RX.match(t)) or \
+        t.startswith(("host-", "email-", "ip-"))
+
+
+def _structural(obj: Any, path: str = "", parent: str = "", person: bool = False, depth: int = 0) -> Iterator[dict]:
+    """Identity-named / host-named fields holding a raw value, and raw host names / IAM principals in free text."""
+    if depth > 16:
+        return
+    if isinstance(obj, dict):
+        pl = any(_snake(k) in _PERSON_MARKERS for k in obj if isinstance(k, str))
+        for k, v in obj.items():
+            ks = str(k)
+            if ks in _SKIP_KEYS:
+                continue
+            p = f"{path}.{ks}" if path else ks
+            if isinstance(v, str) and not _pseudonymous(v):
+                if _identity_key(ks, pl):
+                    yield {"kind": "identity_field", "path": p, "sample": v.strip()[:3] + "…"}
+                    continue
+                if _host_key(ks, parent):
+                    yield {"kind": "hostname", "path": p, "sample": v.strip()[:3] + "…"}
+                    continue
+            if isinstance(v, str) and _snake(ks) in _TEXT_FIELDS:
+                for m in _HOSTNAME_TEXT_RX.finditer(v):
+                    h = m.group(1)
+                    if any(c.isdigit() for c in h) and not h.startswith(_NOT_HOST_PREFIX) and len(h) <= 15:
+                        yield {"kind": "hostname_text", "path": p, "sample": h[:3] + "…"}
+                        break
+            yield from _structural(v, p, ks, pl, depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            yield from _structural(v, f"{path}[{i}]", parent, person, depth + 1)
+    elif isinstance(obj, str):
+        for m in _ARN_PRINCIPAL_RX.finditer(obj):
+            if not _pseudonymous(m.group(1)):
+                yield {"kind": "iam_principal", "path": path, "sample": m.group(1)[:3] + "…"}
+                break
 
 
 def _private_ip(ip: str) -> bool:
@@ -141,7 +234,7 @@ def _check(s: str, *, allow_private_ips: bool) -> dict | None:
 
 def findings(obj: Any, *, allow_private_ips: bool = True) -> list[dict]:
     """Every PII-shaped value in ``obj``: ``[{"kind", "path", "sample"}]`` (sample is masked)."""
-    out: list[dict] = []
+    out: list[dict] = list(_structural(obj))
     for path, s in _walk(obj, ""):
         if len(s) > 20000:
             s = s[:20000]

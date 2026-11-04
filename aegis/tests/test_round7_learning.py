@@ -254,6 +254,24 @@ def test_r8_rolled_back_release_refused_by_the_verifier(tmp_path, monkeypatch):
     assert not verify_pointer(ptr, role_wanted="judge")[0]
 
 
+def _release_dirs(tmp_path, versions=("2026.10.1", "2026.11.1")):
+    """Release directories as an install leaves them: release.json + the signed manifest + .complete (round 8 T8-3
+    re-verifies a rollback target against its manifest). Returns the public keys that verify them."""
+    from aegis import license as L
+    from aegis import model_updates as mu
+    kd = tmp_path / "_keys"; kd.mkdir(exist_ok=True)
+    _, priv = L.write_keypair(kd, "rel-kid", bits=1024)
+    k = json.loads(priv.read_text())
+    n, d_ = int(k["n"], 16), int(k["d"], 16)
+    for v in versions:
+        d = tmp_path / v; d.mkdir(); (d / "adapter_config.json").write_text(v)
+        rel = {"version": v, "channel": "stable", "base_model": "q", "sha256": "0" * 64, "size": 1}
+        (d / "release.json").write_text(json.dumps(rel))
+        (d / mu.MANIFEST_FILE).write_text(mu.sign_manifest(rel, n=n, d=d_, kid="rel-kid"))
+        (d / ".complete").write_text("1")
+    return {"rel-kid": (n, 65537)}
+
+
 def test_r9_rollback_loads_previous_into_vllm_and_register_does_not_skip(tmp_path, monkeypatch):
     monkeypatch.setenv("AEGIS_MODEL_DIR", str(tmp_path))
     monkeypatch.setenv("AEGIS_MODEL_POINTER", str(tmp_path / "current.json"))
@@ -262,13 +280,11 @@ def test_r9_rollback_loads_previous_into_vllm_and_register_does_not_skip(tmp_pat
     monkeypatch.delenv("AEGIS_DECISION_KEY", raising=False)
     from aegis import model_updates as mu
     from aegis.finetune import vllm_registry as vr
-    for v in ("2026.10.1", "2026.11.1"):
-        d = tmp_path / v; d.mkdir(); (d / "adapter_config.json").write_text(v)
-        (d / "release.json").write_text(json.dumps({"version": v, "channel": "stable", "base_model": "q",
-                                                    "sha256": "0" * 64, "size": 1}))
-        (d / ".complete").write_text("1")
-    mu.write_pointer({"version": "2026.11.1", "channel": "stable", "base_model": "q", "sha256": "0" * 64,
-                      "adapter": str(tmp_path / "2026.11.1")}, pointer=tmp_path / "current.json", previous="2026.10.1")
+    keys = _release_dirs(tmp_path)
+    for v in ("2026.10.1", "2026.11.1"):     # each was current once, so the record holds its adapter digest
+        mu.write_pointer({"version": v, "channel": "stable", "base_model": "q", "sha256": "0" * 64,
+                          "adapter": str(tmp_path / v)}, pointer=tmp_path / "current.json",
+                         previous="2026.10.1" if v == "2026.11.1" else "")
     loaded = []
 
     class Reg:
@@ -276,7 +292,7 @@ def test_r9_rollback_loads_previous_into_vllm_and_register_does_not_skip(tmp_pat
             loaded.append(name)
             return True, "loaded"
     monkeypatch.setattr(vr, "VLLMAdapterRegistry", Reg)
-    rb = mu.rollback()
+    rb = mu.rollback(keys=keys)
     assert rb["ok"] and rb["loaded_into_vllm"] and loaded == ["2026.10.1"]
     cur = json.loads((tmp_path / "current.json").read_text())
     assert cur["run"] == "2026.10.1" and cur["served_model"] == "2026.10.1"
@@ -288,15 +304,13 @@ def test_r9_rollback_refused_by_vllm_keeps_the_current_pointer(tmp_path, monkeyp
     monkeypatch.setenv("LLM_BACKEND", "vllm")
     from aegis import model_updates as mu
     from aegis.finetune import vllm_registry as vr
-    for v in ("2026.10.1", "2026.11.1"):
-        d = tmp_path / v; d.mkdir(); (d / "adapter_config.json").write_text(v)
-        (d / "release.json").write_text(json.dumps({"version": v, "channel": "stable", "base_model": "q",
-                                                    "sha256": "0" * 64, "size": 1}))
-        (d / ".complete").write_text("1")
-    mu.write_pointer({"version": "2026.11.1", "channel": "stable", "base_model": "q", "sha256": "0" * 64,
-                      "adapter": str(tmp_path / "2026.11.1")}, pointer=tmp_path / "current.json", previous="2026.10.1")
+    keys = _release_dirs(tmp_path)
+    for v in ("2026.10.1", "2026.11.1"):     # each was current once, so the record holds its adapter digest
+        mu.write_pointer({"version": v, "channel": "stable", "base_model": "q", "sha256": "0" * 64,
+                          "adapter": str(tmp_path / v)}, pointer=tmp_path / "current.json",
+                         previous="2026.10.1" if v == "2026.11.1" else "")
     monkeypatch.setattr(vr, "VLLMAdapterRegistry", lambda: SimpleNamespace(load=lambda n, p: (False, "error")))
-    assert not mu.rollback()["ok"]
+    assert not mu.rollback(keys=keys)["ok"]
     assert json.loads((tmp_path / "current.json").read_text())["run"] == "2026.11.1"
     assert not (tmp_path / "denied.json").exists()
 

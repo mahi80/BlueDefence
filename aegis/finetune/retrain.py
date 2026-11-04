@@ -56,6 +56,53 @@ def _now() -> str:
 
 # --------------------------------------------------------------------------- state
 
+class StateError(RuntimeError):
+    """``state.json`` is unsigned or was altered outside this CLI: nothing is promoted, synced or signed from it."""
+
+
+class PromotionRefused(RuntimeError):
+    """The run's adapter on disk is not the one its gate and shadow judged."""
+
+
+_STATE_DOMAIN = b"aegis-retrain-state-v1|"
+
+
+def _state_key() -> bytes | None:
+    from aegis.hitl.signing import _key
+    return _key()
+
+
+def _state_sig(body: dict, k: bytes) -> str:
+    import hmac
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hmac.new(k, _STATE_DOMAIN + raw, hashlib.sha256).hexdigest()
+
+
+def read_signed_state(p: Path) -> dict:
+    """The retrain state body, after its HMAC is checked (round 8 T8-2). With a signing key configured, an unsigned
+    or altered ``state.json`` raises :class:`StateError`: the routine ``sync`` used to sign whatever ``current`` the
+    file held, so anyone who could write it chose the SOC's model. ``AEGIS_RETRAIN_ADOPT_STATE=1`` accepts an
+    unsigned file once (an install upgraded from an older release) after an operator has reviewed it; the next save
+    signs it."""
+    import hmac
+    d = json.loads(Path(p).read_text(encoding="utf-8"))
+    if not isinstance(d, dict):
+        raise StateError(f"{p} is not a retrain state object")
+    sig = d.pop("sig", None)
+    k = _state_key()
+    if k is None:
+        return d
+    if not sig:
+        if os.environ.get("AEGIS_RETRAIN_ADOPT_STATE", "") == "1":
+            logger.warning("[retrain] adopting unsigned %s (AEGIS_RETRAIN_ADOPT_STATE=1); it is signed on the next save", p)
+            return d
+        raise StateError(f"{p} is not signed (written by an older release or by hand); review it and run once with "
+                         "AEGIS_RETRAIN_ADOPT_STATE=1 to adopt it")
+    if not hmac.compare_digest(str(sig), _state_sig(d, k)):
+        raise StateError(f"{p} was altered outside the retrain CLI (signature mismatch) — refusing to act on it")
+    return d
+
+
 @dataclass
 class State:
     path: Path
@@ -63,48 +110,50 @@ class State:
     runs: dict[str, dict] = field(default_factory=dict)
     last_export: str | None = None
     history: list[dict] = field(default_factory=list)
+    # pointer writes queued by the promote / rollback paths; applied by save() (nothing else writes the pointer)
+    pending: list[tuple[dict | None, list[str]]] = field(default_factory=list, repr=False)
 
     @classmethod
     def load(cls, runs_dir: Path) -> "State":
         p = runs_dir / "retrain" / "state.json"
         st = cls(p)
         if p.exists():
-            d = json.loads(p.read_text(encoding="utf-8"))
+            d = read_signed_state(p)
             st.current, st.runs, st.last_export, st.history = d.get("current"), d.get("runs", {}), d.get("last_export"), d.get("history", [])
         return st
 
+    @property
+    def pointer(self) -> Path:
+        return self.path.parent / "current.json"
+
     def save(self) -> None:
+        """Write the signed state, then any pointer change the promote / rollback paths queued. A routine save never
+        touches the pointer: it used to sign whatever ``current`` the (unsigned) state held (round 8 T8-2)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({"current": self.current, "runs": self.runs, "last_export": self.last_export,
-                                         "history": self.history[-200:]}, indent=2, sort_keys=True), encoding="utf-8")
-        cur = self.path.parent / "current.json"
-        if self.current:
-            out = dict(self.current)
-            out.setdefault("role", "triage")
-            from aegis.agents.shared.llm_client import pointer_signature
-            sig = pointer_signature(out)                 # the SOC refuses an unsigned pointer when a key is set (J-3)
-            if sig:
-                out["sig"] = sig
-            try:
-                on_disk = json.loads(cur.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                on_disk = {}
-            if (isinstance(on_disk, dict) and on_disk.get("served_model") and on_disk.get("run") == out.get("run")
-                    and on_disk.get("sha256") == out.get("sha256")):
-                out["served_model"] = on_disk["served_model"]    # the GPU register step's stamp survives a sync (D4-15)
-            cur.write_text(json.dumps(out, indent=2), encoding="utf-8")
-        else:
-            # Nothing promoted locally. The same file is the pointer the fleet updater and serving share
-            # (AEGIS_MODEL_POINTER): a nightly run that promoted nothing used to delete an installed release, so
-            # serving fell back to the base model and the updater re-installed it — every night (review round 5
-            # Y5-8). Remove it only when it names one of THIS loop's runs (a rollback to the base model).
-            try:
-                on_disk = json.loads(cur.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                on_disk = None
-            if isinstance(on_disk, dict) and on_disk.get("run") in self.runs \
-                    and on_disk.get("approved_by") != "bluedefence-release":
-                cur.unlink(missing_ok=True)   # rolled back to the base model
+        from aegis.finetune.pointer_trust import RELEASE_APPROVER, commit_pointer
+        for cur, deny in self.pending:
+            if cur is None:
+                # Rolled back to the base model. The same file is the pointer the fleet updater and serving share
+                # (AEGIS_MODEL_POINTER): remove it only when it names one of THIS loop's runs (review round 5 Y5-8).
+                try:
+                    on_disk = json.loads(self.pointer.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    on_disk = None
+                if not (isinstance(on_disk, dict) and on_disk.get("run") in self.runs
+                        and on_disk.get("approved_by") != RELEASE_APPROVER):
+                    continue
+            role = (cur or {}).get("role") or "triage"
+            if cur is None and self.runs:
+                role = next(iter(self.runs.values())).get("role") or "triage"
+            commit_pointer(self.pointer, cur, role=role, deny=deny)
+        self.pending = []
+        body = {"current": self.current, "runs": self.runs, "last_export": self.last_export,
+                "history": self.history[-200:]}
+        k = _state_key()
+        out = {**body, "sig": _state_sig(json.loads(json.dumps(body, default=str)), k)} if k is not None else body
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(out, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        os.replace(tmp, self.path)
 
     def log(self, run: str, stage: str, **info) -> None:
         self.history.append({"ts": _now(), "run": run, "stage": stage, **info})
@@ -142,44 +191,81 @@ def export_stage(out: Path, *, since: str | None, dashboard: bool, dry_run: bool
     return {"rc": rc, "dir": str(out), "human_rows": rows, "since": since}
 
 
-def build_stage(data: Path, base_data: Path | None, export_dir: Path, *, dry_run: bool) -> dict:
-    """Merge the new analyst rows with the realistic base set. Analyst rows are the point of the
-    retrain, so they are oversampled ×3 (bounded) against the much larger public set."""
+def _alert_key(row: dict, line: str) -> str:
+    """One key per alert: the alert's ``id`` when the prompt parses to one, else a digest of the prompt."""
+    msgs = row.get("messages") or []
+    prompt = msgs[1].get("content") if len(msgs) > 1 and isinstance(msgs[1], dict) else None
+    if isinstance(prompt, str):
+        try:
+            a = json.loads(prompt)
+            if isinstance(a, dict) and a.get("id") not in (None, ""):
+                return "id:" + str(a["id"])
+        except ValueError:
+            pass
+    return "h:" + hashlib.sha256((prompt if isinstance(prompt, str) else line).encode("utf-8")).hexdigest()
+
+
+def _human_rows(f: Path | None) -> dict[str, str]:
+    """Analyst-labelled rows of a triage jsonl, one per alert (a later row for the same alert wins)."""
+    out: dict[str, str] = {}
+    if not f or not f.exists():
+        return out
+    for line in f.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or not str(row.get("label_source", "")).startswith("human"):
+            continue
+        k = _alert_key(row, line)
+        out.pop(k, None)
+        out[k] = line
+    return out
+
+
+ANALYST_SET = "analyst-set.jsonl"
+
+
+def build_stage(data: Path, base_data: Path | None, export_dir: Path, *, dry_run: bool,
+                prior: Path | None = None) -> dict:
+    """Merge the analyst rows with the realistic base set. Analyst rows are the point of the retrain, so they are
+    oversampled ×3 (bounded) against the much larger public set.
+
+    The analyst rows are the **cumulative** set: every correction accepted in earlier runs (``prior``, the
+    ``$RUNS/retrain/analyst-set.jsonl`` the loop keeps) plus this export, one row per alert, the newest label
+    winning. Each run trains a fresh LoRA from the base model, so an October correction that was only in October's
+    export was missing from every later model (round 8 T8-6). The merged set is written next to the data
+    (``analyst-set.jsonl``) so shadow can measure retention on it."""
     data.mkdir(parents=True, exist_ok=True)
     (data / "sft").mkdir(exist_ok=True)
     out = data / "sft" / "triage.jsonl"
-    counts = {"base": 0, "human": 0, "human_oversampled": 0}
+    counts = {"base": 0, "human": 0, "human_oversampled": 0, "human_prior": 0}
     if dry_run:
         return {"dir": str(data), **counts, "dry_run": True}
+    merged = _human_rows(prior)
+    counts["human_prior"] = len(merged)
+    # one row per alert (the prompt is the alert): an export that overlaps the relabel window must not oversample
+    # the same alert twice (round 7 T-5), and a re-labelled alert replaces its earlier label
+    for k, line in _human_rows(export_dir / "sft" / "triage.jsonl").items():
+        merged.pop(k, None)
+        merged[k] = line
     with out.open("w", encoding="utf-8") as w:
         base = (base_data / "sft" / "triage.jsonl") if base_data else None
         if base and base.exists():
             for line in base.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     w.write(line + "\n"); counts["base"] += 1
-        exp = export_dir / "sft" / "triage.jsonl"
-        if exp.exists():
-            seen: set[str] = set()
-            for line in exp.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                row = json.loads(line)
-                if not str(row.get("label_source", "")).startswith("human"):
-                    continue
-                # one row per alert (the prompt is the alert): an export that overlaps the relabel window must not
-                # oversample the same alert twice (round 7 T-5)
-                msgs = row.get("messages") or []
-                prompt = msgs[1].get("content") if len(msgs) > 1 and isinstance(msgs[1], dict) else None
-                key = hashlib.sha256((prompt if isinstance(prompt, str) else line).encode("utf-8")).hexdigest()
-                if key in seen:
-                    continue
-                seen.add(key)
-                reps = 3 if counts["base"] > 20 * max(1, counts["human"]) else 1
-                for _ in range(reps):
-                    w.write(line + "\n")
-                counts["human"] += 1; counts["human_oversampled"] += reps
+        for line in merged.values():
+            reps = 3 if counts["base"] > 20 * max(1, counts["human"]) else 1
+            for _ in range(reps):
+                w.write(line + "\n")
+            counts["human"] += 1; counts["human_oversampled"] += reps
+    (data / ANALYST_SET).write_text("".join(line + "\n" for line in merged.values()), encoding="utf-8")
     (data / "manifest.json").write_text(json.dumps({"name": data.name, "format": "aegis-retrain-merge", "counts": counts,
-                                                     "base": str(base_data) if base_data else None, "export": str(export_dir)}, indent=2))
+                                                     "base": str(base_data) if base_data else None, "export": str(export_dir),
+                                                     "prior": str(prior) if prior else None}, indent=2))
     return {"dir": str(data), **counts}
 
 
@@ -218,7 +304,10 @@ def gate_stage(adapter: Path, *, dry_run: bool, runner=None, role: str = "triage
 
 
 def _shadow_rows(export_dir: Path) -> list[dict]:
-    f = export_dir / "sft" / "triage.jsonl"
+    return _rows_from(export_dir / "sft" / "triage.jsonl")
+
+
+def _rows_from(f: Path) -> list[dict]:
     if not f.exists():
         return []
     out = []
@@ -265,6 +354,35 @@ def shadow_compare(rows: list[dict], candidate: Callable[[dict], str], current: 
         verdict, why = "ready", f"candidate {cand_rate:.0%}" + (f" vs current {cur_rate:.0%}" if cur_rate is not None else " (no current model)")
     return {"n": n, "candidate_agreement": round(cand_rate, 3), "current_agreement": None if cur_rate is None else round(cur_rate, 3),
             "verdict": verdict, "why": why, "disagreements": disagreements[:50], "ts": _now()}
+
+
+PRIOR_EVAL_MAX = 200
+
+
+def _with_retention(rep: dict, prior_file: Path, held_out: list[dict], cand, cur) -> dict:
+    """Shadow also scores both models on the earlier analyst corrections the candidate was trained with — the
+    held-out rows only measure new alerts, so a candidate that forgot last month's fixes still read ``ready``
+    (round 8 T8-6). Candidate retention below the current model's by more than the tolerance is ``worse``."""
+    seen = {str(r.get("id")) for r in held_out if r.get("id")} | {json.dumps(r["alert"], sort_keys=True) for r in held_out}
+    prior = [r for r in _rows_from(prior_file)
+             if str(r.get("id")) not in seen and json.dumps(r["alert"], sort_keys=True) not in seen]
+    try:
+        cap = int(os.environ.get("AEGIS_RETRAIN_PRIOR_EVAL_MAX", PRIOR_EVAL_MAX))
+    except ValueError:
+        cap = PRIOR_EVAL_MAX
+    prior = prior[-cap:] if cap > 0 else []
+    if not prior:
+        return {**rep, "retention": {"n": 0}}
+    r = shadow_compare(prior, cand, cur)
+    ret = {k: r[k] for k in ("n", "candidate_agreement", "current_agreement")}
+    ret["forgotten"] = r["disagreements"][:20]
+    out = {**rep, "retention": ret}
+    if rep.get("verdict") == "ready" and r["current_agreement"] is not None and \
+            r["candidate_agreement"] < r["current_agreement"] - SHADOW_TOLERANCE:
+        out["verdict"] = "worse"
+        out["why"] = (f"{rep.get('why')}; but forgets earlier analyst corrections: retention "
+                      f"{r['candidate_agreement']:.0%} vs current {r['current_agreement']:.0%} on {r['n']}")
+    return out
 
 
 def _adapter_triage(adapter: str) -> Callable[[dict], str]:
@@ -388,6 +506,21 @@ def _runs_dir(a) -> Path:
     return Path(a.runs or str(Path.home() / "aegis-runs")).expanduser()
 
 
+def _state_guard(fn):
+    """A command run against an unsigned / altered ``state.json`` refuses (exit 2) instead of acting on it."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kw):
+        try:
+            return fn(*args, **kw)
+        except StateError as e:
+            print(f"refused: {e}")
+            return 2
+    return wrapped
+
+
+@_state_guard
 def cmd_run(a) -> int:
     role = getattr(a, "role", "triage") or "triage"
     runs = Path(a.runs or str(Path.home() / "aegis-runs" / ("judge" if role == "judge" else ""))).expanduser()
@@ -429,8 +562,16 @@ def cmd_run(a) -> int:
     if not a.dry_run and ex["human_rows"] < a.min_new_rows:
         st.log(run, "skipped", reason=f"{ex['human_rows']} new analyst rows < {a.min_new_rows}; nothing to learn yet"); st.save()
         print(f"  skipped: {st.runs[run]['stages']['skipped']['reason']}"); return 0
-    bd = build_stage(root / "data", Path(a.base_data).expanduser() if a.base_data else None, root / "export", dry_run=a.dry_run)
-    st.runs[run]["data_counts"] = {k: bd.get(k, 0) for k in ("base", "human", "human_oversampled")}
+    cumulative = runs / "retrain" / ANALYST_SET
+    bd = build_stage(root / "data", Path(a.base_data).expanduser() if a.base_data else None, root / "export",
+                     dry_run=a.dry_run, prior=cumulative)
+    st.runs[run]["data_counts"] = {k: bd.get(k, 0) for k in ("base", "human", "human_oversampled", "human_prior")}
+    if not a.dry_run and (root / "data" / ANALYST_SET).exists():
+        # analyst labels are truth whatever this run's model turns out like: keep them for every later run (T8-6)
+        cumulative.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cumulative.with_name(cumulative.name + ".tmp")
+        tmp.write_text((root / "data" / ANALYST_SET).read_text(encoding="utf-8"), encoding="utf-8")
+        os.replace(tmp, cumulative)
     st.log(run, "built", **bd)
     train_data = root / "data"
     if role == "judge":
@@ -462,6 +603,7 @@ def cmd_run(a) -> int:
     return 0
 
 
+@_state_guard
 def cmd_shadow(a, *, candidate_loader=_adapter_triage, current_loader=_adapter_triage) -> int:
     runs = _runs_dir(a); st = State.load(runs)
     run = a.run or _latest(st, "gated")
@@ -480,11 +622,13 @@ def cmd_shadow(a, *, candidate_loader=_adapter_triage, current_loader=_adapter_t
     cand = candidate_loader(info["adapter"])
     cur = current_loader(st.current["adapter"]) if st.current and st.current.get("adapter") else None
     rep = shadow_compare(rows, cand, cur)
+    rep = _with_retention(rep, runs / run / "data" / ANALYST_SET, rows, cand, cur)
     st.log(run, "shadowed", **rep); st.save()
     print(f"  shadow {rep['verdict']}: {rep['why']}")
     return 0 if rep["verdict"] == "ready" else 1
 
 
+@_state_guard
 def cmd_propose(a, *, ship=None) -> int:
     if ship is None:
         ship = _ship if getattr(a, "dashboard", False) else (lambda p, d: _ship_local(p, d, _hitl_dir(a)))
@@ -503,6 +647,7 @@ def cmd_propose(a, *, ship=None) -> int:
     return 0
 
 
+@_state_guard
 def cmd_sync(a, *, accepted=None) -> int:
     """Accepted `model_promotion` proposals → current pointer. The only path that changes `current`
     besides the offline `promote` (which records who approved it)."""
@@ -536,8 +681,13 @@ def cmd_sync(a, *, accepted=None) -> int:
             continue
         if st.current and st.current.get("run") == run:
             continue
-        _promote(st, run, approved_by=rule.get("decided_by") or "dashboard", rationale=rule.get("decision_rationale") or rule.get("rationale", ""),
-                 proposal_id=rule.get("proposal_id"))
+        try:
+            _promote(st, run, approved_by=rule.get("decided_by") or "dashboard",
+                     rationale=rule.get("decision_rationale") or rule.get("rationale", ""), proposal_id=rule.get("proposal_id"))
+        except PromotionRefused as e:
+            print(f"  refused {e}")
+            refused += 1
+            continue
         print(f"  promoted {run} (accepted in the dashboard)")
     st.save()
     if st.current:
@@ -557,6 +707,7 @@ def _shadow_ready(info: dict) -> bool:
     return _shadow_verdict(info) == "ready"
 
 
+@_state_guard
 def cmd_promote(a) -> int:
     runs = _runs_dir(a); st = State.load(runs)
     if a.run not in st.runs:
@@ -574,25 +725,59 @@ def cmd_promote(a) -> int:
     ok, why = verify_adapter(st.runs[a.run].get("adapter") or "", st.runs[a.run].get("sha256"))
     if not ok:
         print(f"refused {a.run}: {why}"); return 1
-    _promote(st, a.run, approved_by=a.approved_by, rationale=a.rationale, proposal_id=None)
+    try:
+        _promote(st, a.run, approved_by=a.approved_by, rationale=a.rationale, proposal_id=None)
+    except PromotionRefused as e:
+        print(f"refused {e}"); return 1
     st.save(); print(f"  promoted {a.run} (offline approval by {a.approved_by}) → AEGIS_MODEL={st.current['adapter']}")
     return 0
 
 
+def _verify_run_artefacts(info: dict) -> tuple[bool, str]:
+    """The adapter on disk must be the one this run recorded at training time (signed state) and, when its gate
+    report is there, the one that gate judged (``adapter_digest`` in the report)."""
+    adapter = info.get("adapter") or ""
+    ok, why = verify_adapter(adapter, info.get("sha256"))
+    if not ok:
+        return False, why
+    try:
+        from .gate import gate_report_path
+        rep = gate_report_path(adapter)
+        if rep.exists():
+            d = json.loads(rep.read_text(encoding="utf-8"))
+            gd = d.get("adapter_digest")
+            if gd and gd != info.get("sha256"):
+                return False, f"gate report judged adapter {gd}, not the recorded {info.get('sha256')}"
+            if "passes" in d and not d.get("passes"):
+                return False, "the run's gate report says FAIL"
+    except (OSError, ValueError) as e:
+        return False, f"gate report unreadable ({e})"
+    return True, ""
+
+
 def _promote(st: State, run: str, *, approved_by: str, rationale: str, proposal_id: str | None) -> None:
+    """Make ``run`` current and queue its signed pointer (written by ``st.save()``). The only path that signs a
+    pointer for a new run — after re-checking the adapter against the run's own recorded/gated digest (T8-2)."""
     info = st.runs[run]
+    if info.get("denied"):
+        raise PromotionRefused(f"{run} was rolled back — denied for good")
+    ok, why = _verify_run_artefacts(info)
+    if not ok:
+        raise PromotionRefused(f"{run}: {why}")
     prev = st.current
     st.current = {"run": run, "role": info.get("role") or "triage", "adapter": info.get("adapter"),
                   "sha256": info.get("sha256"), "promoted_at": _now(),
                   "approved_by": approved_by, "rationale": rationale[:500], "proposal_id": proposal_id,
                   "previous": {k: prev.get(k) for k in ("run", "adapter", "sha256")} if prev else None}
+    st.pending.append((dict(st.current), []))
     st.log(run, "promoted", approved_by=approved_by, previous=(prev or {}).get("run"))
 
 
+@_state_guard
 def cmd_rollback(a) -> int:
     """Undo the current promotion: the previous model becomes current again (or the base model, if there was
-    none) and the rolled-back run is recorded as denied, so neither ``sync`` nor ``promote`` brings it back.
-    Hand-restoring ``current.json`` used to be overwritten by the next sync (review round 4 D4-8)."""
+    none) and the rolled-back run is recorded as denied — in the signed state and in the pointer's signed record,
+    so neither ``sync``, ``promote`` nor a restored copy of the old pointer brings it back (D4-8, T8-1)."""
     runs = _runs_dir(a); st = State.load(runs)
     if not st.current:
         print("nothing is promoted"); return 1
@@ -602,19 +787,28 @@ def cmd_rollback(a) -> int:
         st.runs[bad]["denied"] = {"ts": _now(), "by": a.approved_by, "rationale": a.rationale[:500]}
     st.log(bad, "denied", approved_by=a.approved_by, rationale=a.rationale[:500])
     if prev and prev.get("run"):
-        ok, why = verify_adapter(prev.get("adapter") or "", prev.get("sha256"))
-        if not ok:
+        pinfo = st.runs.get(prev["run"]) or {}
+        why = ""
+        if pinfo.get("denied"):
+            why = "it was rolled back earlier"
+        elif pinfo and pinfo.get("sha256") and pinfo.get("sha256") != prev.get("sha256"):
+            why = "its recorded digest differs from the one the pointer remembers"
+        else:
+            _, why = verify_adapter(prev.get("adapter") or "", prev.get("sha256"))
+        if why:
             print(f"  previous model {prev.get('run')} cannot be restored ({why}); rolling back to the base model")
             prev = None
     st.current = ({"run": prev["run"], "role": (st.runs.get(prev["run"]) or {}).get("role") or "triage",
                    "adapter": prev.get("adapter"), "sha256": prev.get("sha256"),
                    "promoted_at": _now(), "approved_by": a.approved_by, "rationale": a.rationale[:500],
                    "rolled_back_from": bad, "previous": None} if prev else None)
+    st.pending.append((dict(st.current) if st.current else None, [bad] if bad else []))
     st.save()
     print(f"  rolled back {bad} → {st.current['run'] if st.current else 'base model (no adapter)'}")
     return 0
 
 
+@_state_guard
 def cmd_status(a) -> int:
     st = State.load(_runs_dir(a))
     print(f"current: {st.current['run'] + ' → ' + str(st.current['adapter']) if st.current else '(none promoted)'}")
@@ -659,6 +853,14 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--approved-by", required=True); b.add_argument("--rationale", required=True)
     t = sub.add_parser("status"); common(t)
     a = ap.parse_args(argv)
+    try:
+        return _dispatch(a)
+    except StateError as e:
+        print(f"refused: {e}")
+        return 2
+
+
+def _dispatch(a) -> int:
     return {"run": cmd_run, "shadow": cmd_shadow, "propose": cmd_propose, "sync": cmd_sync, "promote": cmd_promote,
             "rollback": cmd_rollback, "status": cmd_status}[a.cmd](a)
 

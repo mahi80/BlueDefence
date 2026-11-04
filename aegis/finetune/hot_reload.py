@@ -100,7 +100,7 @@ def swap_in_place(primary: Any, served: str) -> bool:
     return True
 
 
-def _unverified(ptr: dict, adapter: str, run: str) -> str:
+def _unverified(ptr: dict, adapter: str, run: str, pointer_path: str | None = None) -> str:
     """Why this pointer may not be swapped in ("" = it may). The adapter must carry a recorded digest; when its
     directory is on this host the digest is checked here, otherwise the GPU-side register step checks it
     (``vllm_registry.register_promoted_adapter``), which loads only an adapter whose digest matches. The
@@ -110,7 +110,8 @@ def _unverified(ptr: dict, adapter: str, run: str) -> str:
     Role, signature and the release deny list go through the same verifier startup uses — hot-reload used to swap in
     a forged, unsigned pointer the restart path would have refused (review round 7 T-3 / R-1)."""
     from aegis.finetune.pointer_trust import verify_pointer
-    ok, why = verify_pointer(ptr, role_wanted="triage", label=f"promotion pointer run={run}")
+    ok, why = verify_pointer(ptr, role_wanted="triage", label=f"promotion pointer run={run}",
+                             path=pointer_path or os.environ.get("AEGIS_MODEL_POINTER") or None)
     if not ok:
         return why
     if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") == "1":
@@ -130,21 +131,44 @@ def _unverified(ptr: dict, adapter: str, run: str) -> str:
     return ""
 
 
-def apply_reload(primary: Any, prev_key: str, ptr: Optional[dict]) -> ReloadResult:
+def base_model_of(primary: Any, base_model: str = "") -> str:
+    """The configured base model name of the live client (what serves when no adapter is promoted)."""
+    if base_model:
+        return base_model
+    inner = unwrap(primary)
+    cfg = getattr(inner, "config", None)
+    name = str(getattr(cfg, "model", "") or getattr(inner, "base_model", "") or "")
+    return name or (os.environ.get("AEGIS_VLLM_MODEL", "").strip() or os.environ.get("AEGIS_MODEL", "").strip())
+
+
+def apply_reload(primary: Any, prev_key: str, ptr: dict | None, *, base_model: str = "",
+                 pointer_path: str | None = None) -> ReloadResult:
     """Decide and perform a reload. Pure except for the in-place ``set_model`` on ``primary``.
 
-    - no pointer, or the pointer is unchanged since ``prev_key`` → noop
+    - no pointer and none was ever applied, or the pointer is unchanged since ``prev_key`` → noop
+    - the pointer disappeared after one was applied (``retrain rollback`` to the base model) → back to the base
+      model: set_model(base) on vllm, restart_required elsewhere (round 8 T8-10 — the rolled-back adapter used to
+      keep serving until a restart)
     - pointer changed and the backend supports in-place swap (vllm) → set_model, changed
     - pointer changed but the backend has no in-place swap (local) → restart_required
     """
     if not ptr:
-        return ReloadResult(changed=False, mode="noop", detail="no promotion pointer")
+        if not prev_key:
+            return ReloadResult(changed=False, mode="noop", detail="no promotion pointer")
+        base = base_model_of(primary, base_model)
+        if base and swap_in_place(primary, base):
+            logger.warning("[hot_reload] promotion pointer removed (rolled back to the base model) → %s", base)
+            return ReloadResult(changed=True, mode="set_model", served_model=base, key="",
+                                detail="pointer removed: rolled back to the base model")
+        logger.warning("[hot_reload] promotion pointer removed; the base model applies at the next restart")
+        return ReloadResult(changed=False, mode="restart_required", key="",
+                            detail="pointer removed; backend has no set_model (or no base model name)")
     key = pointer_key(ptr)
     run = str(ptr.get("run", ""))
     adapter = str(ptr.get("adapter", ""))
     if key and key == prev_key:
         return ReloadResult(changed=False, mode="noop", run=run, adapter=adapter, key=key, detail="unchanged")
-    why = _unverified(ptr, adapter, run)
+    why = _unverified(ptr, adapter, run, pointer_path)
     if why:                          # tampered, swapped after approval, or never fingerprinted: keep the running model
         logger.error("[hot_reload] promotion run=%s refused: %s", run, why)
         # no key: a refused pointer is judged again next time (the GPU register step may have stamped it by then);
@@ -160,4 +184,5 @@ def apply_reload(primary: Any, prev_key: str, ptr: Optional[dict]) -> ReloadResu
                         key=key, detail="backend has no set_model")
 
 
-__all__ = ["ReloadResult", "read_pointer", "pointer_key", "served_name", "unwrap", "swap_in_place", "apply_reload"]
+__all__ = ["ReloadResult", "read_pointer", "pointer_key", "served_name", "unwrap", "swap_in_place", "apply_reload",
+           "base_model_of"]

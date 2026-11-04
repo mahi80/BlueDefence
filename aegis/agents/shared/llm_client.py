@@ -172,13 +172,14 @@ def _force_conservative_verdict(text: str) -> str:
         # model's "benign … allow" could still be read by a lenient caller (review round 4 X4-14).
         return json.dumps({"verdict": "uncertain", "confidence": 0.0,
                            "summary": "[degraded-mode] fallback model gave no usable answer", "actions": []}, indent=2)
-    if "verdict" in obj and obj["verdict"] == "benign":
+    from aegis.dataset.schema import is_permissive_action, normalise_verdict
+    if "verdict" in obj and normalise_verdict(obj["verdict"]) == "benign":       # "Benign " too (round 8 T8-8)
         obj["verdict"] = "uncertain"
         obj["confidence"] = min(float(obj.get("confidence", 0.5)), 0.5)
         obj["summary"] = "[degraded-mode] " + obj.get("summary", "")
     actions = obj.get("actions") or []
     for a in actions:
-        if a.get("type") == "allow":
+        if is_permissive_action(a.get("type")):
             a["type"] = "monitor"
         if a.get("type") not in ("monitor",):
             a["hitl"] = True
@@ -909,14 +910,17 @@ class MockClient(LLMClient):
             ratio = float(ratio_match.group(1)) if ratio_match else 0.0
             auth_violation = '"violation": true' in u
             severity = sum([bola, schema_drift, volumetric_anomaly, auth_violation])
+            # the account the actions act on: the caller the BOLA tool named, not the literal word "principal_id"
+            pm = re.search(r'"principal(?:_id)?":\s*"([^"]+)"', u)
+            principal = pm.group(1) if pm else "principal_id"
             if (bola and (auth_violation or volumetric_anomaly)) or severity >= 3:
                 return _json({
                     "verdict": "malicious",
                     "confidence": 0.92,
                     "summary": "Strong API-abuse signature: BOLA + auth/volumetric corroboration.",
                     "actions": [
-                        {"type": "lock_account", "target": "principal_id", "hitl": True, "confidence": 0.92},
-                        {"type": "revoke_sessions", "target": "principal_id", "hitl": True, "confidence": 0.92},
+                        {"type": "lock_account", "target": principal, "hitl": True, "confidence": 0.92},
+                        {"type": "revoke_sessions", "target": principal, "hitl": True, "confidence": 0.92},
                     ],
                 })
             if bola or auth_violation or (volumetric_anomaly and ratio >= 5.0):
@@ -926,7 +930,7 @@ class MockClient(LLMClient):
                     "summary": "Single API-abuse signal; step-up auth + monitor.",
                     "actions": [
                         {"type": "challenge", "target": "session", "hitl": False, "confidence": 0.7},
-                        {"type": "monitor", "target": "principal_id", "hitl": False, "confidence": 0.7},
+                        {"type": "monitor", "target": principal, "hitl": False, "confidence": 0.7},
                     ],
                 })
             return _json({
@@ -1384,7 +1388,7 @@ def _promoted_model(var: str = "AEGIS_MODEL_POINTER", *, path: str | None = None
         from aegis.finetune.pointer_trust import verify_pointer
         with open(ptr, encoding="utf-8") as fh:
             cur = _json.load(fh)
-        ok, why = verify_pointer(cur, role_wanted=role_wanted, label=f"{path or var} {ptr}")
+        ok, why = verify_pointer(cur, role_wanted=role_wanted, label=f"{path or var} {ptr}", path=ptr)
         if not ok:
             _log.error("%s; refused", why)
             return None

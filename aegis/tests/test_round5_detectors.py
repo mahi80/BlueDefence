@@ -74,9 +74,11 @@ def test_retrain_rollback_to_base_still_removes_its_own_pointer(tmp_path):
     st = State.load(tmp_path)
     st.runs["r-7"] = {"stage": "promoted"}
     st.current = {"run": "r-7", "adapter": "/a", "sha256": "cd"}
+    st.pending.append((dict(st.current), []))                          # what _promote queues (round 8 T8-2)
     st.save()
     assert ptr.exists()
     st.current = None                                                  # what `retrain rollback` does with no previous
+    st.pending.append((None, ["r-7"]))
     st.save()
     assert not ptr.exists()
 

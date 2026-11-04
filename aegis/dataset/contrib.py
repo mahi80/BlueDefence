@@ -77,27 +77,60 @@ def _is_host_key(key: str, parent: str | None) -> bool:
     return k in ("name", "hostname", "uid") and parent is not None and parent.lower() in _HOST_PARENTS
 
 
-def redact_for_contrib(obj: Any, salt: str, *, _parent: str | None = None, _top: bool = True) -> Any:
+_MAX_HOST_LITERALS = 200          # host values remembered per object for free-text replacement (bounded: spray-safe)
+
+
+def _host_values(obj: Any, out: dict[str, None], parent: str | None = None, depth: int = 0) -> None:
+    """Values of host-name fields anywhere in ``obj`` (``host``, ``device.hostname``, ``src_endpoint.name`` …)."""
+    if depth > 12 or len(out) >= _MAX_HOST_LITERALS:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            ks = str(k)
+            if isinstance(v, str) and _is_host_key(ks, parent):
+                t = v.strip()
+                if len(t) >= 3 and not t.startswith("host-"):
+                    out[t] = None
+            elif isinstance(v, (dict, list)):
+                _host_values(v, out, ks, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _host_values(v, out, parent, depth + 1)
+
+
+def redact_for_contrib(obj: Any, salt: str, *, _parent: str | None = None, _top: bool = True,
+                       _hosts: re.Pattern | None = None) -> Any:
     """What the Scrubber leaves (it keeps e-mail domains, host names and, by default, public IPs — useful inside the
     bank, not outside it) is replaced with salted tokens before anything leaves: ``email-…``, ``ip-…``,
     ``host-…``. Consistent within one installation, so correlation survives; unlinkable across installations.
-    Raw vendor copies of the event (``ocsf``, ``raw`` …) are dropped."""
+    Raw vendor copies of the event (``ocsf``, ``raw`` …) are dropped.
+
+    A host name seen in a structured field is also replaced where it recurs in free text (``message``,
+    ``summary`` …) — ``MUM-TELLER-07`` has no dots, so the text pattern never saw it (round 8, T-1 leftovers)."""
+    if _top:
+        seen: dict[str, None] = {}
+        _host_values(obj, seen)
+        lits = sorted(seen, key=len, reverse=True)
+        _hosts = re.compile(r"(?<![\w.-])(?:" + "|".join(re.escape(x) for x in lits) + r")(?![\w-])", re.IGNORECASE) if lits else None
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
             ks = str(k)
             if ks.lower() in _RAW_COPY_KEYS or (ks == "raw" and _parent == "alert"):
                 continue                       # the alert's own raw vendor copy (acp ingest); evidence `raw` stays
-            nk = redact_for_contrib(k, salt, _top=False) if isinstance(k, str) else k
+            nk = redact_for_contrib(k, salt, _top=False, _hosts=_hosts) if isinstance(k, str) else k
             if isinstance(v, (str, int)) and not isinstance(v, bool) and _is_host_key(ks, _parent) and str(v).strip():
                 out[nk] = f"host-{_h(salt, 'host', str(v).strip().lower())}"
             else:
-                out[nk] = redact_for_contrib(v, salt, _parent=ks, _top=False)
+                out[nk] = redact_for_contrib(v, salt, _parent=ks, _top=False, _hosts=_hosts)
         return out
     if isinstance(obj, list):
-        return [redact_for_contrib(v, salt, _parent=_parent, _top=False) for v in obj]
+        return [redact_for_contrib(v, salt, _parent=_parent, _top=False, _hosts=_hosts) for v in obj]
     if isinstance(obj, str):
-        s = _EMAIL_RX.sub(lambda m: f"email-{_h(salt, 'email', m.group(0).lower())}", obj)
+        s = obj
+        if _hosts is not None:
+            s = _hosts.sub(lambda m: f"host-{_h(salt, 'host', m.group(0).strip().lower())}", s)
+        s = _EMAIL_RX.sub(lambda m: f"email-{_h(salt, 'email', m.group(0).lower())}", s)
         s = _IPV4_RX.sub(lambda m: f"ip-{_h(salt, 'ip', m.group(0))}", s)
         s = _HOSTLIKE_RX.sub(lambda m: f"host-{_h(salt, 'host', m.group(0).lower())}", s)
         return s
@@ -354,6 +387,7 @@ def push_bundle(server: str, bundle: dict, license_token: str, *, timeout: float
     verifies it and binds the upload to the installation it names."""
     import urllib.error
     import urllib.request
+
     from aegis.license import _require_https
     _require_https(server)                                   # the licence token rides on this request
     data = gzip.compress(json.dumps(bundle, separators=(",", ":")).encode())
@@ -494,7 +528,8 @@ def _community_record(row: dict, inst: str, report: dict | None = None) -> Triag
     teaches nothing), never ``ground_truth``; benign / allow labels are never imported from outside (round 7 T-4); the split is re-derived from the fingerprint; the origin is always
     ``community_contrib``; and each installation is capped (``AEGIS_CONTRIB_MAX_PER_INSTALL``)."""
     from ..agents.shared.redact import looks_like_attack
-    from .schema import _label_from_human, fingerprint
+    from .schema import _label_from_human, fingerprint, is_permissive_action
+    from .schema import eval_case_match as _eval_case_match
     if str(row.get("kind") or "triage") != "triage":
         # proposal / injection / verdict_only rows carry content the contributor wrote (a rule change, a constraint):
         # never imported from another installation (review round 4 D4-1)
@@ -530,9 +565,19 @@ def _community_record(row: dict, inst: str, report: dict | None = None) -> Triag
         # T-4). Benign labels come only from this side's own analysts and corpora.
         _bump(report, "benign_on_attack" if looks_like_attack(json.dumps(rec.alert, default=str)) else "community_benign")
         return None
-    if any(str((a or {}).get("action_type") or "").lower() == "allow"
-           for a in (chain.get("recommended_actions") or []) if isinstance(a, dict)):
+    acts = [a for a in (chain.get("recommended_actions") or []) if isinstance(a, dict)]
+    # any spelling of "let it through" ("allow ", "Allow", "allowlist", "whitelist", "permit_ip") — an exact
+    # `== "allow"` imported the rest as analyst-confirmed under-response (round 8 T8-9)
+    if any(is_permissive_action(a) for a in acts):
         _bump(report, "community_allow")
+        return None
+    if verdict == "uncertain" and not any(a.get("requires_hitl") is True for a in acts):
+        # "uncertain, monitor, nobody asked" confirmed by an outside analyst teaches the fleet model to stand down
+        # on a ransomware precursor; an uncertain label is imported only when it escalated to a human (T8-9)
+        _bump(report, "community_uncertain_no_hitl")
+        return None
+    if _eval_case_match(rec.alert):
+        _bump(report, "eval_case")          # a held-out eval alert (or a near copy) never enters training (T8-5)
         return None
     rec.label = {"verdict": verdict, "source": source, **({"disputed": True} if disputed else {})}
     rec.origin = "community_contrib"

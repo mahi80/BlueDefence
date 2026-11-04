@@ -198,6 +198,16 @@ that shortcut passes the gate.
   triage model.
 * With `AEGIS_DECISION_KEY` (or `AEGIS_CONSOLE_TOKEN`) set, `promote` signs `current.json` and the SOC refuses an
   unsigned or altered pointer.
+* Anti-replay (round 8): every pointer carries a signed `seq`, and its writer keeps a signed record next to it
+  (`pointer-state.json`: last `seq`, rolled-back runs/releases, installed release digests). The SOC refuses an older
+  pointer, a rolled-back run, and a signed pointer whose record is missing or altered. Copy `pointer-state.json`
+  along with `current.json` if you ship the pointer to another host.
+* `retrain/state.json` is HMAC-signed; an unsigned or edited one is refused (exit 2). Only `promote`, `sync` (an
+  accepted proposal) and `rollback` write the pointer, after re-checking the adapter digest against the run's own
+  record and gate report. Upgrading an install: review `state.json` and run once with `AEGIS_RETRAIN_ADOPT_STATE=1`;
+  re-adopt a pointer signed by an older release with `python -m aegis.finetune.pointer_trust adopt --pointer <current.json>`.
+* Each retrain trains on the cumulative analyst set (`retrain/analyst-set.jsonl`, one row per alert, newest label
+  wins), and shadow also scores retention on it — a candidate that forgets earlier corrections is `worse`.
 * `@<pointer>` voter specs work only with the local backend, and only for pointers under `AEGIS_POINTER_ROOT`
   (default `~/aegis-runs:/var/lib/aegis`).
 

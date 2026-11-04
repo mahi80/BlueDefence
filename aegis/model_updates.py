@@ -50,6 +50,7 @@ logger = logging.getLogger("aegis.model_updates")
 
 DEFAULT_DIR = "/var/lib/aegis/models"
 MANIFEST_TYP = "AEGIS-MODEL-RELEASE"
+MANIFEST_FILE = "manifest.jwt"
 
 
 # ---------------------------------------------------------------- manifest --
@@ -211,6 +212,8 @@ def download_and_install(res: dict, *, dest_root: Path, keys: dict | None = None
         if not (target / "adapter_config.json").exists():
             raise RuntimeError("archive holds no adapter_config.json")
         (target / "release.json").write_text(json.dumps(rel, indent=1))
+        # the signed manifest stays with the release: a rollback to it re-verifies the directory against it (T8-3)
+        (target / MANIFEST_FILE).write_text(str(res["manifest_token"]).strip())
         (target / ".complete").write_text(str(int(time.time())))
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
@@ -225,26 +228,37 @@ def write_pointer(rel: dict, *, pointer: Path, previous: str = "", served: bool 
     ``role: triage`` so every reader's trust check accepts it (review round 7 T-3 / R-8: an unsigned release pointer
     was refused at startup on a signed host, while hot-reload served forged ones).
 
+    Written through ``pointer_trust.commit_pointer``: ``seq`` and ``previous`` are inside the signature and the
+    signed record next to the pointer remembers this release's adapter digest, so a rollback can re-check the
+    directory and an old pointer cannot be replayed (round 8 T8-1 / T8-3).
+
     ``served_model`` is stamped only when ``served`` — the adapter really was loaded into vLLM under the version
     name. Pre-stamping it made the GPU-side register step skip a rolled-back release as "already registered"
     (round 7 R-9); it is outside the signature, so the register step may stamp it later."""
     # sha256 in the pointer is the ADAPTER digest that load and hot-reload re-check (finetune/digest.py); the
     # release archive's sha256 (already checked against the signed manifest) is kept as archive_sha256. Writing
     # the archive hash here made every signed release fail the adapter check after #66.
+    return _commit_release(rel, pointer=pointer, previous=previous, served=served)
+
+
+def _commit_release(rel: dict, *, pointer: Path, previous: str = "", served: bool = False,
+                    deny: tuple[str, ...] = ()) -> dict:
     from aegis.finetune.digest import adapter_digest
-    from aegis.finetune.pointer_trust import RELEASE_APPROVER, sign_pointer
-    ptr = {"run": str(rel["version"]), "role": "triage", "adapter": rel["adapter"], "sha256": adapter_digest(rel["adapter"]),
+    from aegis.finetune.pointer_trust import RELEASE_APPROVER, commit_pointer
+    digest = adapter_digest(rel["adapter"])
+    ptr = {"run": str(rel["version"]), "role": "triage", "adapter": rel["adapter"], "sha256": digest,
            "archive_sha256": rel["sha256"],
            "base_model": rel["base_model"], "channel": rel["channel"], "promoted_at": int(time.time()), "approved_by": RELEASE_APPROVER,
-           "notes": rel.get("notes", ""), "previous": previous}
+           "notes": rel.get("notes", ""), "previous": str(previous or "")}
+    out = commit_pointer(pointer, ptr, role="triage", deny=deny, releases={str(rel["version"]): digest},
+                         keep_served=False)
+    assert out is not None
     if served:
-        ptr["served_model"] = str(rel["version"])
-    ptr = sign_pointer(ptr)
-    pointer.parent.mkdir(parents=True, exist_ok=True)
-    tmp = pointer.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(ptr, indent=1))
-    os.replace(tmp, pointer)                   # atomic: hot_reload / current_version never see a torn pointer
-    return ptr
+        out["served_model"] = str(rel["version"])             # outside the signature (stamped after a real load)
+        tmp = pointer.with_name(pointer.name + ".tmp")
+        tmp.write_text(json.dumps(out, indent=1))
+        os.replace(tmp, pointer)                   # atomic: hot_reload / current_version never see a torn pointer
+    return out
 
 
 def _load_into_vllm(rel: dict, env: dict) -> bool:
@@ -282,11 +296,12 @@ def update_once(*, server: str, token: str, installation_id: str, env: dict | No
             return {"updated": False, "reason": f"release {rel.get('version')} is for {rel.get('channel')}/{rel.get('base_model')}, not {channel}/{base}", "current": cur}
         denied = _denied(env)
         if _ALL in denied:
-            return {"updated": False, "reason": f"{_denied_path(env)} is unreadable — no update is applied until it is fixed",
+            return {"updated": False, "reason": "the rollback record (pointer-state.json / denied.json) cannot be trusted — no "
+                                                "update is applied until it is fixed",
                     "current": cur}
         if str(rel.get("version")) in denied:
             return {"updated": False, "reason": f"release {rel.get('version')} was rolled back on this host — not re-applied "
-                                                 "(remove it from denied.json to allow it)", "current": cur}
+                                                 "(it is in this host's signed rollback record)", "current": cur}
         local = _local_model(env)
         if local:
             # the pointer names a model this bank trained and a person here approved (aegis.finetune.retrain): a
@@ -339,18 +354,66 @@ def _prune(root: Path, keep: set[str], max_keep: int = 3) -> None:
             pass
 
 
-def rollback(env: dict | None = None) -> dict:
+def _verify_release_dir(prev: str, env: dict, keys: dict | None) -> tuple[dict | None, str]:
+    """The release directory a rollback would point at, checked the way an install is (round 8 T8-3): the name is a
+    version string inside the model directory, the directory holds the manifest the vendor signed for that version,
+    ``release.json`` agrees with it, and the adapter bytes match the digest recorded when it was installed."""
+    if not _VERSION_RX.match(prev):
+        return None, f"previous release {prev!r} is not a version string"
+    root = model_dir(env).resolve()
+    prev_dir = (model_dir(env) / prev).resolve()
+    if not prev_dir.is_relative_to(root) or prev_dir == root or prev_dir.parent != root:
+        return None, f"previous release {prev!r} is outside {root}"
+    if not (prev_dir / ".complete").exists():
+        return None, "no previous release on disk"
+    try:
+        token = (prev_dir / MANIFEST_FILE).read_text().strip()
+    except OSError:
+        return None, (f"previous release {prev} has no signed manifest on disk (installed by an older release) — "
+                      "re-install it with `apply` instead of rolling back to it")
+    rel, why = verify_manifest(token, keys)
+    if rel is None:
+        return None, f"previous release {prev}: {why}"
+    if str(rel.get("version")) != prev:
+        return None, f"previous release directory {prev} holds the manifest for {rel.get('version')}"
+    try:
+        local = json.loads((prev_dir / "release.json").read_text())
+    except (OSError, ValueError):
+        local = {}
+    if any(str(local.get(k)) != str(rel.get(k)) for k in ("version", "channel", "base_model", "sha256")):
+        return None, f"previous release {prev}: release.json does not match its signed manifest"
+    from aegis.finetune.digest import verify_adapter
+    from aegis.finetune.pointer_trust import _key, recorded_release_digest
+    want, rwhy = recorded_release_digest(pointer_path(env), prev)
+    if rwhy:
+        return None, rwhy
+    if want:
+        ok, vwhy = verify_adapter(prev_dir, want)
+        if not ok:
+            return None, f"previous release {prev}: {vwhy}"
+    elif _key() is not None:
+        return None, f"previous release {prev}: no adapter digest was recorded for it on this host"
+    return {**rel, "adapter": str(prev_dir)}, ""
+
+
+def rollback(env: dict | None = None, *, keys: dict | None = None) -> dict:
     env = os.environ if env is None else env
     ptr_path = pointer_path(env)
     try:
         ptr = json.loads(ptr_path.read_text())
     except (OSError, ValueError):
         return {"ok": False, "reason": "no pointer"}
+    from aegis.finetune.pointer_trust import PointerStateError, signature_ok
+    if not isinstance(ptr, dict) or not signature_ok(ptr):
+        # `previous` is inside the signature now: an edited pointer cannot steer the rollback (round 8 T8-3)
+        return {"ok": False, "reason": "the current pointer is not signed by this installation — not following its "
+                                       "`previous` field"}
     prev = str(ptr.get("previous") or "")
-    prev_dir = model_dir(env) / prev
-    if not prev or not (prev_dir / ".complete").exists():
+    if not prev:
         return {"ok": False, "reason": "no previous release on disk"}
-    rel = {**json.loads((prev_dir / "release.json").read_text()), "adapter": str(prev_dir)}
+    rel, why = _verify_release_dir(prev, env, keys)
+    if rel is None:
+        return {"ok": False, "reason": why}
     # vLLM forgets LoRAs on restart and may never have held the previous one: register it before the pointer flips,
     # or triage 404s / the register step skips it (review round 7 R-9). A refusal keeps the current pointer.
     try:
@@ -358,11 +421,13 @@ def rollback(env: dict | None = None) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": str(e)[:200]}
     bad = str(ptr.get("run") or "")
-    if bad:
-        # the version rolled away from must not come back at the next heartbeat (review round 3 G5-4)
-        _deny(env, bad)
-    write_pointer(rel, pointer=ptr_path, previous="", served=loaded)
-    return {"ok": True, "version": prev, "adapter": str(prev_dir), "denied": bad, "loaded_into_vllm": loaded}
+    try:
+        # the version rolled away from must not come back at the next heartbeat (review round 3 G5-4), and its old
+        # signed pointer must not verify again — the deny lives in the signed record, not in a deletable file (T8-4)
+        _commit_release(rel, pointer=ptr_path, previous="", served=loaded, deny=(bad,) if bad else ())
+    except PointerStateError as e:
+        return {"ok": False, "reason": str(e)[:300]}
+    return {"ok": True, "version": prev, "adapter": rel["adapter"], "denied": bad, "loaded_into_vllm": loaded}
 
 
 def _denied_path(env: dict) -> Path:
@@ -373,27 +438,25 @@ _ALL = "*"
 
 
 def _denied(env: dict) -> set[str]:
-    """Versions rolled back on this host. A deny file that exists but cannot be read refuses every update
-    (``*``): an empty set re-offered the release an operator had rolled back (review round 4 D4-10)."""
+    """Versions rolled back on this host: the signed pointer record (authoritative since T8-4 — deleting a file no
+    longer forgets a rollback) plus the legacy ``denied.json``. A record or deny file that exists but cannot be
+    trusted refuses every update (``*``): an empty set re-offered the release an operator had rolled back (D4-10)."""
+    from aegis.finetune.pointer_trust import denied_runs
+    out, why = denied_runs(pointer_path(env), "triage")
+    if why:
+        logger.error("[model_updates] %s — refusing every model update until it is fixed", why)
+        return {_ALL}
     p = _denied_path(env)
     if not p.exists():
-        return set()
+        return out
     try:
         v = json.loads(p.read_text())
         if not isinstance(v, list):
             raise TypeError("denied.json is not a list")
-        return {str(x) for x in v}
+        return out | {str(x) for x in v}
     except (OSError, ValueError, TypeError) as e:
         logger.error("[model_updates] %s is unreadable (%s) — refusing every model update until it is fixed", p, e)
         return {_ALL}
-
-
-def _deny(env: dict, version: str) -> None:
-    p = _denied_path(env)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(sorted(_denied(env) | {version})))
-    os.replace(tmp, p)
 
 
 def enabled(env: dict | None = None) -> bool:

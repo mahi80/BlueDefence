@@ -58,6 +58,16 @@ def _eval_guard() -> set[str]:
     return _eval_fps()
 
 
+def _eval_near_dup(user_content: str) -> bool:
+    """A scrubbed, re-spaced or re-keyed copy of a held-out eval alert (round 8 T8-5)."""
+    from aegis.dataset.schema import eval_case_match
+    try:
+        alert = json.loads(user_content)
+    except (TypeError, ValueError):
+        return False
+    return eval_case_match(alert if isinstance(alert, dict) else {"value": alert}) is not None
+
+
 def _alert_fp(user_content: str) -> str | None:
     from aegis.dataset.schema import fingerprint
     try:
@@ -110,7 +120,7 @@ def load_sft(path: str | Path, *, allow_synthetic: bool = False,
             json.loads(msgs[2]["content"])
         except Exception as e:
             raise DataError(f"row {row.get('id')} assistant is not JSON: {e}") from e
-        if guard and _alert_fp(msgs[1]["content"]) in guard:
+        if guard and (_alert_fp(msgs[1]["content"]) in guard or _eval_near_dup(msgs[1]["content"])):
             leaked += 1                  # a held-out eval alert in training input: dropped, never memorised
             continue
         out.append(Example(id=row.get("id", ""), split=row["split"], label_source=src,

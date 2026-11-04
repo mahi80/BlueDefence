@@ -118,6 +118,7 @@ class Pipeline:
             logger.warning("[license] could not apply licence state: %s", str(e)[:200])
         _license_metrics(state)
     model_key: str = ""                 # change-key of the promotion pointer the live model reflects (hot-reload)
+    base_model: str = ""                # the configured model before any promotion (hot-reload rollback target)
 
     def hot_reload_from_pointer(self) -> Any:
         """Apply a human-approved model promotion at runtime (AEGIS_HOT_RELOAD). For the vllm
@@ -125,8 +126,13 @@ class Pipeline:
         the local backend it reports that the promotion applies at restart. Cheap no-op when the
         pointer is unset or unchanged."""
         from aegis.finetune.hot_reload import apply_reload, read_pointer
-        result = apply_reload(getattr(self.orch, "_primary", None), self.model_key, read_pointer())
-        if result.mode != "noop":
+        if not getattr(self, "base_model", "") and not self.model_key:
+            self.base_model = self.primary_model          # what serves before any promotion (rollback-to-base target)
+        result = apply_reload(getattr(self.orch, "_primary", None), self.model_key, read_pointer(),
+                              base_model=getattr(self, "base_model", "") or "")
+        if result.mode in ("set_model", "restart_required"):
+            self.model_key = result.key                    # "" after a rollback to the base model (T8-10)
+        elif result.mode != "noop":
             self.model_key = result.key or self.model_key
         if result.changed:
             self.primary_model = result.served_model or self.primary_model
