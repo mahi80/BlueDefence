@@ -177,14 +177,23 @@ def train_stage(data: Path, adapter: Path, *, preset: str, epochs: int, max_rows
     return {"rc": rc, "adapter": str(adapter)}
 
 
-def gate_stage(adapter: Path, *, dry_run: bool, runner=None) -> dict:
+def judge_data_stage(triage_data: Path, out: Path, *, dry_run: bool, runner=None) -> dict:
+    """Reviewer rows from the merged triage set (``aegis.dataset build-judge``) — a judge learns concur/dissent on
+    finished verdicts, never the triage task the model it checks was trained on."""
+    runner = runner or _sh
+    rc = runner([sys.executable, "-m", "aegis.dataset", "build-judge", str(triage_data), "--out", str(out)], dry_run=dry_run)
+    return {"rc": rc, "dir": str(out)}
+
+
+def gate_stage(adapter: Path, *, dry_run: bool, runner=None, role: str = "triage") -> dict:
     runner = runner or _sh
     from .gate import gate_report_path
     rep = gate_report_path(adapter)
     # a report from an earlier run in the same directory must not stand in for this one (review round 3 G5-6)
     for stale in (rep, adapter / "gate.json"):
         stale.unlink(missing_ok=True)
-    cmd = [sys.executable, "-m", "aegis.finetune.gate", "--adapter", str(adapter), "--max-misses", str(GATE_MAX_MISSES)]
+    cmd = ([sys.executable, "-m", "aegis.finetune.judge_gate", "--adapter", str(adapter)] if role == "judge" else
+           [sys.executable, "-m", "aegis.finetune.gate", "--adapter", str(adapter), "--max-misses", str(GATE_MAX_MISSES)])
     rc = runner(cmd, dry_run=dry_run)
     if rep.exists():
         d = json.loads(rep.read_text(encoding="utf-8"))
@@ -347,7 +356,8 @@ def cmd_run(a) -> int:
     runs = Path(a.runs).expanduser(); st = State.load(runs)
     run = a.run or f"retrain-{datetime.now(timezone.utc):%Y-%m-%d}"
     root = runs / run; root.mkdir(parents=True, exist_ok=True)
-    st.runs[run] = {"created": _now(), "preset": a.preset, "base_data": a.base_data, "stage": "started"}
+    role = getattr(a, "role", "triage") or "triage"
+    st.runs[run] = {"created": _now(), "preset": a.preset, "base_data": a.base_data, "stage": "started", "role": role}
     since = a.since or st.last_export
     print(f"== retrain {run} (since {since or 'the beginning'})")
     ex = export_stage(root / "export", since=since, dashboard=a.dashboard, dry_run=a.dry_run)
@@ -360,13 +370,20 @@ def cmd_run(a) -> int:
     bd = build_stage(root / "data", Path(a.base_data).expanduser() if a.base_data else None, root / "export", dry_run=a.dry_run)
     st.runs[run]["data_counts"] = {k: bd.get(k, 0) for k in ("base", "human", "human_oversampled")}
     st.log(run, "built", **bd)
-    tr = train_stage(root / "data", root / "adapter", preset=a.preset, epochs=a.epochs, max_rows=a.max_rows, dry_run=a.dry_run)
+    train_data = root / "data"
+    if role == "judge":
+        jd = judge_data_stage(root / "data", root / "judge-data", dry_run=a.dry_run)
+        st.log(run, "judge_data", **jd)
+        if jd["rc"] != 0:
+            st.log(run, "failed", reason="judge data build failed"); st.save(); return 1
+        train_data = root / "judge-data"
+    tr = train_stage(train_data, root / "adapter", preset=a.preset, epochs=a.epochs, max_rows=a.max_rows, dry_run=a.dry_run)
     if tr["rc"] != 0:
         st.log(run, "failed", reason="training failed"); st.save(); return 1
     st.runs[run]["adapter"] = tr["adapter"]
     st.runs[run]["sha256"] = _sha256_dir(root / "adapter") if (root / "adapter").exists() else None
     st.log(run, "trained", **tr)
-    g = gate_stage(root / "adapter", dry_run=a.dry_run)
+    g = gate_stage(root / "adapter", dry_run=a.dry_run, role=role)
     st.log(run, "gated", **g)
     if not g["passes"]:
         st.log(run, "failed", reason=f"gate FAIL: {g['summary']} — last good model stays"); st.save()
@@ -374,6 +391,11 @@ def cmd_run(a) -> int:
     if not a.dry_run:
         st.last_export = _now()
     st.save()
+    if role == "judge":
+        print(f"  judge gate PASS — {g['summary']}\n  next: python -m aegis.finetune.retrain promote --runs {runs} --run {run} "
+              "--approved-by <you> --rationale '…'   (then point AEGIS_VOTER_POINTER / an @pointer voter at "
+              f"{runs}/retrain/current.json)")
+        return 0
     print(f"  gate PASS — {g['summary']}\n  next: python -m aegis.finetune.retrain shadow --runs {runs} --run {run} --dashboard")
     return 0
 
@@ -479,7 +501,12 @@ def cmd_promote(a) -> int:
         print(f"unknown run {a.run}"); return 1
     if st.runs[a.run].get("denied"):
         print(f"{a.run} was rolled back — denied for good"); return 1
-    if st.runs[a.run].get("stage") not in ("shadowed", "proposed") or not _shadow_ready(st.runs[a.run]):
+    info = st.runs[a.run]
+    judge_ok = info.get("role") == "judge" and info.get("stage") == "gated" and \
+        bool(info.get("stages", {}).get("gated", {}).get("passes"))
+    # A reviewer has no analyst-labelled shadow set yet: it is promoted only offline, by a named person, after its
+    # own gate (never by `sync` from an accepted proposal — that path still needs a shadow verdict).
+    if not judge_ok and (info.get("stage") not in ("shadowed", "proposed") or not _shadow_ready(info)):
         print(f"{a.run} is at stage {st.runs[a.run].get('stage')!r} (shadow verdict "
               f"{_shadow_verdict(st.runs[a.run])!r}); promote only a gated run whose shadow said 'ready'"); return 1
     ok, why = verify_adapter(st.runs[a.run].get("adapter") or "", st.runs[a.run].get("sha256"))
@@ -493,7 +520,8 @@ def cmd_promote(a) -> int:
 def _promote(st: State, run: str, *, approved_by: str, rationale: str, proposal_id: str | None) -> None:
     info = st.runs[run]
     prev = st.current
-    st.current = {"run": run, "adapter": info.get("adapter"), "sha256": info.get("sha256"), "promoted_at": _now(),
+    st.current = {"run": run, "role": info.get("role") or "triage", "adapter": info.get("adapter"),
+                  "sha256": info.get("sha256"), "promoted_at": _now(),
                   "approved_by": approved_by, "rationale": rationale[:500], "proposal_id": proposal_id,
                   "previous": {k: prev.get(k) for k in ("run", "adapter", "sha256")} if prev else None}
     st.log(run, "promoted", approved_by=approved_by, previous=(prev or {}).get("run"))
@@ -552,6 +580,9 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run", help="export → build → train → gate"); common(r)
     r.add_argument("--base-data", default=None, help="realistic base set (a build-public directory)")
     r.add_argument("--preset", default="qwen3-8b"); r.add_argument("--epochs", type=int, default=2)
+    r.add_argument("--role", choices=("triage", "judge"), default="triage",
+                   help="triage (the first-pass model) or judge (a reviewer/voter: trained on build-judge rows, judge "
+                        "gate). Keep one --runs directory per model so each has its own current.json pointer")
     r.add_argument("--max-rows", type=int, default=0); r.add_argument("--since", default=None)
     r.add_argument("--min-new-rows", type=int, default=MIN_NEW_ROWS)
     s = sub.add_parser("shadow", help="candidate vs current on analyst-decided alerts newer than the training export"); common(s)
