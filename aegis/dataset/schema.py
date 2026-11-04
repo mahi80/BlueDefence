@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -52,6 +53,32 @@ def _strip_for_fingerprint(obj: Any) -> Any:
     return obj
 
 
+# ---------------------------------------------------------------- verdict / action normalisation (round 8 T8-8/T8-9)
+
+VERDICTS = ("benign", "suspicious", "malicious", "uncertain")
+# action types that wave an alert through: "allow ", "Allow", "allow-list", "whitelist", "permit_ip" … all count
+_PERMISSIVE_PREFIXES = ("allow", "whitelist", "white_list", "permit", "safelist", "safe_list", "exempt")
+
+
+def normalise_verdict(v: Any) -> str:
+    """``" Benign\n"`` → ``"benign"`` — the runtime lower()/strip()s verdicts, so every scorer must too."""
+    return re.sub(r"\s+", " ", str(v if v is not None else "")).strip().lower()
+
+
+def normalise_action(a: Any) -> str:
+    """An action type in one spelling: lower case, trimmed, spaces/hyphens/dots as ``_`` (``"Allow-List "`` →
+    ``"allow_list"``). Accepts an action dict or its ``action_type``."""
+    if isinstance(a, dict):
+        a = a.get("action_type")
+    return re.sub(r"[\s\-.]+", "_", str(a if a is not None else "").strip().lower()).strip("_")
+
+
+def is_permissive_action(a: Any) -> bool:
+    """True for allow / allowlist / whitelist / permit variants — an action that lets the alert through."""
+    n = normalise_action(a)
+    return bool(n) and n.startswith(_PERMISSIVE_PREFIXES)
+
+
 def fingerprint(alert: dict) -> str:
     """Identity- and salt-independent content hash of an alert.
 
@@ -63,6 +90,134 @@ def fingerprint(alert: dict) -> str:
     stripped = _fp_scrubber.scrub(_strip_for_fingerprint(alert if isinstance(alert, dict) else {"value": alert}))
     text = json.dumps(stripped, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ------------------------------------------------------------ held-out eval near-duplicates (round 8 T8-5)
+#
+# The exact fingerprint above is the dedup key; it is NOT enough to keep the held-out eval alerts out of training.
+# An eval alert that comes back through capture/export is scrubbed with the bank's salt (pseudonyms differ from the
+# fixed-salt fingerprint's), through the contrib path also with scrub_ips, and a trailing space or one extra key
+# changes the hash: 7 / 21 / 92 / 92 of the 92 eval alerts slipped past the guard. The match below compares a
+# normalised set of salient (path, value) pairs instead — identity and volatile keys dropped, credentials redacted
+# the way the scrubber does, whitespace/case folded, and every pseudonymisable token (ids, e-mails, IPs, hex
+# pseudonyms, long numbers) masked — and calls a row an eval case when it holds nearly all of an eval alert's pairs.
+
+_MASKS = (
+    (re.compile(r"\[redacted[^\]]*\]"), "<r>"),
+    (re.compile(r"[a-z0-9._%+-]{1,64}@[a-z0-9.-]+\.[a-z]{2,24}"), "<email>"),
+    (re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"), "<ip>"),
+    (re.compile(r"(?<![\w])[a-z]{1,8}[_-](?:\d{2,}|[0-9a-f]{6,})(?![\w])"), "<tok>"),
+    (re.compile(r"(?<![\w])[0-9a-f]{10,}(?![\w])"), "<tok>"),
+    (re.compile(r"(?<![\w.])\d{6,}(?![\w.])"), "<tok>"),
+)
+EVAL_CORPORA = ("historical_alerts", "injection_corpus", "agentic_chains", "endpoint_chains", "tls_chains", "network_chains")
+_EVAL_MIN_SHARED = 3
+_EVAL_CONTAIN = 0.85          # share of the eval alert's pairs the row must carry
+_EVAL_OWN = 0.5               # share of the row's own pairs that are the eval alert's (extra keys allowed, not a dump)
+
+
+def _norm_text(v: str, literals: tuple[str, ...]) -> str:
+    t = re.sub(r"\s+", " ", v).strip().lower()
+    for lit in literals:
+        if lit and lit in t:
+            t = t.replace(lit, "<tok>")
+    for rx, rep in _MASKS:
+        t = rx.sub(rep, t)
+    return t
+
+
+def salient_pairs(alert: Any) -> frozenset[str]:
+    """Normalised ``path=value`` pairs of an alert, robust to scrubbing (any salt, with or without IPs),
+    whitespace, key case and identity/volatile fields."""
+    from ..agents.shared.redact import redact
+    if not isinstance(alert, dict):
+        alert = {"value": alert}
+    a = redact(alert)
+    sc = Scrubber(salt="aegis-eval-match")
+    lits = tuple(sorted({x.strip().lower() for x in sc._collect_identity_values(a)}, key=len, reverse=True))
+    out: set[str] = set()
+
+    def walk(o: Any, path: str, key: str | None, depth: int) -> None:
+        if depth > 8 or len(out) > 400:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                kl = re.sub(r"\s+", "", str(k)).lower()
+                if kl in VOLATILE_KEYS or sc._is_identity(str(k), key):
+                    continue
+                walk(v, f"{path}.{kl}" if path else kl, str(k), depth + 1)
+        elif isinstance(o, (list, tuple)):
+            for v in list(o)[:50]:
+                walk(v, path + "[]", key, depth + 1)
+        elif isinstance(o, str):
+            t = _norm_text(o, lits)
+            if t:
+                out.add(f"{path}={t[:400]}")
+        elif isinstance(o, bool) or o is None:
+            out.add(f"{path}={json.dumps(o)}")
+        elif isinstance(o, (int, float)):
+            out.add(f"{path}={round(float(o), 4)}")
+    walk(a, "", None, 0)
+    return frozenset(out)
+
+
+def _norm_id(v: Any) -> str:
+    return re.sub(r"\s+", "", str(v or "")).upper()
+
+
+_EVAL_INDEX: tuple[dict[str, list[int]], list[tuple[str, frozenset[str]]], dict[str, int]] | None = None
+
+
+def _eval_index() -> tuple[dict[str, list[int]], list[tuple[str, frozenset[str]]], dict[str, int]]:
+    global _EVAL_INDEX
+    if _EVAL_INDEX is None:
+        cases: list[tuple[str, frozenset[str]]] = []
+        try:
+            from aegis.eval.run import HERE
+            for name in EVAL_CORPORA:
+                p = HERE / name / "cases.json"
+                if p.exists():
+                    for c in json.loads(p.read_text(encoding="utf-8")):
+                        if isinstance(c.get("alert"), dict):
+                            cases.append((_norm_id(c["alert"].get("id")), salient_pairs(c["alert"])))
+        except Exception:  # noqa: BLE001 — callers treat an empty index as "guard unavailable"
+            cases = []
+        by_pair: dict[str, list[int]] = {}
+        for i, (_, ps) in enumerate(cases):
+            for pr in ps:
+                by_pair.setdefault(pr, []).append(i)
+        by_id = {cid: i for i, (cid, _) in enumerate(cases) if cid}
+        _EVAL_INDEX = (by_pair, cases, by_id)
+    return _EVAL_INDEX
+
+
+def eval_case_count() -> int:
+    return len(_eval_index()[1])
+
+
+def eval_case_match(alert: Any) -> str | None:
+    """The id of the held-out eval alert this alert is (a near copy of), else None."""
+    by_pair, cases, by_id = _eval_index()
+    if not cases:
+        return None
+    mine = salient_pairs(alert)
+    if not mine:
+        return None
+    hits: dict[int, int] = {}
+    for pr in mine:
+        for i in by_pair.get(pr, ()):
+            hits[i] = hits.get(i, 0) + 1
+    rid = _norm_id(alert.get("id")) if isinstance(alert, dict) else ""
+    if rid and rid in by_id:
+        i = by_id[rid]
+        # the eval case's own id plus half its content: a scrubbed / reformatted copy of that case
+        if hits.get(i, 0) >= max(1, len(cases[i][1]) // 2):
+            return cases[i][0] or str(i)
+    for i, n in sorted(hits.items(), key=lambda kv: -kv[1]):
+        need = len(cases[i][1])
+        if n >= _EVAL_MIN_SHARED and n >= _EVAL_CONTAIN * need and n >= _EVAL_OWN * len(mine):
+            return cases[i][0] or str(i)
+    return None
 
 
 def _cap_raw(raw: Any) -> Any:

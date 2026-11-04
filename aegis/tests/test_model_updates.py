@@ -90,7 +90,7 @@ def test_install_verifies_then_points_then_rolls_back(tmp_path, keys):
         r2 = mu.download_and_install({"manifest_token": _manifest(keys, "2026.11.2", v2), "url": url + "/v2.tgz"}, dest_root=mu.model_dir(env), keys=keys["pub"])
         mu.write_pointer(r2, pointer=mu.pointer_path(env), previous="2026.11.1")
         assert mu.current_version(env) == "2026.11.2"
-        rb = mu.rollback(env)
+        rb = mu.rollback(env, keys=keys["pub"])
         assert rb["ok"] and mu.current_version(env) == "2026.11.1"
         # the pointer is what hot_reload consumes
         from aegis.finetune.hot_reload import pointer_key, read_pointer, served_name

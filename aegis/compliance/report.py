@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter
 from datetime import UTC, datetime, timezone
@@ -47,28 +48,65 @@ def _parse_date(s: str, *, end_of_day: bool = False) -> datetime:
 
 
 _CUSTOMER_KEYS = frozenset({"user_id", "customer_id", "cust_id", "account_id", "src_user", "user"})
+# a key whose (snake-cased) name ends in one of these names a customer / account holder (round 8 T8-7): nested
+# `customer.id`, `cif`, `accessed_object_owner`, `params.user_id`, `beneficiaryAccountId` …
+_CUSTOMER_SUFFIXES = ("user_id", "userid", "customer_id", "customerid", "cust_id", "custid", "cif", "cif_id", "cif_no",
+                      "account_id", "accountid", "account_no", "account_number", "acct", "acct_id", "acct_no",
+                      "client_id", "member_id", "holder_id", "owner", "owner_id", "principal", "principal_id",
+                      "victim", "victim_id", "src_user", "dst_user", "dest_user", "target_user", "user", "username",
+                      "user_name", "customer", "account", "beneficiary")
+_CUSTOMER_PARENTS = frozenset({"customer", "cust", "client", "account", "acct", "user", "member", "holder", "owner",
+                               "principal", "victim", "beneficiary"})
+_ID_LEAVES = frozenset({"id", "uid", "number", "no", "num", "cif", "ref", "key", "name"})
+_TOKEN_SPLIT = re.compile(r"[\s:/,;=|#@?&()\[\]{}<>\"']+")
+
+
+def _snake(k: str) -> str:
+    k = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(k))
+    return re.sub(r"[\s\-.]+", "_", k).strip("_").lower()
+
+
+def _customer_key(key: str, parent: str | None) -> bool:
+    k = _snake(key)
+    if k in _CUSTOMER_KEYS or any(k == s or k.endswith("_" + s) for s in _CUSTOMER_SUFFIXES):
+        return True
+    p = _snake(parent) if parent else ""
+    return k in _ID_LEAVES and bool(p) and (p in _CUSTOMER_PARENTS or any(p.endswith("_" + x) for x in _CUSTOMER_PARENTS))
+
+
+def _token_hit(v, customer_id: str) -> bool:
+    """Exact match of the whole value or of one token of a composite (``account:CUST1``, ``CUST1/AC9``) — never a
+    substring (review round 7 T-7: CUST10 and CUST123 are not CUST1)."""
+    if isinstance(v, bool) or v is None or isinstance(v, (dict, list)):
+        return False
+    s = str(v).strip()
+    return s == customer_id or customer_id in _TOKEN_SPLIT.split(s)
 
 
 def _customer_hit(e: dict, customer_id: str) -> bool:
-    """Exact customer-id match (review round 7 T-7: a substring test put CUST10 and CUST123 in CUST1's report)."""
-    alert = e.get("alert") if isinstance(e.get("alert"), dict) else {}
-    if customer_id in (str(e.get("user_id") or ""), str(alert.get("user_id") or "")):
-        return True
-    for a in e.get("recommended_actions", []) or []:
-        if isinstance(a, dict) and str(a.get("target") or "") == customer_id:
-            return True
-
-    def walk(o) -> bool:
-        if isinstance(o, dict):
-            for k, v in o.items():
-                if str(k).lower() in _CUSTOMER_KEYS and not isinstance(v, (dict, list)) and str(v) == customer_id:
-                    return True
-                if isinstance(v, (dict, list)) and walk(v):
-                    return True
-        elif isinstance(o, list):
-            return any(walk(x) for x in o)
+    """Exact customer-id match anywhere a decision names an account holder: the alert (any customer-like key, at any
+    depth), evidence raw data, and action targets (bare or composite). Round 7 T-7 replaced a substring test with an
+    exact match on six flat keys, which lost decisions the old test found (round 8 T8-7)."""
+    customer_id = str(customer_id).strip()
+    if not customer_id:
         return False
 
+    def walk(o, key: str | None = None, parent: str | None = None, depth: int = 0) -> bool:
+        if depth > 12:
+            return False
+        if isinstance(o, dict):
+            return any(walk(v, str(k), key, depth + 1) for k, v in o.items())
+        if isinstance(o, list):
+            return any(walk(x, key, parent, depth + 1) for x in o)
+        return key is not None and _customer_key(key, parent) and _token_hit(o, customer_id)
+
+    if _token_hit(e.get("user_id"), customer_id):
+        return True
+    if isinstance(e.get("alert"), dict) and walk(e["alert"]):
+        return True
+    for a in e.get("recommended_actions", []) or []:
+        if isinstance(a, dict) and _token_hit(a.get("target"), customer_id):
+            return True
     return any(walk(it.get("raw_data", {})) for it in (e.get("evidence", []) or []) if isinstance(it, dict))
 
 

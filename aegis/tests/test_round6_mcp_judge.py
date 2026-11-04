@@ -230,6 +230,7 @@ def test_j2_judge_run_refuses_a_triage_runs_dir(tmp_path, capsys):
 
 def test_j3_signed_pointer_required_when_a_key_is_set(tmp_path, monkeypatch):
     from aegis.agents.shared import llm_client as lc
+    from aegis.finetune.pointer_trust import commit_pointer
     monkeypatch.setenv("AEGIS_DECISION_KEY", "k" * 32)
     monkeypatch.delenv("AEGIS_ALLOW_UNVERIFIED_MODEL", raising=False)
     tri, tsha = _adapter(tmp_path / "tri")
@@ -238,21 +239,26 @@ def test_j3_signed_pointer_required_when_a_key_is_set(tmp_path, monkeypatch):
     p.write_text(json.dumps(cur))
     monkeypatch.setenv("AEGIS_MODEL_POINTER", str(p))
     assert lc._promoted_model() is None                               # unsigned: refused
-    p.write_text(json.dumps({**cur, "sig": lc.pointer_signature(cur)}))
+    signed = commit_pointer(p, cur)                                   # the writer: seq + signed record (round 8 T8-1)
     assert lc._promoted_model() == tri
-    p.write_text(json.dumps({**cur, "approved_by": "attacker", "sig": lc.pointer_signature(cur)}))
+    p.write_text(json.dumps({**signed, "approved_by": "attacker"}))
     assert lc._promoted_model() is None                               # altered after signing
 
 
-def test_j3_retrain_state_save_signs_the_pointer(tmp_path, monkeypatch):
+def test_j3_retrain_promote_signs_the_pointer_and_save_alone_does_not(tmp_path, monkeypatch):
     from aegis.agents.shared import llm_client as lc
     from aegis.finetune import retrain as rt
     monkeypatch.setenv("AEGIS_DECISION_KEY", "k" * 32)
     st = rt.State.load(tmp_path)
     st.current = {"run": "r", "role": "triage", "adapter": "/a", "sha256": "s", "approved_by": "x", "promoted_at": "t"}
     st.save()
+    assert not (tmp_path / "retrain" / "current.json").exists()      # a routine save never signs `current` (T8-2)
+    ad, sha = _adapter(tmp_path / "ad")
+    st.runs["r2"] = {"role": "triage", "adapter": ad, "sha256": sha, "stage": "shadowed"}
+    rt._promote(st, "r2", approved_by="ciso", rationale="ok", proposal_id=None)
+    st.save()
     cur = json.loads((tmp_path / "retrain" / "current.json").read_text())
-    assert cur["sig"] == lc.pointer_signature(cur)
+    assert cur["sig"] == lc.pointer_signature(cur) and cur["run"] == "r2" and cur["seq"] == 1
 
 
 def test_j3_j5_voter_pointer_must_be_local_and_under_the_root(tmp_path, monkeypatch):

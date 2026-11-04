@@ -123,7 +123,7 @@ def register_promoted_adapter(registry: VLLMAdapterRegistry, *, pointer_path: Op
     if not name or not adapter:
         return RegisterResult(ok=False, action="error", detail="pointer has no run/adapter")
     from aegis.finetune.pointer_trust import verify_pointer
-    tok, twhy = verify_pointer(ptr, role_wanted="triage", label=f"promotion pointer {path}")
+    tok, twhy = verify_pointer(ptr, role_wanted="triage", label=f"promotion pointer {path}", path=path)
     if not tok:                                  # forged / wrong-role / rolled-back pointer (review round 7 R-1)
         return RegisterResult(ok=False, action="error", served_model=name, adapter=adapter,
                               detail=f"pointer refused: {twhy}")

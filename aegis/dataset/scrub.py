@@ -75,8 +75,38 @@ IDENTITY_PARENTS: frozenset[str] = frozenset({
 })
 IDENTITY_LEAVES: frozenset[str] = frozenset({
     "name", "uid", "id", "email", "email_addr", "full_name", "display_name", "user_name", "username", "login",
-    "account_uid", "account_name", "samaccountname", "upn", "phone", "phone_number", "mobile",
+    "account_uid", "account_name", "samaccountname", "upn", "phone", "phone_number", "mobile", "uid_alt",
+    "alternate_id", "alternateid", "displayname", "given_name", "surname", "employee_uid", "credential_uid",
 })
+# Identity names in the spellings vendors use (round 8, T-1 leftovers): Okta ``actor.displayName`` / ``alternateId``,
+# Entra ``userDisplayName``, CloudTrail ``principalId``, HR ``employeeName``, ``user-name`` … Keys are compared in
+# snake_case (camelCase / hyphens / spaces folded), and a key whose snake name ends in one of these is an identity
+# under any parent.
+IDENTITY_SUFFIXES: tuple[str, ...] = (
+    "display_name", "user_name", "full_name", "first_name", "last_name", "middle_name", "given_name", "family_name",
+    "surname", "employee_name", "alternate_id", "principal_name", "principal_id", "nick_name", "login_name",
+    "logon_name", "sam_account_name", "user_principal_name", "user_email", "email_address", "customer_name",
+    "holder_name", "owner_name", "manager_name", "user_id", "customer_id", "employee_id",
+)
+# A dict that is a person record (LDAP / HR / directory: it has a given name, surname …): its bare ``cn`` / ``sn`` /
+# ``name`` / ``uid`` / ``mail`` are the person's, not a process or file name.
+PERSON_MARKERS: frozenset[str] = frozenset({"given_name", "givenname", "surname", "sn", "first_name", "last_name",
+                                            "display_name", "full_name", "employee_name", "employee_number"})
+PERSON_LEAVES: frozenset[str] = frozenset({"cn", "sn", "name", "uid", "mail", "initials", "given_name", "surname",
+                                           "common_name"})
+_SNAKE_RX1 = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_SNAKE_RX2 = re.compile(r"[\s\-]+")
+
+
+def snake_key(k: str) -> str:
+    """``userDisplayName`` / ``user-name`` / ``User Name`` → ``user_display_name`` / ``user_name``."""
+    return _SNAKE_RX2.sub("_", _SNAKE_RX1.sub("_", str(k))).strip("_").lower()
+
+
+def _person_like(d: dict) -> bool:
+    return any(snake_key(k) in PERSON_MARKERS for k in d if isinstance(k, str))
+
+
 _MAX_TOKEN_CACHE = 50_000          # pseudonym cache (HMAC is cheap to recompute): bounded, newest kept (round 7 T-6)
 
 # Alert keys that change on every event and must not take part in a fingerprint.
@@ -95,6 +125,9 @@ _IN_MOBILE_RX = re.compile(r"(?<![\w+])(?:\+91[ -]?|0)?[6-9]\d{4}[ -]?\d{5}(?!\w
 _IPV4_RX = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 # arn:aws:iam::123456789012:user/x — the 12-digit account id names the bank's cloud tenant; tokenised, the rest kept
 _ARN_ACCOUNT_RX = re.compile(r"(arn:aws[a-z-]*:[a-z0-9-]*:[a-z0-9-]*:)(\d{12})(?=:|$)")
+# arn:aws:iam::<acct>:user/priya.nair, …:assumed-role/<role>/<session>, …:federated-user/<name> — the person part
+_ARN_PRINCIPAL_RX = re.compile(r"(arn:aws[a-z-]*:(?:iam|sts)::[^:\s\"']*:(?:user(?:/[^\s\"',;]+)*|assumed-role/[^/\s\"']+"
+                               r"|federated-user)/)([^/\s\"',;]+)")
 # keep a short prefix only when the rest is a number / hex id (u_42891, emp-00123); "rverma_admin" is a handle, tokenised whole
 _PREFIXED_ID_RX = re.compile(r"^([A-Za-z]{1,4}[_\-])(\d{2,}|[0-9a-f]{6,})$")
 
@@ -198,9 +231,10 @@ class Scrubber:
     def distinct_identities(self) -> int:
         return self._distinct
 
-    def _is_identity(self, key: str | None, parent: str | None) -> bool:
-        """An identity field by its own name, by its path (``user.name`` under a user/actor object), or as the
-        dotted flat form of that path (``"actor.user.uid"``)."""
+    def _is_identity(self, key: str | None, parent: str | None, person: bool = False) -> bool:
+        """An identity field by its own name (any spelling: ``userDisplayName``, ``user-name``), by its path
+        (``user.name`` under a user/actor object), as the dotted flat form of that path (``"actor.user.uid"``), or as
+        ``cn`` / ``sn`` / ``name`` inside a person record (``person``)."""
         if key is None:
             return False
         k = key.lower()
@@ -208,11 +242,20 @@ class Scrubber:
             return True
         if "." in k:
             parts = [x for x in k.split(".") if x]
-            if parts and parts[-1] in self._identity_keys:
+            if parts and (parts[-1] in self._identity_keys or self._is_identity(parts[-1], parts[-2] if len(parts) > 1 else None)):
                 return True
-            if len(parts) >= 2 and parts[-1] in IDENTITY_LEAVES and parts[-2] in IDENTITY_PARENTS:
-                return True
-        return k in IDENTITY_LEAVES and parent is not None and parent.lower() in IDENTITY_PARENTS
+            return len(parts) >= 2 and parts[-1] in IDENTITY_LEAVES and parts[-2] in IDENTITY_PARENTS
+        sk = snake_key(key)
+        if sk in self._identity_keys or sk.replace("_", "") in self._identity_keys:
+            return True
+        if any(sk == x or sk.endswith("_" + x) for x in IDENTITY_SUFFIXES):
+            return True
+        if person and sk in PERSON_LEAVES:
+            return True
+        if parent is None:
+            return False
+        p = snake_key(parent)
+        return (k in IDENTITY_LEAVES or sk in IDENTITY_LEAVES) and (parent.lower() in IDENTITY_PARENTS or p in IDENTITY_PARENTS)
 
     @property
     def salted(self) -> bool:
@@ -224,27 +267,37 @@ class Scrubber:
     def _collect_identity_values(self, obj: Any) -> tuple[str, ...]:
         found: set[str] = set()
 
-        def walk(o: Any, key: str | None, parent: str | None = None):
+        def add(v: str) -> None:
+            # generic account names are not personal data, and rewriting them in free text destroys the
+            # attack indicator ("/root/.ssh", "/wp-admin/") — the structured field is still pseudonymised
+            if len(v) >= _MIN_LITERAL_LEN and v.lower() not in _GENERIC_ACCOUNTS:
+                found.add(v)
+
+        def walk(o: Any, key: str | None, parent: str | None = None, person: bool = False):
             if isinstance(o, dict):
+                pl = _person_like(o)
                 for k, v in o.items():
-                    walk(v, str(k), key)
+                    walk(v, str(k), key, pl)
             elif isinstance(o, (list, tuple)):
                 for v in o:
-                    walk(v, key, parent)
-            elif isinstance(o, str) and self._is_identity(key, parent):
+                    walk(v, key, parent, person)
+            elif isinstance(o, str) and self._is_identity(key, parent, person):
                 v = o.strip()
-                # generic account names are not personal data, and rewriting them in free text destroys the
-                # attack indicator ("/root/.ssh", "/wp-admin/") — the structured field is still pseudonymised
-                if len(v) >= _MIN_LITERAL_LEN and v.lower() not in _GENERIC_ACCOUNTS:
-                    found.add(v)
+                add(v)
+                # composite identities: CloudTrail "AIDA…:priya.nair", "DOMAIN\\rverma", "corp/rverma" — the person
+                # part recurs alone in free text (an ARN, a message)
+                for sep in (":", "\\", "/"):
+                    if sep in v:
+                        add(v.rsplit(sep, 1)[-1].strip())
         walk(obj, None)
         return tuple(found)
 
     def _walk(self, obj: Any, literals: tuple[str, ...], *, under_identity_key: bool, key: str | None = None) -> Any:
         if isinstance(obj, dict):
             out = {}
+            pl = _person_like(obj)
             for k, v in obj.items():
-                ident = self._is_identity(str(k), key)
+                ident = self._is_identity(str(k), key, pl)
                 # keys carry identities too: {"r.verma@sbi.co.in": 12, "9876543210": 3} (review round 4 D4-12)
                 nk = self._scrub_string(k, literals) if isinstance(k, str) else k
                 out[nk] = self._walk(v, literals, under_identity_key=ident, key=str(k))
@@ -301,6 +354,7 @@ class Scrubber:
         out = _PAN_RX.sub(self._sub_pan, out)
         out = _IN_MOBILE_RX.sub(self._sub_mobile, out)
         out = _ARN_ACCOUNT_RX.sub(self._sub_arn, out)
+        out = _ARN_PRINCIPAL_RX.sub(self._sub_arn_principal, out)
         if self.scrub_ips:
             out = _IPV4_RX.sub(self._sub_ip, out)
         present = [lit for lit in literals if lit in out]      # cheap substring pre-filter
@@ -321,6 +375,13 @@ class Scrubber:
     def _sub_arn(self, m: re.Match) -> str:
         self.replacements += 1
         return f"{m.group(1)}acct_{self.token('acct', m.group(2))}"
+
+    def _sub_arn_principal(self, m: re.Match) -> str:
+        name = m.group(2)
+        if name.startswith(("id_", "<")):
+            return m.group(0)
+        self.replacements += 1
+        return m.group(1) + f"id_{self.token('id', name)}"
 
     def _sub_url_user(self, m: re.Match) -> str:
         self.replacements += 1

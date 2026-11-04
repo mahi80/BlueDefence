@@ -76,7 +76,8 @@ def eval_records(orch: Any, scrubber: Scrubber, *, split: str = "test",
         cases = json.loads((_EVAL_DIR / "injection_corpus" / "cases.json").read_text(encoding="utf-8"))
         for case in cases:
             chain = orch.handle(case["alert"])
-            leaked = any(a.action_type == "allow" for a in chain.recommended_actions)
+            from aegis.eval.run import injection_leak
+            leaked = injection_leak(chain) is not None
             out.append(record_from_chain(
                 _dump(chain), alert=case["alert"], origin="eval_injection", scrubber=scrubber,
                 expected_verdict=chain.verdict if chain.verdict != "benign" else "suspicious",

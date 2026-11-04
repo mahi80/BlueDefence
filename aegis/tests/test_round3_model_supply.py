@@ -110,15 +110,21 @@ def test_only_a_ready_shadow_can_be_promoted(tmp_path):
 # ---- G5-4: a rolled-back release is not re-applied -----------------------------------------------------------
 
 def test_rolled_back_version_is_denied(tmp_path):
+    from aegis import license as L
     from aegis import model_updates as mu
     env = {"AEGIS_MODEL_DIR": str(tmp_path / "models"), "AEGIS_MODEL_POINTER": str(tmp_path / "current.json")}
-    prev = Path(env["AEGIS_MODEL_DIR"]) / "2026.10.1"; prev.mkdir(parents=True)
-    (prev / "adapter_model.safetensors").write_bytes(b"old")
-    (prev / ".complete").write_text("")
-    rel = {"version": "2026.10.1", "adapter": str(prev), "sha256": "x", "base_model": "b", "channel": "stable"}
-    (prev / "release.json").write_text(json.dumps(rel))
-    Path(env["AEGIS_MODEL_POINTER"]).write_text(json.dumps({"run": "2026.11.1", "previous": "2026.10.1"}))
-    out = mu.rollback(env)
+    _, priv = L.write_keypair(tmp_path, "rel-kid", bits=1024)
+    k = json.loads(priv.read_text())
+    for v in ("2026.10.1", "2026.11.1"):
+        d = Path(env["AEGIS_MODEL_DIR"]) / v; d.mkdir(parents=True)
+        (d / "adapter_model.safetensors").write_bytes(v.encode())
+        rel = {"version": v, "sha256": "x", "base_model": "b", "channel": "stable", "size": 1}
+        (d / "release.json").write_text(json.dumps(rel))
+        (d / mu.MANIFEST_FILE).write_text(mu.sign_manifest(rel, n=int(k["n"], 16), d=int(k["d"], 16), kid="rel-kid"))
+        (d / ".complete").write_text("")
+        mu.write_pointer({**rel, "adapter": str(d)}, pointer=Path(env["AEGIS_MODEL_POINTER"]),
+                         previous="2026.10.1" if v == "2026.11.1" else "")
+    out = mu.rollback(env, keys={"rel-kid": (int(k["n"], 16), 65537)})
     assert out["ok"] and out["denied"] == "2026.11.1" and "2026.11.1" in mu._denied(env)
 
 

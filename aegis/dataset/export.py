@@ -152,12 +152,15 @@ class DatasetBuilder:
         # 3.3 gate then scored memorisation (review round 4 D4-11). The fingerprint is recomputed from the alert
         # too — a record's own value is whatever its producer wrote.
         from .importers.mix import _eval_fps
-        from .schema import fingerprint
+        from .schema import eval_case_match, fingerprint
         held = _eval_fps()
         for r in records:
             leaked = r.fingerprint in test_fps or r.fingerprint in held
             if not leaked and held and isinstance(r.alert, dict) and not r.origin.startswith("eval_"):
                 leaked = fingerprint(r.alert) in held
+            if not leaked and isinstance(r.alert, dict) and not r.origin.startswith("eval_"):
+                # a scrubbed / reformatted copy of an eval alert hashes differently (round 8 T8-5)
+                leaked = eval_case_match(r.alert) is not None
             if r.split != "test" and leaked:
                 r.split = "test"
                 r.tags.append("leak_moved_to_test")
