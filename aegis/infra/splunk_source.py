@@ -235,5 +235,9 @@ class SplunkConsumer:
                     return inner
             except json.JSONDecodeError:
                 pass
-        # Fallback: take top-level fields, drop Splunk meta
-        return {k: v for k, v in event.items() if not k.startswith("_")}
+        # Fallback: take top-level fields, drop Splunk meta — but keep the event's ``_cd`` (index address) under a
+        # non-underscore key so callers can still use it as a stable id (round-7 G-11).
+        out = {k: v for k, v in event.items() if not k.startswith("_")}
+        if event.get("_cd") and "splunk_cd" not in out:
+            out["splunk_cd"] = event["_cd"]
+        return out

@@ -28,6 +28,7 @@ ES isn't at the default location.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import urllib.parse
@@ -38,6 +39,19 @@ from .splunk_source import SplunkConfig, SplunkConsumer
 
 
 _log = logging.getLogger("aegis.splunk_es")
+
+
+def _spl_quote(value: object) -> str:
+    """Escape a value for use inside a double-quoted SPL string (round-7 G-11): an unescaped ``"`` let an entity
+    such as ``x" OR risk_object="*`` widen the search to every entity's risk."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _notable_fallback_id(ev: dict) -> str:
+    """A notable with no event_id/_cd/… used to get the constant id ``ES-NOTABLE`` (or its shared rule_id), so the
+    dedup store dropped every notable after the first. Hash the notable's content instead (round-7 G-11)."""
+    canon = json.dumps(ev, sort_keys=True, default=str, ensure_ascii=False)
+    return "ES-NOTABLE-" + hashlib.sha256(canon.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
 # Default ES path; override via SPLUNK_ES_APP_PATH if non-standard.
@@ -87,7 +101,7 @@ class SplunkESConsumer:
     def _notable_to_alert(self, ev: dict) -> dict:
         """Map ES notable_event fields to AEGIS alert envelope."""
         return {
-            "id": ev.get("event_id") or ev.get("_cd") or ev.get("rule_id") or "ES-NOTABLE",
+            "id": ev.get("event_id") or ev.get("splunk_cd") or ev.get("_cd") or _notable_fallback_id(ev),
             "source": "Splunk ES (notable)",
             "severity": ev.get("urgency", "medium"),
             "anomaly_score": _urgency_to_anomaly(ev.get("urgency")),
@@ -140,8 +154,8 @@ class SplunkESConsumer:
         Aggregation: sum of risk_scores within earliest_time.
         """
         spl = (
-            f'search index=risk risk_object_type="{kind}" '
-            f'risk_object="{entity}" | stats sum(risk_score) as total'
+            f'search index=risk risk_object_type="{_spl_quote(kind)}" '
+            f'risk_object="{_spl_quote(entity)}" | stats sum(risk_score) as total'
         )
         total = 0.0
         for event in self._base.iter_alerts(

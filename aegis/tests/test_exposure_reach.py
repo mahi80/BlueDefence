@@ -113,7 +113,8 @@ def test_loadbalancer_service_exposes_target_port(k8s_assets):
 
 def test_ingress_resolves_named_target_port_and_waf(k8s_assets):
     a = by_name(k8s_assets, "Deployment/web/netbanking")
-    assert a.internet_ports == [(8080, 8080)] and a.waf and "Ingress web/netbanking" in a.internet_via[(8080, 8080)]
+    # round 7 G-1: an ingress WAF fronts the ranges it exposes, not the whole asset
+    assert a.internet_ports == [(8080, 8080)] and (8080, 8080) in a.waf_ranges and not a.waf and "Ingress web/netbanking" in a.internet_via[(8080, 8080)]
 
 
 def test_internal_lb_nodeport_and_policed_namespace(k8s_assets):

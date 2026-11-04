@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Iterator, Optional
 
-from .base import AlertCheckpoint, BaseConsumer, severity_to_score
+from .base import CONSUMED, AlertCheckpoint, BaseConsumer, severity_to_score
 
 logger = logging.getLogger("aegis.ingest.acp")
 
@@ -61,6 +61,9 @@ _CONTROL_HINTS = {
 }
 
 
+_SEV_RANK = {"INFO": 0, "INFORMATIONAL": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+
 class AcpFeedError(RuntimeError):
     """The ACP events feed could not be read this poll (outage, 401, 5xx)."""
 
@@ -91,7 +94,11 @@ class AcpGovernanceConsumer(BaseConsumer):
         if self.api_key:
             headers["X-API-Key"] = self.api_key
         for _ in range(20):                                   # bounded pages per poll
-            q = urllib.parse.urlencode({"since": since, "limit": self.page, "min_severity": self.min_severity, "kinds": self.kinds})
+            # INFO, not the configured floor: the dashboard applied min_severity AFTER its per-table LIMIT, and
+            # next_since then jumped past MEDIUM+ rogue alerts hidden behind a page of LOW rows (round 7 G-8). The
+            # floor is applied here, per event, after the page is read. (The server-side fix — filter in SQL before
+            # LIMIT — belongs to the ACP dashboard.)
+            q = urllib.parse.urlencode({"since": since, "limit": self.page, "min_severity": "INFO", "kinds": self.kinds})
             try:
                 status, body = self._transport("GET", f"{self.dashboard_url}/api/soc/events?{q}", None, headers, self.timeout)
             except Exception as e:  # the watermark holds; the cycle counts it as a source error
@@ -122,6 +129,8 @@ class AcpGovernanceConsumer(BaseConsumer):
             return None
         kind = str(ev.get("kind") or "")
         sev = str(ev.get("severity") or "MEDIUM").lower()
+        if _SEV_RANK.get(sev.upper(), 2) < _SEV_RANK.get(self.min_severity, 2):
+            return CONSUMED                                # below the floor: read past, never an alert
         fw = str(ev.get("framework") or "").lower()
         agent = str(ev.get("agent_code") or ev.get("agent_id") or "")
         endpoint = str(ev.get("endpoint") or "")

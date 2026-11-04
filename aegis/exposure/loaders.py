@@ -318,7 +318,7 @@ def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> N
                 a.fronted_by |= {x for x in (name, lb.get("DNSName")) if x}
                 a.public = True
                 if lb.get("web_acl"):
-                    a.waf = True
+                    a.waf_ranges.add(r)          # this path only — not ports opened straight to the instance (G-1)
 
 
 def assets_from_inventory(path: str | Path) -> list[Asset]:
@@ -365,6 +365,7 @@ def merge_assets(*groups: list[Asset]) -> list[Asset]:
             if a.role != "server":
                 m.role = a.role
             m.waf, m.edr = m.waf or a.waf, m.edr or a.edr
+            m.waf_ranges |= a.waf_ranges
             if a.zone and not m.zone:
                 m.zone = a.zone
             if a.source == "inventory" and a.internet_ports:

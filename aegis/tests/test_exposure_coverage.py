@@ -180,14 +180,18 @@ def test_imperva_exporter():
 
 def test_f5_exporter():
     t = Fake({
-        ("GET", "/mgmt/tm/asm/signatures"): {"items": [{"name": "VP_CVE-2021-44228_jndi", "references": []}]},
+        ("GET", "/mgmt/tm/asm/signatures"): {"items": [{"name": "VP_CVE-2021-44228_jndi", "signatureId": 300000001, "references": []}]},
+        # round 7 G-7: the CVE signature counts only on the policy it is assigned to, enabled and out of staging
+        ("GET", "/mgmt/tm/asm/policies/P1/signatures"): {"items": [
+            {"enabled": True, "performStaging": False, "block": True, "signatureReference": {"signatureId": 300000001}}]},
+        ("GET", "/mgmt/tm/asm/policies/P2/signatures"): {"items": []},
         ("GET", "/mgmt/tm/ltm/virtual"): {"items": [
             {"fullPath": "/Common/vs_netbanking", "destination": "/Common/203.0.113.10:443", "pool": "/Common/p_netbanking"},
             {"fullPath": "/Common/vs_reports", "destination": "/Common/203.0.113.30:443", "pool": ""}]},
         ("GET", "/mgmt/tm/ltm/pool/~Common~p_netbanking/members"): {"items": [{"address": "10.0.1.10", "name": "/Common/10.0.1.10:8080"}]},
         ("GET", "/mgmt/tm/asm/policies"): {"items": [
-            {"name": "netbanking", "enforcementMode": "blocking", "virtualServers": ["/Common/vs_netbanking"]},
-            {"name": "reports", "enforcementMode": "transparent", "virtualServers": ["/Common/vs_reports"]}]},
+            {"id": "P1", "name": "netbanking", "enforcementMode": "blocking", "virtualServers": ["/Common/vs_netbanking"]},
+            {"id": "P2", "name": "reports", "enforcementMode": "transparent", "virtualServers": ["/Common/vs_reports"]}]},
     })
     nb, rep = from_f5("https://bigip", t, token="tok")
     assert nb.mode == "block" and nb.virtual_patches == ["CVE-2021-44228"]

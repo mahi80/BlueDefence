@@ -282,7 +282,10 @@ def test_cloud_waf_logs_become_perimeter_alerts():
     assert [a["source"] for a in alerts] == ["Cloudflare WAF", "Cloudflare WAF", "AWS WAF",
                                              "Azure Front Door WAF", "Azure App Gateway WAF"]
     cf, cf_gql, aws, afd, agw = alerts
-    assert cf["id"] == "WAF-8d1f2a3b4c5d6e7f" and cf["source_ip"] == "203.0.113.10" and cf["severity"] == "high"
+    # round 7 G-2: Cloudflare/Azure ids carry a per-rule suffix (several rule rows share one RayID/transactionId);
+    # the vendor id itself moves to correlation_id
+    assert cf["id"].startswith("WAF-8d1f2a3b4c5d6e7f-") and cf["correlation_id"] == "8d1f2a3b4c5d6e7f"
+    assert cf["source_ip"] == "203.0.113.10" and cf["severity"] == "high"
     assert cf["url"].startswith("/api/accounts?id=") and cf["user_agent"].startswith("sqlmap") and cf["action"] == "block"
     assert cf_gql["attack_type"] == "rate limit" and cf_gql["http_method"] == "POST" and cf_gql["url"] == "/login"
     assert aws["attack_type"] == "sql injection" and aws["url"] == "/v1/statements?acct=1%20or%201%3D1"

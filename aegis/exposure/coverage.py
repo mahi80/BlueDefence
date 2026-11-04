@@ -151,8 +151,8 @@ def from_imperva(api_id: str, api_key: str, transport: Transport = httpx_transpo
 def from_f5(base: str, transport: Transport = httpx_transport, *, username: str = "", password: str = "",
             token: str = "") -> list[Protection]:
     """F5 BIG-IP Advanced WAF: each ASM policy's virtual servers → pool members are fronted; blocking
-    when the policy's enforcement mode is "blocking"; user-defined signatures naming a CVE are virtual
-    patches (applied to blocking policies)."""
+    when the policy's enforcement mode is "blocking"; a user-defined signature naming a CVE is a virtual patch
+    only on the blocking policies it is assigned to, enabled, out of staging and set to block."""
     hdr: dict[str, str] = {}
     if token:
         hdr["X-F5-Auth-Token"] = token
@@ -161,7 +161,36 @@ def from_f5(base: str, transport: Transport = httpx_transport, *, username: str 
         hdr["Authorization"] = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
     get = lambda path: call(transport, "GET", base.rstrip("/") + path, headers=hdr).json().get("items") or []
     sigs = get("/mgmt/tm/asm/signatures?$filter=isUserDefined%20eq%20true")
-    vps = cves_in(*[f"{s.get('name', '')} {json.dumps(s.get('references') or s.get('signatureReferences') or '')}" for s in sigs])
+    # user-defined library signatures that name a CVE, by signature id and by name
+    lib: dict[str, str] = {}
+    for sg in sigs:
+        text = f"{sg.get('name', '')} {json.dumps(sg.get('references') or sg.get('signatureReferences') or '')}"
+        if cves_in(text):
+            for k in (sg.get("signatureId"), sg.get("id"), sg.get("name")):
+                if k not in (None, ""):
+                    lib[str(k)] = text
+
+    def policy_patches(pol: dict) -> list[str]:
+        """CVEs virtually patched by THIS policy: only signatures assigned to it, enabled, out of staging and set to
+        block. A library signature naming a CVE used to count on every blocking policy, staged or not (round 7 G-7)."""
+        pid = pol.get("id")
+        if not pid or not lib:
+            return []
+        try:
+            rows = get(f"/mgmt/tm/asm/policies/{pid}/signatures?$expand=signatureReference"
+                       "&$filter=enabled%20eq%20true%20and%20performStaging%20eq%20false")
+        except ConnectorError:
+            return []                                     # unreadable: no virtual-patch credit (never assume)
+        texts = []
+        for r in rows:
+            if r.get("enabled") is False or r.get("performStaging") is True or r.get("block") is False:
+                continue
+            ref = r.get("signatureReference") or {}
+            for k in (ref.get("signatureId"), ref.get("id"), ref.get("name")):
+                if k not in (None, "") and str(k) in lib:
+                    texts.append(lib[str(k)])
+                    break
+        return cves_in(*texts) if texts else []
     virtuals = {v.get("fullPath"): v for v in get("/mgmt/tm/ltm/virtual")}
     out = []
     for pol in get("/mgmt/tm/asm/policies"):
@@ -180,7 +209,7 @@ def from_f5(base: str, transport: Transport = httpx_transport, *, username: str 
                     fronts.append({"host": m.get("address"), "port": int(p) if p.isdigit() else None})
         if fronts:
             out.append(Protection(name=f"F5 policy {pol.get('name')}", vendor="f5", mode="block" if blocking else "monitor",
-                                  fronts=[f for f in fronts if f["host"]], virtual_patches=vps if blocking else []))
+                                  fronts=[f for f in fronts if f["host"]], virtual_patches=policy_patches(pol) if blocking else []))
     return out
 
 
