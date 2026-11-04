@@ -328,6 +328,19 @@ policy is empty. `isolate` is SEVERE, so a person always approves it. Turn it on
 `agent:` / `sandbox:` targets, so a host isolate still goes to the EDR. OpenShell is alpha; the connector uses
 only its documented CLI.
 
+**Sandbox AEGIS itself with OpenShell** (`ops/openshell_policy.py`). The specialists read attacker-written text, so
+a prompt injection that gets past the injection defences must still find nowhere to send data.
+`python -m aegis.ops.openshell_policy --out aegis-sandbox.yaml` writes an OpenShell policy for this deployment. Only
+the hosts its configuration actually talks to are allowed: the model API, each vendor connector, ServiceNow, intel
+feeds, Kafka and the ACP dashboard. Everything else is denied. Then run
+`openshell sandbox create --name aegis --policy aegis-sandbox.yaml -- python -m aegis.service`.
+* **No secrets in the file.** Only host names and ports are read from the environment, never a token, so the file is
+  safe to review and commit.
+* **Fail closed.** An integration this module does not recognise stays blocked until you add it with
+  `--extra host:port`.
+* **Red-team range.** `deploy/openshell/attack-range-policy.yaml` does the same for an attack agent: it can reach
+  the range and its model, and nothing else.
+
 **Never-block guardrail** (`agents/shared/netguard.py`). No connectivity-severing action
 (`block`, `isolate`, `throttle`, `quarantine`, `block_egress`) reaches a connector when the target
 is loopback, link-local, unspecified or multicast / reserved space, or an operator-listed address

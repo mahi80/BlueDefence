@@ -1,0 +1,22 @@
+# OpenShell policy for an attack agent on a red-team range (e.g. the weakbank range) — integration plan #8d.
+# The attacking agent may reach the range's targets and its model API, and nothing else: an attack agent that
+# goes off-script cannot touch the bank, the internet, or the operator's cloud account.
+# Replace the hosts with your range's; keep the list short. OpenShell is alpha — check against your version.
+#   openshell sandbox create --name red-agent --policy attack-range-policy.yaml -- python attacker.py
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /etc]
+  read_write: [/sandbox]
+landlock:
+  compatibility: best_effort
+network_policies:
+  range_targets:
+    name: range_targets
+    endpoints:
+      - {host: weakbank.range.internal, port: 443, protocol: rest, enforcement: enforce}
+      - {host: weakbank-api.range.internal, port: 8443, protocol: rest, enforcement: enforce}
+  model_api:
+    name: model_api
+    endpoints:
+      - {host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce}
