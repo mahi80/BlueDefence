@@ -160,6 +160,15 @@ def _full(c: dict) -> dict:
     return out
 
 
+def _full_target(card: dict, action_type: str, args: dict) -> str:
+    """The card's full target: from its ``action`` ("type -> full target"), else the display ``args.target``."""
+    action = str(card.get("action") or "")
+    pre = f"{action_type} -> "
+    if action_type and action.startswith(pre):
+        return action[len(pre):]
+    return str(args.get("target") or "")
+
+
 class ConsoleAPI:
     def __init__(self, audit_path: Optional[Path], hitl_dir: Optional[Path], index: Any = None):
         self.audit_path = Path(audit_path) if audit_path else None
@@ -299,12 +308,19 @@ class ConsoleAPI:
             full_action[cid] = str(card.get("action") or "")
             if not st:
                 open_ids.add(cid)
+            action_type = str(args.get("action_type") or str(card.get("action", "")).split(" -> ")[0])
             rows.append({
                 "id": cid,
                 "status": status if status in _CARD_STATUSES else "pending",
                 "created_at": _iso(card.get("ts")),
-                "action_type": str(args.get("action_type") or str(card.get("action", "")).split(" -> ")[0]),
-                "target": str(args.get("target") or ""),
+                "action_type": action_type,
+                "target": str(args.get("target") or ""),           # display text (cut at 256 by card_args)
+                # what the card binds to: the console matches the chain's action on this, never on the display cut
+                # (a target over 256 chars never matched and lost Approve/Reject — review round 8 U8-1)
+                "target_full": _full_target(card, action_type, args),
+                # has the service settled (run / failed / expired) it? An approved card that is not settled can
+                # still be rejected (see decide); the console shows "approved — awaiting execution" (U8-2)
+                "settled": bool(st),
                 "alert_id": str(card.get("alert_id") or args.get("alert_id") or ""),
                 "integrity_hash": str(args.get("integrity_hash") or ""),
                 "reasoning": str(args.get("reasoning") or "")[:2000],

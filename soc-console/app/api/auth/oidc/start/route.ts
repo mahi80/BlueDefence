@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { authMode } from "@/lib/auth";
-import { OIDC_COOKIE, OIDC_TX_MAX_AGE_S, encodeTx, newOidcTx } from "@/lib/oidc";
+import { OIDC_TX_MAX_AGE_S, encodeTx, newOidcTx, oidcCookie } from "@/lib/oidc";
 
 // Production SSO seam. Redirects to the bank IdP's authorize endpoint (from OIDC
 // discovery, provided as AEGIS_OIDC_AUTHORIZE_URL at deployment). The callback
@@ -30,11 +30,13 @@ export async function GET() {
   url.searchParams.set("code_challenge", tx.challenge);
   url.searchParams.set("code_challenge_method", "S256");
   const res = NextResponse.redirect(url);
-  res.cookies.set(OIDC_COOKIE, encodeTx(tx), {
+  // HMAC-signed, and `__Host-` (Secure, Path=/, no Domain) over HTTPS so a sibling subdomain cannot plant it (U8-5)
+  const c = oidcCookie();
+  res.cookies.set(c.name, encodeTx(tx), {
     httpOnly: true,
     sameSite: "lax",                                   // the IdP's redirect back is a top-level GET
-    secure: process.env.NODE_ENV === "production",
-    path: "/api/auth/oidc",
+    secure: c.secure,
+    path: c.path,
     maxAge: OIDC_TX_MAX_AGE_S,
   });
   return res;

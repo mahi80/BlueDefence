@@ -1,6 +1,6 @@
 import type { Chain, ChainSummary, Approval, Proposal } from "./types";
 import { cached, SNAPSHOT_TTL_MS } from "./cache";
-import { mergeDetails, missingPendingAlerts, stubChainFromApprovals } from "./hitl";
+import { attachPending, mergeDetails, missingPendingAlerts, normalizeApproval } from "./hitl";
 import fixtureChains from "../fixtures/chains.json";
 import fixtureApprovals from "../fixtures/approvals.json";
 import fixtureProposals from "../fixtures/proposals.json";
@@ -61,8 +61,10 @@ export async function listApprovals(): Promise<Approval[]> {
   if (USE_FIXTURES) return fixtureApprovals as Approval[];
   // Cached + coalesced so every watching analyst shares one detector fetch (see lib/cache.ts).
   return cached("approvals", SNAPSHOT_TTL_MS, async () => {
-    const live = await backend<{ approvals?: Approval[] } | Approval[]>("/api/approvals", fixtureApprovals as Approval[]);
-    return (Array.isArray(live) ? live : (live.approvals ?? [])) as Approval[];
+    const live = await backend<{ approvals?: unknown[] } | unknown[]>("/api/approvals", fixtureApprovals as Approval[]);
+    const rows = Array.isArray(live) ? live : (live.approvals ?? []);
+    // the ACP dashboard nests alert_id / action_type / target in an `args` JSON string (round 8 U8-4)
+    return (Array.isArray(rows) ? rows : []).map(normalizeApproval).filter((a): a is Approval => a !== null);
   });
 }
 
@@ -97,13 +99,11 @@ export async function getRecentChains(): Promise<Chain[]> {
     } catch {
       return chains;                                    // the approvals read reports its own error on the page
     }
-    const extra = missingPendingAlerts(approvals, new Set(chains.map((c) => c.alert_id)));
+    // a partial chain (its detail read failed or came back empty) does not count as loaded: its pending cards are
+    // hydrated again or stubbed onto it, never left behind "details unavailable" with no actions (round 8 U8-3)
+    const extra = missingPendingAlerts(approvals, new Set(chains.filter((c) => !c.partial).map((c) => c.alert_id)));
     const more = await Promise.allSettled(extra.map((id) => getChain(id)));
-    more.forEach((r, i) => {
-      if (r.status === "fulfilled" && r.value) chains.push(r.value);
-      else chains.push(stubChainFromApprovals(extra[i], approvals));   // the cards stay decidable
-    });
-    return chains;
+    return attachPending(chains, approvals, extra, more);   // the cards stay decidable
   });
 }
 

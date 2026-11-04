@@ -27,7 +27,7 @@ AEGIS_API_ORIGIN=http://127.0.0.1:8787 AEGIS_API_KEY=<AEGIS_CONSOLE_TOKEN from a
 
 | Env | Meaning |
 |---|---|
-| `AEGIS_API_ORIGIN` | The AEGIS host's push receiver (`aegis/ingest/http_push.py`), which serves `/api/soc/chains`, `/api/soc/chains/{id}`, `/api/approvals`, `/api/soc/proposals` from the audit chain and HITL files (`aegis/ingest/console_api.py`). The ACP dashboard's `/api/soc/*` has the same shape and also works. Empty → bundled fixtures ("sample stream" in the header). |
+| `AEGIS_API_ORIGIN` | The AEGIS host's push receiver (`aegis/ingest/http_push.py`), which serves `/api/soc/chains`, `/api/soc/chains/{id}`, `/api/approvals`, `/api/soc/proposals` from the audit chain and HITL files (`aegis/ingest/console_api.py`). The ACP dashboard's `/api/soc/*` + `/api/approvals` can be used too, with limits: its approval rows carry `alert_id` / `action_type` / `target` inside an `args` JSON string (the console unpacks it), it does not report whether an approved card has run yet (an approval there shows as final "Approved"), and its chain endpoint must resolve an alert id for cards outside the newest 40 incidents to open with full details (otherwise they open as a stub built from the cards). Empty → bundled fixtures ("sample stream" in the header). |
 | `NEXT_PUBLIC_AEGIS_USE_FIXTURES` | Force fixtures even when an origin is set (`1`). |
 | `AEGIS_API_KEY` | Bearer for server-side calls — `AEGIS_CONSOLE_TOKEN` on the host. Reads work with the read token too; **decisions need the console token**. |
 
@@ -53,7 +53,7 @@ The console sits behind a login. Two modes:
 | `demo` (default) | local id + password (`AEGIS_DEMO_USER` / `_PASSWORD` / `_ROLE`) | demos, local dev — not production |
 | `oidc` | single sign-on to the bank IdP (Entra ID / SAML), IdP-group → role via `AEGIS_OIDC_ROLE_MAP` | production |
 
-The session is a signed, httpOnly cookie (`AEGIS_CONSOLE_SECRET` — set a strong value in prod). Roles: `admin` / `cio` / `ciso` / `bu_head` / `analyst`; only the first four may approve a containment action or promote a model. The **backend enforces** every high-impact action and audits who + role + rationale; the console reflects permissions. The OIDC callback's verified `id_token` handling is completed at deployment against the bank's IdP (the route refuses an unverified token path by default).
+The session is a signed, httpOnly cookie (`AEGIS_CONSOLE_SECRET` — set a strong value in prod). Roles: `admin` / `cio` / `ciso` / `bu_head` / `analyst`; only the first four may approve a containment action or promote a model. The **backend enforces** every high-impact action and audits who + role + rationale; the console reflects permissions. The OIDC callback's verified `id_token` handling is completed at deployment against the bank's IdP (the route refuses an unverified token path by default). The OIDC login transaction (state / nonce / PKCE verifier) rides a short-lived cookie HMAC-signed with the same secret and, over HTTPS, named `__Host-aegis_oidc_tx` so a sibling subdomain cannot plant one.
 
 ## Ask Agent Q
 

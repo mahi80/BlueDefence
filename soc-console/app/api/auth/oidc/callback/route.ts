@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { authMode } from "@/lib/auth";
-import { OIDC_COOKIE, verifyCallbackState } from "@/lib/oidc";
+import { oidcCookie, verifyCallbackState } from "@/lib/oidc";
 
 // Production SSO seam — completed at deployment against the bank's IdP.
 //
@@ -21,10 +21,12 @@ export async function GET(req: NextRequest) {
     return NextResponse.redirect(new URL("/login", process.env.AEGIS_CONSOLE_URL || "http://localhost:3000"));
   }
   // login CSRF / code injection guard (round 7 U-5): the state must match this browser's login transaction
-  const tx = verifyCallbackState(req.cookies.get(OIDC_COOKIE)?.value, req.nextUrl.searchParams.get("state"));
+  // the cookie is HMAC-signed by /start; an unsigned or foreign-signed one is refused (U8-5)
+  const c = oidcCookie();
+  const tx = verifyCallbackState(req.cookies.get(c.name)?.value, req.nextUrl.searchParams.get("state"));
   if (!tx) {
     const bad = NextResponse.json({ error: "login state mismatch or expired — start the sign-in again" }, { status: 400 });
-    bad.cookies.delete({ name: OIDC_COOKIE, path: "/api/auth/oidc" });
+    bad.cookies.delete({ name: c.name, path: c.path, secure: c.secure });
     return bad;
   }
   // tx.verifier → the token request's code_verifier; tx.nonce → must equal the verified id_token's nonce (nonceMatches)
@@ -32,6 +34,6 @@ export async function GET(req: NextRequest) {
     { error: "OIDC callback is wired at deployment with verified id_token handling (see docs/deploy/onprem-bank.md)." },
     { status: 501 },
   );
-  res.cookies.delete({ name: OIDC_COOKIE, path: "/api/auth/oidc" });   // one-shot: a state is never reused
+  res.cookies.delete({ name: c.name, path: c.path, secure: c.secure });   // one-shot: a state is never reused
   return res;
 }

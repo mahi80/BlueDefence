@@ -93,7 +93,14 @@ export interface Approval {
   status: "pending" | "approved" | "rejected" | "expired" | "failed" | "awaiting_second";
   created_at: string;
   action_type: string;
-  target: string;
+  target: string;          // display text — the backend cuts it at 256 chars
+  // the FULL target the card binds to (AEGIS receiver); a card is matched to its chain action on this, never on the
+  // display cut, or a long target never matched and lost its Approve/Reject (round 8 U8-1)
+  target_full?: string;
+  action?: string;         // "type -> full target" (AEGIS card / ACP dashboard row) — also yields the full target
+  // false = not settled by the service yet (an approval still waiting to run can be rejected); true = settled.
+  // Absent when the backend does not report it (U8-2).
+  settled?: boolean;
   alert_id?: string;
   integrity_hash?: string;
   reasoning?: string;
