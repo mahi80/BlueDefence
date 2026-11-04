@@ -1,5 +1,6 @@
 import type { Chain, ChainSummary, Approval, Proposal } from "./types";
 import { cached, SNAPSHOT_TTL_MS } from "./cache";
+import { mergeDetails, missingPendingAlerts, stubChainFromApprovals } from "./hitl";
 import fixtureChains from "../fixtures/chains.json";
 import fixtureApprovals from "../fixtures/approvals.json";
 import fixtureProposals from "../fixtures/proposals.json";
@@ -76,20 +77,33 @@ export async function listProposals(): Promise<Proposal[]> {
 // Full chains for the live map. Fixtures carry the whole chain; against the backend we list summaries
 // then hydrate the most recent few — an N+1 that is shared across all analysts by the snapshot cache,
 // so the detector sees one list + hydrate per TTL window regardless of how many are watching.
+// Chains that carry a pending approval card are hydrated too, however old: a card on an incident that fell out
+// of the newest-40 window used to be undecidable from the console (round 7 U-2).
 export async function getRecentChains(): Promise<Chain[]> {
   if (USE_FIXTURES) return CHAINS;
   return cached("recent-chains", SNAPSHOT_TTL_MS, async () => {
     const summaries = await listChains();
     const top = summaries.slice(0, 40);
     // one failed detail read used to reject the whole Promise.all and empty the map (review round 3 R3-12):
-    // a detail that fails shows its summary instead; only when every read fails is the backend reported down
+    // a detail that fails shows its summary, marked partial (U-4); only when every read fails is the backend down
     const res = await Promise.allSettled(top.map((s) => getChain(s.chain_id)));
     if (top.length && res.every((r) => r.status === "rejected")) {
       throw (res[0] as PromiseRejectedResult).reason;
     }
-    return res
-      .map((r, i) => (r.status === "fulfilled" ? r.value : ({ ...top[i] } as unknown as Chain)))
-      .filter((c): c is Chain => c !== null);
+    const { chains } = mergeDetails(top, res);
+    let approvals: Approval[] = [];
+    try {
+      approvals = await listApprovals();
+    } catch {
+      return chains;                                    // the approvals read reports its own error on the page
+    }
+    const extra = missingPendingAlerts(approvals, new Set(chains.map((c) => c.alert_id)));
+    const more = await Promise.allSettled(extra.map((id) => getChain(id)));
+    more.forEach((r, i) => {
+      if (r.status === "fulfilled" && r.value) chains.push(r.value);
+      else chains.push(stubChainFromApprovals(extra[i], approvals));   // the cards stay decidable
+    });
+    return chains;
   });
 }
 
