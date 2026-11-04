@@ -5,7 +5,7 @@ for every decision, so an analyst or auditor can check it.
 
 ```bash
 python -m aegis.exposure \
-  --vulns tenable_vulns.json \            # Tenable vulns export (JSON / JSONL) or a simple CSV
+  --vulns tenable_vulns.json \            # Tenable, Qualys, Rapid7, Wiz, Defender VM, Prisma, Trivy, or a simple CSV (repeatable)
   --aws-bundle bundle.json \              # python -m aegis.posture export-aws (repeatable)
   --inventory assets.csv \                # on-prem assets, zones, roles, WAF / EDR coverage
   --kev known_exploited_vulnerabilities.json --epss epss_scores.csv \
@@ -15,6 +15,24 @@ python -m aegis.exposure \
 Try it on the sample bank: `S=aegis/exposure/samples; python -m aegis.exposure --vulns $S/tenable_vulns.json
 --aws-bundle $S/aws_bundle.json --inventory $S/inventory.csv --kev $S/kev_sample.json --epss $S/epss_sample.csv
 --settings $S/exposure.yaml` → `14 findings → 10 exploitable → 7 reachable → 5 undefended → 3 ACT NOW`.
+
+## Scanner exports
+
+Each scanner's own export is read as it comes out of the console or API. The format is recognised by its shape,
+so there is no flag. Nothing here connects to a scanner.
+
+| Scanner | Export | Port | Exploit signals |
+|---|---|---|---|
+| Tenable.io / .sc | vulns export (JSON / JSONL) | per finding | `exploit_available`, KEV flag |
+| Qualys VMDR | scan / vulnerability report CSV (preamble skipped; "Information Gathered" rows dropped) | per finding | `Exploitability` column |
+| Rapid7 InsightVM | "Vulnerability details" CSV / SQL export (`NV` / `SD` / `SV` result codes dropped) | per finding | `Exploit Count` |
+| Wiz | `vulnerabilityFindings` GraphQL nodes (JSON) or the findings CSV | package (any exposed port) | `hasExploit`, `hasCisaKevExploit`, EPSS |
+| Defender Vulnerability Management | `SoftwareVulnerabilitiesByMachine` API response or CSV | package | `exploitabilityLevel` |
+| Prisma Cloud Compute | `/api/v1/hosts` · `/api/v1/images` scan results | package | `exploit`, risk factor "Exploit exists – in the wild" |
+| Trivy | `trivy image -f json` | package | — |
+
+Fixed and resolved findings are skipped. Assets are matched on the instance id, then the host name, then the IP, so
+findings from several scanners about the same host land on one asset. Samples are in `samples/scanners/`.
 
 ## The four questions
 

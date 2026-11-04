@@ -1,0 +1,13 @@
+{"data": {"vulnerabilityFindings": {"nodes": [
+  {"id": "f-1", "name": "CVE-2021-44228", "detailedName": "log4j-core", "version": "2.14.1", "score": 10.0,
+   "epssProbability": 0.975, "hasExploit": true, "hasCisaKevExploit": true, "status": "OPEN",
+   "vulnerableAsset": {"id": "wiz-a-1", "type": "VIRTUAL_MACHINE", "name": "legacy-reports",
+                       "providerUniqueId": "arn:aws:ec2:ap-south-1:123456789012:instance/i-0legacy"}},
+  {"id": "f-2", "name": "CVE-2023-38545", "detailedName": "curl", "version": "7.88.1", "score": 9.8,
+   "hasExploit": false, "hasCisaKevExploit": false, "status": "OPEN",
+   "vulnerableAsset": {"id": "wiz-a-2", "type": "VIRTUAL_MACHINE", "name": "payments-api",
+                       "providerUniqueId": "arn:aws:ec2:ap-south-1:123456789012:instance/i-0api"}},
+  {"id": "f-3", "name": "CVE-2022-22965", "detailedName": "spring-beans", "version": "5.3.17", "score": 9.8,
+   "hasExploit": true, "status": "RESOLVED",
+   "vulnerableAsset": {"id": "wiz-a-2", "name": "payments-api", "providerUniqueId": "i-0api"}}
+]}}}

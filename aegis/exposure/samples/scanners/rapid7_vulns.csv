@@ -1,0 +1,4 @@
+Asset IP Address,Asset Names,Vulnerability ID,Vulnerability Title,Vulnerability CVE IDs,Vulnerability CVSSv3 Score,Service Port,Service Protocol,Exploit Count,Vulnerability Test Result Code
+172.20.1.10,ib.bank.example,apache-struts-cve-2017-5638,Apache Struts Jakarta Multipart parser RCE,CVE-2017-5638,10.0,443,tcp,6,VE
+172.20.1.20,ftp.bank.example,progress-moveit-cve-2023-34362,MOVEit Transfer SQL injection,CVE-2023-34362,9.8,443,tcp,3,VV
+10.50.2.10,swift-gw01.dc.bank,openssl-cve-2022-0778,OpenSSL BN_mod_sqrt loop,CVE-2022-0778,7.5,443,tcp,0,NV

@@ -245,10 +245,13 @@ def test_collector_records_an_unreachable_endpoint_instead_of_crashing(monkeypat
 
 
 def test_csv_without_asset_column_is_refused(tmp_path):
-    p = tmp_path / "qualys.csv"
-    p.write_text("IP,QID,Title\n10.0.0.1,1,x\n")
+    p = tmp_path / "custom.csv"
+    p.write_text("Host,Finding,Rating\n10.0.0.1,1,x\n")
     with pytest.raises(PostureSourceError, match="no 'asset' column"):
         loaders.load_vulns(p)
+    q = tmp_path / "qualys.csv"                    # a Qualys report is now read natively (integration plan #6)
+    q.write_text("IP,QID,Title\n10.0.0.1,1,x\n")
+    assert [v.asset for v in loaders.load_vulns(q)] == ["10.0.0.1"]
 
 
 # ---- remediation proposals are never silenced for good ------------------------------------------
