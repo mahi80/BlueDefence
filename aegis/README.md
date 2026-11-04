@@ -728,10 +728,13 @@ AEGIS_SOAR_VENDOR=sentinel AEGIS_SOAR_PLAYBOOKS="revoke_sessions=<Logic App trig
 AEGIS_EDR_VENDOR=crowdstrike AEGIS_EDR_CLIENT_ID  AEGIS_EDR_CLIENT_SECRET  [AEGIS_EDR_URL]
 AEGIS_EDR_VENDOR=defender  AEGIS_EDR_TENANT_ID  AEGIS_EDR_CLIENT_ID  AEGIS_EDR_CLIENT_SECRET (or managed identity)
 AEGIS_EDR_VENDOR=sentinelone AEGIS_EDR_URL  AEGIS_EDR_TOKEN
+AEGIS_EDR_VENDOR=trend     AEGIS_EDR_URL (regional API, e.g. https://api.in.xdr.trendmicro.com)  AEGIS_EDR_TOKEN
 AEGIS_FW_VENDOR=panos      AEGIS_FW_URL  AEGIS_FW_TOKEN (API key)  [AEGIS_FW_TAG_SRC=aegis-block-src  AEGIS_FW_TAG_DST=aegis-block-dst]
 AEGIS_FW_VENDOR=fortigate  AEGIS_FW_URL  AEGIS_FW_TOKEN (REST admin token)  [AEGIS_FW_VDOM]
 AEGIS_IDP_VENDOR=entra     AEGIS_IDP_TENANT_ID  AEGIS_IDP_CLIENT_ID  AEGIS_IDP_CLIENT_SECRET  [AEGIS_IDP_PROTECTED=breakglass@bank.in,…]
+AEGIS_IDP_VENDOR=ad        AEGIS_AD_URL (ldaps://)  AEGIS_AD_BASE_DN  AEGIS_AD_BIND_DN  AEGIS_AD_BIND_PASSWORD   (pip install 'aegis[ad]')
 AEGIS_PAM_VENDOR=cyberark  AEGIS_PAM_URL  AEGIS_PAM_USERNAME  AEGIS_PAM_PASSWORD
+AEGIS_BLOCK_FEED=1         firewalls pull GET /ingest/blocklist?format=txt[&kind=dst] (read token; bearer or basic auth)
 AEGIS_ENFORCEMENT_MODE=shadow   AEGIS_PROTECTED_TARGETS="cbs-db,swift-gw,dc-*"
 ```
 
@@ -744,7 +747,15 @@ The bank stack (each has a `mock…` vendor for a lab; a private CA → `SSL_CER
 | EDR | Defender for Endpoint | isolate (Full) | device isolation (resolves host name → one device, or the device id) | unisolate / newest machine action | `Machine.Isolate`, `Machine.Read.All` |
 | EDR | SentinelOne | isolate | agent network disconnect | connect / `networkStatus` | API user with disconnect / connect |
 | Identity | Entra ID | revoke_sessions, force_logout (one-shot); lock_account | revoke all refresh tokens; disable the account + revoke | re-enables only an account AEGIS disabled / `accountEnabled` | `User.RevokeSessions.All`, `User.EnableDisableAccount.All` |
+| Firewall | Check Point / any NGFW, by pull | block, block_egress (IP / CIDR) | nothing on the firewall: live blocks are listed at `/ingest/blocklist?format=txt` (`&kind=dst` for egress); a Network Feed object (R81.20+), PAN-OS EDL or FortiGate threat feed fetches it and one deny rule uses it | drops off the next fetch / not verifiable (AEGIS cannot see the last fetch) | the feed's read token only (basic-auth password) |
+| EDR | Trend Vision One | isolate | endpoint isolation (resolves endpoint name → one agent GUID) | restore / the isolation task's status | API key with Response permissions |
+| Identity | Active Directory (on-prem) | lock_account | sets `userAccountControl` ACCOUNTDISABLE over LDAPS; built-in privileged accounts (Administrator, krbtgt) refused | re-enables only an account AEGIS disabled / the bit | delegated write of `userAccountControl` on the user OUs |
 | PAM | CyberArk PVWA | rotate_credential (permanent, two-person) | immediate CPM password change of exactly one vaulted account (`account:<user>[@<address>]`) | cannot be undone / last-modified time | vault user allowed to initiate CPM changes only |
+
+AD has no session revoke: Kerberos tickets that were already issued stay valid until they expire (10 h by default).
+When that matters, pair an AD lock with `rotate_credential` or an EDR isolate. Check Point is served by the feed and
+not by a Management API connector, because a direct write would need a publish and a policy install, which is a
+change-window operation.
 
 Principals on `AEGIS_IDP_PROTECTED` (break-glass accounts) are never locked, revoked or rotated by AEGIS. Whether an
 action may run unattended is decided by its action contract and the autonomy tier, the same as for every other

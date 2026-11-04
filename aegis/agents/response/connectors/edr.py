@@ -299,6 +299,68 @@ class SentinelOneConnector(_HostEdr):
         return str(rows[0].get("networkStatus") or "").lower() in ("disconnected", "disconnecting")
 
 
+class TrendVisionOneConnector(_HostEdr):
+    """Trend Vision One (Apex One / Server & Workload Protection agents): isolate an endpoint, restore on undo.
+
+    API v3.0 (regional base, e.g. ``https://api.in.xdr.trendmicro.com`` for India; ``Authorization: Bearer``)::
+
+        resolve  GET  /v3.0/endpointSecurity/endpoints    header TMV1-Query: endpointName eq '<host>'  → items[].agentGuid
+        isolate  POST /v3.0/response/endpoints/isolate    [{"agentGuid", "description"}]  → 207, Operation-Location
+        restore  POST /v3.0/response/endpoints/restore    [{"agentGuid", "description"}]
+        verify   GET  /v3.0/response/tasks/{id}           status succeeded / failed / running
+
+    The read-back follows the isolation task, so a restore made in the Trend console is not seen as drift.
+    """
+
+    name = "trend"
+
+    def __init__(self, *, token: str, **kw: Any):
+        super().__init__(**kw)
+        self._tok = token
+
+    def _h(self, **extra: str) -> dict:
+        return {"Authorization": f"Bearer {self._tok}", "Content-Type": "application/json;charset=utf-8", **extra}
+
+    def _guid(self, target: str) -> str:
+        host = self._host(target)
+        if re.fullmatch(r"[0-9a-fA-F-]{36}", host):
+            return host
+        res = call(self._transport, "GET", f"{self.base_url}/v3.0/endpointSecurity/endpoints",
+                   headers=self._h(**{"TMV1-Query": f"endpointName eq '{host}'"}))
+        rows = res.json().get("items") or []
+        if len(rows) != 1:
+            raise ConnectorError(f"{len(rows)} Trend endpoints named {host!r}; give the agent GUID")
+        return str(rows[0]["agentGuid"])
+
+    def _act(self, guid: str, what: str, note: str) -> str:
+        res = call(self._transport, "POST", f"{self.base_url}/v3.0/response/endpoints/{what}",
+                   json_body=[{"agentGuid": guid, "description": note[:256]}], headers=self._h(), expect=(200, 202, 207))
+        items = res.body if isinstance(res.body, list) else []
+        first = items[0] if items and isinstance(items[0], dict) else {}
+        if int(first.get("status") or 202) >= 400:
+            raise ConnectorError(f"Trend refused {what}: {str(first)[:200]}")
+        loc = next((h.get("value") for h in first.get("headers") or [] if str(h.get("name", "")).lower() == "operation-location"), "")
+        return str(loc or "").rsplit("/", 1)[-1]
+
+    def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
+        guid = self._guid(action.target)
+        task = self._act(guid, "isolate", f"AEGIS {key[:16]}: {getattr(action, 'reasoning', '')!s}")
+        return f"{guid}#{task}", f"[trend] isolation of {action.target} (agent {guid}) requested, task {task or '?'}", guid
+
+    def _do_rollback(self, receipt: Receipt) -> str:
+        guid = receipt.rollback_token or self._guid(receipt.target)
+        self._act(guid, "restore", f"AEGIS release of {receipt.receipt_id}")
+        return f"[trend] restore of {receipt.target} requested"
+
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        task = (receipt.vendor_ref or "").partition("#")[2]
+        if not task:
+            return None
+        res = call(self._transport, "GET", f"{self.base_url}/v3.0/response/tasks/{task}", headers=self._h())
+        st = str(res.json().get("status") or "").lower()
+        return True if st == "succeeded" else False if st in ("failed", "rejected", "canceled", "cancelled") else None
+
+
 class _FalconToken:
     """OAuth2 client-credentials token with in-process caching (refetch near expiry)."""
 
@@ -331,7 +393,8 @@ def crowdstrike_from_env(transport: Optional[Transport] = None) -> Optional[Conn
     """``AEGIS_EDR_VENDOR = crowdstrike | defender | sentinelone | mock | mock-defender | mock-sentinelone`` (default
     off). CrowdStrike: ``AEGIS_EDR_CLIENT_ID`` + ``AEGIS_EDR_CLIENT_SECRET`` (``AEGIS_EDR_URL`` defaults to US-1).
     Defender: ``AEGIS_EDR_TENANT_ID`` + ``AEGIS_EDR_CLIENT_ID`` + ``AEGIS_EDR_CLIENT_SECRET`` (or a managed identity).
-    SentinelOne: ``AEGIS_EDR_URL`` (console) + ``AEGIS_EDR_TOKEN``."""
+    SentinelOne: ``AEGIS_EDR_URL`` (console) + ``AEGIS_EDR_TOKEN``. Trend Vision One: ``AEGIS_EDR_URL`` (regional API
+    base) + ``AEGIS_EDR_TOKEN``."""
     vendor = os.environ.get("AEGIS_EDR_VENDOR", "off").strip().lower()
     if vendor in ("", "off", "0", "none"):
         return None
@@ -343,6 +406,16 @@ def crowdstrike_from_env(transport: Optional[Transport] = None) -> Optional[Conn
         from .mock_bank import MockSentinelOne
         return SentinelOneConnector(base_url="https://s1.mock", api_token="mock-s1-token",
                                     transport=transport or MockSentinelOne())
+    if vendor == "mock-trend":
+        from .mock_bank import MockTrend
+        return TrendVisionOneConnector(base_url="https://trend.mock", token="mock-trend-token",
+                                       transport=transport or MockTrend())
+    if vendor in ("trend", "visionone", "trendmicro"):
+        base, tok = os.environ.get("AEGIS_EDR_URL", "").strip(), os.environ.get("AEGIS_EDR_TOKEN", "")
+        if not (base.startswith("https://") and tok):
+            logger.warning("[edr] trend needs AEGIS_EDR_URL (regional https API base) and AEGIS_EDR_TOKEN")
+            return None
+        return TrendVisionOneConnector(base_url=base, token=tok, transport=transport)
     if vendor in ("defender", "mde"):
         from .cloud_auth import AzureToken
         tok = AzureToken(tenant_id=os.environ.get("AEGIS_EDR_TENANT_ID", ""), client_id=os.environ.get("AEGIS_EDR_CLIENT_ID", ""),

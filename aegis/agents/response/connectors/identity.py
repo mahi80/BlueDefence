@@ -238,6 +238,111 @@ class CyberArkConnector(Connector):
         return f"[cyberark] {receipt.target} already rotated; nothing to renew"
 
 
+_UAC_DISABLED = 0x2
+
+
+def _ldap_escape(v: str) -> str:
+    """RFC 4515 filter escaping."""
+    return "".join({"\\": r"\5c", "*": r"\2a", "(": r"\28", ")": r"\29", "\0": r"\00"}.get(c, c) for c in v)
+
+
+class Directory:
+    """The two LDAP operations the AD connector needs; the default speaks LDAPS through ``ldap3`` (optional)."""
+
+    def __init__(self, url: str, bind_dn: str, password: str, *, timeout: int = 15):
+        if not url.lower().startswith("ldaps://"):
+            raise ValueError("AEGIS_AD_URL must be ldaps:// (account changes never go over cleartext LDAP)")
+        self.url, self._dn, self._pw, self.timeout = url, bind_dn, password, timeout
+
+    def _conn(self) -> Any:
+        try:
+            import ldap3  # type: ignore
+        except ImportError:
+            raise ConnectorError("ldap3 is not installed: pip install 'aegis[ad]'") from None
+        server = ldap3.Server(self.url, use_ssl=True, connect_timeout=self.timeout)
+        return ldap3.Connection(server, user=self._dn, password=self._pw, auto_bind=True, receive_timeout=self.timeout)
+
+    def search(self, base: str, flt: str, attrs: list[str]) -> list[tuple[str, dict]]:
+        c = self._conn()
+        try:
+            c.search(base, flt, attributes=attrs, size_limit=3)
+            return [(e.entry_dn, {a: e[a].value for a in attrs if a in e}) for e in c.entries]
+        finally:
+            c.unbind()
+
+    def replace(self, dn: str, attr: str, value: Any) -> None:
+        import ldap3  # type: ignore
+        c = self._conn()
+        try:
+            if not c.modify(dn, {attr: [(ldap3.MODIFY_REPLACE, [value])]}):
+                raise ConnectorError(f"AD refused the change: {c.result.get('description')} {c.result.get('message', '')[:120]}")
+        finally:
+            c.unbind()
+
+
+class ActiveDirectoryConnector(Connector):
+    """On-prem Active Directory: disable / re-enable an account (``userAccountControl`` ACCOUNTDISABLE bit) over LDAPS.
+
+    ``lock_account`` only. AD has no session revoke: Kerberos tickets already issued stay valid until they expire
+    (10 h by default), so pair a lock with ``rotate_credential`` (CyberArk) or an EDR isolate when that matters. The
+    state before is saved; undo re-enables only an account AEGIS disabled. The account must resolve to exactly one
+    user (``sAMAccountName`` or ``userPrincipalName``); ``AEGIS_IDP_PROTECTED`` and well-known privileged accounts
+    (``Administrator``, ``krbtgt``) are refused. Bind with a delegated account that may only write
+    ``userAccountControl`` on the user OUs.
+    """
+
+    name = "ad"
+    actions = frozenset({"lock_account"})
+    _NEVER = frozenset({"administrator", "krbtgt", "guest"})
+
+    def __init__(self, *, directory: Any, base_dn: str, **kw: Any):
+        super().__init__(**kw)
+        self.dir, self.base_dn = directory, base_dn
+
+    def supports_target(self, target: str) -> bool:
+        try:
+            _principal(target)
+            return True
+        except ConnectorError:
+            return False
+
+    def _find(self, who: str) -> tuple[str, int]:
+        e = _ldap_escape(who)
+        flt = f"(&(objectCategory=person)(objectClass=user)(|(sAMAccountName={e})(userPrincipalName={e})))"
+        rows = self.dir.search(self.base_dn, flt, ["userAccountControl", "sAMAccountName"])
+        if len(rows) != 1:
+            raise ConnectorError(f"{len(rows)} AD accounts match {who!r}; give the sAMAccountName or UPN")
+        dn, attrs = rows[0]
+        if str(attrs.get("sAMAccountName", "")).lower() in self._NEVER:
+            raise ConnectorError(f"{who} is a built-in privileged account; a person acts on it")
+        return dn, int(attrs.get("userAccountControl") or 512)
+
+    def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
+        who = _principal(action.target)
+        _refuse_protected(who)
+        if who.lower().split("@", 1)[0] in self._NEVER:
+            raise ConnectorError(f"{who} is a built-in privileged account; a person acts on it")
+        dn, uac = self._find(who)
+        if uac & _UAC_DISABLED:
+            return dn, f"[ad] {who} was already disabled", "disabled"
+        self.dir.replace(dn, "userAccountControl", uac | _UAC_DISABLED)
+        return dn, (f"[ad] disabled {who} ({dn}); Kerberos tickets already issued stay valid until they expire"), "enabled"
+
+    def _do_rollback(self, receipt: Receipt) -> str:
+        if receipt.rollback_token != "enabled":
+            return f"[ad] {receipt.target} was already disabled before AEGIS acted; left disabled"
+        _, uac = self._find(_principal(receipt.target))
+        self.dir.replace(receipt.vendor_ref, "userAccountControl", uac & ~_UAC_DISABLED)
+        return f"[ad] re-enabled {receipt.target}"
+
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        _, uac = self._find(_principal(receipt.target))
+        return bool(uac & _UAC_DISABLED)
+
+    def _do_renew(self, receipt: Receipt, ttl_sec: int) -> str:
+        return f"[ad] {receipt.target} still disabled"
+
+
 def _graph_token(transport: Transport | None) -> Callable[[], str]:
     from .cloud_auth import AzureToken
     return AzureToken(tenant_id=os.environ.get("AEGIS_IDP_TENANT_ID", ""), client_id=os.environ.get("AEGIS_IDP_CLIENT_ID", ""),
@@ -245,8 +350,9 @@ def _graph_token(transport: Transport | None) -> Callable[[], str]:
 
 
 def idp_from_env(transport: Transport | None = None) -> Connector | None:
-    """``AEGIS_IDP_VENDOR = entra | mock`` (default off). Live: ``AEGIS_IDP_TENANT_ID``, ``AEGIS_IDP_CLIENT_ID``,
-    ``AEGIS_IDP_CLIENT_SECRET`` (or a managed identity with azure-identity installed)."""
+    """``AEGIS_IDP_VENDOR = entra | ad | mock | mock-ad`` (default off). Entra: ``AEGIS_IDP_TENANT_ID``,
+    ``AEGIS_IDP_CLIENT_ID``, ``AEGIS_IDP_CLIENT_SECRET`` (or a managed identity with azure-identity installed).
+    AD: ``AEGIS_AD_URL`` (ldaps://), ``AEGIS_AD_BASE_DN``, ``AEGIS_AD_BIND_DN``, ``AEGIS_AD_BIND_PASSWORD``."""
     vendor = os.environ.get("AEGIS_IDP_VENDOR", "off").strip().lower()
     if vendor in ("", "off", "0", "none"):
         return None
@@ -256,6 +362,16 @@ def idp_from_env(transport: Transport | None = None) -> Connector | None:
                               transport=transport or MockEntra())
     if vendor in ("entra", "azuread", "aad"):
         return EntraConnector(token_provider=_graph_token(transport), transport=transport)
+    if vendor == "mock-ad":
+        from .mock_bank import MockDirectory
+        return ActiveDirectoryConnector(directory=MockDirectory(), base_dn="DC=bank,DC=local")
+    if vendor in ("ad", "activedirectory", "ldap"):
+        url, base = os.environ.get("AEGIS_AD_URL", "").strip(), os.environ.get("AEGIS_AD_BASE_DN", "").strip()
+        dn, pw = os.environ.get("AEGIS_AD_BIND_DN", ""), os.environ.get("AEGIS_AD_BIND_PASSWORD", "")
+        if not (url and base and dn and pw):
+            logger.warning("[identity] ad needs AEGIS_AD_URL (ldaps://), AEGIS_AD_BASE_DN, AEGIS_AD_BIND_DN, AEGIS_AD_BIND_PASSWORD")
+            return None
+        return ActiveDirectoryConnector(directory=Directory(url, dn, pw), base_dn=base)
     logger.warning("[identity] unknown AEGIS_IDP_VENDOR=%r (entra | mock)", vendor)
     return None
 
@@ -283,4 +399,4 @@ def pam_from_env(transport: Transport | None = None) -> Connector | None:
     return None
 
 
-__all__ = ["CyberArkConnector", "EntraConnector", "idp_from_env", "pam_from_env"]
+__all__ = ["ActiveDirectoryConnector", "CyberArkConnector", "Directory", "EntraConnector", "idp_from_env", "pam_from_env"]

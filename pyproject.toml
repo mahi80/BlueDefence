@@ -20,6 +20,8 @@ dependencies = [
 index = ["sqlalchemy>=2.0,<2.1", "duckdb-engine>=0.17", "duckdb>=1.1"]
 postgres = ["sqlalchemy>=2.0,<2.1", "psycopg2-binary>=2.9"]
 mssql = ["sqlalchemy>=2.0,<2.1", "pyodbc>=5.0"]
+# On-prem Active Directory account disable (AEGIS_IDP_VENDOR=ad)
+ad = ["ldap3>=2.9"]
 # Kafka ingest (AEGIS_SOURCES=kafka; aegis/ingest/kafka.py)
 kafka = ["confluent-kafka>=2.3"]
 # Posture scans in live mode (AEGIS_POSTURE_LIVE=1). Offline exports need nothing extra.

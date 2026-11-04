@@ -22,7 +22,9 @@
                               alarms folded in, flaps, drift, bad pushes). ``?feed=syslog`` tags the source.
     POST /ingest/alerts       already-normalised AEGIS alerts, one JSON object per line
                               (custom forwarders, the purple-team harness).
-    GET  /ingest/blocklist    the active enforcement set (IPs, CIDRs, client fingerprints)
+    GET  /ingest/blocklist    the active enforcement set (IPs, CIDRs, client fingerprints); ``?format=txt``
+                              (``&kind=src|dst``): one IP / CIDR per line, the external feed a firewall pulls
+                              (Check Point Network Feed, PAN-OS EDL, FortiGate threat feed; basic auth ok)
     GET  /ingest/license      the installation's licence state (status, edition, tier, features, limits) — the
                               Kafka bridge checks the ``kafka_bridge`` feature here before it starts
     POST /ingest/ocsf         OCSF events (any class; NDJSON or JSON arrays; ?product=<name>)
@@ -352,6 +354,49 @@ class PushServer:
                     ips.append({**row, "target": t})
         return {"generated_at": time.time(), "ips": ips, "fingerprints": fps}
 
+    def feed_authorized(self, headers: Any) -> bool:
+        """The plain-text feed: the read token as a bearer token, or as the password of HTTP basic auth (what a
+        firewall's external-feed object can send: Check Point Network Feed, PAN-OS EDL, FortiGate threat feed)."""
+        if self.read_authorized(headers):
+            return True
+        auth = headers.get("Authorization", "")
+        if not auth.lower().startswith("basic ") or not self.read_token:
+            return False
+        import base64
+        try:
+            _, _, pw = base64.b64decode(auth[6:].strip(), validate=True).decode("utf-8").partition(":")
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return bool(pw) and hmac.compare_digest(pw.encode(), self.read_token.encode())
+
+    def blocklist_text(self, kind: str = "src") -> str:
+        """The active, live IP / CIDR blocks as one entry per line — the external feed a firewall pulls.
+        ``kind=src``: blocked sources (``block``); ``kind=dst``: blocked destinations (``block_egress``).
+        Fingerprints and host names are never listed (a firewall feed takes addresses only)."""
+        import ipaddress
+        want = "block_egress" if kind == "dst" else "block"
+        seen: list[str] = []
+        try:
+            receipts = self.blocklist() if self.blocklist is not None else []
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ingest:http] blocklist source failed: %s", str(e)[:120])
+            receipts = []
+        for r in receipts:
+            if getattr(r, "dry_run", False) or getattr(r, "action_type", "") != want:
+                continue
+            t = str(r.target).strip()
+            for p in ("ip:", "src:", "dst:", "outbound:"):
+                if t.lower().startswith(p):
+                    t = t[len(p):].strip()
+            try:
+                net = ipaddress.ip_network(t, strict=False)
+            except ValueError:
+                continue
+            entry = str(net.network_address) if net.num_addresses == 1 else str(net)
+            if entry not in seen:
+                seen.append(entry)
+        return "".join(f"{e}\n" for e in seen)
+
     def verdicts_payload(self, after: int, limit: int) -> dict:
         """Chains with seq > ``after`` from the audit log. ``seq`` is the 1-based line number: append-only,
         so a consumer that stores ``next`` resumes exactly where it stopped, and ``integrity_hash`` /
@@ -655,6 +700,20 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
         if path == "/ingest/blocklist":
+            q = parse_qs(urlsplit(self.path).query)
+            fmt = (q.get("format") or ["json"])[0].lower()
+            if fmt == "txt":
+                if not self.server_ref.feed_authorized(self.headers):
+                    self._reply(401, {"error": "unauthorized"})
+                    return
+                raw = self.server_ref.blocklist_text((q.get("kind") or ["src"])[0].lower()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(raw)
+                return
             if not self.server_ref.read_authorized(self.headers):
                 self._reply(401, {"error": "unauthorized"})
                 return
