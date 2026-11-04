@@ -53,6 +53,17 @@ spec:
       protocol: TCP
     - port: 443
       protocol: TCP
+{{- if .Values.license.serverCIDRs }}
+  # BlueDefence licence service (heartbeat, renewal, signed model releases) — review round 8 R8-13
+  - to:
+{{- range .Values.license.serverCIDRs }}
+    - ipBlock:
+        cidr: {{ . }}
+{{- end }}
+    ports:
+    - port: {{ .Values.license.serverPort }}
+      protocol: TCP
+{{- end }}
 ---
 # No ingress allowed except Prometheus scrape from the OTel collector.
 apiVersion: networking.k8s.io/v1

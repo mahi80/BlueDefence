@@ -183,7 +183,9 @@ class AuditLog:
                 logger.warning("[audit] %s: %d unparseable line(s) skipped while locating the chain tail — run `python -m aegis.audit verify --all`", f.name, bad)
             if last:
                 return str(last["integrity_hash"])
-        return GENESIS
+        # every segment retired (and the live file empty or absent): the next row chains from the checkpoint's seed,
+        # not GENESIS — otherwise the first row after a full retention broke verify --all (review round 8 R8-7)
+        return self.chain_seed()
 
     # ----------------------------------------------------------- retention --
     # Retention drops whole rotated segments. Without a record of what was dropped, ``verify --all`` started from
@@ -194,13 +196,42 @@ class AuditLog:
     def retention_path(self) -> Path:
         return self.path.with_name(self.path.name + ".retention")
 
+    # The checkpoint key (review round 8 R8-3): a dedicated audit key, never the console token. The console token is
+    # rotated like any API key and lives on the console host; deriving the retention signature from it meant a token
+    # rotation broke ``verify --all`` for good and anyone holding the console key could re-sign a cut. Order:
+    # ``AEGIS_AUDIT_KEY``, else ``AEGIS_DECISION_KEY``. Rotation: set the new key in ``AEGIS_AUDIT_KEY`` and the old one
+    # in ``AEGIS_AUDIT_KEY_PREVIOUS`` (comma-separated; ``console:<token>`` names a pre-round-8 checkpoint that was
+    # signed with the key derived from that console token), then ``python -m aegis.audit resign`` — checkpoints signed
+    # by a listed previous key keep verifying until then, and the next retire/resign signs with the current key.
     @staticmethod
-    def _retention_sig(body: dict) -> str:
-        try:
-            from aegis.hitl.signing import _key
-            key = _key()
-        except Exception:  # noqa: BLE001
-            key = None
+    def _audit_key() -> bytes | None:
+        for var in ("AEGIS_AUDIT_KEY", "AEGIS_DECISION_KEY"):
+            v = os.environ.get(var, "").strip()
+            if v:
+                return v.encode()
+        return None
+
+    @staticmethod
+    def _previous_audit_keys() -> list[bytes]:
+        import hmac as _hmac
+        out: list[bytes] = []
+        for item in os.environ.get("AEGIS_AUDIT_KEY_PREVIOUS", "").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if item.startswith("console:"):
+                out.append(_hmac.new(item[len("console:"):].encode(), b"aegis-decision-signing-v1", hashlib.sha256).digest())
+            else:
+                out.append(item.encode())
+        return out
+
+    @staticmethod
+    def _key_id(key: bytes) -> str:
+        return hashlib.sha256(b"aegis-audit-kid|" + key).hexdigest()[:16]
+
+    @staticmethod
+    def _retention_sig(body: dict, key: bytes | None = None) -> str:
+        key = AuditLog._audit_key() if key is None else key
         if key is None:
             return ""
         import hmac as _hmac
@@ -208,8 +239,8 @@ class AuditLog:
                              sort_keys=True, separators=(",", ":")).encode()
         return _hmac.new(key, b"aegis-audit-retention-v1|" + payload, hashlib.sha256).hexdigest()
 
-    def retention(self) -> tuple[dict | None, str]:
-        """(checkpoint, problem). No checkpoint → (None, ""). A checkpoint that fails its signature → (None, why)."""
+    def _read_retention(self) -> tuple[dict | None, str]:
+        """The checkpoint as stored, signature NOT checked: (checkpoint, problem)."""
         p = self.retention_path()
         if not p.exists():
             return None, ""
@@ -219,15 +250,67 @@ class AuditLog:
             return None, f"retention checkpoint unreadable: {e}"
         if not isinstance(cp, dict) or not isinstance(cp.get("seed"), str):
             return None, "retention checkpoint malformed"
-        want = self._retention_sig(cp)
-        if want and not __import__("hmac").compare_digest(want, str(cp.get("sig") or "")):
+        return cp, ""
+
+    def retention(self) -> tuple[dict | None, str]:
+        """(checkpoint, problem). No checkpoint → (None, ""). A checkpoint that fails its signature → (None, why).
+        With no audit key configured a checkpoint cannot be checked at all → (None, "unverifiable: no key …"): an
+        unsigned or hand-written checkpoint used to be accepted as-is and turned a deleted segment green (R8-4)."""
+        cp, problem = self._read_retention()
+        if cp is None:
+            return None, problem
+        current = self._audit_key()
+        keys = ([current] if current is not None else []) + self._previous_audit_keys()
+        if not keys:
+            return None, ("unverifiable: no key — the retention checkpoint cannot be checked; set AEGIS_AUDIT_KEY "
+                          "(or AEGIS_DECISION_KEY) to the key the service signs with")
+        got = str(cp.get("sig") or "")
+        import hmac as _hmac
+        if not got or not any(_hmac.compare_digest(self._retention_sig(cp, k), got) for k in keys):
             return None, "retention checkpoint signature does not match (edited, or signed with another key)"
         return cp, ""
 
     def chain_seed(self) -> str:
-        """What the oldest retained row chains from: the retention checkpoint's seed, else GENESIS."""
-        cp, _ = self.retention()
+        """What the oldest retained row chains from: the retention checkpoint's seed, else GENESIS. The stored seed
+        is used even when the signature cannot be checked here — chaining from GENESIS instead would fork the log;
+        whether the checkpoint is genuine is ``verify``'s question, not the writer's."""
+        cp, _ = self._read_retention()
         return str(cp["seed"]) if cp else GENESIS
+
+    def _write_retention(self, body: dict) -> None:
+        tmp = self.retention_path().with_name(self.retention_path().name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(body, indent=1))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.retention_path())
+
+    def resign_retention(self, *, trust_unverified: bool = False) -> dict:
+        """Key rotation: re-sign the checkpoint with the current key after it verified under a listed key.
+        ``trust_unverified`` is the one-off migration for a checkpoint written unsigned (before round 8) or under a
+        key nobody has any more: the operator vouches for it, and the checkpoint records that it was re-signed
+        without verification (``vouched_at``) so an auditor can see it."""
+        with _LOCK:
+            key = self._audit_key()
+            if key is None:
+                return {"ok": False, "error": "no audit key: set AEGIS_AUDIT_KEY before re-signing"}
+            cp, problem = self.retention()
+            vouched = False
+            if problem:
+                raw, unreadable = self._read_retention()
+                if not trust_unverified or raw is None:
+                    return {"ok": False, "error": unreadable or problem}
+                cp, vouched = raw, True
+            if cp is None:
+                return {"ok": True, "resigned": False, "note": "no retention checkpoint"}
+            cp = {**cp, "kid": self._key_id(key)}
+            if vouched:
+                cp["vouched_at"] = time.time()
+                logger.warning("[audit] retention checkpoint %s re-signed WITHOUT verification (operator vouched)", self.retention_path())
+            cp["sig"] = self._retention_sig(cp, key)
+            self._write_retention(cp)
+            return {"ok": True, "resigned": True, "kid": cp["kid"], "vouched": vouched}
 
     def retire_segments(self, count: int) -> dict:
         """Drop the ``count`` oldest rotated segments, after verifying them and recording a retention checkpoint.
@@ -237,6 +320,11 @@ class AuditLog:
             count = max(0, min(int(count), len(segments)))
             if count == 0:
                 return {"ok": True, "dropped": [], "seed": self.chain_seed()}
+            key = self._audit_key()
+            if key is None:
+                # an unsigned checkpoint is indistinguishable from a forged one (R8-3/R8-4): never delete without one
+                return {"ok": False, "error": "no audit key: set AEGIS_AUDIT_KEY (or AEGIS_DECISION_KEY) — the same value the "
+                                              "service runs with — before retiring segments; nothing was deleted"}
             cp, problem = self.retention()
             if problem:
                 return {"ok": False, "error": problem}
@@ -262,11 +350,10 @@ class AuditLog:
                         prev = claimed
                         entries += 1
             body = {"seed": prev, "dropped": (list(cp.get("dropped", [])) if cp else []) + [s.name for s in segments[:count]],
-                    "anchors_retired": sorted(retired_anchors), "entries_retired": entries, "ts": time.time()}
-            body["sig"] = self._retention_sig(body)
-            tmp = self.retention_path().with_name(self.retention_path().name + ".tmp")
-            tmp.write_text(json.dumps(body, indent=1), encoding="utf-8")
-            os.replace(tmp, self.retention_path())
+                    "anchors_retired": sorted(retired_anchors), "entries_retired": entries, "ts": time.time(),
+                    "kid": self._key_id(key)}
+            body["sig"] = self._retention_sig(body, key)
+            self._write_retention(body)
             for seg in segments[:count]:
                 seg.unlink()
             logger.info("[audit] retired %d segment(s); the chain now starts from %s", count, prev[:16])
@@ -400,7 +487,10 @@ class AuditLog:
         previous segment's tail)."""
         cp, problem = self.retention()
         if problem:
-            return {"ok": False, "entries": 0, "files": [], "broken_at": ("<retention>", problem)}
+            # including "unverifiable: no key" — never green on a checkpoint nobody could check, and the anchors it
+            # claims to retire are not silently dropped (R8-4)
+            return {"ok": False, "entries": 0, "files": [], "broken_at": ("<retention>", problem),
+                    "unverifiable": problem.startswith("unverifiable")}
         prev = (str(cp["seed"]) if cp else GENESIS) if all_files else self._live_segment_seed()
         entries, files = 0, set()
         anchors = (self._anchors() - set(cp.get("anchors_retired", []) if cp else ())) if all_files else set()

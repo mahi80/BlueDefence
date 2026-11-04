@@ -1,11 +1,13 @@
----
-# Forensic snapshot pre-respawn. The AEGIS controller creates one of
-# these as a Kubernetes Job before deleting the suspect pod, copying
-# memory + disk + recent NetFlow into the WORM PVC for later analysis.
+# Forensic snapshot pre-respawn — the Job the healing controller instantiates
+# before severing a suspect pod: memory + process state + recent NetFlow copied
+# onto WORM storage for later analysis.
 #
-# This template is rendered by the controller dynamically with the
-# specific pod name; the rendered manifest is recorded in the audit log.
-# The template here is the canonical contract.
+# Not rendered as a Job at install (review round 8 R8-10): it used to be, so
+# `helm install` started a snapshot Job with an empty TARGET_POD on day one. The
+# chart ships the Job as a ConfigMap; the controller reads it, substitutes
+# ${TARGET_POD} / ${ARTIFACT_ID}, labels the target pod
+# aegis.bank/forensic-target=${ARTIFACT_ID} and creates the Job. The rendered
+# manifest is recorded in the audit log. This ConfigMap is the canonical contract.
 #
 # Identity (review R-5): the Job runs as its OWN ServiceAccount
 # ({{ .Values.forensics.serviceAccount }}) with no API token mounted — it needs no
@@ -13,68 +15,91 @@
 # hostPID + SYS_ADMIN the controller's credentials. There is no container-runtime
 # socket mount: process state is read through hostPID + SYS_PTRACE, and the
 # runtime socket would have been node-root for anyone who reached this container.
+#
+# Placement (R8-9): no nodeName / nodeSelector / tolerations — a required
+# podAffinity to the labelled target pod (topologyKey kubernetes.io/hostname) puts
+# the Job on the target's node and nowhere else, and the scheduler still honours
+# taints (nodeName would have bypassed them).
+#
+# Storage (R8-10): one generic ephemeral volume per snapshot, in the WORM storage
+# class, instead of one shared ReadWriteOnce claim (which pinned every snapshot to
+# whichever node held the claim — a Job that must run on the target's node then
+# stayed Pending). The ephemeral PVC is deleted with the pod; the evidence survives
+# because the WORM class MUST use reclaimPolicy: Retain (see README).
+#
 # templates/forensic-admission-policy.yaml rejects any Job the controller creates
 # that deviates from this shape.
-apiVersion: batch/v1
-kind: Job
-metadata:
-  generateName: aegis-forensic-
-  namespace: {{ .Values.target.namespace }}
-  labels:
-{{ include "aegis.labels" . | indent 4 }}
-    aegis.bank/role: forensic-snapshot
-spec:
-  ttlSecondsAfterFinished: 3600
-  backoffLimit: 1
-  template:
-    metadata:
-      labels:
-{{ include "aegis.labels" . | indent 8 }}
-        aegis.bank/role: forensic-snapshot
-    spec:
-      serviceAccountName: {{ .Values.forensics.serviceAccount }}
-      restartPolicy: Never
-      automountServiceAccountToken: false
-      hostPID: true     # required to read process state of suspect pod
-      containers:
-      - name: snapshot
-        image: {{ .Values.forensics.image }}
-        securityContext:
-          privileged: false
-          capabilities:
-            add: [SYS_PTRACE, SYS_ADMIN]
-            drop: [ALL]
-        # The controller passes TARGET_POD + ARTIFACT_ID via env at
-        # render time. The image runs LiME (memory) + criu (process
-        # state) + tcpdump-on-replay against captured NetFlow.
-        env:
-        - name: TARGET_POD
-          value: ""    # filled by controller
-        - name: ARTIFACT_ID
-          value: ""    # filled by controller (matches HealEvent.forensic_artifact_id)
-        - name: AUDIT_LOG_BUCKET
-          value: s3://bank-aegis-audit-worm/
-        volumeMounts:
-        - name: forensic-store
-          mountPath: /forensic
-      volumes:
-      - name: forensic-store
-        persistentVolumeClaim:
-          claimName: aegis-forensic-pvc
----
 apiVersion: v1
-kind: PersistentVolumeClaim
+kind: ConfigMap
 metadata:
-  name: aegis-forensic-pvc
+  name: aegis-forensic-job-template
   namespace: {{ .Values.target.namespace }}
   labels:
-{{ include "aegis.labels" . | indent 4 }}
-spec:
-  accessModes: [ReadWriteOnce]
-  storageClassName: {{ .Values.forensics.storageClass }}
-  resources:
-    requests:
-      storage: {{ .Values.forensics.pvcSize }}
+{{ include "aegis.forensicLabels" . | indent 4 }}
+data:
+  job.yaml: |
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      generateName: aegis-forensic-
+      namespace: {{ .Values.target.namespace }}
+      labels:
+{{ include "aegis.forensicLabels" . | indent 8 }}
+        aegis.bank/artifact-id: "${ARTIFACT_ID}"
+    spec:
+      ttlSecondsAfterFinished: 3600
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+{{ include "aegis.forensicLabels" . | indent 12 }}
+        spec:
+          serviceAccountName: {{ .Values.forensics.serviceAccount }}
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          hostPID: true     # required to read process state of suspect pod
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ .Values.target.name }}
+                    aegis.bank/forensic-target: "${ARTIFACT_ID}"
+          containers:
+          - name: snapshot
+            image: {{ .Values.forensics.image }}
+            command: {{ toJson .Values.forensics.command }}
+{{- if .Values.forensics.args }}
+            args: {{ toJson .Values.forensics.args }}
+{{- end }}
+            securityContext:
+              privileged: false
+              capabilities:
+                add: [SYS_PTRACE, SYS_ADMIN]
+                drop: [ALL]
+            # LiME (memory) + criu (process state) + tcpdump-on-replay against captured NetFlow
+            env:
+            - name: TARGET_POD
+              value: "${TARGET_POD}"
+            - name: ARTIFACT_ID
+              value: "${ARTIFACT_ID}"     # matches HealEvent.forensic_artifact_id
+            volumeMounts:
+            - name: forensic-store
+              mountPath: /forensic
+          volumes:
+          - name: forensic-store
+            ephemeral:
+              volumeClaimTemplate:
+                metadata:
+                  labels:
+{{ include "aegis.forensicLabels" . | indent 20 }}
+                spec:
+                  accessModes: [ReadWriteOnce]
+                  storageClassName: {{ .Values.forensics.storageClass }}
+                  resources:
+                    requests:
+                      storage: {{ .Values.forensics.pvcSize }}
 ---
 # The forensic Job's identity: no RBAC binding, no token mounted.
 apiVersion: v1
@@ -83,5 +108,23 @@ metadata:
   name: {{ .Values.forensics.serviceAccount }}
   namespace: {{ .Values.target.namespace }}
   labels:
-{{ include "aegis.labels" . | indent 4 }}
+{{ include "aegis.forensicLabels" . | indent 4 }}
 automountServiceAccountToken: false
+---
+# R8-9: a forensic pod talks to nothing. It writes to its WORM volume only; no
+# egress (no exfiltration of the memory image it just took), no ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aegis-forensic-deny-all
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.forensicLabels" . | indent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      aegis.bank/role: forensic-snapshot
+  policyTypes:
+  - Ingress
+  - Egress
+  # no ingress / egress entries -> deny-all

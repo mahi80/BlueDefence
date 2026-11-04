@@ -10,13 +10,21 @@ target:
 
 # Forensic snapshot destination (immutable WORM bucket / S3 Object Lock).
 forensics:
-  pvcSize: 50Gi
+  pvcSize: 50Gi        # per snapshot: each Job gets its own ephemeral claim
   storageClass: worm-immutable
   retentionDays: 2555  # ~7 years for regulatory retention
   # The snapshot Job's own identity (no API token) and image. The admission
   # policy only lets the controller create Jobs that use exactly these.
   serviceAccount: aegis-forensic-snapshot
   image: registry.bank.internal/aegis/forensic-tools:0.1.0
+  # The snapshot tool's entrypoint, pinned by the admission policy: a Job the
+  # controller creates must run exactly this command (and these args), so the
+  # forensic image cannot be repurposed to run a shell with hostPID + SYS_ADMIN.
+  command: ["/usr/local/bin/aegis-forensic-snapshot"]
+  args: []
+  # The WORM storage class MUST have reclaimPolicy: Retain — each snapshot gets its
+  # own ephemeral claim, deleted with the Job's pod; Retain keeps the volume.
+
   # ValidatingAdmissionPolicy (Kubernetes >= 1.30) that constrains the Jobs the
   # controller may create. Leave on; turn off only on clusters < 1.30 and replace
   # it with an equivalent Kyverno/Gatekeeper rule.

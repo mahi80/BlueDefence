@@ -32,6 +32,33 @@ spec:
       terminationGracePeriodSeconds: 60    # let the cycle finish and the audit file flush
       securityContext:
         fsGroup: {{ .Values.securityContext.runAsUser }}
+{{- if .Values.license.existingSecret }}
+      # seed the licence onto the PVC (only when absent there or the Secret changed; never over a renewal)
+      initContainers:
+      - name: license-seed
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["python", "-m", "aegis.license", "seed", "--from", "/license-seed/license.jwt",
+                  "--to", "{{ .Values.state.mountPath }}/license/license.jwt"]
+        env:
+        - name: AEGIS_INSTALL_ID
+{{- if .Values.installation.id }}
+          value: {{ .Values.installation.id | quote }}
+{{- else }}
+          valueFrom:
+            secretKeyRef:
+              name: {{ required "installation.id or installation.idSecret.name is required" .Values.installation.idSecret.name }}
+              key: {{ .Values.installation.idSecret.key }}
+{{- end }}
+        securityContext:
+{{ toYaml .Values.securityContext | indent 10 }}
+        volumeMounts:
+        - name: state
+          mountPath: {{ .Values.state.mountPath }}
+        - name: license-seed
+          mountPath: /license-seed
+          readOnly: true
+{{- end }}
       containers:
       - name: agent
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -75,6 +102,33 @@ spec:
           value: {{ .Values.token_budget.max_output | quote }}
         - name: AEGIS_TOKEN_BUDGET_COST_CENTS
           value: {{ .Values.token_budget.max_cost_cents | quote }}
+        # licence on the PVC: the service rewrites it on renewal, and the root filesystem is read-only (R8-13)
+        - name: AEGIS_LICENSE
+          value: "{{ .Values.state.mountPath }}/license/license.jwt"
+        - name: AEGIS_LICENSE_ENFORCE
+          value: {{ .Values.license.enforce | quote }}
+{{- if .Values.license.server }}
+        - name: AEGIS_LICENSE_SERVER
+          value: {{ .Values.license.server | quote }}
+{{- end }}
+        # pinned: the licence is bound to it, and a rescheduled pod must keep it
+        - name: AEGIS_INSTALL_ID
+{{- if .Values.installation.id }}
+          value: {{ .Values.installation.id | quote }}
+{{- else if .Values.installation.idSecret.name }}
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.installation.idSecret.name }}
+              key: {{ .Values.installation.idSecret.key }}
+{{- else }}
+          value: {{ required "installation.id or installation.idSecret.name is required: the licence is bound to a pinned AEGIS_INSTALL_ID" .Values.installation.id | quote }}
+{{- end }}
+        # audit retention key — mandatory: the pod does not start without it (R8-3/R8-4)
+        - name: AEGIS_AUDIT_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.audit.keySecret.name }}
+              key: {{ .Values.audit.keySecret.key }}
         # Credentials (AEGIS_INGEST_TOKEN, AEGIS_METRICS_TOKEN, AEGIS_DECISION_KEY, vendor keys) come
         # from Secrets Manager via external-secrets — never plain values in this chart.
         envFrom:
@@ -102,6 +156,14 @@ spec:
       volumes:
       - name: tmp
         emptyDir: {}
+{{- if .Values.license.existingSecret }}
+      - name: license-seed
+        secret:
+          secretName: {{ .Values.license.existingSecret }}
+          items:
+          - key: license.jwt
+            path: license.jwt
+{{- end }}
   # One PVC per pod (= one, ever): audit chain, checkpoint, HITL queue, ACP_HOME, caches.
   # Ship the chain off-box with the audit-storage module (S3 Object Lock) — the PVC is the
   # working copy, not the archive.

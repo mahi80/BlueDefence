@@ -229,17 +229,89 @@ class ConsoleAPI:
     def chain(self, chain_id: str) -> Optional[dict]:
         if not _ID_RX.match(chain_id):
             return None
-        if self.index is not None and not self.index.stale:
+        healthy_index = self.index is not None and not self.index.stale
+        if healthy_index:
             c = self.index.get(chain_id)
             if c is not None:
-                return _full(c)
+                return {**_full(c), "verified": True}         # the index only holds rows whose hash chained (R-7)
         c = self._by_id(chain_id)
         if c is None:
             for row in self._chains():
                 if str(row.get("alert_id")) == chain_id:
                     c = row
                     break
-        return _full(c) if c is not None else None
+        if c is None:
+            return None
+        # the file scan sees every line, including one appended by hand with a made-up hash (review round 8 R8-5):
+        # check the row's link to its predecessor before showing it. With a healthy index a row the index refused is
+        # never served; without one (or while it is stale) it is served marked unverified.
+        ok, why = self._verify_row(c)
+        if healthy_index and not ok:
+            logger.warning("[console] chain %s is in the audit file but not in the index and does not verify (%s) — not served",
+                           chain_id[:24], why)
+            return None
+        out = _full(c)
+        out["verified"] = ok
+        if not ok:
+            out["integrity"] = f"unverified: {why}"
+        return out
+
+    def _verify_row(self, c: dict) -> tuple[bool, str]:
+        """Does ``c`` chain from the row before it in the live audit file (or the segment seed for the first row)?"""
+        claimed = str(c.get("integrity_hash") or "")
+        if not claimed or self.audit_path is None:
+            return False, "no integrity hash"
+        import hashlib
+        try:
+            ino = self.audit_path.stat().st_ino
+        except OSError:
+            return False, "audit file unreadable"
+        memo = getattr(self, "_verified", None)
+        if memo is None or memo.get("ino") != ino:
+            memo = self._verified = {"ino": ino}
+        if claimed in memo:
+            return memo[claimed]
+        body = {k: v for k, v in c.items() if k != "integrity_hash"}
+        serialized = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        res: tuple[bool, str] = (False, "row not found in the scanned window of the audit file")
+        try:
+            size = self.audit_path.stat().st_size
+            start = max(0, size - MAX_SCAN_BYTES)
+            prev: str | None = None
+            if start == 0:
+                from aegis.agents.shared.audit import AuditLog
+                prev = AuditLog(self.audit_path, repair=False)._live_segment_seed()
+            with self.audit_path.open("rb") as fh:
+                fh.seek(start)
+                if start:
+                    fh.readline()
+                for line in fh:
+                    if not line.endswith(b"\n") or not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, RecursionError):
+                        prev = None                     # an unparseable line: what follows cannot be linked
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    h = str(row.get("integrity_hash") or "")
+                    if h == claimed:
+                        if prev is None:
+                            res = (False, "the row before it is outside the scanned window")
+                        elif hashlib.sha256((prev + serialized).encode("utf-8")).hexdigest() == claimed:
+                            res = (True, "")
+                        else:
+                            res = (False, "integrity hash does not follow from the previous row")
+                        break
+                    prev = h or None
+        except OSError as e:
+            res = (False, f"audit file unreadable: {e.strerror or e}")
+        if len(memo) > 10_000:
+            memo.clear()
+            memo["ino"] = ino
+        memo[claimed] = res
+        return res
 
     # ---------- approvals ----------
     def _decisions(self) -> dict[str, dict]:
