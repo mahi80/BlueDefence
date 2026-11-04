@@ -24,14 +24,16 @@ so there is no flag. Nothing here connects to a scanner.
 | Scanner | Export | Port | Exploit signals |
 |---|---|---|---|
 | Tenable.io / .sc | vulns export (JSON / JSONL) | per finding | `exploit_available`, KEV flag |
-| Qualys VMDR | scan / vulnerability report CSV (preamble skipped; "Information Gathered" rows dropped) | per finding | `Exploitability` column |
-| Rapid7 InsightVM | "Vulnerability details" CSV / SQL export (`NV` / `SD` / `SV` result codes dropped) | per finding | `Exploit Count` |
+| Qualys VMDR | scan / vulnerability report CSV (preamble skipped; "Information Gathered" rows dropped; "Practice" = potential vulnerability, kept) | per finding | `Exploitability` column |
+| Rapid7 InsightVM | "Vulnerability details" CSV / SQL export (only `VE` / `VV` / `VP` result codes kept) | per finding | `Exploit Count` |
 | Wiz | `vulnerabilityFindings` GraphQL nodes (JSON) or the findings CSV | package (any exposed port) | `hasExploit`, `hasCisaKevExploit`, EPSS |
-| Defender Vulnerability Management | `SoftwareVulnerabilitiesByMachine` API response or CSV | package | `exploitabilityLevel` |
+| Defender Vulnerability Management | `SoftwareVulnerabilitiesByMachine` API response or CSV (rows with status Fixed / Remediated skipped) | package | `exploitabilityLevel` → public exploit; "in the wild" is left to the KEV feed |
 | Prisma Cloud Compute | `/api/v1/hosts` · `/api/v1/images` scan results | package | `exploit`, risk factor "Exploit exists – in the wild" |
 | Trivy | `trivy image -f json` | package | — |
 
-Fixed and resolved findings are skipped. Assets are matched on the instance id, then the host name, then the IP, so
+Fixed and resolved findings are skipped. A saved page of a paged API response (Defender `@odata.nextLink`, Wiz
+`pageInfo.hasNextPage`) is refused, and so is an empty export from one of these scanners beside other exports
+(`allow_empty: true` to accept): either would mark the missing findings resolved. Exports with a UTF-8 BOM load. Assets are matched on the instance id, then the host name, then the IP, so
 findings from several scanners about the same host land on one asset. Samples are in `samples/scanners/`.
 
 ## The four questions

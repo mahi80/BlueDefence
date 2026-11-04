@@ -68,7 +68,7 @@ def _parse_ports(s: str | None, default: PortRanges) -> PortRanges:
 # ---- vulnerabilities ------------------------------------------------------------------------------
 
 def _read_records(path: Path) -> list[dict]:
-    text = path.read_text(encoding="utf-8").strip()
+    text = path.read_text(encoding="utf-8-sig").strip()
     if not text:
         return []
     if text[0] == "[":
@@ -129,31 +129,40 @@ def _from_trivy(doc: dict) -> list[Vuln]:
     return out
 
 
+#: native scanner formats (scanners.py): an export of one of these with no findings is refused by the scan
+NATIVE_FORMATS = frozenset({"qualys", "rapid7", "wiz", "defender-vm", "prisma"})
+
+
 def load_vulns(path: str | Path) -> list[Vuln]:
+    return load_vulns_with_format(path)[1]
+
+
+def load_vulns_with_format(path: str | Path) -> tuple[str, list[Vuln]]:
+    """(format, vulns): format is a scanners.py name, ``trivy``, ``tenable`` / ``json`` or ``csv``."""
     p = Path(path)
     try:
         if p.suffix.lower() == ".csv":
-            with p.open(newline="", encoding="utf-8") as fh:
+            with p.open(newline="", encoding="utf-8-sig") as fh:
                 header = next(csv.reader([fh.readline()]), [])
                 fh.seek(0)
                 if "asset" not in [h.strip() for h in header]:
                     from .scanners import from_csv
                     native = from_csv(p.read_text(encoding="utf-8-sig"))
                     if native is not None:
-                        return native[1]
+                        return native
                     # a Qualys / custom export with other column names used to read as "zero findings" — and
                     # an empty scan resolves every open exposure. Refuse it; the runner carries findings forward.
                     raise PostureSourceError(f"{path}: CSV has no 'asset' column (columns: {', '.join(header[:8]) or 'none'}) "
                                              "— map it to asset,cve,title,port,cvss,epss,kev,poc, or export it in a "
                                              "recognised scanner format (Qualys, Rapid7, Wiz, Defender VM)")
-                return [Vuln(asset=row["asset"].strip(), cve=(row.get("cve") or "").strip() or None,
+                return "csv", [Vuln(asset=row["asset"].strip(), cve=(row.get("cve") or "").strip() or None,
                              title=(row.get("title") or row.get("cve") or "?").strip(), port=_port(row.get("port")),
                              cvss=_f(row.get("cvss")), epss=_f(row.get("epss")), kev=_b(row.get("kev")),
                              poc=_b(row.get("poc")), source="csv")
                         for row in csv.DictReader(fh) if (row.get("asset") or "").strip()]
-        text = p.read_text(encoding="utf-8").lstrip()
+        text = p.read_text(encoding="utf-8-sig").lstrip()
         if text.startswith("{") and '"Results"' in text[:20000] and '"ArtifactName"' in text[:20000]:
-            return _from_trivy(json.loads(text))
+            return "trivy", _from_trivy(json.loads(text))
         if text[:1] in "[{":
             from .scanners import from_json
             try:
@@ -161,16 +170,21 @@ def load_vulns(path: str | Path) -> list[Vuln]:
             except json.JSONDecodeError:
                 native = None                              # JSONL: the record loop below reads it
             if native is not None:
-                return native[1]
+                return native
         out: list[Vuln] = []
         for r in _read_records(p):
             out += _from_tenable(r) if "plugin" in r else [Vuln(
                 asset=r["asset"], cve=r.get("cve"), title=r.get("title", r.get("cve") or "?"), port=_port(r.get("port")),
                 cvss=_f(r.get("cvss")), epss=_f(r.get("epss")), kev=bool(r.get("kev")), poc=bool(r.get("poc")), source="json")]
-        return out
+        return "tenable" if out and out[0].source.startswith("tenable") else "json", out
     except FileNotFoundError as e:
         raise PostureSourceError(f"vulnerability export not found: {path}") from e
-    except (KeyError, ValueError, json.JSONDecodeError) as e:
+    except PostureSourceError as e:
+        if str(path) in str(e):
+            raise
+        raise PostureSourceError(f"{path}: {e}") from e
+    except (KeyError, ValueError, json.JSONDecodeError, AttributeError, TypeError) as e:
+        # a malformed shape (a string where an object belongs) is a parse error, not a crash
         raise PostureSourceError(f"cannot parse vulnerability export {path}: {e}") from e
 
 

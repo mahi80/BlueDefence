@@ -831,19 +831,26 @@ before any model call.
   OCSF event is run against those rules (`aegis/detect/sigma.py`). This covers `/ingest/ocsf`, Kafka `ocsf` topics and
   OCSF connectors. A hit is attached to the alert (`sigma`: rule id, title, level, ATT&CK techniques) and raises its
   severity to the rule's level. It decides nothing by itself; the swarm still investigates.
-  * **Supported:** maps, lists, keywords, `null`; the modifiers `contains`, `startswith`, `endswith`, `all`, `re`,
-    `cidr`, `exists`, `windash` and `lt` / `gt`; and conditions with `and` / `or` / `not`, `1 of` / `all of`.
-  * **Skipped and counted, never half-run:** aggregations, `near`, and the `base64*` / `utf16*` / `fieldref`
-    modifiers.
-  * **Field mapping:** the logsource picks the OCSF class, and Sigma fields map to OCSF attributes
-    (`CommandLine` → `process.cmd_line` …).
+  * **Supported:** maps, lists, keywords (including key-less `'|all'` blocks), `null` and empty values; the modifiers
+    `contains`, `startswith`, `endswith`, `all`, `re`, `cidr`, `exists`, `windash` (mixed `-` `/` and Unicode
+    dashes at flag positions), `cased` and `lt` / `gt`; and conditions with `and` / `or` / `not`, `1 of` / `all of`.
+  * **Skipped and counted, never half-run:** aggregations, `near`, the `base64*` / `utf16*` / `fieldref` modifiers, and
+    any modifier the engine does not know (a time modifier, a typo).
+  * **Field mapping:** the logsource picks the OCSF class (and, for process / file categories, the `activity_id`: a
+    `process_creation` rule does not fire on a Terminate event). Sigma fields map to OCSF attributes
+    (`CommandLine` → `process.cmd_line` …); outside Process Activity the process that acted is `actor.process`, so
+    `Image` / `CommandLine` there resolve to it. `Hashes` reads OCSF hash objects as `SHA256=…`, and
+    `c-uri-extension` is the URL path's extension.
+  * **Linear matching.** Wildcard values are matched by literal pieces (`str.find`), never by a backtracking regex, so
+    an attacker-written command line cannot stall ingest. Values are matched whole up to 32 KB. A rule's own `|re`
+    stays a regular expression (trusted like the bank's SIEM trusts it), applied to the first 32 KB.
   * **Logsources covered:** Windows channels → Event Log Activity (1008); PowerShell script and module logging →
     Script Activity (1009); Linux auditd; AV detections → Detection Finding (2004); Kubernetes, Bitbucket and GitHub
     audit → API Activity (6003); plus the process, file, network, DNS, web, cloud and identity categories.
   * **Against SigmaHQ (Nov 2026):** 3,109 rules load. 52 are skipped: 25 below the level floor, 15 with a logsource
-    that has no OCSF class, and 12 that use an unsupported modifier. On one core, a process event takes about 8 ms
-    against the 1,724 process rules; an event-log or script event takes about 1 ms. Each field is looked up once per
-    event, and values without wildcards use plain string tests instead of regexes.
+    that has no OCSF class, and 12 that use an unsupported modifier. On one core, a process event takes about 10 ms
+    against the 1,724 process rules; an event-log or script event takes about 1–1.5 ms; a 32 KB adversarial command
+    line about 0.4 s across every process rule.
   * `AEGIS_SIGMA_MIN_LEVEL` (default `low`) sets the lowest rule level loaded.
   * `python -m aegis.detect --rules <dir> events.ndjson` shows what loads and what fires.
 * **Kafka at scale:** `AEGIS_SOURCES=kafka` joins a consumer group (`aegis/ingest/kafka.py`, extra `aegis[kafka]`).

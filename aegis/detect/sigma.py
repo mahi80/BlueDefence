@@ -39,7 +39,7 @@ from typing import Any
 
 logger = logging.getLogger("aegis.detect.sigma")
 
-MAX_VALUE = 8192
+MAX_VALUE = 32768                   # Windows command lines reach 32 K; matching is linear, so the cap can be generous
 _LEVELS = {"informational": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 #: logsource (category / service / product) → OCSF class_uids a rule applies to
@@ -62,6 +62,13 @@ _SERVICE_CLASSES: dict[str, tuple[int, ...]] = {
     "auditd": (1007, 1001, 1008), "syslog": (1008,), "http": (4002,), "dce_rpc": (4001,), "kerberos": (3002,),
     "audit": (6003,), "aaa": (3002, 6003), "event": (4001, 1008), "windefend": (2004, 1008),
     "powershell": (1009, 1008), "powershell-classic": (1009, 1008),
+}
+#: categories whose OCSF class carries an activity_id that tells them apart (Process Activity: 1 Launch, 2 Terminate,
+#: 3 Open, 4 Inject; File System Activity: 1 Create, 2 Read, 3 Update, 4 Delete, 5 Rename). An event without an
+#: activity_id is not gated.
+_CATEGORY_ACTIVITIES: dict[str, tuple[int, ...]] = {
+    "process_creation": (1,), "process_termination": (2,), "process_access": (3,), "create_remote_thread": (4,),
+    "file_event": (1, 3), "file_access": (2,), "file_delete": (4,), "file_rename": (5,),
 }
 #: products whose every other service is an event log (Windows channels, a Linux host's journal)
 _PRODUCT_DEFAULT: dict[str, tuple[int, ...]] = {"windows": (1008,), "linux": (1007, 1008), "macos": (1007, 1008)}
@@ -147,10 +154,28 @@ FIELD_MAP: dict[str, tuple[str, ...]] = {
     # Kubernetes / Bitbucket / GitHub audit
     "verb": ("api.operation", "unmapped.verb"),
     "objectref.resource": ("resources.type", "unmapped.objectRef.resource"),
-    "auditType.action": ("api.operation",),
+    "audittype.action": ("api.operation",),
+}
+FIELD_MAP = {k.lower(): v for k, v in FIELD_MAP.items()}          # lookups lowercase the Sigma field name
+#: in every OCSF class except Process Activity the process that did it is the actor (actor.process); Process
+#: Activity describes the process itself in `process`
+_ACTOR_FIELDS: dict[str, tuple[str, ...]] = {
+    "image": ("actor.process.file.path", "process.file.path", "actor.process.name", "process.name"),
+    "parentimage": ("actor.process.parent_process.file.path", "process.parent_process.file.path",
+                    "actor.process.parent_process.name"),
+    "commandline": ("actor.process.cmd_line", "process.cmd_line"),
+    "parentcommandline": ("actor.process.parent_process.cmd_line", "process.parent_process.cmd_line"),
+    "processid": ("actor.process.pid", "process.pid"),
+    "originalfilename": ("actor.process.file.original_name", "process.file.original_name", "actor.process.file.name"),
+    "user": ("actor.user.name", "actor.process.user.name", "user.name", "process.user.name"),
+    "hashes": ("actor.process.file.hashes", "process.file.hashes"),
 }
 
 _UNSUPPORTED_MODS = ("base64", "base64offset", "utf16", "utf16le", "utf16be", "wide", "fieldref", "expand")
+#: modifiers this engine implements; anything else (a time modifier, a typo) makes the rule Unsupported rather
+#: than being silently ignored
+_KNOWN_MODS = frozenset({"contains", "startswith", "endswith", "all", "re", "i", "m", "s", "cidr", "exists", "windash",
+                         "lt", "lte", "gt", "gte", "cased"})
 
 
 class Unsupported(ValueError):
@@ -159,22 +184,126 @@ class Unsupported(ValueError):
 
 # ------------------------------------------------------------------------------------------------ matching --
 
-def _glob_rx(value: str, *, contains: bool = False, start: bool = False, end: bool = False) -> re.Pattern:
-    out, i = [], 0
+def _glob_pieces(value: str) -> list[list[str | None]]:
+    """A Sigma value → literal pieces split on unescaped ``*``; ``None`` inside a piece is a ``?`` (any one char).
+    ``\\*``, ``\\?`` and ``\\\\`` are literal; any other backslash is itself (a Windows path)."""
+    pieces: list[list[str | None]] = [[]]
+    i = 0
     while i < len(value):
         c = value[i]
         if c == "\\" and i + 1 < len(value) and value[i + 1] in "*?\\":
-            out.append(re.escape(value[i + 1]))
+            pieces[-1].append(value[i + 1])
             i += 2
             continue
-        out.append(".*" if c == "*" else "." if c == "?" else re.escape(c))
+        if c == "*":
+            pieces.append([])
+        else:
+            pieces[-1].append(None if c == "?" else c)
         i += 1
-    body = "".join(out)
-    if contains or end:
-        body = ".*" + body
-    if contains or start:
-        body = body + ".*"
-    return re.compile(f"(?s){body}\\Z", re.IGNORECASE)
+    return pieces
+
+
+class _Glob:
+    """A Sigma wildcard value matched without regex backtracking: anchored first / last pieces, the middle ones
+    found left to right (leftmost is always safe for ``*``-only globs). Linear in the text for ``?``-free pieces;
+    O(text × piece) with ``?`` — never exponential, never polynomial blow-up from attacker-written input."""
+
+    __slots__ = ("cased", "fast", "first", "last", "mids", "shape", "star")
+
+    def __init__(self, value: str, *, contains: bool = False, start: bool = False, end: bool = False,
+                 cased: bool = False):
+        pieces = _glob_pieces(value)
+        if contains or end:
+            pieces = [[], *pieces]
+        if contains or start:
+            pieces = [*pieces, []]
+        self.cased = cased
+        norm = [self._norm(p) for p in pieces]
+        self.star = len(norm) > 1
+        self.first, self.last = norm[0], norm[-1]
+        self.mids = norm[1:-1] if self.star else []
+        self.fast = self._specialise()
+
+    def _specialise(self) -> Callable[[str], bool] | None:
+        """The common ``?``-free shapes on native str methods (most SigmaHQ values)."""
+        parts = [self.first, *self.mids, self.last]
+        if any(None in p for p in parts):
+            return None
+        first, last = "".join(self.first), "".join(self.last)              # type: ignore[arg-type]
+        mids = ["".join(m) for m in self.mids]                               # type: ignore[arg-type]
+        self.shape: tuple[str, str] | None = None
+        if not self.star:
+            self.shape = ("eq", first)
+            return first.__eq__
+        if not mids:
+            if not first and not last:
+                return lambda t: True
+            if not first:
+                self.shape = ("end", last)
+                return lambda t, s=last: t.endswith(s)
+            if not last:
+                self.shape = ("start", first)
+                return lambda t, s=first: t.startswith(s)
+        if not first and not last and len(mids) == 1:
+            self.shape = ("in", mids[0])
+            return lambda t, s=mids[0]: s in t
+        return None
+
+    def _norm(self, piece: list[str | None]) -> tuple[str | None, ...]:
+        return tuple(c if c is None or self.cased else c.lower() for c in piece)
+
+    @staticmethod
+    def _at(text: str, i: int, piece: tuple[str | None, ...]) -> bool:
+        if i < 0 or i + len(piece) > len(text):
+            return False
+        return all(p is None or text[i + k] == p for k, p in enumerate(piece))
+
+    @staticmethod
+    def _find(text: str, piece: tuple[str | None, ...], lo: int, hi: int) -> int:
+        n = len(piece)
+        if None not in piece:
+            return text.find("".join(piece), lo, hi)                      # type: ignore[arg-type]
+        for i in range(lo, hi - n + 1):
+            if _Glob._at(text, i, piece):
+                return i
+        return -1
+
+    def __call__(self, x: Any) -> bool:
+        text = x if isinstance(x, str) else str(x)
+        if not self.cased:
+            text = _lower(text)
+        if self.fast is not None:
+            return self.fast(text)
+        if not self.star:
+            return len(text) == len(self.first) and self._at(text, 0, self.first)
+        lo, hi = len(self.first), len(text) - len(self.last)
+        if hi < lo or not self._at(text, 0, self.first) or not self._at(text, hi, self.last):
+            return False
+        for piece in self.mids:
+            j = self._find(text, piece, lo, hi)
+            if j < 0:
+                return False
+            lo = j + len(piece)
+        return True
+
+
+def _lower(text: str) -> str:
+    """``text.lower()``, computed once per string per event while SigmaEngine.match runs."""
+    cache = getattr(_LOCAL, "lowers", None)
+    if cache is None:
+        return text.lower()
+    low = cache.get(text)
+    if low is None:
+        low = cache[text] = text.lower()
+    return low
+
+
+#: dash-like characters at a flag position (start, or after whitespace / quote, before a word char)
+_WINDASH_RX = re.compile(r"(?:(?<=^)|(?<=[\s\"']))[-/\u2013\u2014\u2015](?=\w)")
+
+
+def _windash(text: str) -> str:
+    return _WINDASH_RX.sub("-", text)
 
 
 def _num(v: Any) -> float | None:
@@ -190,7 +319,7 @@ class _Field:
     mods: tuple[str, ...]
     tests: list[Callable[[Any], bool]]
     need_all: bool
-    null: bool = False
+    null: bool = False                  # null alone, or as one alternative in a list: missing / empty matches
     exists: bool | None = None
 
 
@@ -198,7 +327,8 @@ def _value_test(v: Any, mods: tuple[str, ...]) -> list[Callable[[Any], bool]]:
     if "re" in mods:
         flags = re.IGNORECASE if "i" in mods else 0
         rx = re.compile(str(v), flags | (re.MULTILINE if "m" in mods else 0) | (re.DOTALL if "s" in mods else 0))
-        return [lambda x, rx=rx: rx.search(str(x)) is not None]
+        # a rule author's own regex (trusted like the bank's SIEM trusts it); input bounded by MAX_VALUE
+        return [lambda x, rx=rx: rx.search(str(x)[:MAX_VALUE]) is not None]
     if "cidr" in mods:
         net = ipaddress.ip_network(str(v), strict=False)
 
@@ -215,50 +345,63 @@ def _value_test(v: Any, mods: tuple[str, ...]) -> list[Callable[[Any], bool]]:
                 raise Unsupported(f"non-numeric {op} value {v!r}")
             cmp = {"lt": float.__lt__, "lte": float.__le__, "gt": float.__gt__, "gte": float.__ge__}[op]
             return [lambda x, ref=ref, cmp=cmp: (n := _num(x)) is not None and cmp(n, ref)]
+    string_mods = {"contains", "startswith", "endswith", "windash", "cased"} & set(mods)
     if isinstance(v, bool):
         return [lambda x, v=v: str(x).lower() == str(v).lower()]
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float)) and not string_mods:
         return [lambda x, v=v: _num(x) == float(v) or str(x) == str(v)]
-    s = str(v)
-    variants = [s]
-    if "windash" in mods:
-        variants = list({s, s.replace("-", "/"), s.replace("/", "-"), s.replace("-", "–")})
-    contains, start, end = "contains" in mods, "startswith" in mods, "endswith" in mods
-    if not any("*" in x or "?" in x or "\\\\" in x for x in variants):      # a lone backslash (Windows path) is literal
-        # no wildcard and no escape: plain case-insensitive string tests (most SigmaHQ values) — far cheaper than a regex
-        lows = tuple(x.lower() for x in variants)
-        if contains:
-            return [lambda x, lows=lows: any(v in _low(x) for v in lows)]
-        if start:
-            return [lambda x, lows=lows: _low(x).startswith(lows)]
-        if end:
-            return [lambda x, lows=lows: _low(x).endswith(lows)]
-        return [lambda x, lows=lows: _low(x) in lows]
-    rxs = [_glob_rx(x, contains=contains, start=start, end=end) for x in variants]
-    return [lambda x, rxs=rxs: any(r.match(str(x)) for r in rxs)]
-
-
-def _low(x: Any) -> str:
-    return str(x).lower()
+    s = str(v)                                   # an int under a string modifier (`Port|startswith: 44`) is a string
+    cased, windash = "cased" in mods, "windash" in mods
+    if windash:
+        s = _windash(s)
+    g = _Glob(s, contains="contains" in mods, start="startswith" in mods, end="endswith" in mods, cased=cased)
+    if windash:
+        return [lambda x, g=g: g(_windash(str(x)))]
+    return [g]
 
 
 def _compile_field(key: str, value: Any) -> _Field:
     name, *mods = key.split("|")
     mods_t = tuple(m.lower() for m in mods)
-    bad = [m for m in mods_t if m in _UNSUPPORTED_MODS or m.startswith("base64")]
+    bad = [m for m in mods_t if m in _UNSUPPORTED_MODS or m.startswith("base64") or m not in _KNOWN_MODS]
     if bad:
         raise Unsupported(f"modifier {bad[0]}")
     if "exists" in mods_t:
         return _Field(name, mods_t, [], False, exists=bool(value))
     vals = value if isinstance(value, list) else [value]
-    if vals == [None]:
-        return _Field(name, mods_t, [], False, null=True)
     tests: list[Callable[[Any], bool]] = []
     for v in vals:
         if v is None:
             continue
         tests += _value_test(v, mods_t)
-    return _Field(name, mods_t, tests, "all" in mods_t)
+    if "all" not in mods_t:
+        tests = _merge(tests)
+    return _Field(name, mods_t, tests, "all" in mods_t, null=None in vals)
+
+
+def _merge(tests: list[Callable[[Any], bool]]) -> list[Callable[[Any], bool]]:
+    """Any-of: fold the plain (``?``-free, same-case) values of one field into one native check per shape —
+    ``endswith(tuple)``, ``startswith(tuple)``, set membership, one ``in`` loop — instead of one call per value."""
+    groups: dict[tuple[str, bool], list[str]] = {}
+    rest: list[Callable[[Any], bool]] = []
+    for t in tests:
+        shape = getattr(t, "shape", None)
+        if isinstance(t, _Glob) and shape is not None:
+            groups.setdefault((shape[0], t.cased), []).append(shape[1])
+        else:
+            rest.append(t)
+    out: list[Callable[[Any], bool]] = []
+    for (kind, cased), vals in groups.items():
+        low = (lambda x: x if isinstance(x, str) else str(x)) if cased else (lambda x: _lower(x if isinstance(x, str) else str(x)))
+        if kind == "end":
+            out.append(lambda x, v=tuple(vals), low=low: low(x).endswith(v))
+        elif kind == "start":
+            out.append(lambda x, v=tuple(vals), low=low: low(x).startswith(v))
+        elif kind == "eq":
+            out.append(lambda x, v=frozenset(vals), low=low: low(x) in v)
+        else:
+            out.append(lambda x, v=tuple(vals), low=low: any(s in low(x) for s in v))
+    return out + rest
 
 
 def _walk(obj: Any, parts: list[str]) -> list[Any]:
@@ -292,29 +435,64 @@ def field_values(ev: dict, sigma_field: str) -> list[Any]:
     return _field_values(ev, sigma_field)
 
 
+def _paths(ev: dict, field_lower: str) -> tuple[str, ...]:
+    if field_lower in _ACTOR_FIELDS and ev.get("class_uid") not in (1007, "1007"):
+        return _ACTOR_FIELDS[field_lower]
+    return FIELD_MAP.get(field_lower, ())
+
+
+_HASH_NAMES = {1: "MD5", 2: "SHA1", 3: "SHA256", 4: "SHA512", 5: "CTPH", 6: "TLSH", 7: "QUICKXORHASH"}
+
+
+def _sysmon_hashes(hashes: Any) -> str:
+    """OCSF ``hashes`` objects → the Sysmon ``Hashes`` string rules match (``SHA256=…,IMPHASH=…``)."""
+    parts = []
+    for h in hashes if isinstance(hashes, list) else []:
+        if not isinstance(h, dict) or not h.get("value"):
+            continue
+        alg = str(h.get("algorithm") or _HASH_NAMES.get(h.get("algorithm_id"), "")).upper().replace("-", "")
+        if alg:
+            parts.append(f"{alg}={h['value']}")
+    return ",".join(parts)
+
+
+def _present(vals: list[Any]) -> list[Any]:
+    return [v for v in vals if v is not None]
+
+
 def _field_values(ev: dict, sigma_field: str) -> list[Any]:
-    paths = FIELD_MAP.get(sigma_field.lower(), ())
-    for p in paths:
-        vals = [v for v in _walk(ev, p.split(".")) if v is not None and v != ""]
+    """Values of a Sigma field in an OCSF event: [] when the field is absent; "" when it is present but empty."""
+    low = sigma_field.lower()
+    if low == "c-uri-extension":
+        out = []
+        for path in _present(_walk(ev, ["http_request", "url", "path"]) or _walk(ev, ["http_request", "url", "url_string"])):
+            last = str(path).split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+            out.append(last.rsplit(".", 1)[1] if "." in last else "")
+        if out:
+            return out
+    for p in _paths(ev, low):
+        vals = _present(_walk(ev, p.split(".")))
         if vals:
+            if low == "hashes" and any(isinstance(v, dict) for v in vals):
+                return [_sysmon_hashes(vals)]
             return vals
     for root in ("unmapped", None):
         base = ev.get(root) if root else ev
         if isinstance(base, dict):
-            vals = [v for v in _walk(base, sigma_field.split(".")) if v is not None and v != ""]
+            vals = _present(_walk(base, sigma_field.split(".")))
             if vals:
                 return vals
     return []
 
 
 def _str_values(obj: Any, out: list[str], depth: int = 0) -> None:
-    if depth > 6 or len(out) > 400:
+    if depth > 8 or len(out) > 2000:
         return
     if isinstance(obj, dict):
         for v in obj.values():
             _str_values(v, out, depth + 1)
     elif isinstance(obj, list):
-        for v in obj[:100]:
+        for v in obj[:500]:
             _str_values(v, out, depth + 1)
     elif isinstance(obj, (str, int, float)) and not isinstance(obj, bool):
         out.append(str(obj)[:MAX_VALUE])
@@ -324,9 +502,9 @@ def _field_match(f: _Field, ev: dict) -> bool:
     vals = field_values(ev, f.name)
     if f.exists is not None:
         return bool(vals) == f.exists
-    if f.null:
-        return not vals
-    if not vals:
+    if f.null and (not vals or all(v == "" for v in vals)):
+        return True                     # null: absent or empty (alone, or as one alternative of a list)
+    if not vals or not f.tests:
         return False
     if any(isinstance(v, str) and len(v) > MAX_VALUE for v in vals):
         vals = [v[:MAX_VALUE] if isinstance(v, str) else v for v in vals]
@@ -335,22 +513,35 @@ def _field_match(f: _Field, ev: dict) -> bool:
     return any(t(v) for t in f.tests for v in vals)
 
 
+def _keywords(words: list[Any], *, need_all: bool = False) -> Callable[[dict], bool]:
+    globs = [_Glob(str(w), contains=True) for w in words]
+
+    def keywords(ev: dict) -> bool:
+        strs: list[str] = []
+        _str_values(ev, strs)
+        found = (any(g(x) for x in strs) for g in globs)
+        return all(found) if need_all else any(found)
+    return keywords
+
+
 def _compile_item(item: Any) -> Callable[[dict], bool]:
     """One named detection block → predicate."""
     if isinstance(item, dict):
-        fields = [_compile_field(k, v) for k, v in item.items()]
-        return lambda ev, fields=fields: all(_field_match(f, ev) for f in fields)
+        preds: list[Callable[[dict], bool]] = []
+        fields = []
+        for k, v in item.items():
+            name, *mods = str(k).split("|")
+            if name == "":                  # `'|all': [...]` — keywords, every one of which must appear
+                preds.append(_keywords(v if isinstance(v, list) else [v], need_all="all" in [m.lower() for m in mods]))
+            else:
+                fields.append(_compile_field(k, v))
+        return lambda ev, fields=fields, preds=preds: (all(_field_match(f, ev) for f in fields)
+                                                       and all(p(ev) for p in preds))
     if isinstance(item, list):
         if all(isinstance(x, dict) for x in item):
             preds = [_compile_item(x) for x in item]
             return lambda ev, preds=preds: any(p(ev) for p in preds)
-        rxs = [_glob_rx(str(x), contains=True) for x in item]
-
-        def keywords(ev: dict, rxs=rxs) -> bool:
-            strs: list[str] = []
-            _str_values(ev, strs)
-            return any(r.match(s) for r in rxs for s in strs)
-        return keywords
+        return _keywords(item)
     if isinstance(item, str):
         return _compile_item([item])
     raise Unsupported(f"detection block of type {type(item).__name__}")
@@ -454,6 +645,7 @@ class CompiledRule:
     classes: tuple[int, ...] | None          # None = any class (a keyword rule with a broad logsource)
     match: Callable[[dict], bool]
     path: str = ""
+    activities: tuple[int, ...] | None = None   # OCSF activity_ids this rule applies to (None = any)
 
     @property
     def techniques(self) -> list[str]:
@@ -493,7 +685,8 @@ def compile_rule(doc: dict, path: str = "") -> CompiledRule:
     match = _compile_condition(str(cond), blocks)
     return CompiledRule(id=str(doc.get("id") or path), title=str(doc.get("title") or path),
                         level=str(doc.get("level") or "medium").lower(), tags=[str(t) for t in doc.get("tags") or []],
-                        classes=_classes(doc.get("logsource") or {}), match=match, path=path)
+                        classes=_classes(doc.get("logsource") or {}), match=match, path=path,
+                        activities=_CATEGORY_ACTIVITIES.get(str((doc.get("logsource") or {}).get("category") or "").lower()))
 
 
 @dataclass
@@ -547,9 +740,16 @@ class SigmaEngine:
         except (TypeError, ValueError):
             return []
         out = []
+        try:
+            act: int | None = int(ev.get("activity_id"))
+        except (TypeError, ValueError):
+            act = None                     # no activity_id: rules are not gated on it
         _LOCAL.cache = (ev, {})            # each field is looked up once per event, not once per rule
+        _LOCAL.lowers = {}                 # and each value lowercased once
         try:
             for r in self._by_class.get(cls, ()):
+                if act is not None and r.activities is not None and act not in r.activities:
+                    continue
                 try:
                     if r.match(ev):
                         out.append(r)
@@ -557,27 +757,36 @@ class SigmaEngine:
                     logger.debug("[sigma] rule %s failed on an event: %s", r.id, e)
         finally:
             _LOCAL.cache = None
+            _LOCAL.lowers = None
         return out
 
 
 _ENGINE: SigmaEngine | None = None
 _ENGINE_LOCK = threading.Lock()
-_ENGINE_FROM = ""
+_ENGINE_KEY: tuple[str, str] = ("", "")
+_WARNED: set[str] = set()
 
 
 def engine_from_env() -> SigmaEngine | None:
     """``AEGIS_SIGMA_RULES`` (a SigmaHQ checkout or a rules directory; unset = off), ``AEGIS_SIGMA_MIN_LEVEL``
-    (``low``). Loaded once per process."""
-    global _ENGINE, _ENGINE_FROM
+    (``low``). Loaded once per (path, level); the per-event path takes no lock."""
+    global _ENGINE, _ENGINE_KEY
     root = os.environ.get("AEGIS_SIGMA_RULES", "").strip()
     if not root:
         return None
+    key = (root, os.environ.get("AEGIS_SIGMA_MIN_LEVEL", "low").strip().lower() or "low")
+    eng, cur = _ENGINE, _ENGINE_KEY
+    if eng is not None and cur == key:
+        return eng
     with _ENGINE_LOCK:
-        if _ENGINE is None or _ENGINE_FROM != root:
-            eng = SigmaEngine.from_dir(root, min_level=os.environ.get("AEGIS_SIGMA_MIN_LEVEL", "low").strip().lower())
+        if _ENGINE is None or _ENGINE_KEY != key:
+            if not Path(root).is_dir() and root not in _WARNED:
+                _WARNED.add(root)
+                logger.error("[sigma] AEGIS_SIGMA_RULES=%s is not a directory — no Sigma rule will run", root)
+            eng = SigmaEngine.from_dir(root, min_level=key[1])
             logger.info("[sigma] %d rule(s) loaded from %s; skipped %s", len(eng.rules), root,
                         ", ".join(f"{k}: {v}" for k, v in sorted(eng.skipped.items())) or "none")
-            _ENGINE, _ENGINE_FROM = eng, root
+            _ENGINE, _ENGINE_KEY = eng, key
         return _ENGINE
 
 
