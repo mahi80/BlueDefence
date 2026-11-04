@@ -26,6 +26,8 @@ from typing import Any, Callable, Optional
 
 from .base import BaseHITL, PendingApproval
 
+_REOPEN_STATE = os.environ.get("AEGIS_SNOW_REOPEN_STATE", "2")      # incident: 2 = In Progress
+
 logger = logging.getLogger("aegis.hitl.servicenow")
 
 Transport = Callable[[str, str, Optional[dict], dict, float], tuple[int, dict]]
@@ -131,6 +133,12 @@ class ServiceNowHITL(BaseHITL):
                 who = ""
         if decision in ("approved", "rejected"):
             return decision, who, str(rec.get("close_notes") or "")[:500]
+        if getattr(p, "first_approver", ""):
+            # awaiting the second approver: only an explicit u_aegis_decision counts. The first approval may have
+            # been given by resolving the ticket with an approve close code; that state stayed, and anyone who then
+            # typed their own name into u_aegis_decided_by became the second approver without deciding anything
+            # (review round 7 A-6).
+            return None
         state = str(_display(rec.get("state")) or "").strip().lower()
         if state in _DECISION_STATES:
             code = str(_display(rec.get("close_code")) or "").strip().lower()
@@ -140,13 +148,16 @@ class ServiceNowHITL(BaseHITL):
             return "rejected", who, (str(rec.get("close_notes") or "") or f"closed with code '{code or 'none'}'")[:500]
         return None
 
+    # the awaiting-second PATCH also re-opens the ticket (incident "In Progress") and clears the close code, so a
+    # resolved-with-approve first approval does not read as a decision any more (review round 7 A-6)
     def _record_awaiting_second(self, p: PendingApproval, first: str) -> None:
         """Clear the decision fields so the second approval is a decision someone actually makes — the first one's
         `approved` stayed on the ticket and every later write to it looked like a new approval (Y5-2)."""
         note = (f"[AEGIS] First approval recorded from {first}. This action needs a second, different approver: set "
                 "u_aegis_decision to 'approved' (or 'rejected') and u_aegis_decided_by to your own user id.")
         status, _data = self._transport("PATCH", self._api(f"/{p.external_id}"),
-                                         {"u_aegis_decision": "", "u_aegis_decided_by": "", "work_notes": note},
+                                         {"u_aegis_decision": "", "u_aegis_decided_by": "", "state": _REOPEN_STATE,
+                                          "close_code": "", "work_notes": note},
                                          self._headers(), self.timeout)
         if status not in (200, 204):
             logger.warning("[hitl:servicenow] could not reset the decision on %s after the first approval (HTTP %s); "

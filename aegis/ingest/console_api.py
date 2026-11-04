@@ -332,6 +332,10 @@ class ConsoleAPI:
             return 503, {"error": "no HITL directory on this host"}
         if not _ID_RX.match(approval_id):
             return 400, {"error": "bad approval id"}
+        if not decided_by.strip():
+            # no signed-in identity: an anonymous decision cannot be anyone's approval, least of all a second
+            # person's (review round 7 A-8 — it used to be recorded as "console")
+            return 400, {"error": "no decider identity (X-AEGIS-User)"}
         if status not in ("approved", "rejected"):
             return 400, {"error": "status must be approved or rejected"}
         cards = {a["id"]: a for a in self.approvals()["approvals"]}
@@ -340,7 +344,7 @@ class ConsoleAPI:
         cur = cards[approval_id]
         if cur["status"] == "awaiting_second":
             from ..hitl.signing import same_person
-            if same_person(decided_by[:120] or "console", cur.get("decided_by") or ""):
+            if same_person(decided_by[:120], cur.get("decided_by") or ""):
                 return 409, {"error": "a second, different approver is required"}
         elif cur["status"] == "approved" and status == "rejected" and approval_id in self._open_ids:
             pass        # approved but not run yet (rate cap, vendor error): a rejection still lands (R4-7)
@@ -348,7 +352,7 @@ class ConsoleAPI:
             return 409, {"error": f"already {cur['status']}"}
         # bind to the card's full `type -> target`, never the 256-char display cut (R4-2)
         action = self._full_action.get(approval_id) or f"{cur.get('action_type')} -> {cur.get('target')}"
-        row = {"approval_id": approval_id, "status": status, "decided_by": decided_by[:120] or "console",
+        row = {"approval_id": approval_id, "status": status, "decided_by": decided_by[:120],
                "reason": reason[:500], "ts": time.time(), "via": "console", "action": action}
         if corrected_verdict in _VERDICTS:
             row["corrected_verdict"] = corrected_verdict
@@ -408,6 +412,8 @@ class ConsoleAPI:
     def decide_proposal(self, proposal_id: str, decision: str, *, decided_by: str, rationale: str = "") -> tuple[int, dict]:
         if self.hitl_dir is None:
             return 503, {"error": "no HITL directory on this host"}
+        if not decided_by.strip():
+            return 400, {"error": "no decider identity (X-AEGIS-User)"}
         if not _ID_RX.match(proposal_id) or decision not in ("accept", "reject"):
             return 400, {"error": "bad proposal id or decision"}
         # an unknown id used to get 200 and a decision row; accept-then-reject got 200 twice (review C5)
@@ -416,7 +422,7 @@ class ConsoleAPI:
             return 404, {"error": "unknown proposal"}
         if not (cur["status"].startswith("pending") or cur["status"] == "proposed"):
             return 409, {"error": f"already {cur['status']}", "status": cur["status"]}
-        row = {"proposal_id": proposal_id, "decision": decision, "decided_by": decided_by[:120] or "console",
+        row = {"proposal_id": proposal_id, "decision": decision, "decided_by": decided_by[:120],
                "rationale": rationale[:500], "ts": time.time(), "via": "console"}
         from ..hitl.signing import sign
         row = sign(row)

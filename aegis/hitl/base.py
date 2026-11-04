@@ -460,7 +460,7 @@ class BaseHITL:
             if res:
                 status, decided_by, reason = res
                 if status == "approved":
-                    if not decided_by and (p.first_approver or bool(
+                    if _anonymous(decided_by) and (p.first_approver or bool(
                             getattr(response_agent, "two_person_required", lambda a: False)(p.action))):
                         # an approval nobody can be named for cannot be one of two people (R4-6)
                         key = (approval_id, "unattributed")
@@ -629,6 +629,14 @@ class BaseHITL:
         logger.info("[hitl:%s] %s %s on alert %s by %s%s", self.name, status, d.action_type, d.alert_id, decided_by or "-",
                     f" ({reason})" if reason else "")
         return d
+
+
+#: names a transport used to stand in for "nobody we can name" — never one of two people (review round 7 A-8)
+_PLACEHOLDER_DECIDERS = frozenset({"", "console", "file", "dashboard", "servicenow", "slack", "-", "unknown"})
+
+
+def _anonymous(decided_by: Any) -> bool:
+    return str(decided_by or "").strip().lower() in _PLACEHOLDER_DECIDERS
 
 
 __all__ = ["BaseHITL", "Decision", "PendingApproval", "action_text", "card_args"]

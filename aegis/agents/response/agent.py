@@ -97,13 +97,31 @@ def _target_matches(target: str, patterns: list[str]) -> bool:
     overlap (``198.51.100.7/32`` or a wider block inside a protected /24 — only a bare IP used to match);
     ``host:`` / ``device:`` prefixes and case are ignored for name globs; an opaque EDR device id cannot be
     tied to a hostname here, so it counts as protected whenever any protection is configured."""
-    import fnmatch
-
-    from .grounding import unwrap
     if not patterns:
         return False
     from ..shared.netguard import strip_prefixes
     t = strip_prefixes(target)                 # every kind prefix, until stable (src:/dst:/ip:… too — round 6 C-6)
+    if _matches_one(t, patterns):
+        return True
+    # `<host-or-device-id>:<pid>` (kill_process): the host part is what is protected (review round 7 A-1)
+    m = __import__("re").fullmatch(r"(.+?):(\d+)", t)
+    if m and not _is_network(t):
+        return _matches_one(strip_prefixes(m.group(1)), patterns)
+    return False
+
+
+def _is_network(t: str) -> bool:
+    try:
+        ipaddress.ip_network(t.strip("[]"), strict=False)
+        return True
+    except ValueError:
+        return False
+
+
+def _matches_one(t: str, patterns: list[str]) -> bool:
+    import fnmatch
+
+    from .grounding import unwrap
     low = t.lower()
     if _DEVICE_ID.match(low):
         return True
@@ -289,7 +307,28 @@ class ResponseAgent:
             return []
         kwargs.setdefault("timeout_policy", self._hitl_timeout)
         kwargs.setdefault("max_age_sec", _hitl_max_age_s())
-        return self._hitl.sync(self, **kwargs)
+        decisions = self._hitl.sync(self, **kwargs)
+        for d in decisions:
+            if getattr(d, "status", "") == "rejected" and getattr(d, "action_type", "") == "hold":
+                self._release_breaker_hold(str(d.target), str(getattr(d, "decided_by", "") or "a person"))
+        return decisions
+
+    def _file_keep_or_release(self, action: RecommendedAction, chain: EvidenceChain, done: ExecutedAction) -> None:
+        """The outflow breaker held payments with no human in the loop; a person still gets the card — approve
+        to KEEP the hold (it then lasts until released), reject to RELEASE it. The breaker's docstring promised
+        this and nothing filed it, so an unattended hold just lapsed at its TTL (review round 7 A-7)."""
+        card = RecommendedAction(
+            action_type=action.action_type, target=action.target, requires_hitl=True, confidence=action.confidence,
+            reasoning=(f"The outflow circuit breaker is holding {action.target} for {self._breaker.ttl_sec}s "
+                       f"(no human in the loop): {action.reasoning} — approve to KEEP the hold until released, "
+                       "reject to RELEASE it now."))
+        self._file_hitl(card, chain, done, timeout_ok=False)
+
+    def _release_breaker_hold(self, target: str, who: str) -> None:
+        for r in list(self._connectors.active_receipts):
+            if r.action_type == "hold" and str(r.target) == target and str(r.approver).startswith("aegis:breaker"):
+                rb = self._connectors.rollback(r, reason=f"released by {who} (breaker hold rejected)")
+                print(f"[HITL] outflow-breaker hold on {target} released by {who}: {rb.status}", file=self._hitl_stream)
 
     # ---- decision logic ------------------------------------------------
 
@@ -341,6 +380,8 @@ class ResponseAgent:
                     self._breaker.take()
                     done = self._checked(action, self._from_receipt(action, receipt, prefix="outflow-breaker"))
                     done.note = f"{done.note} ({why})"
+                    if done.status == "executed":
+                        self._file_keep_or_release(action, chain, done)
                     return done
         # Always-HITL list takes precedence
         if action.action_type in _ALWAYS_HITL_ACTIONS:
@@ -427,6 +468,14 @@ class ResponseAgent:
             note=f"[{prefix}:{receipt.connector}:{receipt.status}] {receipt.error or receipt.detail}; human needed",
         )
 
+    def _simulated(self, action: RecommendedAction, approved_by: str, alert_id: str | None,
+                   what: str) -> ExecutedAction:
+        receipt = self._connectors.preview(action, alert_id=alert_id or "", approver=approved_by,
+                                           note="shadow: self-heal pipeline simulation")
+        return ExecutedAction(action=action, status="executed", receipt=receipt,
+                              note=f"[shadow] {what} simulated by the self-healing pipeline — no vendor was called, "
+                                   f"nothing is enforced (approved by {approved_by})")
+
     def _is_protected(self, target: str) -> bool:
         return bool(self._protected_targets) and _target_matches(target, self._protected_targets)
 
@@ -483,22 +532,26 @@ class ResponseAgent:
                          f"approver (first: {approver})",
                 )
         self._high_impact_times.append(time.monotonic())
-        # Route to the right back-end
-        if action.action_type == "trigger_self_heal" and self._self_healing:
+        # Route to the right back-end. The self-healing pipeline is a walking-skeleton SIMULATION (no service
+        # mesh / orchestrator is called): it only ever runs in shadow mode, and its result carries a dry-run
+        # receipt so nothing downstream counts it as containment. In live mode an isolate / self-heal that no
+        # vendor connector handles goes to the registry and parks for a person, like any other unsupported
+        # action — it used to be reported "executed: Host isolated" with no vendor called (review round 7 A-2).
+        from .connectors.base import MODE_SHADOW, enforcement_mode
+        simulate = self._self_healing is not None and enforcement_mode() == MODE_SHADOW
+        approved_by = approver if not second_approver else f"{approver}+{second_approver}"
+        if action.action_type == "trigger_self_heal" and simulate:
             self._self_healing.handle_compromise(action.target, source_alert=source_alert_id)
-            return ExecutedAction(action=action, status="executed",
-                                  note=f"Self-heal triggered (approved by {approver})")
+            return self._simulated(action, approved_by, source_alert_id, "self-heal triggered")
         # isolate goes to the EDR when one is configured; the self-healing pipeline (workload snapshot +
         # sever) only takes it when no connector can. Before, an approved isolate always went to the
         # pipeline and was reported "Host isolated" while the EDR was never called.
-        if action.action_type == "isolate" and self._self_healing and self._connectors.route_action(action) is self._connectors.fallback:
+        if action.action_type == "isolate" and simulate and self._connectors.route_action(action) is self._connectors.fallback:
             # Treat isolate as a precursor to heal: snapshot+sever, hold respawn for human
             self._self_healing.snapshot_and_sever(action.target, source_alert=source_alert_id)
-            return ExecutedAction(action=action, status="executed",
-                                  note=f"Host isolated (approved by {approver})")
+            return self._simulated(action, approved_by, source_alert_id, "host isolation")
         # Everything else: the connector registry (vendor APIs in 1.2/1.3;
         # the logging fallback until then). The receipt carries the approver.
-        approved_by = approver if not second_approver else f"{approver}+{second_approver}"
         receipt = self._connectors.apply(action, alert_id=source_alert_id or "", approver=approved_by,
                                          ttl_sec=approved_ttl_sec(action.action_type, approver))
         executed = self._checked(action, self._from_receipt(action, receipt, prefix="approved"))
