@@ -564,3 +564,17 @@ button.pt-row[data-sev="critical"][data-overdue] { background: color-mix(in srgb
   .ex-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ex-answers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* round 7 U-2: approvals awaiting a decision, independent of the loaded incident window */
+.left-col { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.pending-queue { padding: 10px 12px; border-bottom: 1px solid var(--line); max-height: 40vh; overflow-y: auto; }
+.pending-queue h2 { font-size: 12px; margin: 0 0 6px; text-transform: none; }
+.pending-queue h2 .n { color: var(--v-malicious); margin-left: 4px; }
+.pending-queue ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.pq-item { width: 100%; text-align: left; background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; color: inherit; cursor: pointer; font: inherit; font-size: 12px; }
+.pq-item:hover, .pq-item:focus-visible { border-color: var(--swarm); }
+.pq-act { font-weight: 600; }
+.pq-meta { display: block; color: var(--ink-faint); font-size: 11px; }
+.pq-more { color: var(--ink-faint); font-size: 11px; margin-top: 6px; }
+.left-col { background: var(--bg-2); border-right: 1px solid var(--line); }
+.left-col > .rail { flex: 1 1 auto; border-right: none; }

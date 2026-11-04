@@ -7,6 +7,13 @@ import { getSession, canDecide } from "@/lib/auth";
 // Always render against the latest SOC state (or fixtures when no backend is set).
 export const dynamic = "force-dynamic";
 
+/** Read errors plus incidents whose details could not be read (round 7 U-4): never a silent green "live". */
+function backendErrors(errors: string[], chains: Chain[]): string | null {
+  const partial = chains.filter((c) => c.partial).length;
+  const all = partial ? [...errors, `${partial} incident detail${partial > 1 ? "s" : ""} unavailable`] : errors;
+  return all.length ? all.join(" · ") : null;
+}
+
 export default async function Page() {
   const session = await getSession();
   if (!session) redirect("/login");
@@ -20,7 +27,7 @@ export default async function Page() {
       approvals={approvals}
       proposals={proposals}
       fixtureMode={isFixtureMode}
-      backendError={errors.length ? errors.join(" · ") : null}
+      backendError={backendErrors(errors, chains)}
       session={{ user: session.user, role: session.role }}
       canDecide={canDecide(session.role)}
     />

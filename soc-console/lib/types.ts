@@ -83,6 +83,7 @@ export interface Chain extends ChainSummary {
   recommended_actions: RecommendedAction[];
   evidence?: EvidenceItem[]; // the signals behind the verdict — what Agent Q cites
   integrity_hash: string;
+  partial?: boolean; // the detail read failed: only the summary (or the pending cards) is known — round 7 U-4
 }
 
 // HITL card from GET /api/approvals (args carry the AEGIS context).

@@ -8,6 +8,7 @@ import { VERDICT_RANK } from "../lib/graph";
 import BlastGraph from "./BlastGraph";
 import IncidentList from "./IncidentList";
 import HitlPanel from "./HitlPanel";
+import PendingQueue from "./PendingQueue";
 import ModelLoopStrip from "./ModelLoopStrip";
 import AskAgentQ from "./AskAgentQ";
 
@@ -171,11 +172,20 @@ export default function Console({
       </header>
 
       <div className="cols">
+        <div className="left-col">
+        <PendingQueue
+          approvals={approvals}
+          onOpen={(alertId, focus) => {
+            const hit = sorted.find((c) => c.alert_id === alertId);
+            if (hit) { setSelId(hit.chain_id); setFocusKey(focus); }
+          }}
+        />
         <IncidentList
           chains={sorted}
           selectedId={selected?.chain_id}
           onSelect={(id) => { setSelId(id); setFocusKey(null); }}
         />
+        </div>
 
         <section className="decide" aria-label="Incident decision">
           {selected ? (
