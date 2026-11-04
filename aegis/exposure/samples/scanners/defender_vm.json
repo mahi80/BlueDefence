@@ -1,0 +1,9 @@
+{"@odata.context": "https://api.securitycenter.microsoft.com/api/$metadata#Collection(SoftwareVulnerabilitiesByMachine)",
+ "value": [
+  {"id": "a1_cbs_oracle", "deviceId": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1", "deviceName": "CBS-DB01.dc.bank",
+   "osPlatform": "Linux", "softwareVendor": "oracle", "softwareName": "database_server", "softwareVersion": "19.3",
+   "cveId": "CVE-2012-1675", "cvssScore": 7.5, "exploitabilityLevel": "ExploitIsPublic", "vulnerabilitySeverityLevel": "High"},
+  {"id": "b2_swift_openssl", "deviceId": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2", "deviceName": "swift-gw01.dc.bank",
+   "osPlatform": "Linux", "softwareVendor": "openssl", "softwareName": "openssl", "softwareVersion": "1.1.1k",
+   "cveId": "CVE-2022-0778", "cvssScore": 7.5, "exploitabilityLevel": "NoExploit", "vulnerabilitySeverityLevel": "High"}
+ ]}

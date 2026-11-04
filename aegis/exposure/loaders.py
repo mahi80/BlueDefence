@@ -1,8 +1,9 @@
 """Inputs for the exposure engine — all offline files the bank already has or can export.
 
 * **Vulnerabilities** — a Tenable.io / Tenable.sc vulns export (JSON array or JSONL, one record per
-  plugin × asset × port), or a simple CSV (``asset,cve,title,port,cvss,epss,kev,poc``) for any other
-  scanner (Qualys, Rapid7, Nessus CSV exports reshaped in a spreadsheet).
+  plugin × asset × port), a Trivy image report, the native exports of Qualys, Rapid7, Wiz, Defender
+  Vulnerability Management and Prisma Cloud (``scanners.py``, recognised by shape), or a simple CSV
+  (``asset,cve,title,port,cvss,epss,kev,poc``) for anything else.
 * **Threat intel** — the CISA KEV catalogue JSON and the FIRST EPSS CSV; both are free daily downloads
   and can be mirrored into an air-gapped SOC.
 * **Assets and reachability** — the AWS posture bundle (``python -m aegis.posture export-aws``): instances,
@@ -136,10 +137,15 @@ def load_vulns(path: str | Path) -> list[Vuln]:
                 header = next(csv.reader([fh.readline()]), [])
                 fh.seek(0)
                 if "asset" not in [h.strip() for h in header]:
+                    from .scanners import from_csv
+                    native = from_csv(p.read_text(encoding="utf-8-sig"))
+                    if native is not None:
+                        return native[1]
                     # a Qualys / custom export with other column names used to read as "zero findings" — and
                     # an empty scan resolves every open exposure. Refuse it; the runner carries findings forward.
                     raise PostureSourceError(f"{path}: CSV has no 'asset' column (columns: {', '.join(header[:8]) or 'none'}) "
-                                             "— map it to asset,cve,title,port,cvss,epss,kev,poc")
+                                             "— map it to asset,cve,title,port,cvss,epss,kev,poc, or export it in a "
+                                             "recognised scanner format (Qualys, Rapid7, Wiz, Defender VM)")
                 return [Vuln(asset=row["asset"].strip(), cve=(row.get("cve") or "").strip() or None,
                              title=(row.get("title") or row.get("cve") or "?").strip(), port=_port(row.get("port")),
                              cvss=_f(row.get("cvss")), epss=_f(row.get("epss")), kev=_b(row.get("kev")),
@@ -148,6 +154,14 @@ def load_vulns(path: str | Path) -> list[Vuln]:
         text = p.read_text(encoding="utf-8").lstrip()
         if text.startswith("{") and '"Results"' in text[:20000] and '"ArtifactName"' in text[:20000]:
             return _from_trivy(json.loads(text))
+        if text[:1] in "[{":
+            from .scanners import from_json
+            try:
+                native = from_json(json.loads(text))
+            except json.JSONDecodeError:
+                native = None                              # JSONL: the record loop below reads it
+            if native is not None:
+                return native[1]
         out: list[Vuln] = []
         for r in _read_records(p):
             out += _from_tenable(r) if "plugin" in r else [Vuln(

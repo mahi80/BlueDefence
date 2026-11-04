@@ -1,0 +1,8 @@
+"Scan Results","BlueDefence sample"
+"Bank of Example","Report generated 2026-11-01"
+
+"IP","DNS","NetBIOS","OS","IP Status","QID","Title","Type","Severity","Port","Protocol","FQDN","SSL","CVE ID","Vendor Reference","Bugtraq ID","CVSS Base","CVSS3.1 Base","Threat","Impact","Solution","Exploitability","Results"
+"10.50.1.10","cbs-db01.dc.bank","CBS-DB01","Oracle Linux 8","host scanned, found vuln","19824","Oracle Database TNS Listener Poison Attack","Vuln","5","1521","tcp","","","CVE-2012-1675","","","7.5","7.5","","","Apply patch","Metasploit: exploit/...","TNS"
+"172.20.1.20","ftp.bank.example","DMZ-FTP","Linux","host scanned, found vuln","38599","vsftpd 2.3.4 backdoor","Vuln","5","21","tcp","","","CVE-2011-2523","","","10.0","9.8","","","Upgrade","Exploit-DB 49757","banner"
+"172.20.1.20","ftp.bank.example","DMZ-FTP","Linux","host scanned, found vuln","45038","Host Scan Time","Ig","1","0","","","","","","","","","","","","",""
+"10.50.2.10","swift-gw01.dc.bank","SWIFT-GW01","RHEL 8","host scanned, found vuln","38861","OpenSSL infinite loop in BN_mod_sqrt","Vuln","3","443","tcp","","","CVE-2022-0778, CVE-2022-0778","","","5.0","7.5","","","Upgrade OpenSSL","",""

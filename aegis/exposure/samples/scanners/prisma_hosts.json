@@ -1,0 +1,10 @@
+[
+ {"_id": "ops-bastion", "hostname": "ops-bastion", "cloudMetadata": {"provider": "aws", "resourceID": "i-0bastion"},
+  "vulnerabilities": [
+   {"cve": "CVE-2024-6387", "cvss": 8.1, "severity": "high", "packageName": "openssh-server", "packageVersion": "9.6p1",
+    "status": "fixed in 9.8p1", "exploit": "", "riskFactors": {"Remote execution": {}, "Exploit exists - POC": {}}}]},
+ {"_id": "sha256:abc", "repoTag": {"registry": "registry.bank.local", "repo": "payments/api", "tag": "2.4.1"},
+  "vulnerabilities": [
+   {"cve": "CVE-2022-22965", "cvss": 9.8, "severity": "critical", "packageName": "spring-beans", "packageVersion": "5.3.17",
+    "status": "fixed in 5.3.18", "exploit": "exploit-db", "riskFactors": {"Exploit exists - in the wild": {}}}]}
+]
