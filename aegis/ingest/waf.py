@@ -34,7 +34,13 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-from .base import AlertCheckpoint, BaseConsumer, normalize_severity, severity_to_score
+from .base import (
+    AlertCheckpoint,
+    BaseConsumer,
+    loads_bounded,
+    normalize_severity,
+    severity_to_score,
+)
 
 _log = logging.getLogger("aegis.ingest.waf")
 
@@ -308,8 +314,8 @@ class WafConsumer(BaseConsumer):
         line = line.strip()
         if line.startswith("{"):
             try:
-                obj = json.loads(line)
-            except (json.JSONDecodeError, RecursionError):
+                obj = loads_bounded(line)
+            except (ValueError, RecursionError):
                 return None                      # counted as invalid by the caller; not worth a log line per record
             return self._from_json(obj)
         cef = parse_cef(line)
@@ -333,8 +339,12 @@ class WafConsumer(BaseConsumer):
         alert["signature_id"] = cef.get("signature_id", "")
         alert["severity"] = normalize_severity(alert.get("severity") or cef.get("severity"))
         if "id" not in alert:
-            alert["id"] = self._make_id(alert, ext.get("deviceExternalId") or ext.get("support_id")
-                                        or ext.get("fileid") or ext.get("rt") or ext.get("start"))
+            # rt / start are timestamps, not event ids: as the vendor id, every event in the same second (or ms)
+            # shared one id and all but the first were dropped as duplicates (round 8 G8-4). With no real event id
+            # the id is a hash of the whole event (header + every extension field: src, dst, rule, request, time),
+            # so a replay of the same event still dedupes and two different events never collide.
+            vid = ext.get("deviceExternalId") or ext.get("support_id") or ext.get("fileid")
+            alert["id"] = self._make_id(alert, vid) if vid else self._content_id(cef)
         alert["raw"] = {"cef": {k: v for k, v in cef.items() if k != "ext"}, **ext}
         return self._finish(alert)
 
@@ -381,6 +391,13 @@ class WafConsumer(BaseConsumer):
             if tgt and v not in (None, ""):
                 alert.setdefault(tgt, v)
         return alert
+
+    @staticmethod
+    def _content_id(cef: dict) -> str:
+        import hashlib
+        head = [cef.get(k, "") for k in ("vendor", "product", "version", "signature_id", "name", "severity")]
+        body = json.dumps([head, sorted((str(k), str(v)) for k, v in (cef.get("ext") or {}).items())], separators=(",", ":"))
+        return "WAF-cef-" + hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:20]
 
     @staticmethod
     def _make_id(alert: dict, vendor_id: Any, *, per_rule: bool = False) -> str:

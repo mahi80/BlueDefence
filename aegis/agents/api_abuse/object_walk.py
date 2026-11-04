@@ -140,6 +140,23 @@ class _Principal:
     emitted_ips: dict[str, set] = field(default_factory=dict)                     # template → client IPs already reported
 
 
+_REPLAY_KEEP = 4096        # emitting events remembered for re-delivery
+
+
+def _event_key(key: str, ev: dict) -> str:
+    """Identity of one gateway event: its request id when the gateway logs one, else what the request was (and its
+    vendor time — an arrival time stamped at normalisation differs on every re-delivery)."""
+    rid = ev.get("request_id")
+    parts = [key, str(ev.get("method") or ""), str(ev.get("path") or "")]
+    if rid:
+        parts.append(f"rid={rid}")
+    else:
+        parts += [str(ev.get("status") or ""), str(ev.get("client_ip") or "")]
+        if not ev.get("ts_synthetic"):
+            parts.append(repr(float(ev.get("ts") or 0.0)))
+    return hashlib.sha256("|".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
 class ObjectWalkDetector:
     def __init__(self, ownership: Optional[OwnershipSource] = None, *, window_s: Optional[int] = None,
                  cross_min: Optional[int] = None, attempt_min: Optional[int] = None, distinct_min: Optional[int] = None,
@@ -155,6 +172,7 @@ class ObjectWalkDetector:
         self.exempt = exempt if exempt is not None else exempt_principals()
         self._p: "OrderedDict[str, _Principal]" = OrderedDict()
         self._lock = threading.Lock()
+        self._by_event: OrderedDict[str, dict] = OrderedDict()   # event that emitted → its alert (replay)
         self.seen = self.emitted = self.exempted = 0
 
     # ------------------------------------------------------------------ api --
@@ -172,6 +190,16 @@ class ObjectWalkDetector:
         if not objs:
             return None
         ts = float(ev.get("ts") or 0.0)
+        # a re-delivered event (ingest is at-least-once: a crash or a stopped caller between take and handle) gets
+        # back the alert it produced the first time. The re-emit suppression used to return None for it, the record
+        # was CONSUMED and the object-walk alert was never handled (round 8 G8-7 / G-6). The ingest checkpoint
+        # drops it as a duplicate if it was handled after all. The replayed event is not counted twice either.
+        ek = _event_key(key, ev)
+        with self._lock:
+            prior = self._by_event.get(ek)
+            if prior is not None:
+                self._by_event.move_to_end(ek)
+                return dict(prior)
         owned, foreign = self._ownership(principal, objs)
         e = _Ev(ts=ts, template=template, objects=tuple(objs), status=int(ev.get("status") or 0),
                 ip=str(ev.get("client_ip") or ""), owned=owned, foreign=tuple(foreign))
@@ -224,7 +252,12 @@ class ObjectWalkDetector:
             st.emitted[template] = (ts, level, seq)
             st.emitted_ips[template] = ips
         self.emitted += 1
-        return self._alert(ev, principal, key, template, level, stats, seq, same)
+        alert = self._alert(ev, principal, key, template, level, stats, seq, same)
+        with self._lock:
+            self._by_event[ek] = dict(alert)
+            while len(self._by_event) > _REPLAY_KEEP:
+                self._by_event.popitem(last=False)
+        return alert
 
     # ------------------------------------------------------------- internals --
     def _ownership(self, principal: str, objs: list[tuple[str, str]]) -> tuple[Optional[bool], list[tuple[str, str]]]:

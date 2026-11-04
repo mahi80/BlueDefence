@@ -149,6 +149,7 @@ def normalize(record: dict, *, principal_field: str = "") -> Optional[dict]:
     if out.get("ts") is None:
         import time as _time
         out["ts"] = _time.time()                   # no vendor timestamp: order by arrival
+        out["ts_synthetic"] = True                 # not part of the event's identity (a re-delivery gets a new one)
     try:
         out["status"] = int(out.get("status") or 0)
     except (TypeError, ValueError):

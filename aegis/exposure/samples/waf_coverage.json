@@ -5,7 +5,7 @@
    "fronts": [{"host": "10.0.1.10", "port": 443}, {"host": "13.0.0.10", "port": 443}],
    "virtual_patches": ["CVE-2023-44487"]},
   {"name": "reports.bank.example", "vendor": "imperva", "mode": "monitor",
-   "fronts": [{"host": "13.0.0.30", "port": null}],
+   "fronts": [{"host": "13.0.0.30", "port": null}], "ports": [8080],
    "virtual_patches": ["CVE-2021-44228"]},
   {"name": "edge shim ib-edge-01", "vendor": "bluedefence-edge", "mode": "block",
    "fronts": [{"host": "172.20.1.10", "port": 443}]}

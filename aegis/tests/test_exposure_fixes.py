@@ -93,10 +93,12 @@ def test_reused_private_ip_does_not_attach_a_finding_to_the_wrong_host():
     vuln = Vuln(asset="i-cbs", asset_alt=["10.0.1.5"], cve="CVE-2012-1675", title="t", port=1521, kev=True)
     (e,) = _tiers(b, [vuln]).values()
     assert e.asset == "i-cbs" and e.tier != "ACT_NOW"
-    # an IP alone that names two machines matches neither (reported as not in the asset model)
+    # an IP alone that names two machines identifies neither: round 8 G8-6 scores it on every candidate (fail-closed)
+    # and marks each one unverifiable, instead of dropping it (which let remediation call an approved fix verified)
     ex, notes = assess([Vuln(asset="10.0.1.5", cve="CVE-2012-1675", title="t", port=1521, kev=True)],
                        loaders.assets_from_aws(b))
-    assert ex == [] and "not in the asset model" in notes[0]
+    assert sorted(e.asset for e in ex) == ["i-cbs", "i-dmz"] and all("ambiguous asset" in e.unverifiable for e in ex)
+    assert "names several assets" in notes[0]
 
 
 def test_tenable_record_prefers_the_instance_id_over_the_ip():

@@ -35,7 +35,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from .base import CONSUMED, AlertCheckpoint, BaseConsumer
+from .base import CONSUMED, AlertCheckpoint, BaseConsumer, loads_bounded
 
 logger = logging.getLogger("aegis.ingest.stream")
 
@@ -480,7 +480,7 @@ class StreamConsumer(BaseConsumer):
         if _is_netops(item):
             return self._netops(item)
         if item.passthrough:
-            obj = json.loads(item.line)
+            obj = loads_bounded(item.line)
             if not isinstance(obj, dict) or not obj.get("id"):
                 return None
             alert = dict(obj)
@@ -500,7 +500,7 @@ class StreamConsumer(BaseConsumer):
     def _ocsf(self, item: StreamItem) -> Any:
         """OCSF events (one per line, or a JSON array per line) → AEGIS alerts; non-OCSF records are dropped."""
         from .ocsf import to_alert
-        obj = json.loads(item.line)
+        obj = loads_bounded(item.line)
         events = obj if isinstance(obj, list) else [obj]
         out = []
         hint = item.source[5:] if item.source.startswith("ocsf-") else ""
@@ -536,8 +536,8 @@ class StreamConsumer(BaseConsumer):
         """API-gateway events feed the stateful object-walk detector; most produce no alert."""
         from .apigw import normalize as apigw_normalize, shared_detector
         try:
-            obj = json.loads(item.line)
-        except json.JSONDecodeError:
+            obj = loads_bounded(item.line)
+        except ValueError:
             return None
         ev = apigw_normalize(obj)
         if ev is None:
@@ -557,8 +557,8 @@ class StreamConsumer(BaseConsumer):
         """Host telemetry (Sysmon events, osquery result logs) pushed to ``/ingest/edr``."""
         from aegis.agents.edr.normalize import to_alert
         try:
-            obj = json.loads(item.line)
-        except json.JSONDecodeError:
+            obj = loads_bounded(item.line)
+        except ValueError:
             return None
         alert = to_alert(obj)
         if alert is None:
@@ -571,8 +571,8 @@ class StreamConsumer(BaseConsumer):
         """Network sensor events feed the egress detector; most produce no alert."""
         from .ndr import normalize as ndr_normalize, shared_detector
         try:
-            obj = json.loads(item.line)
-        except json.JSONDecodeError:
+            obj = loads_bounded(item.line)
+        except ValueError:
             return None
         ev = ndr_normalize(obj)
         if ev is None:
@@ -598,8 +598,8 @@ class StreamConsumer(BaseConsumer):
         record: Any = line
         if line[:1] in "{[":
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
+                record = loads_bounded(line)
+            except ValueError:
                 return None
         ev = netops_normalize(record)
         if ev is None:
@@ -638,7 +638,7 @@ def _top_keys(item: StreamItem) -> set[str] | None:
     line = item.line.lstrip()
     if line.startswith("{"):
         try:
-            obj = json.loads(line)
+            obj = loads_bounded(line)
             keys = set(obj) if isinstance(obj, dict) else None
             if keys is not None:
                 keys |= {f"{k}={v}" for k, v in obj.items() if k == "event_type" and isinstance(v, str)}
@@ -691,6 +691,9 @@ def _is_apigw(item: StreamItem) -> bool:
 MAX_INFLATE = 64 * 1024 * 1024      # decompressed bytes one body may expand to (AEGIS_INGEST_MAX_INFLATE_MB)
 
 
+MAX_GZIP_MEMBERS = 100_000      # gzip members one body may hold (AEGIS_INGEST_MAX_GZIP_MEMBERS)
+
+
 class InflateTooLarge(ValueError):
     pass
 
@@ -705,19 +708,38 @@ def gunzip_bounded(body: bytes, limit: Optional[int] = None) -> bytes:
             limit = int(_os.environ.get("AEGIS_INGEST_MAX_INFLATE_MB", "")) * 1024 * 1024
         except ValueError:
             limit = MAX_INFLATE
+    try:
+        max_members = int(_os.environ.get("AEGIS_INGEST_MAX_GZIP_MEMBERS", "") or MAX_GZIP_MEMBERS)
+    except ValueError:
+        max_members = MAX_GZIP_MEMBERS
     # every member of a multi-member gzip (`cat a.gz b.gz`, what log shippers append): only the first was read
-    # and the rest silently dropped (review round 3 G4-5)
+    # and the rest silently dropped (review round 3 G4-5). Linear in the body (round 8 G8-8): the input is fed
+    # through a memoryview in chunks, so a member's end leaves at most one chunk in ``unused_data`` — handing the
+    # whole remainder to each member copied it once per member (4 MB of empty members took 37 s). The chunk
+    # starts small at each member and doubles while the member runs on, so tiny members copy little and large
+    # members still go through in few calls.
     out = bytearray()
-    rest = body
-    while rest:
+    view = memoryview(body)
+    n, pos, members = len(body), 0, 0
+    while pos < n:
+        members += 1
+        if members > max_members:
+            raise InflateTooLarge(f"more than {max_members} gzip members in one body")
         d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        out += d.decompress(rest, limit + 1 - len(out))
-        if len(out) > limit or d.unconsumed_tail:
-            raise InflateTooLarge(f"decompressed body over {limit} bytes")
-        if not d.eof:
-            raise ValueError("truncated gzip member")
-        rest = d.unused_data
-        if rest[:2] != b"\x1f\x8b":
+        chunk = 256
+        while True:
+            piece = view[pos:pos + chunk]
+            out += d.decompress(piece, limit + 1 - len(out))
+            if len(out) > limit or d.unconsumed_tail:
+                raise InflateTooLarge(f"decompressed body over {limit} bytes")
+            if d.eof:
+                pos += len(piece) - len(d.unused_data)
+                break
+            pos += len(piece)
+            if pos >= n:
+                raise ValueError("truncated gzip member")
+            chunk = min(chunk * 2, 1 << 20)
+        if bytes(view[pos:pos + 2]) != b"\x1f\x8b":
             break                                         # trailing padding / garbage after the last member
     return bytes(out)
 
@@ -735,7 +757,7 @@ def ocsf_lines_from_body(body: bytes) -> tuple[list[str], int]:
     if not text:
         return [], 0
     try:
-        whole = json.loads(text)
+        whole = loads_bounded(text)          # an over-deep record is a ValueError (JsonTooDeep), never a RecursionError
     except ValueError:
         whole = None
         chunks = []
@@ -744,7 +766,7 @@ def ocsf_lines_from_body(body: bytes) -> tuple[list[str], int]:
             if not ln.strip():
                 continue
             try:
-                chunks.append(json.loads(ln))
+                chunks.append(loads_bounded(ln))
             except ValueError:
                 bad += 1
     else:

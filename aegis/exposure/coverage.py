@@ -5,7 +5,8 @@ One vendor-neutral file (``waf_coverage.json``) describes every protection::
     {"protections": [
       {"name": "netbanking.bank.example", "vendor": "imperva", "mode": "block",      # or "monitor"
        "fronts": [{"host": "10.0.1.10", "port": 443}, {"host": "alb-netbanking"}],   # origin IPs / hostnames / LB names
-       "virtual_patches": ["CVE-2021-44228"]}                                         # CVE-specific blocking rules
+       "virtual_patches": ["CVE-2021-44228"],                                        # CVE-specific blocking rules
+       "ports": [8080]}                  # HTTP(S) ports proxied for a front with no port, beyond 80 / 443
     ]}
 
 The exposure engine reads it: a protection in **block** mode in front of a web port is a WAF (``partial``);
@@ -42,6 +43,8 @@ from ..agents.response.connectors.http import Transport, call, httpx_transport
 from ..posture.sources import PostureSourceError
 
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+#: what a WAF proxies for a front that names no port
+DEFAULT_PROXIED_PORTS = (80, 443)
 
 
 @dataclass
@@ -51,11 +54,26 @@ class Protection:
     mode: str                                   # "block" | "monitor"
     fronts: list[dict] = field(default_factory=list)   # {"host": str, "port": int | None}
     virtual_patches: list[str] = field(default_factory=list)
+    #: HTTP(S) ports the WAF proxies for a front with no port, beyond 80 / 443 (an exporter or the coverage file
+    #: declares them). A front with port None used to cover EVERY port of the host: Cloudflare in front of 443
+    #: credited an admin console on :8080 and Elasticsearch on :9200 reached straight on the origin IP (round 8 G8-11).
+    ports: list[int] = field(default_factory=list)
 
-    def covers(self, keys: set[str], port: int | None) -> bool:
+    def proxied_ports(self) -> set[int]:
+        return set(DEFAULT_PROXIED_PORTS) | {int(p) for p in self.ports if str(p).isdigit()}
+
+    def covers(self, keys: set[str], port: int | None, entry: int | None = None) -> bool:
+        """``entry``: the port the internet actually hits when it is not ``port`` (a load balancer listener in front
+        of the target port) — that is what a WAF in front of the load balancer proxies."""
         low = {k.lower() for k in keys}
+        hits = {port} | ({entry} if entry is not None else set())
         for f in self.fronts:
-            if str(f.get("host", "")).lower() in low and (f.get("port") in (None, port) or port in (None, -1)):
+            if str(f.get("host", "")).lower() not in low:
+                continue
+            fp = f.get("port")
+            if port in (None, -1) or fp in hits:
+                return True
+            if fp is None and hits & self.proxied_ports():
                 return True
         return False
 
@@ -78,7 +96,8 @@ def load_coverage(path: str | Path) -> list[Protection]:
             raise PostureSourceError(f"protection #{i} in {path} needs mode block|monitor and at least one front")
         out.append(Protection(name=str(p.get("name", f"protection-{i}")), vendor=str(p.get("vendor", "?")), mode=mode,
                               fronts=[{"host": str(f["host"]), "port": f.get("port")} for f in p["fronts"] if f.get("host")],
-                              virtual_patches=[c.upper() for c in p.get("virtual_patches") or []]))
+                              virtual_patches=[c.upper() for c in p.get("virtual_patches") or []],
+                              ports=[int(x) for x in p.get("ports") or [] if str(x).isdigit()]))
     return out
 
 
@@ -119,12 +138,39 @@ def from_cloudflare(zones: list[str], token: str, transport: Transport = httpx_t
             return [] if res.status == 404 else ((res.json().get("result") or {}).get("rules") or [])  # 404: no ruleset in this phase
 
         managed = [r for r in phase("http_request_firewall_managed") if r.get("enabled", True) and r.get("action") == "execute"]
+        # a managed ruleset deployed with a non-blocking override (``overrides.action: "log"`` — how Cloudflare runs
+        # it in monitor mode — or per-rule / per-category overrides to log / skip, or disabled) only logs: it used
+        # to export as blocking and every finding behind it lost its ACT NOW (round 8 G8-5)
+        blocking = bool(managed) and all(_cf_blocking(r) for r in managed)
         vps = cves_in(*[f"{r.get('description', '')} {r.get('expression', '')}" for r in phase("http_request_firewall_custom")
                         if r.get("enabled", True) and r.get("action") == "block"])
         fronts = [{"host": r.get("content"), "port": None} for r in proxied] + [{"host": r.get("name"), "port": None} for r in proxied]
-        out.append(Protection(name=f"cloudflare zone {z}", vendor="cloudflare", mode="block" if managed else "monitor",
+        out.append(Protection(name=f"cloudflare zone {z}", vendor="cloudflare", mode="block" if blocking else "monitor",
                               fronts=fronts, virtual_patches=vps))
     return out
+
+
+_CF_BLOCKING_ACTIONS = {"block", "challenge", "js_challenge", "managed_challenge"}
+
+
+def _cf_blocking(rule: dict) -> bool:
+    """Does a managed-ruleset ``execute`` rule block? Not when its overrides set a non-blocking action or disable
+    rules — at the ruleset level, per category or per rule."""
+    ov = (rule.get("action_parameters") or {}).get("overrides") or {}
+    if not isinstance(ov, dict):
+        return True
+    if ov.get("enabled") is False:
+        return False
+    if ov.get("action") is not None and str(ov["action"]).lower() not in _CF_BLOCKING_ACTIONS:
+        return False
+    for sub in list(ov.get("categories") or []) + list(ov.get("rules") or []):
+        if not isinstance(sub, dict):
+            continue
+        if sub.get("enabled") is False:
+            return False
+        if sub.get("action") is not None and str(sub["action"]).lower() not in _CF_BLOCKING_ACTIONS:
+            return False
+    return True
 
 
 def from_imperva(api_id: str, api_key: str, transport: Transport = httpx_transport,

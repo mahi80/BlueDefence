@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
+from .base import JsonTooDeep, loads_bounded
 from .console_api import console_api_from_env
 from .stream import InflateTooLarge, StreamQueue, get_stream, gunzip_bounded, lines_from_body
 
@@ -305,6 +306,8 @@ class PushServer:
         """OCSF: one event per queue item, whatever the framing (NDJSON, one array, a pretty-printed document).
         Records that are not JSON objects are counted back to the sender, never dropped behind a 200."""
         from .stream import ocsf_lines_from_body
+        # per record: a malformed or over-deep record (JsonTooDeep, never a RecursionError) is counted in "rejected";
+        # the good records of the batch are queued (round 8 G8-3)
         lines, bad = ocsf_lines_from_body(body)
         if not lines:
             return (400, {"error": "no JSON object in the body", "rejected": bad}) if bad else (200, {"ok": True, "accepted": 0})
@@ -316,11 +319,23 @@ class PushServer:
         lines = lines_from_body(body)
         bad = 0
         good: list[str] = []
-        for ln in lines:
+        errors: list[dict] = []
+
+        def reject(n: int, why: str) -> None:
+            nonlocal bad
+            bad += 1
+            if len(errors) < 50:
+                errors.append({"line": n, "error": why})
+        for n, ln in enumerate(lines, 1):
+            # per record: one malformed or over-deep record is rejected and reported; the good ones in the batch are
+            # still queued (round 8 G8-3 — a RecursionError answered 500 and the vendor retried the batch forever)
             try:
-                obj = json.loads(ln)
+                obj = loads_bounded(ln)
+            except JsonTooDeep as e:
+                reject(n, str(e)[:120])
+                continue
             except ValueError:
-                bad += 1
+                reject(n, "not JSON")
                 continue
             if isinstance(obj, dict) and obj.get("id"):
                 # The sender picks the id, and every source shared one dedupe namespace: a pushed alert with a real
@@ -331,15 +346,20 @@ class PushServer:
                     obj.pop(k, None)
                 # a pre-correlated finding would skip the LLM and the reviewer and go straight to blocks / rollbacks;
                 # these are derived inside AEGIS from raw telemetry (/ingest/netops, /ingest/apigw, …), never accepted
-                ln = json.dumps(_demote_derived(obj), separators=(",", ":"))
+                try:
+                    ln = json.dumps(_demote_derived(obj), separators=(",", ":"))
+                except (ValueError, TypeError, RecursionError) as e:
+                    reject(n, f"{type(e).__name__}: {str(e)[:100]}")
+                    continue
                 good.append(ln)
             else:
-                bad += 1
+                reject(n, "not an AEGIS alert object with an id")
         if lines and not good:
-            return 415, {"error": "expected one AEGIS alert JSON object (with id) per line", "rejected": bad}
+            return 415, {"error": "expected one AEGIS alert JSON object (with id) per line", "rejected": bad,
+                         "rejected_lines": errors}
         if not self.queue.put_many("alerts", good, passthrough=True):
             return 503, {"error": "queue full, retry"}
-        return 200, {"ok": True, "accepted": len(good), "rejected": bad}
+        return 200, {"ok": True, "accepted": len(good), "rejected": bad, **({"rejected_lines": errors} if errors else {})}
 
     def blocklist_payload(self) -> dict:
         from ..agents.shared.fingerprint import is_fingerprint_target, parse_target

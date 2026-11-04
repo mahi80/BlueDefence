@@ -66,7 +66,7 @@ def to_finding(e: Exposure) -> PostureFinding:
         evidence=" · ".join(e.reasons), recommended_remediation=_fix(e), risk_score=e.risk_score,
         extra={"tier": e.tier, "reach": e.reach, "defended": e.defended, "exploitable": e.exploitable,
                "crown_distance": e.crown_distance, "port": e.port, "title": e.title, "reasons": e.reasons,
-               "source": e.vuln_source, "path": e.path})
+               "source": e.vuln_source, "path": e.path, **({"unverifiable": e.unverifiable} if e.unverifiable else {})})
 
 
 def run_scan(o: dict) -> tuple[list[PostureFinding], list[str], dict]:
