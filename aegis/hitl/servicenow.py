@@ -72,6 +72,8 @@ class ServiceNowHITL(BaseHITL):
                                       if n and n.strip()}
         # ServiceNow's own automation (business rules, SLA engine, scheduled jobs) writes as these: never a decider
         self._self_names |= {"system", "guest", "maint", "admin.system"}
+        # approval id -> did the awaiting-second reset clear the first approval's decision off the ticket (A8-4)
+        self._reset_ok: dict[str, bool] = {}
 
     @property
     def enabled(self) -> bool:
@@ -121,6 +123,13 @@ class ServiceNowHITL(BaseHITL):
             raise RuntimeError(f"ServiceNow poll for {p.external_id} returned HTTP {status}")
         rec = data.get("result") or {}
         decision = str(rec.get("u_aegis_decision") or "").strip().lower()
+        if getattr(p, "first_approver", "") and not self._reset_done(p, decision):
+            # the first approval's `approved` may still be on the ticket: nothing written after it can be told
+            # apart from it, so no approval is accepted until the reset lands (review round 8 A8-4). A rejection
+            # is still honoured — failing closed never runs the action.
+            if decision == "rejected":
+                return "rejected", self._decider(rec), str(rec.get("close_notes") or "")[:500]
+            return None
         who = self._decider(rec)
         if getattr(p, "first_approver", "") and who:
             # The SECOND approver must have made the decision themselves: the account that last wrote the record
@@ -152,16 +161,53 @@ class ServiceNowHITL(BaseHITL):
     # resolved-with-approve first approval does not read as a decision any more (review round 7 A-6)
     def _record_awaiting_second(self, p: PendingApproval, first: str) -> None:
         """Clear the decision fields so the second approval is a decision someone actually makes — the first one's
-        `approved` stayed on the ticket and every later write to it looked like a new approval (Y5-2)."""
+        `approved` stayed on the ticket and every later write to it looked like a new approval (Y5-2).
+
+        Whether the clear landed is kept here: an instance that refuses the PATCH (a data policy forbidding an
+        integration user to re-open a resolved incident → 403) left `approved` on the ticket, and a second user who
+        only typed their own name into u_aegis_decided_by became the second approver without deciding anything
+        (review round 8 A8-4). Until a reset is confirmed, ``_poll`` retries it and accepts no approval."""
+        self._reset_ok[p.approval_id] = self._reset_decision(p, first)
+
+    def _reset_decision(self, p: PendingApproval, first: str) -> bool:
         note = (f"[AEGIS] First approval recorded from {first}. This action needs a second, different approver: set "
                 "u_aegis_decision to 'approved' (or 'rejected') and u_aegis_decided_by to your own user id.")
-        status, _data = self._transport("PATCH", self._api(f"/{p.external_id}"),
-                                         {"u_aegis_decision": "", "u_aegis_decided_by": "", "state": _REOPEN_STATE,
-                                          "close_code": "", "work_notes": note},
-                                         self._headers(), self.timeout)
-        if status not in (200, 204):
-            logger.warning("[hitl:servicenow] could not reset the decision on %s after the first approval (HTTP %s); "
-                           "the second approver is still required to name themselves", p.external_id, status)
+        full = {"u_aegis_decision": "", "u_aegis_decided_by": "", "state": _REOPEN_STATE, "close_code": "",
+                "work_notes": note}
+        # the re-open is what an instance is most likely to refuse; the decision fields are what matter, so a refused
+        # re-open is retried without it (an awaiting card ignores state / close code anyway)
+        for body in (full, {"u_aegis_decision": "", "u_aegis_decided_by": "", "work_notes": note}):
+            try:
+                status, data = self._transport("PATCH", self._api(f"/{p.external_id}"), body, self._headers(),
+                                                self.timeout)
+            except Exception as e:  # noqa: BLE001 — an unreachable instance is a failed reset, never a crash
+                status, data = 0, {"error": str(e)[:160]}
+            if status in (200, 204):
+                rec = (data or {}).get("result") if isinstance(data, dict) else None
+                self._learn_self(rec)
+                if isinstance(rec, dict) and str(_display(rec.get("u_aegis_decision")) or "").strip():
+                    status = 0        # accepted, but a business rule put a decision back: not reset
+                else:
+                    return True
+        logger.warning("[hitl:servicenow] could not reset the decision on %s after the first approval (HTTP %s); no "
+                       "second approval is accepted until the reset succeeds (retried on every sync)",
+                       p.external_id, status)
+        return False
+
+    def _reset_done(self, p: PendingApproval, decision: str) -> bool:
+        """Has the first approval's decision been cleared off the ticket? Retries a failed reset. After a restart
+        nothing is known: an empty decision field means it was; a decision on the ticket may be the first approval's,
+        so it is cleared again (the second approver decides again — fail closed)."""
+        ok = self._reset_ok.get(p.approval_id)
+        if ok:
+            return True
+        if ok is None and decision not in ("approved", "rejected"):
+            self._reset_ok[p.approval_id] = True
+            return True
+        if ok is None and decision == "rejected":
+            return False          # honoured by the caller; nothing to clear
+        self._reset_ok[p.approval_id] = self._reset_decision(p, p.first_approver)
+        return False              # this poll's record predates the reset: the next poll reads a fresh decision
 
     def _learn_self(self, rec: Any) -> None:
         if isinstance(rec, dict):

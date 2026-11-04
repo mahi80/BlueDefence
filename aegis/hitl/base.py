@@ -631,12 +631,38 @@ class BaseHITL:
         return d
 
 
-#: names a transport used to stand in for "nobody we can name" — never one of two people (review round 7 A-8)
-_PLACEHOLDER_DECIDERS = frozenset({"", "console", "file", "dashboard", "servicenow", "slack", "-", "unknown"})
+#: names a transport / the ACP dashboard / an IdP uses to stand in for "nobody we can name" — never one of two
+#: people (review round 7 A-8). Compared after case-folding and dropping spaces, dots, dashes and underscores, so
+#: "Local User", "local_user" and "LOCAL-USER" are one entry (round 8 A8-2: the dashboard writes "System" for a
+#: request with no session and "Local User" with auth off; neither was here).
+_PLACEHOLDER_DECIDERS = frozenset({
+    "", "console", "file", "dashboard", "servicenow", "slack", "unknown", "unkown", "system", "systemuser",
+    "localuser", "local", "localhost", "user", "defaultuser", "default", "anonymous", "anon", "anonymoususer",
+    "guest", "na", "none", "null", "nil", "undefined", "nobody", "noone", "everyone", "unattributed", "unassigned",
+    "admin", "administrator", "root", "service", "serviceaccount", "api", "apiuser", "automation", "bot", "auto",
+    "aegis", "acp", "test", "tbd", "todo", "xxx",
+})
+# the shape of an identity: a user id (employee numbers included), an e-mail / UPN, `team:name`, `DOMAIN\user`, or a
+# display name — starts and ends alphanumeric, printable, no markup / control characters, at most 256 characters
+_IDENTITY = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9 ._@:+\\/'-]{0,254}[A-Za-z0-9]$")
 
 
 def _anonymous(decided_by: Any) -> bool:
-    return str(decided_by or "").strip().lower() in _PLACEHOLDER_DECIDERS
+    """True when ``decided_by`` cannot be a named person: it does not have the shape of an identity, or it is one of
+    the stand-in names above, or it is AEGIS itself (``aegis:*`` — the timer, the breaker, auto-block)."""
+    raw = str(decided_by or "").strip()
+    if not raw or not _IDENTITY.match(raw):
+        return True
+    low = raw.lower()
+    if low.startswith(("aegis:", "system:")):
+        return True
+    import re as _re
+    folded = _re.sub(r"[\s./_-]+", "", low)
+    if folded in _PLACEHOLDER_DECIDERS:
+        return True
+    # a role/channel prefix in front of a stand-in ("dashboard:System", "user:anonymous") is still a stand-in
+    tail = _re.sub(r"[\s._-]+", "", _re.split(r"[:\\/]", low)[-1])
+    return tail in _PLACEHOLDER_DECIDERS
 
 
 __all__ = ["BaseHITL", "Decision", "PendingApproval", "action_text", "card_args"]
