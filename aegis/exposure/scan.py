@@ -75,7 +75,15 @@ def run_scan(o: dict) -> tuple[list[PostureFinding], list[str], dict]:
     files = _files(o["vulns"])
     if not files:
         raise PostureSourceError(f"exposure scan: no vulnerability export found in {o['vulns']}")
-    vulns = [v for f in files for v in loaders.load_vulns(f)]
+    vulns = []
+    for f in files:
+        fmt, got = loaders.load_vulns_with_format(f)
+        if not got and fmt in loaders.NATIVE_FORMATS and not o.get("allow_empty"):
+            # one scanner's export came back empty while the others had findings: every exposure on that scanner's
+            # assets would be resolved and approved remediations marked verified (review round 6 X-1)
+            raise PostureSourceError(f"exposure scan: the {fmt} export {f} contains no findings — refusing to treat "
+                                     "that as clean (allow_empty: true to accept)")
+        vulns += got
     if not vulns and not o.get("allow_empty"):
         # An export with no findings at all is far more often a broken export (an expired API key writing
         # "[]", a filter that matched nothing) than a clean estate — and treating it as clean resolves every

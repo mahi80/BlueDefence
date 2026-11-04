@@ -27,6 +27,7 @@ import io
 import re
 from typing import Any
 
+from ..posture.sources import PostureSourceError
 from .engine import ANY_PORT, Vuln
 
 _CVE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
@@ -98,7 +99,8 @@ def _qualys(rows: list[dict]) -> list[Vuln]:
     out: list[Vuln] = []
     for r in rows:
         typ = _col(r, "Type").lower()
-        if typ in ("ig", "information gathered", "practice") or _col(r, "Vuln Status", "Status").lower() == "fixed":
+        # "Ig" = information gathered (no vulnerability); "Practice" is a *potential* vulnerability — kept
+        if typ in ("ig", "information gathered") or _col(r, "Vuln Status", "Status").lower() == "fixed":
             continue
         keys = _keys(_col(r, "EC2 Instance ID", "Instance ID"), _col(r, "DNS", "FQDN"), _col(r, "NetBIOS"), _col(r, "IP"))
         if not keys:
@@ -115,8 +117,9 @@ def _qualys(rows: list[dict]) -> list[Vuln]:
 def _rapid7(rows: list[dict]) -> list[Vuln]:
     out: list[Vuln] = []
     for r in rows:
-        if _col(r, "Vulnerability Test Result Code", "Result Code").upper() in ("NV", "SD", "SV"):   # not vulnerable / superseded
-            continue
+        code = _col(r, "Vulnerability Test Result Code", "Result Code").upper()
+        if code and code not in ("VE", "VV", "VP"):     # only vulnerable-exploited / -version / -potential; NV, SD, SV,
+            continue                                    # ER, DS, NT, UK, EE, OV … are not open findings
         keys = _keys(_col(r, "Asset Names", "Asset Name", "Asset Host Name"), _col(r, "Asset IP Address", "Asset IP"))
         if not keys:
             continue
@@ -135,7 +138,8 @@ def _rapid7(rows: list[dict]) -> list[Vuln]:
 def _wiz_csv(rows: list[dict]) -> list[Vuln]:
     out: list[Vuln] = []
     for r in rows:
-        if _col(r, "Status").upper() in ("RESOLVED", "REJECTED"):
+        # the finding's own status — a plain "Status" column can be the resource's state in some Wiz reports
+        if _col(r, "FindingStatus", "Finding Status", "Status").upper() in ("RESOLVED", "REJECTED"):
             continue
         keys = _keys(*_EC2.findall(_col(r, "Provider Unique Id", "Resource Provider Unique Id", "Resource External Id")),
                      _col(r, "Resource Name", "Asset Name"), _col(r, "Resource Id", "Asset Id"))
@@ -153,17 +157,22 @@ def _wiz_csv(rows: list[dict]) -> list[Vuln]:
 def _defender_rows(rows: list[dict]) -> list[Vuln]:
     out: list[Vuln] = []
     for r in rows:
+        if not isinstance(r, dict):
+            raise PostureSourceError("Defender export: a vulnerability row is not an object")
         cve = _col(r, "cveId", "CVE ID")
         keys = _keys(_col(r, "deviceName", "Device Name"), _col(r, "deviceId", "Device ID"))
         if not cve or not keys:
+            continue
+        if _col(r, "status", "Status").lower() in ("fixed", "remediated"):    # the delta export carries fixed rows
             continue
         expl = _col(r, "exploitabilityLevel", "Exploitability Level")
         out.append(Vuln(asset=keys[0].lower(), asset_alt=keys[1:], cve=_cves(cve)[0],
                         title=f"{_col(r, 'softwareVendor', 'Software Vendor')} {_col(r, 'softwareName', 'Software Name')} "
                               f"{_col(r, 'softwareVersion', 'Software Version')}: {cve}".strip(),
                         port=ANY_PORT, cvss=_f(_col(r, "cvssScore", "CVSS Score")),
+                        # a public / verified / kit exploit exists → poc; "exploited in the wild" (KEV) is left to the
+                        # CISA KEV feed — Defender's levels do not say that
                         poc=expl.lower() not in ("", "noexploit", "no exploit"),
-                        kev=expl.lower() in ("exploitisinkit", "exploit is in kit", "exploitisverified", "exploit is verified"),
                         source="defender-vm"))
     return out
 
@@ -191,9 +200,11 @@ def from_csv(text: str) -> tuple[str, list[Vuln]] | None:
 def _wiz_nodes(nodes: list[dict]) -> list[Vuln]:
     out: list[Vuln] = []
     for n in nodes:
+        if not isinstance(n, dict):
+            raise PostureSourceError("Wiz export: a finding node is not an object")
         if str(n.get("status", "OPEN")).upper() in ("RESOLVED", "REJECTED"):
             continue
-        a = n.get("vulnerableAsset") or {}
+        a = n.get("vulnerableAsset") if isinstance(n.get("vulnerableAsset"), dict) else {}
         keys = _keys(*_EC2.findall(str(a.get("providerUniqueId") or "")), a.get("name"), a.get("providerUniqueId"), a.get("id"))
         if not keys:
             continue
@@ -208,15 +219,18 @@ def _wiz_nodes(nodes: list[dict]) -> list[Vuln]:
 def _prisma(items: list[dict]) -> list[Vuln]:
     out: list[Vuln] = []
     for it in items:
-        tag = it.get("repoTag") or {}
+        if not isinstance(it, dict):
+            raise PostureSourceError("Prisma export: an item is not an object")
+        tag = it.get("repoTag") if isinstance(it.get("repoTag"), dict) else {}
         image = f"{tag.get('registry') + '/' if tag.get('registry') else ''}{tag.get('repo', '')}:{tag.get('tag', '')}" if tag.get("repo") else ""
         keys = _keys(*_EC2.findall(str((it.get("cloudMetadata") or {}).get("resourceID") or "")), it.get("hostname"), image,
                      image.rsplit("/", 1)[-1] if image else "", it.get("_id"))
         if not keys:
             continue
         for v in it.get("vulnerabilities") or []:
-            if str(v.get("status", "")).lower().startswith("fixed in") and not v.get("packageVersion"):
-                continue
+            if not isinstance(v, dict):
+                raise PostureSourceError("Prisma export: a vulnerability entry is not an object")
+            # "fixed in X" means a fix is available — the vulnerable package is still installed
             risk = {str(k).lower() for k in (v.get("riskFactors") or {})}
             out.append(Vuln(asset=keys[0], asset_alt=keys[1:], cve=_cves(v.get("cve"))[0],
                             title=f"{v.get('packageName', '?')} {v.get('packageVersion', '')}: {v.get('cve') or v.get('id')}".strip(),
@@ -226,17 +240,29 @@ def _prisma(items: list[dict]) -> list[Vuln]:
     return out
 
 
+def _partial(what: str) -> PostureSourceError:
+    return PostureSourceError(f"{what} export is one page of several — export every page (a partial export would mark "
+                              "the findings on the missing pages as resolved)")
+
+
 def from_json(obj: Any) -> tuple[str, list[Vuln]] | None:
-    """(format, vulns) for a recognised scanner JSON document, else None."""
+    """(format, vulns) for a recognised scanner JSON document, else None. A saved page of a paged API response
+    (Defender ``@odata.nextLink``, Wiz ``pageInfo.hasNextPage``) is refused rather than read as the whole estate."""
     if isinstance(obj, dict):
         data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
-        nodes = (data.get("vulnerabilityFindings") or {}).get("nodes") if data else None
+        vf = data.get("vulnerabilityFindings") if isinstance(data.get("vulnerabilityFindings"), dict) else {}
+        nodes, page = vf.get("nodes") if vf else None, vf.get("pageInfo") if vf else None
         if nodes is None and isinstance(obj.get("nodes"), list):
-            nodes = obj["nodes"]
-        if isinstance(nodes, list) and (not nodes or "vulnerableAsset" in nodes[0]):
+            nodes, page = obj["nodes"], obj.get("pageInfo")
+        if isinstance(nodes, list) and (not nodes or (isinstance(nodes[0], dict) and "vulnerableAsset" in nodes[0])):
+            if isinstance(page, dict) and page.get("hasNextPage"):
+                raise _partial("Wiz")
             return "wiz", _wiz_nodes(nodes)
-        if isinstance(obj.get("value"), list) and obj["value"] and "cveId" in obj["value"][0]:
-            return "defender-vm", _defender_rows(obj["value"])
+        val = obj.get("value")
+        if isinstance(val, list) and val and isinstance(val[0], dict) and "cveId" in val[0]:
+            if obj.get("@odata.nextLink"):
+                raise _partial("Defender")
+            return "defender-vm", _defender_rows(val)
         return None
     if isinstance(obj, list) and obj and isinstance(obj[0], dict):
         first = obj[0]

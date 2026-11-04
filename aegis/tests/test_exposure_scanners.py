@@ -87,3 +87,97 @@ def test_detectors_reject_lookalikes():
     assert from_json({"data": {"vulnerabilityFindings": {"nodes": []}}}) == ("wiz", [])
     assert from_csv("a,b\n1,2\n") is None
     assert json.loads((SC / "wiz_findings.json").read_text())                  # valid sample
+
+
+# ---------------------------------------------------------------------------------------------------- round 6 --
+
+def test_qualys_practice_is_a_potential_vulnerability_not_info(tmp_path):
+    """X-1: Type "Practice" (potential) is kept; only "Ig" is information gathered."""
+    p = tmp_path / "q.csv"
+    p.write_text('"IP","DNS","QID","Title","Type","Severity","Port","Protocol","CVE ID","CVSS3.1 Base"\n'
+                 '"10.0.0.5","web.bank","11827","Apache path traversal","Practice","5","443","tcp","CVE-2021-41773","9.8"\n'
+                 '"10.0.0.5","web.bank","45038","Host Scan Time","Ig","1","0","","",""\n')
+    assert [v.cve for v in loaders.load_vulns(p)] == ["CVE-2021-41773"]
+
+
+def test_scan_refuses_an_empty_native_export_beside_others(tmp_path):
+    """X-1: one scanner's empty export would resolve every exposure on its assets."""
+    from aegis.exposure.scan import run_scan
+    empty = tmp_path / "rapid7.csv"
+    empty.write_text("Asset IP Address,Asset Names,Vulnerability ID,Vulnerability CVE IDs,Vulnerability Test Result Code\n")
+    with pytest.raises(PostureSourceError, match="rapid7 export"):
+        run_scan({"vulns": [str(SC / "qualys_report.csv"), str(empty)], "inventory": str(S / "inventory.csv")})
+
+
+def test_partial_paged_exports_are_refused(tmp_path):
+    """X-2."""
+    d = tmp_path / "d.json"
+    d.write_text(json.dumps({"value": [{"deviceName": "h", "cveId": "CVE-2024-10001"}],
+                             "@odata.nextLink": "https://api.securitycenter.microsoft.com/api/...&$skip=50000"}))
+    with pytest.raises(PostureSourceError, match="one page"):
+        loaders.load_vulns(d)
+    w = tmp_path / "w.json"
+    w.write_text(json.dumps({"data": {"vulnerabilityFindings": {
+        "nodes": [{"name": "CVE-2024-10002", "vulnerableAsset": {"name": "h"}}], "pageInfo": {"hasNextPage": True}}}}))
+    with pytest.raises(PostureSourceError, match="one page"):
+        loaders.load_vulns(w)
+
+
+def test_defender_fixed_rows_skipped_and_kev_left_to_the_feed(tmp_path):
+    """X-3."""
+    d = tmp_path / "d.json"
+    d.write_text(json.dumps({"value": [
+        {"deviceName": "h1", "cveId": "CVE-2024-10001", "exploitabilityLevel": "ExploitIsVerified"},
+        {"deviceName": "h2", "cveId": "CVE-2024-10003", "exploitabilityLevel": "ExploitIsInKit", "status": "Fixed"}]}))
+    (v,) = loaders.load_vulns(d)
+    assert v.cve == "CVE-2024-10001" and v.poc and not v.kev
+
+
+def test_rapid7_keeps_only_vulnerable_result_codes(tmp_path):
+    """X-4."""
+    p = tmp_path / "r.csv"
+    p.write_text("Asset IP Address,Asset Names,Vulnerability ID,Vulnerability CVE IDs,Vulnerability CVSSv3 Score,"
+                 "Service Port,Exploit Count,Vulnerability Test Result Code\n"
+                 "10.0.0.1,a,v1,CVE-2024-10001,9.8,443,1,VE\n10.0.0.1,a,v2,CVE-2024-10002,9.8,443,1,VP\n"
+                 "10.0.0.1,a,v3,CVE-2024-10003,10,443,1,ER\n10.0.0.1,a,v4,CVE-2024-10004,10,443,1,DS\n"
+                 "10.0.0.1,a,v5,CVE-2024-10005,10,443,1,EE\n10.0.0.1,a,v6,CVE-2024-10006,10,443,1,UK\n")
+    assert sorted(v.cve for v in loaders.load_vulns(p)) == ["CVE-2024-10001", "CVE-2024-10002"]
+
+
+def test_malformed_shapes_are_parse_errors_not_crashes(tmp_path):
+    """X-5."""
+    for doc in ({"data": {"vulnerabilityFindings": {"nodes": [{"name": "CVE-2024-10001", "vulnerableAsset": "h"}]}}},
+                [{"hostname": "h", "vulnerabilities": ["CVE-2024-10001"]}],
+                {"nodes": ["x"]}):
+        p = tmp_path / "m.json"
+        p.write_text(json.dumps(doc))
+        try:
+            loaders.load_vulns(p)
+        except PostureSourceError:
+            pass                                       # a parse error is fine; an AttributeError / TypeError is not
+
+
+def test_bom_exports_load(tmp_path):
+    """X-6."""
+    j = tmp_path / "b.json"
+    j.write_bytes(b"\xef\xbb\xbf" + json.dumps({"value": [{"deviceName": "h", "cveId": "CVE-2024-10001"}]}).encode())
+    assert [v.cve for v in loaders.load_vulns(j)] == ["CVE-2024-10001"]
+    c = tmp_path / "b.csv"
+    c.write_bytes(b"\xef\xbb\xbfasset,cve,title,port\nh,CVE-2024-10002,x,443\n")
+    assert [v.cve for v in loaders.load_vulns(c)] == ["CVE-2024-10002"]
+
+
+def test_prisma_fix_available_is_still_open(tmp_path):
+    """X-7."""
+    p = tmp_path / "p.json"
+    p.write_text(json.dumps([{"hostname": "h", "vulnerabilities": [
+        {"cve": "CVE-2024-6387", "packageName": "openssh", "status": "fixed in 9.8p1"}]}]))
+    assert [v.cve for v in loaders.load_vulns(p)] == ["CVE-2024-6387"]
+
+
+def test_wiz_csv_finding_status_wins_over_resource_status(tmp_path):
+    """X-8."""
+    p = tmp_path / "w.csv"
+    p.write_text("Name,Has Exploit,Resource Name,Status,FindingStatus\n"
+                 "CVE-2024-10001,true,h,Active,RESOLVED\nCVE-2024-10002,false,h,Active,OPEN\n")
+    assert [v.cve for v in loaders.load_vulns(p)] == ["CVE-2024-10002"]
