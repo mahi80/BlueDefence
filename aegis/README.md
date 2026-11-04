@@ -795,6 +795,28 @@ before any model call.
 "Recorded sample" = the response shape from the vendor's API documentation, replayed in CI; a spec becomes
 `live-tenant` only after a pull against a real tenant.
 
+### MCP gateway (ask AEGIS from an AI assistant)
+
+`python -m aegis.mcp` is a stdio MCP server, so an analyst's MCP client (Claude, an IDE assistant, an internal
+copilot) can ask AEGIS what it found. Tools: `aegis_recent_verdicts` (optionally by verdict),
+`aegis_get_evidence_chain` (by chain hash or alert id), `aegis_list_approvals` (pending by default),
+`aegis_list_proposals`.
+
+* **Backends.** By default it reads this host's audit file (`AEGIS_AUDIT_PATH`) and HITL directory (`AEGIS_HITL_DIR`).
+  For a remote AEGIS, set `AEGIS_MCP_URL=https://…` and `AEGIS_MCP_TOKEN` (the read token); https only, http only to
+  loopback.
+* **Untrusted output.** Every result is redacted and wrapped as untrusted data, with prompt-injection and obfuscation
+  flags. Evidence carries attacker-written text, and the client's model must read it as evidence, not instructions.
+* **Never approves.** Approving a containment is a person's decision, made where they sign in. With
+  `AEGIS_MCP_ALLOW_REJECT=1` and `AEGIS_MCP_USER=<name>`, a fifth tool, `aegis_reject_action`, can reject one pending
+  action, which is the safe direction. A reason is required, the decision is signed like a console decision, and it
+  is recorded as `mcp:<name>`. Remote rejects also need `AEGIS_MCP_CONSOLE_TOKEN`.
+
+```json
+{"mcpServers": {"bluedefence": {"command": "python", "args": ["-m", "aegis.mcp"],
+  "env": {"AEGIS_MCP_URL": "https://aegis.bank.internal", "AEGIS_MCP_TOKEN": "<read token>"}}}}
+```
+
 ## ACP integration (full edition)
 
 - **The SOC brain is a governed agent** (`governance.py`, `SOC-AGENTQ-01`): every specialist,
@@ -871,7 +893,7 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 | Model | `LLM_BACKEND` (`mock` · `local` · `anthropic` · `auto`), `AEGIS_MODEL`, `AEGIS_LOCAL_4BIT`, `AEGIS_MODEL_POINTER` (an adapter must carry its recorded digest; `AEGIS_ALLOW_UNVERIFIED_MODEL=1` overrides in a lab), `ANTHROPIC_API_KEY`, `AEGIS_VOTER_BACKEND`, `AEGIS_PII_TOKENIZATION` |
 | Sources | `AEGIS_SOURCES`, `AEGIS_CHECKPOINT`, `AEGIS_POLL_SECONDS`, `AEGIS_MAX_ALERTS_PER_CYCLE`, Sentinel / Splunk / WAF / ACP variables above, `AEGIS_CHECKPOINT_FLUSH_S` (1 s: how often the ingest checkpoint is written; a crash re-delivers at most that much), `AEGIS_INGEST_POISON_MAX` (3: an alert that ended the process this many times is skipped), `AEGIS_HTTP_MAX_RETRY_AFTER` (30 s cap on a vendor's Retry-After) |
 | Index | `AEGIS_INDEX_URL` (derived, rebuildable SQL index of the audit chain for the console and reports — `duckdb:///…` default, `sqlite:///…`, `postgresql+psycopg2://…`, `mssql+pyodbc://…`; one SQLAlchemy ORM, pick by URL), `AEGIS_INDEX=0` to disable; `python -m aegis.store reindex | stats` |
-| Push / stream | `AEGIS_INGEST_HTTP`, `AEGIS_INGEST_BIND`, `AEGIS_INGEST_TOKEN`, `AEGIS_INGEST_READ_TOKEN` (optional separate token for `GET /ingest/verdicts|blocklist|license` and the console reads), `AEGIS_CONSOLE_TOKEN` (the analyst console's key: reads `/api/soc/*` + `/api/approvals` and may POST decisions — see `aegis/ingest/console_api.py`), `AEGIS_INGEST_MAX_MB`, `AEGIS_INGEST_MAX_INFLATE_MB` (cap on what a gzip body may expand to, default 64), `AEGIS_STREAM_CAPACITY`, `AEGIS_EVENTHUB_CONN`, `AEGIS_EVENTHUB_NAME`, `AEGIS_EVENTHUB_GROUP`, `AEGIS_EVENTHUB_START`, `AEGIS_EVENTHUB_CHECKPOINT`, `AEGIS_KAFKA_*` (see § OCSF and declarative connectors), `AEGIS_STREAM_JOURNAL` (write-ahead file for pushed records: a batch is on disk before the vendor gets its 200, and what was not handled is queued again after a restart; off by default), `AEGIS_STREAM_JOURNAL_FSYNC` (`1`: fsync each batch); `POST /ingest/edr` takes Sysmon events and osquery result logs |
+| Push / stream | `AEGIS_INGEST_HTTP`, `AEGIS_INGEST_BIND`, `AEGIS_INGEST_TOKEN`, `AEGIS_INGEST_READ_TOKEN` (optional separate token for `GET /ingest/verdicts|blocklist|license` and the console reads), `AEGIS_CONSOLE_TOKEN` (the analyst console's key: reads `/api/soc/*` + `/api/approvals` and may POST decisions — see `aegis/ingest/console_api.py`), `AEGIS_INGEST_MAX_MB`, `AEGIS_INGEST_MAX_INFLATE_MB` (cap on what a gzip body may expand to, default 64), `AEGIS_STREAM_CAPACITY`, `AEGIS_EVENTHUB_CONN`, `AEGIS_EVENTHUB_NAME`, `AEGIS_EVENTHUB_GROUP`, `AEGIS_EVENTHUB_START`, `AEGIS_EVENTHUB_CHECKPOINT`, `AEGIS_KAFKA_*` (see § OCSF and declarative connectors), `AEGIS_MCP_URL`, `AEGIS_MCP_TOKEN`, `AEGIS_MCP_CONSOLE_TOKEN`, `AEGIS_MCP_ALLOW_REJECT`, `AEGIS_MCP_USER` (see § MCP gateway), `AEGIS_STREAM_JOURNAL` (write-ahead file for pushed records: a batch is on disk before the vendor gets its 200, and what was not handled is queued again after a restart; off by default), `AEGIS_STREAM_JOURNAL_FSYNC` (`1`: fsync each batch); `POST /ingest/edr` takes Sysmon events and osquery result logs |
 | Investigation | `AEGIS_CAMPAIGN_CONTEXT`, `AEGIS_CAMPAIGN_WINDOW_MIN`, `AEGIS_SWARM`, `AEGIS_SWARM_MAX_WORKERS`, `AEGIS_SWARM_MAX_SECONDS`, `AEGIS_INVESTIGATE`, `AEGIS_INVESTIGATE_MAX_SECONDS`, `AEGIS_INVESTIGATE_WORKERS`, `AEGIS_TWIN`, `AEGIS_TWIN_PERSONAS`, `AEGIS_TWIN_ROUNDS`, `AEGIS_MOCK_SPREAD`, `AEGIS_INVESTIGATE_MAX_QUEUED` (200), `AEGIS_SWARM_MAX_ABANDONED` (4 x workers: stuck threads before the swarm stops replacing its pool) |
 | Approvals | `AEGIS_HITL_TRANSPORT`, `AEGIS_HITL_DIR`, `AEGIS_HITL_STATE`, `AEGIS_HITL_TIMEOUT`, `AEGIS_HITL_TIMEOUT_SEC`, `AEGIS_HITL_TIMEOUT_MIN_CONF`, `AEGIS_SLACK_WEBHOOK`, `AEGIS_SERVICENOW_*`, `AEGIS_SNOW_APPROVE_CODES` (`approved`: the ServiceNow close codes that count as an approval), `AEGIS_SERVICENOW_SELF` (AEGIS's own ServiceNow account(s), never counted as an approver; the basic-auth user is included), `AEGIS_HITL_MAX_AGE_S` (604800 = 7 days; `off` = never: an undecided approval older than this settles `expired`, never executed), `AEGIS_HITL_SYNC_BUDGET_S` (30: seconds spent polling approvals per cycle; the rest wait for the next cycle, least-recently polled first) |
 | Response | `AEGIS_ENFORCEMENT_MODE`, `AEGIS_AUTONOMY_TIER`, `AEGIS_AUTONOMY_FLOOR_LOW` / `_MODERATE` / `_HIGH`, `AEGIS_UNATTENDED_DENY_PRINCIPALS`, `AEGIS_VERIFY_EVERY_S`, `AEGIS_VERIFY_GRACE_S` (60 s before a new rule is judged), `AEGIS_VERIFY_RETRY_S` (2 s second look after a missed read-back), `AEGIS_PROTECTED_TARGETS`, `AEGIS_NEVER_BLOCK`, `AEGIS_NEVER_BLOCK_HOSTS`, `AEGIS_HIGH_IMPACT_MAX`, `AEGIS_HIGH_IMPACT_WINDOW_SEC`, `AEGIS_APPROVED_TTL_SEC`, `AEGIS_APPROVED_BLOCK_TTL_SEC`, `AEGIS_OUTFLOW_BREAKER` (its own `AEGIS_OUTFLOW_BREAKER_MIN_CONF` floor applies to `hold`, not the autonomy tier), `AEGIS_WAF_*`, `AEGIS_SOAR_*`, `AEGIS_AGENT_SANDBOX` (`openshell` · `mock`), `AEGIS_OPENSHELL_BIN`, `AEGIS_RECEIPTS`, `AEGIS_RECEIPTS_PATH`, `AEGIS_OUTFLOW_SPLIT_FLOOR_INR` (1/20 of `AEGIS_HIGH_VALUE_INR`: smaller transfers enter the outflow ledger and add up), `AEGIS_DB_APP_HOSTS` (IPs / CIDRs whose DB `application_name` is trusted) |
@@ -895,7 +917,8 @@ All run in `.github/workflows/aegis-ci.yml`. Live results: `aegis/eval/results/`
 | `service.py` | the long-running SOC process (`build_pipeline`, `run_cycle`, `--once`) |
 | `edition.py` | editions, defaults, contradiction checks |
 | `license.py` | per-installation licence: stdlib RSA verify, issue/keygen/verify/report CLI, evaluation mode, feature gates, 24 h meter; public keys in `keys/` |
-| `ingest/` | Sentinel, WAF, API-gateway, network-sensor (`ndr.py`), network-operations (`netops.py`: syslog / traps / flows / telemetry / configs / LLDP), ACP consumers; push receiver (`http_push.py`, incl. the `/ingest/verdicts` feed), stream queue (`stream.py`), Event Hub reader (`eventhub.py`); checkpoint |
+| `ingest/` | Sentinel, WAF, API-gateway, network-sensor (`ndr.py`), network-operations (`netops.py`: syslog / traps / flows / telemetry / configs / LLDP), ACP consumers; push receiver (`http_push.py`, incl. the `/ingest/verdicts` feed), stream queue (`stream.py`), Event Hub reader (`eventhub.py`), Kafka reader (`kafka.py`), OCSF (`ocsf.py`), declarative connectors (`kit.py`); checkpoint |
+| `mcp/` | MCP gateway: analysts' MCP clients query verdicts, evidence chains and the approval queue (read-only; reject only when enabled) |
 | `agents/orchestrator/` | triage, specialist dispatch, voter, fast paths (control-plane, adaptive attacker, credential stuffing, BOLA, spoofed browser, egress), swarm |
 | `agents/netops/` | network assurance: topology (LLDP) → reachability-diff blast radius, root cause vs symptom, flaps, telemetry thresholds, config drift and bad pushes |
 | `agents/ndr/` | egress detector (beacons, exfiltration, certificate oddities), TLS IOC list (`tls_intel.py`), AI-service catalogue + register + discovered usage (`ai_usage.py`) |
