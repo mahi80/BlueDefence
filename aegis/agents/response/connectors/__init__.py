@@ -26,6 +26,7 @@ from .waf import F5WafConnector, ImpervaWafConnector, waf_from_env
 from .edr import (CrowdStrikeConnector, DefenderConnector, SentinelOneConnector, TrendVisionOneConnector,
                   crowdstrike_from_env)
 from .firewall import FeedConnector, FortiGateConnector, PanosConnector, feed_from_env, firewall_from_env
+from .payhold import PaymentHoldConnector, payhold_from_env
 from .identity import ActiveDirectoryConnector, CyberArkConnector, EntraConnector, idp_from_env, pam_from_env
 from .swg import ZscalerConnector, zscaler_from_env
 
@@ -38,5 +39,6 @@ __all__ = [
     "CrowdStrikeConnector", "crowdstrike_from_env", "ZscalerConnector", "zscaler_from_env",
     "DefenderConnector", "SentinelOneConnector", "PanosConnector", "FortiGateConnector", "firewall_from_env",
     "EntraConnector", "CyberArkConnector", "idp_from_env", "pam_from_env",
+    "PaymentHoldConnector", "payhold_from_env",
     "TrendVisionOneConnector", "FeedConnector", "feed_from_env", "ActiveDirectoryConnector",
 ]

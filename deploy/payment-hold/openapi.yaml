@@ -1,0 +1,63 @@
+openapi: 3.0.3
+info:
+  title: AEGIS Payment Hold API
+  version: "1.0"
+  description: |
+    The contract a bank implements once, on the system that can park a payment (payment hub, NEFT / RTGS / IMPS /
+    UPI switch, SWIFT gateway, or the fraud engine in front of them), so BlueDefence AEGIS can hold money before it
+    settles and release it after a person has checked.
+
+    Security — the adapter MUST:
+      * require `Authorization: Bearer <token>` (AEGIS_PAYHOLD_TOKEN);
+      * verify `X-AEGIS-Signature: sha256=<hex HMAC-SHA256(signing key, X-AEGIS-Timestamp + "." + raw body)>`
+        (GET / DELETE sign an empty body) and refuse a timestamp more than 300 s from its clock;
+      * be reachable only from the AEGIS host (network allowlist) over TLS.
+    A hold only parks payments; it never reverses, debits or credits anything. Release returns the payment to
+    normal processing. A hold must lapse on its own at `expires_at` if AEGIS never releases it.
+servers:
+  - url: https://payhub.bank.internal/aegis/v1
+paths:
+  /holds:
+    post:
+      summary: Place a hold
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, ref, idempotency_key, requested_by]
+              properties:
+                scope: {type: string, enum: [account, transaction],
+                        description: "account = every outbound payment from this account; transaction = one transfer"}
+                ref: {type: string, maxLength: 128, description: "account number / id, or transaction reference (UTR, RRN, SWIFT UETR)"}
+                reason: {type: string, maxLength: 500}
+                expires_at: {type: string, format: date-time, nullable: true, description: "lapse time; null = until released"}
+                idempotency_key: {type: string, description: "the same key again returns the existing active hold (and may extend it)"}
+                requested_by: {type: string, enum: [aegis]}
+      responses:
+        "201": {description: Hold placed, content: {application/json: {schema: {$ref: "#/components/schemas/Hold"}}}}
+        "200": {description: An active hold with this idempotency key already exists, content: {application/json: {schema: {$ref: "#/components/schemas/Hold"}}}}
+        "409": {description: "Too late: the transfer already settled (AEGIS escalates to the fraud team for a recall)",
+                content: {application/json: {schema: {type: object, properties: {state: {type: string, enum: [settled]}}}}}}
+        "401": {description: Bad token or signature}
+  /holds/{hold_id}:
+    parameters:
+      - {name: hold_id, in: path, required: true, schema: {type: string}}
+    get:
+      summary: Read a hold
+      responses:
+        "200": {description: The hold, content: {application/json: {schema: {$ref: "#/components/schemas/Hold"}}}}
+        "404": {description: Unknown hold}
+    delete:
+      summary: Release a hold (payments resume normal processing)
+      responses:
+        "200": {description: Released, content: {application/json: {schema: {$ref: "#/components/schemas/Hold"}}}}
+        "404": {description: Unknown hold (treated as already released)}
+components:
+  schemas:
+    Hold:
+      type: object
+      properties:
+        hold_id: {type: string}
+        state: {type: string, enum: [active, released, expired]}

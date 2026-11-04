@@ -278,5 +278,51 @@ class MockDirectory:
         self.users[dn][attr] = value
 
 
-__all__ = ["MockCyberArk", "MockDefender", "MockDirectory", "MockEntra", "MockFortiGate", "MockPanos", "MockSentinelOne",
+class MockPaymentHub(_MockBase):
+    """A bank's adapter for the AEGIS Payment Hold API: checks the bearer token and the request signature, holds
+    accounts / transfers, refuses transfers that already settled."""
+
+    def __init__(self, token: str = "mock-payhub-token", key: bytes = b"mock-payhub-signing-key-0123456789"):
+        super().__init__()
+        self.token, self.key = token, key
+        self.holds: dict[str, dict] = {}
+        self.settled = {"TXN-SETTLED-1"}
+        self.rejected_signatures = 0
+
+    def __call__(self, method: str, url: str, body: object, headers: dict, timeout: float) -> HttpResult:
+        from .payhold import verify_signature
+        raw = bytes(body) if isinstance(body, (bytes, bytearray)) else b""
+        if headers.get("Authorization") != f"Bearer {self.token}":
+            return HttpResult(401, {"error": "unauthorized"})
+        if not verify_signature(self.key, headers.get("X-AEGIS-Timestamp", ""), raw, headers.get("X-AEGIS-Signature", "")):
+            self.rejected_signatures += 1
+            return HttpResult(401, {"error": "bad signature"})
+        return super().__call__(method, url, body.json() if isinstance(body, RawBody) else None, headers, timeout)
+
+    def handle(self, method: str, url: str, body: dict, headers: dict) -> HttpResult:
+        path = url.split("?", 1)[0]
+        if path.endswith("/holds") and method == "POST":
+            if body.get("scope") == "transaction" and body.get("ref") in self.settled:
+                return HttpResult(409, {"state": "settled"})
+            for hid, h in self.holds.items():
+                if h["idempotency_key"] == body.get("idempotency_key") and h["state"] == "active":
+                    h["expires_at"] = body.get("expires_at")
+                    return HttpResult(200, {"hold_id": hid, "state": "active"})
+            hid = f"H{next(self._ids)}"
+            self.holds[hid] = {**body, "state": "active"}
+            return HttpResult(201, {"hold_id": hid, "state": "active"})
+        m = re.search(r"/holds/([^/]+)$", path)
+        if m:
+            h = self.holds.get(unquote(m.group(1)))
+            if h is None:
+                return HttpResult(404, {"error": "unknown hold"})
+            if method == "DELETE":
+                h["state"] = "released"
+                return HttpResult(200, {"state": "released"})
+            if method == "GET":
+                return HttpResult(200, {"hold_id": m.group(1), "state": h["state"]})
+        return HttpResult(404, {"error": "not found"})
+
+
+__all__ = ["MockCyberArk", "MockDefender", "MockDirectory", "MockEntra", "MockFortiGate", "MockPanos", "MockPaymentHub", "MockSentinelOne",
            "MockTrend"]

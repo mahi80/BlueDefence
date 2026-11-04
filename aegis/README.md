@@ -747,6 +747,7 @@ AEGIS_FW_VENDOR=fortigate  AEGIS_FW_URL  AEGIS_FW_TOKEN (REST admin token)  [AEG
 AEGIS_IDP_VENDOR=entra     AEGIS_IDP_TENANT_ID  AEGIS_IDP_CLIENT_ID  AEGIS_IDP_CLIENT_SECRET  [AEGIS_IDP_PROTECTED=breakglass@bank.in,…]
 AEGIS_IDP_VENDOR=ad        AEGIS_AD_URL (ldaps://)  AEGIS_AD_BASE_DN  AEGIS_AD_BIND_DN  AEGIS_AD_BIND_PASSWORD   (pip install 'aegis[ad]')
 AEGIS_PAM_VENDOR=cyberark  AEGIS_PAM_URL  AEGIS_PAM_USERNAME  AEGIS_PAM_PASSWORD
+AEGIS_PAYHOLD_VENDOR=api   AEGIS_PAYHOLD_URL (https)  AEGIS_PAYHOLD_TOKEN  AEGIS_PAYHOLD_SIGNING_KEY   (the bank's adapter: deploy/payment-hold/openapi.yaml)
 AEGIS_BLOCK_FEED=1         firewalls pull GET /ingest/blocklist?format=txt[&kind=dst] (read token; bearer or basic auth)
 AEGIS_ENFORCEMENT_MODE=shadow   AEGIS_PROTECTED_TARGETS="cbs-db,swift-gw,dc-*"
 ```
@@ -763,6 +764,7 @@ The bank stack (each has a `mock…` vendor for a lab; a private CA → `SSL_CER
 | Firewall | Check Point / any NGFW, by pull | block, block_egress (IP / CIDR) | nothing on the firewall: live blocks are listed at `/ingest/blocklist?format=txt` (`&kind=dst` for egress); a Network Feed object (R81.20+), PAN-OS EDL or FortiGate threat feed fetches it and one deny rule uses it | drops off the next fetch / not verifiable (AEGIS cannot see the last fetch) | the feed's read token only (basic-auth password) |
 | EDR | Trend Vision One | isolate | endpoint isolation (resolves endpoint name → one agent GUID) | restore / the isolation task's status | API key with Response permissions |
 | Identity | Active Directory (on-prem) | lock_account | sets `userAccountControl` ACCOUNTDISABLE over LDAPS; built-in privileged accounts (Administrator, krbtgt) refused | re-enables only an account AEGIS disabled / the bit | delegated write of `userAccountControl` on the user OUs |
+| Money | **AEGIS Payment Hold API** (the bank's adapter on its payment hub / switch / fraud engine) | hold: `outbound:<account>` (every outbound payment) or one transfer (`txn:<UTR / RRN / UETR>`) | a TTL'd hold that parks payments; never debits, credits or reverses. Requests are HMAC-signed with a timestamp, and the adapter refuses anything else. A transfer that already settled is reported as too late (escalate for recall), never as applied | release / the hold's state | a token and signing key for that one API, reachable only from the AEGIS host |
 | PAM | CyberArk PVWA | rotate_credential (permanent, two-person) | immediate CPM password change of exactly one vaulted account (`account:<user>[@<address>]`) | cannot be undone / last-modified time | vault user allowed to initiate CPM changes only |
 
 AD has no session revoke: Kerberos tickets that were already issued stay valid until they expire (10 h by default).
