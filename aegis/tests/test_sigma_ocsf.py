@@ -163,3 +163,24 @@ def test_powershell_event_log_auditd_and_av_logsources_map():
     with pytest.raises(Unsupported):
         compile_rule({"title": "t", "id": "x", "logsource": {"product": "exotic", "service": "thing"},
                       "detection": {"s": {"a": 1}, "condition": "s"}})
+
+
+def test_fast_string_path_agrees_with_the_regex_path():
+    from aegis.detect.sigma import _glob_rx, _value_test
+    values = ["\\cmd.exe", "Invoke-Mimikatz", "C:\\Windows\\Temp\\", "-enc", "net user", "ADMIN$", "a.b"]
+    samples = ["C:\\Windows\\System32\\CMD.EXE", "powershell invoke-mimikatz -x", "c:\\windows\\temp\\x.dll",
+               "PS -ENC abc", "NET USER bob /add", "\\\\host\\admin$", "axb", "a.b", "", "cmd.exe"]
+    for v in values:
+        for mods, kw in (((), {}), (("contains",), {"contains": True}), (("startswith",), {"start": True}),
+                         (("endswith",), {"end": True})):
+            (fast,) = _value_test(v, mods)
+            rx = _glob_rx(v, **kw)
+            for s in samples:
+                assert fast(s) == bool(rx.match(s)), (v, mods, s)
+
+
+def test_lookup_cache_is_per_event(eng):
+    a = _proc("C:\\Windows\\System32\\cmd.exe", "cmd /c whoami", "C:\\inetpub\\w3wp.exe")
+    b = _proc("C:\\Windows\\System32\\cmd.exe", "cmd /c whoami", "C:\\Windows\\explorer.exe")
+    assert "0001" in _ids(eng.match(a)) and "0001" not in _ids(eng.match(b))
+    assert sigma._LOCAL.cache is None
