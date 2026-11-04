@@ -725,8 +725,31 @@ AEGIS_WAF_VENDOR=azure     AEGIS_AZURE_SUBSCRIPTION_ID  AEGIS_AZURE_RESOURCE_GRO
                            auth: AEGIS_AZURE_TENANT_ID/_CLIENT_ID/_CLIENT_SECRET, AEGIS_AZURE_TOKEN, or managed identity (azure-identity)
 AEGIS_SOAR_VENDOR=xsoar    AEGIS_SOAR_URL  AEGIS_SOAR_API_KEY  AEGIS_SOAR_PLAYBOOKS="isolate=Isolate-Host,isolate.undo=Release-Host"
 AEGIS_SOAR_VENDOR=sentinel AEGIS_SOAR_PLAYBOOKS="revoke_sessions=<Logic App trigger URL>"
+AEGIS_EDR_VENDOR=crowdstrike AEGIS_EDR_CLIENT_ID  AEGIS_EDR_CLIENT_SECRET  [AEGIS_EDR_URL]
+AEGIS_EDR_VENDOR=defender  AEGIS_EDR_TENANT_ID  AEGIS_EDR_CLIENT_ID  AEGIS_EDR_CLIENT_SECRET (or managed identity)
+AEGIS_EDR_VENDOR=sentinelone AEGIS_EDR_URL  AEGIS_EDR_TOKEN
+AEGIS_FW_VENDOR=panos      AEGIS_FW_URL  AEGIS_FW_TOKEN (API key)  [AEGIS_FW_TAG_SRC=aegis-block-src  AEGIS_FW_TAG_DST=aegis-block-dst]
+AEGIS_FW_VENDOR=fortigate  AEGIS_FW_URL  AEGIS_FW_TOKEN (REST admin token)  [AEGIS_FW_VDOM]
+AEGIS_IDP_VENDOR=entra     AEGIS_IDP_TENANT_ID  AEGIS_IDP_CLIENT_ID  AEGIS_IDP_CLIENT_SECRET  [AEGIS_IDP_PROTECTED=breakglass@bank.in,…]
+AEGIS_PAM_VENDOR=cyberark  AEGIS_PAM_URL  AEGIS_PAM_USERNAME  AEGIS_PAM_PASSWORD
 AEGIS_ENFORCEMENT_MODE=shadow   AEGIS_PROTECTED_TARGETS="cbs-db,swift-gw,dc-*"
 ```
+
+The bank stack (each has a `mock…` vendor for a lab; a private CA → `SSL_CERT_FILE`):
+
+| Control point | Vendor | Actions | What AEGIS changes | Undo / read-back | Least privilege |
+|---|---|---|---|---|---|
+| Firewall | Palo Alto PAN-OS | block (source), block_egress (destination), one IP | registers the IP with a timed tag (TTL) in two Dynamic Address Groups the bank wires to deny rules once; never edits rules or commits | unregister / `show object registered-ip` | API role: User-ID + operational show only |
+| Firewall | Fortinet FortiGate | block, block_egress, one IP | banned-IP quarantine list with an expiry (TTL) | clear / list banned | REST admin profile limited to user-quarantine |
+| EDR | Defender for Endpoint | isolate (Full) | device isolation (resolves host name → one device, or the device id) | unisolate / newest machine action | `Machine.Isolate`, `Machine.Read.All` |
+| EDR | SentinelOne | isolate | agent network disconnect | connect / `networkStatus` | API user with disconnect / connect |
+| Identity | Entra ID | revoke_sessions, force_logout (one-shot); lock_account | revoke all refresh tokens; disable the account + revoke | re-enables only an account AEGIS disabled / `accountEnabled` | `User.RevokeSessions.All`, `User.EnableDisableAccount.All` |
+| PAM | CyberArk PVWA | rotate_credential (permanent, two-person) | immediate CPM password change of exactly one vaulted account (`account:<user>[@<address>]`) | cannot be undone / last-modified time | vault user allowed to initiate CPM changes only |
+
+Principals on `AEGIS_IDP_PROTECTED` (break-glass accounts) are never locked, revoked or rotated by AEGIS. Whether an
+action may run unattended is decided by its action contract and the autonomy tier, the same as for every other
+connector. `isolate` is SEVERE. `rotate_credential` is IRREVERSIBLE and needs two people. Everything runs in shadow
+until `AEGIS_ENFORCEMENT_MODE=live`.
 
 How each WAF is bound:
 

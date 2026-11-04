@@ -653,12 +653,16 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
 
     - ``AEGIS_WAF_VENDOR``  = imperva | f5 | cloudflare | aws | azure | mock | mock-<cloud> → WAF connector (block / challenge / throttle on IPs)
     - ``AEGIS_SOAR_VENDOR`` = xsoar | sentinel | mock → playbook connector for the actions in ``AEGIS_SOAR_PLAYBOOKS``
-    - ``AEGIS_EDR_VENDOR``  = crowdstrike | mock → Falcon host contain (isolate) + RTR kill_process (both HITL)
+    - ``AEGIS_EDR_VENDOR``  = crowdstrike | defender | sentinelone | mock[-defender|-sentinelone] → host isolate
+      (+ Falcon RTR kill_process); all HITL
     - ``AEGIS_SWG_VENDOR``  = zscaler | mock → ZIA egress block (block_egress on a destination URL/IP)
+    - ``AEGIS_FW_VENDOR``   = panos | fortigate | mock-panos | mock-fortigate → firewall block / block_egress of one IP
+    - ``AEGIS_IDP_VENDOR``  = entra | mock → revoke_sessions / force_logout / lock_account on a user principal
+    - ``AEGIS_PAM_VENDOR``  = cyberark | mock → rotate_credential of one vaulted account
     - ``AEGIS_AGENT_SANDBOX`` = openshell | mock → NVIDIA OpenShell network quarantine of an AI agent (isolate agent:<sandbox>)
     - ``AEGIS_ENFORCEMENT_MODE`` = shadow (default) | live — shadow makes every vendor connector dry-run
 
-    Registration order (WAF, SOAR, EDR, SWG) gives the SOAR playbook connector priority for
+    Registration order (OpenShell, WAF, SOAR, EDR, SWG, firewall, IdP, PAM) gives the SOAR playbook connector priority for
     ``isolate`` when a playbook is configured; the direct EDR connector catches it otherwise.
 
     Anything not routed falls to the logging connector. ``mock`` vendors are the in-process
@@ -700,6 +704,15 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
             connectors.append(swg)
     except Exception as e:  # noqa: BLE001
         logger.warning("[connectors] SWG connector not built: %s", str(e)[:160])
+    for label, mod, fn in (("firewall", ".firewall", "firewall_from_env"), ("identity", ".identity", "idp_from_env"),
+                           ("PAM", ".identity", "pam_from_env")):
+        try:
+            import importlib
+            c = getattr(importlib.import_module(mod, __package__), fn)()
+            if c is not None:
+                connectors.append(c)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[connectors] %s connector not built: %s", label, str(e)[:160])
     reg = ConnectorRegistry(connectors, on_receipt=on_receipt)
     if connectors:
         logger.info("[connectors] %s mode: %s", reg.mode, ", ".join(f"{c.name}({'dry-run' if c.dry_run else 'LIVE'})" for c in connectors))
