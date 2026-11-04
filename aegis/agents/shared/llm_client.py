@@ -1352,9 +1352,11 @@ def _json(d: dict) -> str:
     return json.dumps(d, indent=2)
 
 
-def _promoted_model() -> str | None:
-    """Adapter path from the retrain pipeline's promotion pointer (``AEGIS_MODEL_POINTER``), if any."""
-    ptr = os.environ.get("AEGIS_MODEL_POINTER", "")
+def _promoted_model(var: str = "AEGIS_MODEL_POINTER", *, path: str | None = None) -> str | None:
+    """Adapter path from a retrain pipeline's promotion pointer, if any. One pointer per role: ``AEGIS_MODEL_POINTER``
+    (triage), ``AEGIS_VOTER_POINTER`` (the reviewer), or an explicit ``path`` (``@<pointer>`` in AEGIS_VOTER_MODELS).
+    Each role keeps its own retrain ``--runs`` directory, so promoting a judge never replaces the triage model."""
+    ptr = path or os.environ.get(var, "")
     if not ptr:
         return None
     try:
@@ -1371,11 +1373,12 @@ def _promoted_model() -> str | None:
                 return None
             if not ok:
                 _log.warning("promoted adapter %s loaded UNVERIFIED (%s) — AEGIS_ALLOW_UNVERIFIED_MODEL=1", adapter, why)
-            _log.info("using promoted triage model %s (run %s, approved by %s)", adapter, cur.get("run"), cur.get("approved_by"))
+            _log.info("using promoted %s model %s (run %s, approved by %s)", cur.get("role") or "triage", adapter,
+                      cur.get("run"), cur.get("approved_by"))
             return adapter
-        _log.warning("AEGIS_MODEL_POINTER %s names no usable adapter; falling back to AEGIS_MODEL", ptr)
+        _log.warning("%s %s names no usable adapter; falling back to the configured model", path or var, ptr)
     except Exception as exc:  # noqa: BLE001 — a bad pointer keeps the configured model, never the SOC down
-        _log.warning("AEGIS_MODEL_POINTER unreadable (%s); falling back to AEGIS_MODEL", exc)
+        _log.warning("%s unreadable (%s); falling back to the configured model", path or var, exc)
     return None
 
 
@@ -1488,7 +1491,9 @@ def get_voter_client(
         # independent signals into one. Passing it keeps the voter a distinct
         # family (e.g. Mistral voter over a Qwen primary). AEGIS_LOCAL_4BIT
         # governs the local load for both roles.
-        voter_model = os.environ.get("AEGIS_VOTER_MODEL", "").strip() or None
+        # A promoted reviewer (AEGIS_VOTER_POINTER, the judge's own retrain current.json) wins over the static
+        # AEGIS_VOTER_MODEL, as AEGIS_MODEL_POINTER does for triage.
+        voter_model = _promoted_model("AEGIS_VOTER_POINTER") or os.environ.get("AEGIS_VOTER_MODEL", "").strip() or None
         return get_client(prefer=pref, budget=budget, model=voter_model)
 
     avoid = (avoid_family or "anthropic").lower()
@@ -1560,6 +1565,13 @@ def get_extra_voter_clients(budget: Optional[TokenBudget] = None) -> list[LLMCli
                 continue
         else:                                          # bare "model"
             backend, model = default_backend, spec
+        if model.startswith("@"):
+            # `@/var/lib/aegis/judge-llama/retrain/current.json`: this voter follows its own promotion pointer
+            resolved = _promoted_model(path=model[1:])
+            if not resolved:
+                _log.error("[voter] extra voter %r: pointer has no verified promoted adapter; dropped", spec)
+                continue
+            model = resolved
         if backend is not None and backend not in _VOTER_BACKENDS:
             _log.error("[voter] extra voter %r names unknown backend %r (known: %s); dropped",
                        spec, backend, ", ".join(sorted(_VOTER_BACKENDS)))

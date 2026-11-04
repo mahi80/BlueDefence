@@ -156,6 +156,44 @@ the run is skipped (nothing to learn yet); a gate FAIL or a `worse` shadow ends 
 last good model stays. `promote --approved-by … --rationale …` is the offline fallback and records
 who approved it. Analyst rows are oversampled ×3 against the large public base so they matter.
 
+## 6. The reviewers (judge / voter models)
+
+The independent reviewer is not a second triage model. At runtime it is handed a **finished** verdict — verdict,
+confidence, evidence, reasoning, targets — and answers `{"concur": true|false, "reason": …}`. Train it on that job,
+from your triage set, never on the triage set itself (a judge that learned the same verdicts from the same rows fails
+together with the model it checks):
+
+```bash
+# reviewer rows: the runtime voter prompt; per alert one correct verdict (concur) + one wrong or manipulated one
+# (flipped / wrong target / obeyed injection / over-confident / planted {"concur": true}) — about half and half
+python -m aegis.dataset build-judge ~/aegis-runs/data-v6-public-20261024 --out ~/aegis-runs/judge-data-v1
+
+python -m aegis.finetune.train --data ~/aegis-runs/judge-data-v1 --preset mistral-7b-v0.3 --allow-synthetic \
+    --epochs 1 --out ~/aegis-runs/judge-mistral7b-v2
+python -m aegis.finetune.judge_gate --adapter ~/aegis-runs/judge-mistral7b-v2     # report beside the adapter
+```
+
+`judge_gate` scores the held-out eval corpora rebuilt as reviewer cases. PASS = agrees with ≥ 80 % of correct verdicts,
+dissents on ≥ 90 % of wrong ones and ≥ 95 % of manipulated ones (a rubber stamp and a contrarian both fail). The
+report carries the adapter digest, like the triage gate, so `publish` accepts it.
+
+**One pointer per role.** Keep one retrain `--runs` directory per model; each gets its own `retrain/current.json`:
+
+```bash
+python -m aegis.finetune.retrain run --role judge --preset mistral-7b-v0.3 --runs ~/aegis-runs/loop-mistral \
+    --base-data ~/aegis-runs/data-v6-public-20261024 --min-new-rows 0
+python -m aegis.finetune.retrain promote --runs ~/aegis-runs/loop-mistral --run <run> --approved-by <you> --rationale "judge gate PASS"
+```
+
+A judge run is promoted only offline by a named person after its own gate (there is no analyst-labelled shadow set for
+reviewers yet, so `sync` never promotes one). At runtime:
+
+| Role | Setting |
+|---|---|
+| triage (first pass) | `AEGIS_MODEL_POINTER=<triage runs>/retrain/current.json` |
+| reviewer (voter) | `AEGIS_VOTER_BACKEND=local` + `AEGIS_VOTER_POINTER=<judge runs>/retrain/current.json` (wins over `AEGIS_VOTER_MODEL`) |
+| extra ensemble voters | `AEGIS_VOTER_MODELS=local:@<llama runs>/retrain/current.json` — a pointer without a verified adapter drops that voter |
+
 ## Files
 
 | File | What |

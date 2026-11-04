@@ -212,6 +212,50 @@ def cmd_synth(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_judge(args: argparse.Namespace) -> int:
+    """Reviewer (judge / voter) training set from an existing triage dataset — see ``aegis.dataset.judge``."""
+    import collections
+    import hashlib
+    from datetime import datetime
+
+    from .judge import ORIGIN, build_judge_rows
+    src = Path(args.src).expanduser()
+    f = src / "sft" / "triage.jsonl" if src.is_dir() else src
+    if not f.exists():
+        print(f"no sft/triage.jsonl at {f}", file=sys.stderr)
+        return 2
+
+    def rows():
+        with f.open(encoding="utf-8") as fh:
+            for ln in fh:
+                if ln.strip():
+                    yield json.loads(ln)
+    out_rows = build_judge_rows(rows(), seed=args.seed, context_pct=args.context_pct, max_rows=args.max_rows)
+    if not out_rows:
+        print("no usable triage rows to build from", file=sys.stderr)
+        return 1
+    out = Path(args.out); (out / "sft").mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    with (out / "sft" / "triage.jsonl").open("w", encoding="utf-8") as fh:       # the file name train.py loads
+        for r in out_rows:
+            line = json.dumps(r, ensure_ascii=False, sort_keys=True)
+            h.update(line.encode()); fh.write(line + "\n")
+    by_variant = collections.Counter(r["variant"] for r in out_rows)
+    by_split = collections.Counter(r["split"] for r in out_rows)
+    concur = sum(1 for r in out_rows if json.loads(r["messages"][2]["content"])["concur"])
+    manifest = {"name": args.name or out.name, "format": "aegis-judge", "origin": ORIGIN, "source": str(f),
+                "generated_at": datetime.now(UTC).isoformat(), "seed": args.seed,
+                "counts": {"rows": len(out_rows), "concur": concur, "dissent": len(out_rows) - concur,
+                           "by_variant": dict(by_variant), "by_split": dict(by_split)},
+                "sha256": h.hexdigest(),
+                "NOTE": "Reviewer rows: the runtime voter prompt and {concur, reason} answers. Train a judge/voter "
+                        "adapter on this, NOT on the triage set. Label sources are inherited from the source rows."}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"  wrote {out}/sft/triage.jsonl: {len(out_rows)} reviewer rows ({concur} concur / {len(out_rows) - concur} "
+          f"dissent), splits {dict(by_split)}, variants {dict(by_variant)}")
+    return 0
+
+
 def cmd_build_public(args: argparse.Namespace) -> int:
     """Public corpora (Sigma + Security-Datasets) + synthetic + injection → one sft/triage.jsonl."""
     import hashlib
@@ -386,6 +430,15 @@ def main(argv: list[str] | None = None) -> int:
     bp.add_argument("--xsoar-pct", type=int, default=20, help="share of rows wrapped in a Cortex XSOAR incident envelope")
     bp.add_argument("--cve-calibrate", action="store_true", help="calibrate the synthetic CVE overlay to real KEV/NVD/EPSS distributions from the threat-intel cache (abstract stats only, no real ids)")
     bp.set_defaults(fn=cmd_build_public)
+
+    bj = sub.add_parser("build-judge", help="reviewer (judge/voter) training set from a triage dataset: concur/dissent on finished verdicts")
+    bj.add_argument("src", help="a triage dataset directory (with sft/triage.jsonl), e.g. ~/aegis-runs/data-v6-public-20261024")
+    bj.add_argument("--out", required=True, help="output directory (created)")
+    bj.add_argument("--name", default="")
+    bj.add_argument("--seed", type=int, default=7)
+    bj.add_argument("--context-pct", type=float, default=15.0, help="share of rows that also show the alert (the auto-close vote)")
+    bj.add_argument("--max-rows", type=int, default=0, help="stop after this many reviewer rows (0 = all)")
+    bj.set_defaults(fn=cmd_build_judge)
 
     ve = sub.add_parser("verify", help="re-hash a dataset directory and check the split invariant")
     ve.add_argument("dir")
