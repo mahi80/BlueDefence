@@ -23,6 +23,8 @@ CLASSES: dict[int, tuple[str, str]] = {
     1001: ("file_activity", "File System Activity"),
     1006: ("scheduled_job", "Scheduled Job Activity"),
     1007: ("process_activity", "Process Activity"),
+    1008: ("event_log_activity", "Event Log Activity"),
+    1009: ("script_activity", "Script Activity"),
     2001: ("security_finding", "Security Finding"),
     2002: ("vulnerability_finding", "Vulnerability Finding"),
     2003: ("compliance_finding", "Compliance Finding"),

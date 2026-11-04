@@ -141,3 +141,25 @@ def test_stream_ocsf_path_uses_env_rules(monkeypatch):
 def test_cli(capsys):
     assert sigma.main(["--rules", str(RULES)]) == 0
     assert '"loaded": 6' in capsys.readouterr().out
+
+
+def test_powershell_event_log_auditd_and_av_logsources_map():
+    script = compile_rule({"title": "t", "id": "ps", "logsource": {"product": "windows", "category": "ps_script"},
+                           "detection": {"s": {"ScriptBlockText|contains": "Invoke-Mimikatz"}, "condition": "s"}})
+    assert script.classes == (1009,) and script.match({"script": {"script_content": "x; Invoke-Mimikatz -DumpCreds"}})
+    svc = compile_rule({"title": "t", "id": "svc", "logsource": {"product": "windows", "service": "system"},
+                        "detection": {"s": {"EventID": 7045, "ServiceName": "PSEXESVC"}, "condition": "s"}})
+    assert svc.classes == (1008,)
+    assert svc.match({"metadata": {"event_code": "7045"}, "unmapped": {"ServiceName": "PSEXESVC"}})
+    aud = compile_rule({"title": "t", "id": "au", "logsource": {"product": "linux", "service": "auditd"},
+                        "detection": {"s": {"type": "EXECVE", "a0": "nc", "a1": "-e"}, "condition": "s"}})
+    assert 1007 in aud.classes and aud.match({"unmapped": {"type": "EXECVE", "a0": "nc", "a1": "-e"}})
+    av = compile_rule({"title": "t", "id": "av", "logsource": {"category": "antivirus"},
+                       "detection": {"s": {"Signature|contains": "Mimikatz"}, "condition": "s"}})
+    assert av.classes == (2004,) and av.match({"malware": {"name": "HackTool:Win64/Mimikatz.D"}})
+    k8s = compile_rule({"title": "t", "id": "k", "logsource": {"product": "kubernetes", "service": "audit"},
+                        "detection": {"s": {"verb": "create", "objectRef.resource": "pods/exec"}, "condition": "s"}})
+    assert 6003 in k8s.classes
+    with pytest.raises(Unsupported):
+        compile_rule({"title": "t", "id": "x", "logsource": {"product": "exotic", "service": "thing"},
+                      "detection": {"s": {"a": 1}, "condition": "s"}})

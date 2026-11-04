@@ -51,12 +51,20 @@ _CATEGORY_CLASSES: dict[str, tuple[int, ...]] = {
     "registry_delete": (201001, 201002),
     "network_connection": (4001,), "firewall": (4001,), "dns_query": (4003,), "dns": (4003,),
     "proxy": (4002,), "webserver": (4002,), "application": (4002, 6003),
+    "ps_script": (1009,), "ps_module": (1009,), "ps_classic_start": (1009, 1008), "ps_classic_provider_start": (1009, 1008),
+    "pipe_created": (1008,), "wmi_event": (1008,), "create_stream_hash": (1001,), "raw_access_thread": (1001,),
+    "antivirus": (2004,), "sysmon_status": (1008,), "sysmon_error": (1008,),
 }
 _SERVICE_CLASSES: dict[str, tuple[int, ...]] = {
     "cloudtrail": (6003,), "azureactivity": (6003,), "activitylogs": (6003,), "gcp.audit": (6003,), "okta": (3002, 3001, 6003),
     "signinlogs": (3002,), "auditlogs": (3001, 6003), "security": (3002, 3001, 1007), "sysmon": (1007, 1001, 4001, 4003),
     "dns": (4003,), "zeek": (4001, 4002, 4003), "smb_files": (4006,), "ssh": (3002,), "sshd": (3002,), "auth": (3002,),
+    "auditd": (1007, 1001, 1008), "syslog": (1008,), "http": (4002,), "dce_rpc": (4001,), "kerberos": (3002,),
+    "audit": (6003,), "aaa": (3002, 6003), "event": (4001, 1008), "windefend": (2004, 1008),
+    "powershell": (1009, 1008), "powershell-classic": (1009, 1008),
 }
+#: products whose every other service is an event log (Windows channels, a Linux host's journal)
+_PRODUCT_DEFAULT: dict[str, tuple[int, ...]] = {"windows": (1008,), "linux": (1007, 1008), "macos": (1007, 1008)}
 
 #: Sigma field → OCSF attribute paths, first that exists wins
 FIELD_MAP: dict[str, tuple[str, ...]] = {
@@ -117,6 +125,29 @@ FIELD_MAP: dict[str, tuple[str, ...]] = {
     "resultdescription": ("status_detail",),
     "eventtype": ("activity_name",),
     "displaymessage": ("message",),
+    # PowerShell script blocks / module logging (OCSF Script Activity)
+    "scriptblocktext": ("script.script_content", "unmapped.ScriptBlockText"),
+    "path": ("script.file.path", "file.path", "unmapped.Path"),
+    "payload": ("unmapped.Payload", "script.script_content"),
+    "contextinfo": ("unmapped.ContextInfo",),
+    "hostapplication": ("process.cmd_line", "unmapped.HostApplication"),
+    # Windows event-log channels (OCSF Event Log Activity) and AV detections
+    "provider_name": ("metadata.log_provider", "unmapped.Provider_Name"),
+    "channel": ("metadata.log_name", "unmapped.Channel"),
+    "servicename": ("unmapped.ServiceName", "service.name"),
+    "imagepath": ("unmapped.ImagePath", "process.file.path"),
+    "pipename": ("unmapped.PipeName", "file.name"),
+    "signature": ("malware.name", "finding_info.title", "unmapped.Signature"),
+    "filename": ("file.path", "unmapped.Filename"),
+    # Linux auditd
+    "exe": ("process.file.path", "unmapped.exe"),
+    "comm": ("process.name", "unmapped.comm"),
+    "a0": ("unmapped.a0",), "a1": ("unmapped.a1",), "a2": ("unmapped.a2",), "a3": ("unmapped.a3",),
+    "key": ("unmapped.key",),
+    # Kubernetes / Bitbucket / GitHub audit
+    "verb": ("api.operation", "unmapped.verb"),
+    "objectref.resource": ("resources.type", "unmapped.objectRef.resource"),
+    "auditType.action": ("api.operation",),
 }
 
 _UNSUPPORTED_MODS = ("base64", "base64offset", "utf16", "utf16le", "utf16be", "wide", "fieldref", "expand")
@@ -412,8 +443,10 @@ def _classes(logsource: dict) -> tuple[int, ...] | None:
         return _CATEGORY_CLASSES[cat]
     if svc in _SERVICE_CLASSES:
         return _SERVICE_CLASSES[svc]
-    if prod in ("aws", "azure", "gcp", "m365", "okta", "github") and not cat:
+    if prod in ("aws", "azure", "gcp", "m365", "okta", "github", "bitbucket", "kubernetes") and not cat:
         return (6003, 3002, 3001)
+    if prod in _PRODUCT_DEFAULT and not cat:
+        return _PRODUCT_DEFAULT[prod]
     raise Unsupported(f"logsource {cat or '-'} / {svc or '-'} / {prod or '-'} has no OCSF class mapping")
 
 
