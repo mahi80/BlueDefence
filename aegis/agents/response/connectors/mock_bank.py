@@ -217,4 +217,66 @@ class MockCyberArk(_MockBase):
         return HttpResult(404, {"ErrorCode": "PASWS000E"})
 
 
-__all__ = ["MockCyberArk", "MockDefender", "MockEntra", "MockFortiGate", "MockPanos", "MockSentinelOne"]
+class MockTrend(_MockBase):
+    def __init__(self, token: str = "mock-trend-token", endpoints: dict[str, str] | None = None):
+        super().__init__()
+        self.token = token
+        self.endpoints = endpoints or {"app-ledger-07": "11111111-2222-3333-4444-555555555555",
+                                       "db-core": "66666666-7777-8888-9999-000000000000"}
+        self.isolated: set[str] = set()
+        self.tasks: dict[str, str] = {}
+
+    def handle(self, method: str, url: str, body: object, headers: dict) -> HttpResult:
+        if headers.get("Authorization") != f"Bearer {self.token}":
+            return HttpResult(401, {"error": {"code": "NotAuthenticated"}})
+        path = url.split("?", 1)[0]
+        if path.endswith("/v3.0/endpointSecurity/endpoints") and method == "GET":
+            m = re.search(r"endpointName eq '([^']+)'", headers.get("TMV1-Query", ""))
+            name = m.group(1) if m else ""
+            return HttpResult(200, {"items": [{"agentGuid": g, "endpointName": n} for n, g in self.endpoints.items() if n == name]})
+        m = re.search(r"/v3.0/response/endpoints/(isolate|restore)$", path)
+        if m and method == "POST":
+            out = []
+            for item in body if isinstance(body, list) else []:
+                g = item.get("agentGuid")
+                if g not in self.endpoints.values():
+                    out.append({"status": 400, "body": {"error": {"code": "InvalidAgent"}}})
+                    continue
+                (self.isolated.add if m.group(1) == "isolate" else self.isolated.discard)(g)
+                tid = f"00000{next(self._ids)}"
+                self.tasks[tid] = "succeeded"
+                out.append({"status": 202, "headers": [{"name": "Operation-Location",
+                                                        "value": f"https://trend.mock/v3.0/response/tasks/{tid}"}]})
+            return HttpResult(207, out)
+        m = re.search(r"/v3.0/response/tasks/([^/]+)$", path)
+        if m and method == "GET":
+            st = self.tasks.get(m.group(1))
+            return HttpResult(200, {"id": m.group(1), "status": st}) if st else HttpResult(404, {"error": {"code": "NotFound"}})
+        return HttpResult(404, {"error": {"code": "NotFound"}})
+
+
+class MockDirectory:
+    """Stands in for ``identity.Directory`` (LDAP search / replace) over an in-memory user set."""
+
+    def __init__(self):
+        self.users = {
+            "CN=Priya Sharma,OU=Staff,DC=bank,DC=local": {"sAMAccountName": "priya.sharma", "userPrincipalName": "priya.sharma@bank.local", "userAccountControl": 512},
+            "CN=svc_loan,OU=Service,DC=bank,DC=local": {"sAMAccountName": "svc_loan", "userPrincipalName": "svc_loan@bank.local", "userAccountControl": 66048},
+            "CN=Old Leaver,OU=Staff,DC=bank,DC=local": {"sAMAccountName": "old.leaver", "userPrincipalName": "old.leaver@bank.local", "userAccountControl": 514},
+            "CN=Administrator,CN=Users,DC=bank,DC=local": {"sAMAccountName": "Administrator", "userPrincipalName": "", "userAccountControl": 512},
+        }
+        self.filters: list[str] = []
+
+    def search(self, base: str, flt: str, attrs: list[str]) -> list[tuple[str, dict]]:
+        self.filters.append(flt)
+        m = re.search(r"\(sAMAccountName=([^)]*)\)", flt)
+        want = (m.group(1) if m else "").lower()
+        return [(dn, {a: u.get(a) for a in attrs}) for dn, u in self.users.items()
+                if want and want in (u["sAMAccountName"].lower(), u["userPrincipalName"].lower())]
+
+    def replace(self, dn: str, attr: str, value: object) -> None:
+        self.users[dn][attr] = value
+
+
+__all__ = ["MockCyberArk", "MockDefender", "MockDirectory", "MockEntra", "MockFortiGate", "MockPanos", "MockSentinelOne",
+           "MockTrend"]

@@ -653,12 +653,13 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
 
     - ``AEGIS_WAF_VENDOR``  = imperva | f5 | cloudflare | aws | azure | mock | mock-<cloud> → WAF connector (block / challenge / throttle on IPs)
     - ``AEGIS_SOAR_VENDOR`` = xsoar | sentinel | mock → playbook connector for the actions in ``AEGIS_SOAR_PLAYBOOKS``
-    - ``AEGIS_EDR_VENDOR``  = crowdstrike | defender | sentinelone | mock[-defender|-sentinelone] → host isolate
+    - ``AEGIS_EDR_VENDOR``  = crowdstrike | defender | sentinelone | trend | mock[-defender|-sentinelone|-trend] → host isolate
       (+ Falcon RTR kill_process); all HITL
     - ``AEGIS_SWG_VENDOR``  = zscaler | mock → ZIA egress block (block_egress on a destination URL/IP)
     - ``AEGIS_FW_VENDOR``   = panos | fortigate | mock-panos | mock-fortigate → firewall block / block_egress of one IP
-    - ``AEGIS_IDP_VENDOR``  = entra | mock → revoke_sessions / force_logout / lock_account on a user principal
+    - ``AEGIS_IDP_VENDOR``  = entra | ad | mock → revoke_sessions / force_logout / lock_account on a user principal
     - ``AEGIS_PAM_VENDOR``  = cyberark | mock → rotate_credential of one vaulted account
+    - ``AEGIS_BLOCK_FEED``  = 1 → block / block_egress listed on the pull feed firewalls fetch (registered last)
     - ``AEGIS_AGENT_SANDBOX`` = openshell | mock → NVIDIA OpenShell network quarantine of an AI agent (isolate agent:<sandbox>)
     - ``AEGIS_ENFORCEMENT_MODE`` = shadow (default) | live — shadow makes every vendor connector dry-run
 
@@ -705,7 +706,7 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
     except Exception as e:  # noqa: BLE001
         logger.warning("[connectors] SWG connector not built: %s", str(e)[:160])
     for label, mod, fn in (("firewall", ".firewall", "firewall_from_env"), ("identity", ".identity", "idp_from_env"),
-                           ("PAM", ".identity", "pam_from_env")):
+                           ("PAM", ".identity", "pam_from_env"), ("block feed", ".firewall", "feed_from_env")):
         try:
             import importlib
             c = getattr(importlib.import_module(mod, __package__), fn)()

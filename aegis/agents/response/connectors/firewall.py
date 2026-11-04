@@ -164,6 +164,46 @@ class FortiGateConnector(_Firewall):
                    if isinstance(r, dict))
 
 
+class FeedConnector(Connector):
+    """A pull feed instead of an API write: the block is listed at ``GET /ingest/blocklist?format=txt`` (``&kind=dst``
+    for ``block_egress``) and the firewall enforces whatever its external-feed object last fetched — Check Point
+    Network Feed (R81.20+), PAN-OS External Dynamic List, FortiGate external threat feed, Cisco Secure Firewall
+    Security Intelligence. AEGIS changes no firewall config and needs no firewall credential; the security team
+    points one deny rule at the feed once. Undo / expiry drop the entry from the next fetch. AEGIS cannot see what
+    the firewall last fetched, so the receipt reads "not verifiable". Registered last: a direct firewall / WAF
+    connector wins when one is configured."""
+
+    name = "feed"
+    actions = frozenset({"block", "block_egress"})
+
+    def supports_target(self, target: str) -> bool:
+        t = str(target).strip()
+        for p in ("ip:", "src:", "dst:", "outbound:"):
+            if t.lower().startswith(p):
+                t = t[len(p):].strip()
+        try:
+            ipaddress.ip_network(t, strict=False)
+            return True
+        except ValueError:
+            return False
+
+    def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
+        kind = "dst" if action.action_type == "block_egress" else "src"
+        return f"feed:{kind}", (f"[feed] {action.target} listed on the {kind} block feed; firewalls apply it on their "
+                                f"next fetch"), kind
+
+    def _do_rollback(self, receipt: Receipt) -> str:
+        return f"[feed] {receipt.target} dropped from the block feed (gone on the firewalls' next fetch)"
+
+    def _do_renew(self, receipt: Receipt, ttl_sec: int) -> str:
+        return f"[feed] {receipt.target} stays on the block feed"
+
+
+def feed_from_env() -> Connector | None:
+    """``AEGIS_BLOCK_FEED=1`` (default off): serve live blocks as a firewall pull feed."""
+    return FeedConnector() if os.environ.get("AEGIS_BLOCK_FEED", "0").strip() == "1" else None
+
+
 def firewall_from_env(transport: Transport | None = None) -> Connector | None:
     """``AEGIS_FW_VENDOR = panos | fortigate | mock-panos | mock-fortigate`` (default off). Live needs ``AEGIS_FW_URL``
     and ``AEGIS_FW_TOKEN`` (PAN-OS API key / FortiGate REST token); ``AEGIS_FW_TAG_SRC`` / ``AEGIS_FW_TAG_DST``
@@ -191,4 +231,4 @@ def firewall_from_env(transport: Transport | None = None) -> Connector | None:
     return None
 
 
-__all__ = ["FortiGateConnector", "PanosConnector", "firewall_from_env"]
+__all__ = ["FeedConnector", "FortiGateConnector", "PanosConnector", "feed_from_env", "firewall_from_env"]
