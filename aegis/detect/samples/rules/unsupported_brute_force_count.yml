@@ -1,0 +1,8 @@
+title: Many failed logons (aggregation — skipped by the engine)
+id: 7c1f2e10-0b1d-4c55-9a51-0d6f5e0c0007
+status: experimental
+logsource: {product: windows, service: security}
+detection:
+  selection: {EventID: 4625}
+  condition: selection | count(TargetUserName) by IpAddress > 10
+level: medium

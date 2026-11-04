@@ -1,0 +1,10 @@
+title: SQL injection probe in the query string
+id: 7c1f2e10-0b1d-4c55-9a51-0d6f5e0c0004
+status: experimental
+logsource: {category: webserver}
+detection:
+  selection:
+    cs-uri-query|contains: ["' or 1=1", 'union select', 'sleep(']
+  condition: selection
+level: high
+tags: [attack.initial_access, attack.t1190]
