@@ -584,7 +584,8 @@ class SwarmOrchestrator:
 
 
 def swarm_from_env(orchestrator: Any, **kw: Any) -> Any:
-    """Wrap when AEGIS_SWARM=1 (default off); caps from AEGIS_SWARM_MAX_WORKERS / _MAX_SECONDS.
+    """Wrap unless AEGIS_SWARM=0 (default ON: the post-verdict fan-out + re-vote is what the platform is built
+    around; a licence without the "swarm" feature still forces it off); caps from AEGIS_SWARM_MAX_WORKERS / _MAX_SECONDS.
 
     Campaign context (``AEGIS_CAMPAIGN_CONTEXT``, default on) is independent of the swarm: it is
     cheap and in-memory, and the adaptive-attacker fast path depends on it. With the swarm off,
@@ -594,7 +595,7 @@ def swarm_from_env(orchestrator: Any, **kw: Any) -> Any:
     if "event_store" not in kw and os.environ.get("AEGIS_CAMPAIGN_CONTEXT", "1").strip().lower() in on:
         from .walkers.campaign import EventStore
         kw["event_store"] = EventStore(window_min=int(os.environ.get("AEGIS_CAMPAIGN_WINDOW_MIN", "30")))
-    if os.environ.get("AEGIS_SWARM", "0").strip().lower() not in on:
+    if os.environ.get("AEGIS_SWARM", "1").strip().lower() not in on:
         if kw.get("event_store") is None:
             return orchestrator
         return SwarmOrchestrator(orchestrator, workers={}, max_workers=1, trigger_verdicts=frozenset(),

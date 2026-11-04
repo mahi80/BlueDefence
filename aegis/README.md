@@ -564,7 +564,7 @@ SIEM and the CMDB read AEGIS decisions as a stream.
 
 ## What happens after the verdict
 
-**Inline swarm** (`orchestrator/swarm.py`, `AEGIS_SWARM=1`, ≤ 60 s) — on a suspicious /
+**Inline swarm** (`orchestrator/swarm.py`, on by default — `AEGIS_SWARM=0` turns it off, ≤ 60 s) — on a suspicious /
 malicious / uncertain verdict, short-lived parallel workers each do one job: IOC extract,
 intel enrichment, deception check, one-hop blast radius, log-hunt queries for the analyst,
 patch proposal, analyst brief. Their evidence is merged, the voter re-scores, and the swarm

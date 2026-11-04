@@ -130,8 +130,11 @@ def test_swarm_workers_are_governed_tool_calls_and_pause_stops_them(orch):
     assert chain2.metadata["swarm"]["evidence_added"] == 0
 
 
-def test_swarm_from_env_off_by_default(orch, monkeypatch):
+def test_swarm_from_env_on_by_default(orch, monkeypatch):
     monkeypatch.delenv("AEGIS_SWARM", raising=False)
+    on = swarm_from_env(orch)                                   # default ON: the full worker set fans out
+    assert isinstance(on, SwarmOrchestrator) and on._workers and on.trigger_verdicts
+    monkeypatch.setenv("AEGIS_SWARM", "0")
     # swarm off: still wrapped for campaign context only — no workers, never fans out
     ctx_only = swarm_from_env(orch)
     assert ctx_only._workers == {} and ctx_only.trigger_verdicts == frozenset() and ctx_only._events is not None
