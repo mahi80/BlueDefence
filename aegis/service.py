@@ -91,6 +91,7 @@ class Pipeline:
     edition: str = "full"               # external | soc | full (aegis.edition)
     push_server: Any = None             # HTTP push receiver (AEGIS_INGEST_HTTP=1) — Cloudflare Logpush / Firehose / forwarders
     eventhub: Any = None                # Azure Event Hub reader (AEGIS_SOURCES includes eventhub)
+    kafka: Any = None                   # Kafka reader (AEGIS_SOURCES includes kafka)
     stream: Any = None                  # the shared StreamQueue the receivers feed; the loop wakes on it
     watchdog: Any = None                # feed-liveness watchdog (AEGIS_FEED_WATCHDOG=1); a silent feed is not "no attacks"
     metrics_server: Any = None          # standalone /metrics (AEGIS_METRICS_BIND) for a deployment with no push receiver
@@ -155,6 +156,7 @@ class Pipeline:
                 + (f" — push receiver {self.push_server.url} (+/metrics)" if self.push_server is not None else "")
                 + (f" — metrics {self.metrics_server.url}/metrics" if self.metrics_server is not None else "")
                 + (" — event hub reader on" if self.eventhub is not None else "")
+                + (" — kafka reader on" if self.kafka is not None else "")
                 + (" — feed watchdog on" if self.watchdog is not None else ""))
 
     def close(self) -> None:
@@ -163,7 +165,7 @@ class Pipeline:
             flush()                                      # the discovered-AI-usage register, if NDR ran
         except Exception as e:  # noqa: BLE001
             logger.warning("[service] AI usage register flush failed: %s", e)
-        for r in (self.push_server, self.eventhub, self.metrics_server):
+        for r in (self.push_server, self.eventhub, self.kafka, self.metrics_server):
             if r is not None:
                 try:
                     r.stop()
@@ -267,6 +269,10 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
     if "eventhub" in [x.strip().lower() for x in os.environ.get("AEGIS_SOURCES", "").split(",")]:
         from aegis.ingest.eventhub import eventhub_from_env
         eventhub = eventhub_from_env()
+    kafka = None
+    if "kafka" in [x.strip().lower() for x in os.environ.get("AEGIS_SOURCES", "").split(",")]:
+        from aegis.ingest.kafka import kafka_from_env
+        kafka = kafka_from_env()
     from aegis.ingest.watchdog import feed_watchdog_from_env
     watchdog = feed_watchdog_from_env()              # a dead feed must page someone, not hide as silence
     from aegis.agents.shared.observability import metrics_server_from_env
@@ -275,7 +281,7 @@ def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = Fals
                  connectors=connectors, receipt_log=receipt_log, persist_sink=persist_sink, governed=governed,
                  rules_report=rules_report, primary_name=primary.name, primary_model=primary.model,
                  investigator=investigator, containment=containment, edition=edition.name,
-                 push_server=push_server, eventhub=eventhub, stream=get_stream(), watchdog=watchdog,
+                 push_server=push_server, eventhub=eventhub, kafka=kafka, stream=get_stream(), watchdog=watchdog,
                  metrics_server=metrics_server, license=lic_state, _license_holder=_lic_holder,
                  license_meter=licensing.LicenseMeter(eps_limit=lic_state.eps_limit, devices_limit=lic_state.devices_limit,
                                                       allowance_s=_envf("AEGIS_LICENSE_OVERLIMIT_DAYS", 7) * 86400))

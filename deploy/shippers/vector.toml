@@ -1,0 +1,47 @@
+# Vector -> BlueDefence (AEGIS). Two ways in; keep the one that fits your pipeline.
+#   A) straight to the AEGIS push receiver (/ingest/ocsf or /ingest/edr, /ingest/waf ...)
+#   B) onto Kafka, where AEGIS reads it (AEGIS_SOURCES=kafka, AEGIS_KAFKA_TOPICS=sec.ocsf=ocsf)
+# Secrets come from the environment: AEGIS_INGEST_TOKEN, KAFKA_USERNAME, KAFKA_PASSWORD. Never inline them.
+# TLS terminates in front of AEGIS (reverse proxy); point the URL at that https endpoint.
+
+[sources.ocsf_files]
+type = "file"
+include = ["/var/log/security/ocsf/*.json"]   # one OCSF event per line (Security Lake export, a vendor's OCSF feed)
+
+[transforms.parse]
+type = "remap"
+inputs = ["ocsf_files"]
+source = '''
+. = parse_json!(.message)
+'''
+
+# --- A) HTTP push --------------------------------------------------------------------------------
+[sinks.aegis_http]
+type = "http"
+inputs = ["parse"]
+uri = "https://aegis.bank.internal/ingest/ocsf?product=security-lake"
+method = "post"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+compression = "gzip"
+request.headers.Authorization = "Bearer ${AEGIS_INGEST_TOKEN}"
+batch.max_bytes = 4000000           # well under AEGIS_INGEST_MAX_MB
+batch.timeout_secs = 2
+request.retry_attempts = 1000000    # AEGIS answers 503 when its queue is full: Vector keeps the batch and retries
+buffer.type = "disk"
+buffer.max_size = 1073741824
+tls.verify_certificate = true
+
+# --- B) Kafka ------------------------------------------------------------------------------------
+# [sinks.aegis_kafka]
+# type = "kafka"
+# inputs = ["parse"]
+# bootstrap_servers = "kafka-1.bank.internal:9093,kafka-2.bank.internal:9093"
+# topic = "sec.ocsf"
+# encoding.codec = "json"
+# compression = "zstd"
+# sasl.enabled = true
+# sasl.mechanism = "SCRAM-SHA-512"
+# sasl.username = "${KAFKA_USERNAME}"
+# sasl.password = "${KAFKA_PASSWORD}"
+# tls.enabled = true

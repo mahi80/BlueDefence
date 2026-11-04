@@ -1,0 +1,52 @@
+# Fluent Bit -> BlueDefence (AEGIS). Sysmon / osquery to /ingest/edr, OCSF to /ingest/ocsf, or both onto Kafka.
+# Secrets from the environment (AEGIS_INGEST_TOKEN, KAFKA_USERNAME, KAFKA_PASSWORD) — never inline them.
+service:
+  flush: 2
+  storage.path: /var/lib/fluent-bit/buffer      # filesystem buffer: a 503 from AEGIS (queue full) is retried, not lost
+
+pipeline:
+  inputs:
+    - name: tail
+      path: /var/log/osquery/osqueryd.results.log
+      tag: edr.osquery
+      parser: json
+      storage.type: filesystem
+    - name: tail
+      path: /var/log/security/ocsf/*.json
+      tag: ocsf.events
+      parser: json
+      storage.type: filesystem
+
+  outputs:
+    - name: http
+      match: edr.*
+      host: aegis.bank.internal
+      port: 443
+      tls: on
+      tls.verify: on
+      uri: /ingest/edr
+      format: json_lines
+      compress: gzip
+      header: Authorization Bearer ${AEGIS_INGEST_TOKEN}
+      retry_limit: no_limits
+    - name: http
+      match: ocsf.*
+      host: aegis.bank.internal
+      port: 443
+      tls: on
+      tls.verify: on
+      uri: /ingest/ocsf?product=fluent-bit
+      format: json_lines
+      compress: gzip
+      header: Authorization Bearer ${AEGIS_INGEST_TOKEN}
+      retry_limit: no_limits
+    # Kafka instead (AEGIS_SOURCES=kafka, AEGIS_KAFKA_TOPICS=sec.ocsf=ocsf,sec.edr=edr):
+    # - name: kafka
+    #   match: ocsf.*
+    #   brokers: kafka-1.bank.internal:9093
+    #   topics: sec.ocsf
+    #   format: json
+    #   rdkafka.security.protocol: SASL_SSL
+    #   rdkafka.sasl.mechanism: SCRAM-SHA-512
+    #   rdkafka.sasl.username: ${KAFKA_USERNAME}
+    #   rdkafka.sasl.password: ${KAFKA_PASSWORD}
