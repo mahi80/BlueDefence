@@ -105,7 +105,14 @@ def _unverified(ptr: dict, adapter: str, run: str) -> str:
     directory is on this host the digest is checked here, otherwise the GPU-side register step checks it
     (``vllm_registry.register_promoted_adapter``), which loads only an adapter whose digest matches. The
     pointer file itself must be writable only by the promotion step. ``AEGIS_ALLOW_UNVERIFIED_MODEL=1`` is the
-    explicit operator override for a lab."""
+    explicit operator override for a lab.
+
+    Role, signature and the release deny list go through the same verifier startup uses — hot-reload used to swap in
+    a forged, unsigned pointer the restart path would have refused (review round 7 T-3 / R-1)."""
+    from aegis.finetune.pointer_trust import verify_pointer
+    ok, why = verify_pointer(ptr, role_wanted="triage", label=f"promotion pointer run={run}")
+    if not ok:
+        return why
     if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") == "1":
         return ""
     sha = str(ptr.get("sha256") or "")

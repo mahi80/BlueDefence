@@ -58,7 +58,22 @@ def _formatting(examples, tokenizer) -> list[str]:
     return texts
 
 
+def _out_conflict(args) -> str | None:
+    """A non-empty ``--out`` would be silently overwritten (round 7 T-2): refuse unless resuming / overwriting."""
+    out = Path(args.out)
+    if getattr(args, "dry_run", False) or getattr(args, "resume", None) or getattr(args, "overwrite", False):
+        return None
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        return (f"--out {out} already exists and is not empty — pick a new dir, "
+                "or pass --resume to continue it / --overwrite to replace it")
+    return None
+
+
 def run(args) -> int:
+    why = _out_conflict(args)
+    if why:
+        print(f"\nERROR: {why}", file=sys.stderr)
+        return 2
     rows = load_sft(args.data, allow_synthetic=args.allow_synthetic)
     if args.max_rows and len(rows) > args.max_rows:
         import random
@@ -189,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-rows", type=int, default=0, help="train on a random subset of this size (0 = all)")
     ap.add_argument("--resume", nargs="?", const="auto", default=None,
                     help="continue from the latest checkpoint-N under --out (or a given checkpoint path)")
+    ap.add_argument("--overwrite", action="store_true", help="allow writing into a non-empty --out")
     ap.add_argument("--seed", type=int, default=7, help="seed for --max-rows sampling")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and exit; no GPU needed")
     args = ap.parse_args(argv)

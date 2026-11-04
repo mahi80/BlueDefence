@@ -65,6 +65,20 @@ IDENTITY_KEYS: frozenset[str] = frozenset({
     "mailboxowner", "onbehalfof", "senderfromaddress", "recipientemailaddress", "p1sender", "p2sender",
 })
 
+# Nested identity objects (OCSF / ECS): ``{"user": {"name": …}}``, ``{"actor": {"user": {"uid": …}}}``. The leaf
+# (`name`, `uid` …) is not an identity key by itself — `{"process": {"name": "cmd.exe"}}` must stay — so a leaf
+# counts only under one of these parents, or as the last part of a dotted flat key (`"user.name"`) (round 7 T-1).
+IDENTITY_PARENTS: frozenset[str] = frozenset({
+    "user", "users", "actor", "src_user", "dst_user", "dest_user", "target_user", "subject_user", "owner", "initiator",
+    "requester", "approver", "assignee", "creator", "modifier", "account", "principal", "identity", "person",
+    "sender", "recipient", "customer", "employee", "member", "invitee", "manager",
+})
+IDENTITY_LEAVES: frozenset[str] = frozenset({
+    "name", "uid", "id", "email", "email_addr", "full_name", "display_name", "user_name", "username", "login",
+    "account_uid", "account_name", "samaccountname", "upn", "phone", "phone_number", "mobile",
+})
+_MAX_TOKEN_CACHE = 50_000          # pseudonym cache (HMAC is cheap to recompute): bounded, newest kept (round 7 T-6)
+
 # Alert keys that change on every event and must not take part in a fingerprint.
 VOLATILE_KEYS: frozenset[str] = frozenset({
     "id", "alert_id", "event_id", "uuid", "guid", "timestamp", "time", "@timestamp", "event_time",
@@ -122,9 +136,9 @@ class Scrubber:
         self._ephemeral = ephemeral_salt            # a random per-process salt: keyed, but not the operator's
         self.scrub_ips = scrub_ips
         self._identity_keys = frozenset(k.lower() for k in identity_keys)
-        self._map: dict[tuple[str, str], str] = {}
+        self._map: OrderedDict[tuple[str, str], str] = OrderedDict()
         self._known: OrderedDict[str, None] = OrderedDict()   # identity values seen so far, bounded, newest last
-        self._known_sorted: tuple[str, ...] = ()
+        self._known_sorted: tuple[str, ...] = ()               # a snapshot of _known (ordered longest-first at use)
         self.replacements = 0
 
     # ----------------------------------------------------------------- api --
@@ -155,23 +169,50 @@ class Scrubber:
             self._known.popitem(last=False)
             changed = True
         if changed:
-            self._known_sorted = tuple(sorted(self._known, key=len, reverse=True))
+            # a plain snapshot: only the few literals present in a string are ordered (longest first), at use —
+            # re-sorting all 5,000 on every alert made each alert ~4x slower once the set was full (round 7 T-6)
+            self._known_sorted = tuple(self._known)
 
     def token(self, kind: str, value: str) -> str:
         key = (kind, value.strip().lower())
         tok = self._map.get(key)
-        if tok is None:
-            msg = f"{kind}|{key[1]}".encode("utf-8")
-            if self._salt:
-                tok = hmac.new(self._salt, msg, hashlib.sha256).hexdigest()[:10]
-            else:
-                tok = hashlib.sha256(b"aegis-dataset|" + msg).hexdigest()[:10]
-            self._map[key] = tok
+        if tok is not None:
+            self._map.move_to_end(key)
+            return tok
+        msg = f"{kind}|{key[1]}".encode("utf-8")
+        if self._salt:
+            tok = hmac.new(self._salt, msg, hashlib.sha256).hexdigest()[:10]
+        else:
+            tok = hashlib.sha256(b"aegis-dataset|" + msg).hexdigest()[:10]
+        self._map[key] = tok
+        self._distinct += 1
+        while len(self._map) > _MAX_TOKEN_CACHE:
+            # the token is a pure function of (salt, kind, value): evicting only costs a recomputation. Unbounded,
+            # every attacker-written e-mail / phone added a permanent entry on the alert hot path (round 7 T-6)
+            self._map.popitem(last=False)
         return tok
+
+    _distinct = 0
 
     @property
     def distinct_identities(self) -> int:
-        return len(self._map)
+        return self._distinct
+
+    def _is_identity(self, key: str | None, parent: str | None) -> bool:
+        """An identity field by its own name, by its path (``user.name`` under a user/actor object), or as the
+        dotted flat form of that path (``"actor.user.uid"``)."""
+        if key is None:
+            return False
+        k = key.lower()
+        if k in self._identity_keys:
+            return True
+        if "." in k:
+            parts = [x for x in k.split(".") if x]
+            if parts and parts[-1] in self._identity_keys:
+                return True
+            if len(parts) >= 2 and parts[-1] in IDENTITY_LEAVES and parts[-2] in IDENTITY_PARENTS:
+                return True
+        return k in IDENTITY_LEAVES and parent is not None and parent.lower() in IDENTITY_PARENTS
 
     @property
     def salted(self) -> bool:
@@ -183,14 +224,14 @@ class Scrubber:
     def _collect_identity_values(self, obj: Any) -> tuple[str, ...]:
         found: set[str] = set()
 
-        def walk(o: Any, key: str | None):
+        def walk(o: Any, key: str | None, parent: str | None = None):
             if isinstance(o, dict):
                 for k, v in o.items():
-                    walk(v, str(k))
+                    walk(v, str(k), key)
             elif isinstance(o, (list, tuple)):
                 for v in o:
-                    walk(v, key)
-            elif isinstance(o, str) and key is not None and key.lower() in self._identity_keys:
+                    walk(v, key, parent)
+            elif isinstance(o, str) and self._is_identity(key, parent):
                 v = o.strip()
                 # generic account names are not personal data, and rewriting them in free text destroys the
                 # attack indicator ("/root/.ssh", "/wp-admin/") — the structured field is still pseudonymised
@@ -199,19 +240,19 @@ class Scrubber:
         walk(obj, None)
         return tuple(found)
 
-    def _walk(self, obj: Any, literals: tuple[str, ...], *, under_identity_key: bool) -> Any:
+    def _walk(self, obj: Any, literals: tuple[str, ...], *, under_identity_key: bool, key: str | None = None) -> Any:
         if isinstance(obj, dict):
             out = {}
             for k, v in obj.items():
-                ident = str(k).lower() in self._identity_keys
+                ident = self._is_identity(str(k), key)
                 # keys carry identities too: {"r.verma@sbi.co.in": 12, "9876543210": 3} (review round 4 D4-12)
                 nk = self._scrub_string(k, literals) if isinstance(k, str) else k
-                out[nk] = self._walk(v, literals, under_identity_key=ident)
+                out[nk] = self._walk(v, literals, under_identity_key=ident, key=str(k))
             return out
         if isinstance(obj, list):
-            return [self._walk(v, literals, under_identity_key=under_identity_key) for v in obj]
+            return [self._walk(v, literals, under_identity_key=under_identity_key, key=key) for v in obj]
         if isinstance(obj, tuple):
-            return tuple(self._walk(v, literals, under_identity_key=under_identity_key) for v in obj)
+            return tuple(self._walk(v, literals, under_identity_key=under_identity_key, key=key) for v in obj)
         if isinstance(obj, str):
             if under_identity_key:
                 return self._pseudonym_for_field(obj)
@@ -262,8 +303,9 @@ class Scrubber:
         out = _ARN_ACCOUNT_RX.sub(self._sub_arn, out)
         if self.scrub_ips:
             out = _IPV4_RX.sub(self._sub_ip, out)
-        present = [lit for lit in literals if lit in out]      # cheap substring pre-filter, longest first
+        present = [lit for lit in literals if lit in out]      # cheap substring pre-filter
         if present:
+            present.sort(key=len, reverse=True)                 # longest first, so "ravi kumar" wins over "ravi"
             # replace only on word boundaries: "ravi" must not rewrite "ravikumar"
             rx = re.compile(r"(?<![\w])(?:" + "|".join(re.escape(x) for x in present) + r")(?![\w])")
             out = rx.sub(lambda m: self._pseudonym_for_literal(m.group(0)), out)

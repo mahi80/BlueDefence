@@ -220,17 +220,26 @@ def download_and_install(res: dict, *, dest_root: Path, keys: dict | None = None
     return {**rel, "adapter": str(target)}
 
 
-def write_pointer(rel: dict, *, pointer: Path, previous: str = "") -> dict:
-    """The promotion pointer ``aegis.finetune.hot_reload`` reads. ``served_model`` = the version, which is also the
-    name the vLLM register step uses for the LoRA."""
+def write_pointer(rel: dict, *, pointer: Path, previous: str = "", served: bool = False) -> dict:
+    """The promotion pointer ``aegis.finetune.hot_reload`` reads, signed with the installation's promotion key and
+    ``role: triage`` so every reader's trust check accepts it (review round 7 T-3 / R-8: an unsigned release pointer
+    was refused at startup on a signed host, while hot-reload served forged ones).
+
+    ``served_model`` is stamped only when ``served`` — the adapter really was loaded into vLLM under the version
+    name. Pre-stamping it made the GPU-side register step skip a rolled-back release as "already registered"
+    (round 7 R-9); it is outside the signature, so the register step may stamp it later."""
     # sha256 in the pointer is the ADAPTER digest that load and hot-reload re-check (finetune/digest.py); the
     # release archive's sha256 (already checked against the signed manifest) is kept as archive_sha256. Writing
     # the archive hash here made every signed release fail the adapter check after #66.
     from aegis.finetune.digest import adapter_digest
-    ptr = {"run": str(rel["version"]), "adapter": rel["adapter"], "sha256": adapter_digest(rel["adapter"]),
-           "archive_sha256": rel["sha256"], "served_model": str(rel["version"]),
-           "base_model": rel["base_model"], "channel": rel["channel"], "promoted_at": int(time.time()), "approved_by": "bluedefence-release",
+    from aegis.finetune.pointer_trust import RELEASE_APPROVER, sign_pointer
+    ptr = {"run": str(rel["version"]), "role": "triage", "adapter": rel["adapter"], "sha256": adapter_digest(rel["adapter"]),
+           "archive_sha256": rel["sha256"],
+           "base_model": rel["base_model"], "channel": rel["channel"], "promoted_at": int(time.time()), "approved_by": RELEASE_APPROVER,
            "notes": rel.get("notes", ""), "previous": previous}
+    if served:
+        ptr["served_model"] = str(rel["version"])
+    ptr = sign_pointer(ptr)
     pointer.parent.mkdir(parents=True, exist_ok=True)
     tmp = pointer.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(ptr, indent=1))
@@ -238,17 +247,19 @@ def write_pointer(rel: dict, *, pointer: Path, previous: str = "") -> dict:
     return ptr
 
 
-def _load_into_vllm(rel: dict, env: dict) -> None:
+def _load_into_vllm(rel: dict, env: dict) -> bool:
     """On the vLLM backend the adapter has to be registered with the server before the pointer flips, or every
-    triage would 404 against a LoRA name vLLM has never heard of. Raises on failure (the pointer is then not written)."""
+    triage would 404 against a LoRA name vLLM has never heard of. Raises on failure (the pointer is then not written).
+    Returns True when it was loaded into vLLM, False on a backend that needs no registration."""
     backend = (env.get("LLM_BACKEND") or env.get("AEGIS_LLM_BACKEND") or "").strip().lower()
     if backend != "vllm":
-        return
+        return False
     from aegis.finetune.vllm_registry import VLLMAdapterRegistry
     ok, how = VLLMAdapterRegistry().load(str(rel["version"]), str(rel["adapter"]))
     if not ok:
         raise RuntimeError(f"vLLM refused to load adapter {rel['version']} ({how}); keeping the current model")
     logger.info("[model_updates] vLLM %s adapter %s", how, rel["version"])
+    return True
 
 
 def update_once(*, server: str, token: str, installation_id: str, env: dict | None = None) -> dict:
@@ -288,8 +299,8 @@ def update_once(*, server: str, token: str, installation_id: str, env: dict | No
         if not in_rollout(installation_id, int(rel.get("rollout_pct", 100))):
             return {"updated": False, "reason": "not in this release's rollout yet", "current": cur, "offered": rel.get("version")}
         installed = download_and_install(res, dest_root=model_dir(env))
-        _load_into_vllm(installed, env)
-        write_pointer(installed, pointer=pointer_path(env), previous=cur)
+        loaded = _load_into_vllm(installed, env)
+        write_pointer(installed, pointer=pointer_path(env), previous=cur, served=loaded)
         logger.info("[model_updates] installed %s (%s, %s) → %s; hot-reload applies it", installed["version"], installed["channel"],
                     installed["base_model"], installed["adapter"])
         _prune(model_dir(env), keep={installed["version"], cur})
@@ -339,13 +350,19 @@ def rollback(env: dict | None = None) -> dict:
     prev_dir = model_dir(env) / prev
     if not prev or not (prev_dir / ".complete").exists():
         return {"ok": False, "reason": "no previous release on disk"}
-    rel = json.loads((prev_dir / "release.json").read_text())
+    rel = {**json.loads((prev_dir / "release.json").read_text()), "adapter": str(prev_dir)}
+    # vLLM forgets LoRAs on restart and may never have held the previous one: register it before the pointer flips,
+    # or triage 404s / the register step skips it (review round 7 R-9). A refusal keeps the current pointer.
+    try:
+        loaded = _load_into_vllm(rel, env)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": str(e)[:200]}
     bad = str(ptr.get("run") or "")
     if bad:
         # the version rolled away from must not come back at the next heartbeat (review round 3 G5-4)
         _deny(env, bad)
-    write_pointer({**rel, "adapter": str(prev_dir)}, pointer=ptr_path, previous="")
-    return {"ok": True, "version": prev, "adapter": str(prev_dir), "denied": bad}
+    write_pointer(rel, pointer=ptr_path, previous="", served=loaded)
+    return {"ok": True, "version": prev, "adapter": str(prev_dir), "denied": bad, "loaded_into_vllm": loaded}
 
 
 def _denied_path(env: dict) -> Path:

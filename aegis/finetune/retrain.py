@@ -36,7 +36,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -159,12 +159,21 @@ def build_stage(data: Path, base_data: Path | None, export_dir: Path, *, dry_run
                     w.write(line + "\n"); counts["base"] += 1
         exp = export_dir / "sft" / "triage.jsonl"
         if exp.exists():
+            seen: set[str] = set()
             for line in exp.read_text(encoding="utf-8").splitlines():
                 if not line.strip():
                     continue
                 row = json.loads(line)
                 if not str(row.get("label_source", "")).startswith("human"):
                     continue
+                # one row per alert (the prompt is the alert): an export that overlaps the relabel window must not
+                # oversample the same alert twice (round 7 T-5)
+                msgs = row.get("messages") or []
+                prompt = msgs[1].get("content") if len(msgs) > 1 and isinstance(msgs[1], dict) else None
+                key = hashlib.sha256((prompt if isinstance(prompt, str) else line).encode("utf-8")).hexdigest()
+                if key in seen:
+                    continue
+                seen.add(key)
                 reps = 3 if counts["base"] > 20 * max(1, counts["human"]) else 1
                 for _ in range(reps):
                     w.write(line + "\n")
@@ -357,6 +366,24 @@ def _accepted_model_rules(dry_run: bool) -> list[dict]:
 
 # --------------------------------------------------------------------------- commands
 
+def _since_with_relabel_window(last_export: str | None) -> str | None:
+    """The export filter. The dashboard filters on a chain's creation time, so a chain created before the last
+    export but labelled by an analyst after it (ordinary HITL latency) was never exported again (round 7 T-5): each
+    export re-reads ``AEGIS_RETRAIN_RELABEL_DAYS`` (default 7) before the watermark; ``build_stage`` keeps one row
+    per alert, so a re-read chain is not oversampled twice."""
+    if not last_export:
+        return None
+    try:
+        days = max(0.0, float(os.environ.get("AEGIS_RETRAIN_RELABEL_DAYS", "7") or 7))
+        ts = datetime.fromisoformat(str(last_export))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        from datetime import timedelta
+        return (ts - timedelta(days=days)).isoformat()
+    except (ValueError, OverflowError):
+        return last_export
+
+
 def _runs_dir(a) -> Path:
     return Path(a.runs or str(Path.home() / "aegis-runs")).expanduser()
 
@@ -373,11 +400,28 @@ def cmd_run(a) -> int:
         print(f"refused: {runs} holds {cur_role or min(other)} runs; use a separate --runs directory for the "
               f"{role} model (default for judge: ~/aegis-runs/judge)")
         return 2
-    run = a.run or f"retrain-{role}-{datetime.now(timezone.utc):%Y-%m-%d}"
+    cur_run = (st.current or {}).get("run")
+    if a.run:
+        run = a.run
+        # never train into an existing run: its adapter dir may be the one the promotion pointer names, and the
+        # human-approved weights were overwritten in place (round 7 T-2)
+        if run in st.runs or ((runs / run).exists() and any((runs / run).iterdir())):
+            print(f"refused: run {run!r} already exists in {runs}"
+                  f"{' and is the promoted model' if run == cur_run else ''}; pick a new --run name")
+            return 2
+    else:
+        # unique per invocation: the trainer daemon restarting on the same day reused `retrain-<role>-<date>` and
+        # retrained into the promoted run's adapter dir (round 7 T-2)
+        stamp = f"retrain-{role}-{datetime.now(timezone.utc):%Y-%m-%dT%H%M%SZ}"
+        run, n = stamp, 1
+        while run in st.runs or (runs / run).exists():
+            n += 1
+            run = f"{stamp}-{n}"
     root = runs / run; root.mkdir(parents=True, exist_ok=True)
     st.runs[run] = {"created": _now(), "preset": a.preset, "base_data": a.base_data, "stage": "started", "role": role}
-    since = a.since or st.last_export
+    since = a.since or _since_with_relabel_window(st.last_export)
     print(f"== retrain {run} (since {since or 'the beginning'})")
+    export_started = _now()          # the watermark is the moment of the export, not the end of training (T-5)
     ex = export_stage(root / "export", since=since, dashboard=a.dashboard, dry_run=a.dry_run)
     st.log(run, "exported", **ex)
     if ex["rc"] != 0:
@@ -407,7 +451,7 @@ def cmd_run(a) -> int:
         st.log(run, "failed", reason=f"gate FAIL: {g['summary']} — last good model stays"); st.save()
         print(f"  gate FAIL — {g['summary']}; current model unchanged"); return 1
     if not a.dry_run:
-        st.last_export = _now()
+        st.last_export = export_started
     st.save()
     if role == "judge":
         print(f"  judge gate PASS — {g['summary']}\n  next: python -m aegis.finetune.retrain promote --runs {runs} --run {run} "
