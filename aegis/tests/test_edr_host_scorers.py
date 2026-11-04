@@ -74,7 +74,9 @@ def test_tcc_sensitive_untrusted_is_high():
 
 
 def test_tcc_trusted_client_is_low():
-    assert tools.tcc_grant("kTCCServiceCamera", "com.apple.FaceTime", allowed=1).weight == "low"
+    # round 7 D-12: a "com.apple." bundle id is a name anyone can pick — trusted only with Apple's signing authority
+    assert tools.tcc_grant("kTCCServiceCamera", "com.apple.FaceTime", allowed=1, authority="Software Signing").weight == "low"
+    assert tools.tcc_grant("kTCCServiceCamera", "com.apple.FaceTime", allowed=1).weight == "medium"
 
 
 def test_tcc_non_sensitive_service_is_low():

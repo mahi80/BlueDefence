@@ -66,6 +66,7 @@ _DANGEROUS_ROLES = {
 }
 # CloudTrail names the service in eventSource and the call in eventName WITHOUT a prefix
 # ("AttachUserPolicy", eventSource "iam.amazonaws.com"); the check used to need "iam" in the eventName.
+_POLICY_WRITE_ACTIONS = {"iam:PutUserPolicy", "iam:PutRolePolicy", "iam:PutGroupPolicy", "iam:CreatePolicyVersion"}
 _SERVICE_PREFIX = {"iam.amazonaws.com": "iam:", "sts.amazonaws.com": "sts:"}
 _WILDCARD_RX = re.compile(r'"(?:Action|NotAction|Resource|actions)"\s*:\s*(?:"\*"|\[[^\]]*"\*"[^\]]*\])', re.IGNORECASE)
 
@@ -137,27 +138,37 @@ def iam_change_check(event: dict | None) -> ToolResult:
     # the policy ARN (AttachUserPolicy / AttachRolePolicy) and the Azure role definition id name the grant
     grant_text = " ".join(str(params.get(k) or "") for k in ("policyArn", "roleDefinitionId", "role", "roleName"))
     stmts = _statements(doc)
-    has_wildcard = (any(_has_star(st.get(k)) for st in stmts for k in ("Action", "NotAction", "Resource", "actions"))
-                    if stmts is not None else bool(_WILDCARD_RX.search(policy_text)))
+    if stmts is not None:
+        has_wildcard = any(_wild(st.get(k), _ACTION_WILD_RX) for st in stmts for k in ("Action", "NotAction", "actions")) \
+            or any(_wild(st.get("Resource"), _RESOURCE_WILD_RX) for st in stmts)
+        admin_grant = any(_admin_grant(st) for st in stmts)
+    else:
+        has_wildcard = bool(_WILDCARD_RX.search(policy_text))
+        admin_grant = False
     has_dangerous_role = any(role.lower() in (policy_text + " " + grant_text).lower() for role in _DANGEROUS_ROLES)
     # Was a long-lived access key created for a service principal?
     user_type = (event.get("userIdentity") or {}).get("type", "")
     is_service_principal = user_type in ("AssumedRole", "ServicePrincipal", "Application")
     creates_access_key = action == "iam:CreateAccessKey" and is_service_principal
 
-    risk = sum([has_wildcard, has_dangerous_role, creates_access_key])
+    # full IAM admin (iam:* / * over a wildcard resource) is self-escalation on its own: it counts twice
+    risk = sum([has_wildcard, has_dangerous_role, creates_access_key]) + (1 if admin_grant else 0)
     if risk >= 2:
         weight = "high"
     elif risk >= 1:
         weight = "medium"
     else:
         weight = "low"
+    # writing an inline policy / a new policy version is how privileges are escalated; never "low" (round 7 D-3)
+    if weight == "low" and action in _POLICY_WRITE_ACTIONS:
+        weight = "medium"
 
     return ToolResult(name="iam_change", data={
         "action": action,
         "has_wildcard_policy": has_wildcard,
         "has_dangerous_role_grant": has_dangerous_role,
         "long_lived_key_for_service_principal": creates_access_key,
+        "admin_grant": admin_grant,
         "risk_score": risk,
     }, weight=weight)
 
@@ -197,6 +208,28 @@ def _has_star(v: Any) -> bool:
     if isinstance(v, (list, tuple)):
         return any(isinstance(x, str) and x.strip() == "*" for x in v)
     return False
+
+
+# a wildcard that grants a whole service or account, not just "*": `iam:*`, `*:*`, `s3:*`, and resource ARNs whose
+# resource part is `*` (`arn:aws:iam::111122223333:*`, `arn:aws:s3:::*`). `arn:aws:s3:::bucket/*` (objects of one
+# bucket) is NOT one. Only an exact "*" used to count (review round 7 D-3).
+_ACTION_WILD_RX = re.compile(r"^\s*(?:\*|\*:\*|[a-z0-9-]+:\*)\s*$", re.IGNORECASE)
+_RESOURCE_WILD_RX = re.compile(r"^\s*(?:\*|arn:[^:]*:[^:]*:[^:]*:[^:]*:\*|arn:[^:]*:s3:::\*)\s*$", re.IGNORECASE)
+
+
+def _wild(v: Any, rx: re.Pattern) -> bool:
+    vals = v if isinstance(v, (list, tuple)) else [v]
+    return any(isinstance(x, str) and rx.match(x) for x in vals)
+
+
+def _admin_grant(st: dict) -> bool:
+    """Allow on every action of IAM (or everything) over a wildcard resource: full admin / self-escalation."""
+    if str(_ci(st, "Effect") or "allow").lower() != "allow":
+        return False
+    acts = _ci(st, "Action", "actions")
+    acts = acts if isinstance(acts, (list, tuple)) else [acts]
+    admin = any(isinstance(a, str) and a.strip().lower() in ("*", "*:*", "iam:*") for a in acts)
+    return admin and _wild(_ci(st, "Resource") or "*", _RESOURCE_WILD_RX)
 
 
 def _public_principal(p: Any) -> bool:
@@ -271,9 +304,37 @@ def resource_policy_check(event: dict | None) -> ToolResult:
             "action": action, "public_access_block_weakened": weakened,
         }, weight="high" if weakened else "low")
 
+    if action in ("DeleteBucketPublicAccessBlock", "DeletePublicAccessBlock"):
+        # removing the block entirely (bucket or whole account, s3control) is the commonest S3 exposure step
+        return ToolResult(name="resource_policy", data={
+            "action": action, "public_access_block_removed": True,
+            "scope": "account" if action == "DeletePublicAccessBlock" else "bucket",
+        }, weight="high")
+
+    if action in ("PutBucketAcl", "PutObjectAcl"):
+        public = _acl_grants_public(params)
+        return ToolResult(name="resource_policy", data={
+            "action": action, "grants_public": public,
+        }, weight="high" if public else "low")
+
     return ToolResult(name="resource_policy", data={
         "action": action, "tracked": False,
     }, weight="low")
+
+
+_PUBLIC_GROUPS = ("acs.amazonaws.com/groups/global/allusers", "acs.amazonaws.com/groups/global/authenticatedusers")
+_PUBLIC_CANNED = {"public-read", "public-read-write", "authenticated-read"}
+
+
+def _acl_grants_public(params: dict) -> bool:
+    """A PutBucketAcl / PutObjectAcl that grants AllUsers or AuthenticatedUsers: a canned ACL (``x-amz-acl``),
+    a grant header (``x-amz-grant-*: uri=…AllUsers``) or an AccessControlPolicy grant (review round 7 D-3)."""
+    import json
+    canned = str(_ci(params, "x-amz-acl", "acl") or "").strip().lower()
+    if canned in _PUBLIC_CANNED:
+        return True
+    text = json.dumps(params, default=str).lower()
+    return any(g in text for g in _PUBLIC_GROUPS)
 
 
 # ---- Network change check (security groups, NSG, peering) -----------
@@ -697,7 +758,8 @@ def hsm_audit_check(event: dict | None) -> ToolResult:
 
 _EXTRA_NAMES = (
     "PutBucketPolicy", "s3:PutBucketPolicy", "Microsoft.Storage/storageAccounts/write", "PutBucketEncryption",
-    "DeleteBucketEncryption", "PutBucketPublicAccessBlock", "AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules",
+    "DeleteBucketEncryption", "PutBucketPublicAccessBlock", "DeleteBucketPublicAccessBlock", "DeletePublicAccessBlock",
+    "PutPublicAccessBlock", "PutBucketAcl", "PutObjectAcl", "AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules",
     "Microsoft.Network/networkSecurityGroups/securityRules/write", "Microsoft.Network/networkSecurityGroups/write",
     "CreateVpcPeeringConnection", "AcceptVpcPeeringConnection", "CreateVpnConnection", "CreateClientVpnEndpoint",
     "Microsoft.Network/virtualNetworkGateways/write", "network.security_group_rule.create.end",

@@ -16,7 +16,6 @@ class ToolResult:
 
 # ---- Header authentication (SPF / DKIM / DMARC) --------------------
 
-_AR_METHOD_RX = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*([a-z]+)")
 
 
 def _trusted_auth_results(headers: dict) -> str:
@@ -33,6 +32,19 @@ def _trusted_auth_results(headers: dict) -> str:
     return items[0].lower() if items else ""
 
 
+def _ar_methods(ar: str) -> dict[str, str]:
+    """Method results from one Authentication-Results header, read per ``;``-separated resinfo: each resinfo's
+    FIRST ``method=result`` token is its verdict. Property values such as ``smtp.mailfrom=`` are text the sender
+    chose (an attacker's MAIL FROM local part could read ``dkim=pass.dmarc=pass@evil``) and are never scanned for
+    verdicts (review round 7 D-1). The first segment is the authserv-id."""
+    out: dict[str, str] = {}
+    for resinfo in ar.split(";")[1:]:
+        m = re.match(r"\s*(spf|dkim|dmarc)\s*=\s*([a-z]+)", resinfo)
+        if m:
+            out.setdefault(m.group(1), m.group(2))
+    return out
+
+
 def _verdict(v: str) -> str:
     """``pass (signature verified)`` → ``pass``; the first word of a method result."""
     m = re.match(r"\s*([a-z]+)", str(v or "").lower())
@@ -45,15 +57,19 @@ def header_auth_check(headers: dict | None) -> ToolResult:
     # header names are case-insensitive: an authenticated mail with lower-case keys scored medium (round 4 S4-16)
     h = {str(k).lower(): v for k, v in headers.items()}
     ar = _trusted_auth_results(h)
-    methods: dict[str, str] = {}
-    for meth, val in _AR_METHOD_RX.findall(ar):
-        methods.setdefault(meth, val)
+    methods = _ar_methods(ar)
     # Per-method results. DMARC used to read "fail" anywhere in the whole A-R line, so a forwarded mail with a
     # broken DKIM signature and a DMARC pass was a DMARC fail too. A DKIM-Signature header is something the
     # SENDER writes; only the gateway's verdict counts (review round 3 G7-15).
-    spf = _verdict(h.get("spf") or methods.get("spf") or h.get("received-spf") or "")
-    dkim = _verdict(h.get("dkim") or methods.get("dkim") or "")
-    dmarc = _verdict(h.get("dmarc") or methods.get("dmarc") or "")
+    # When the gateway's A-R is present it is the only source: plain ``SPF:`` / ``DKIM:`` / ``DMARC:`` headers and
+    # Received-SPF are written by the sender (or an untrusted hop) and used to override it (review round 7 D-1).
+    # The shorthand keys are only read when no trusted A-R exists (pre-parsed feeds that carry verdicts that way).
+    if ar:
+        spf, dkim, dmarc = (_verdict(methods.get(m, "")) for m in ("spf", "dkim", "dmarc"))
+    else:
+        spf = _verdict(h.get("spf") or h.get("received-spf") or "")
+        dkim = _verdict(h.get("dkim") or "")
+        dmarc = _verdict(h.get("dmarc") or "")
 
     spf_fail = spf in ("fail", "softfail")
     dkim_fail = dkim != "pass"

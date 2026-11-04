@@ -84,7 +84,8 @@ def import_from_peer(store: IOCStore, bundle: dict, *,
                 confidence=float(d.get("confidence", 0.7)) * trust_factor,
                 source=f"peer:{bundle.get('source_region', 'unknown')}:{d.get('source', 'unknown')}",
                 first_seen=float(d.get("first_seen", 0.0)),
-                last_seen=float(d.get("last_seen", time.time())),
+                # a peer entry without last_seen is not a fresh observation (round 7 D-4)
+                last_seen=float(d.get("last_seen", 0.0)),
                 tags=tuple(d.get("tags") or ()),
                 ttl_seconds=int(d.get("ttl_seconds", 86400 * 14)),
             ))

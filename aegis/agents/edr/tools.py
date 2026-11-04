@@ -1,8 +1,8 @@
 """Tools for the EDR/Host specialist."""
 from __future__ import annotations
 
+import ipaddress
 import itertools
-
 import re
 from dataclasses import dataclass
 
@@ -162,6 +162,8 @@ _IOC_HASHES = {
     "44d88612fea8a8f36de82e1278abb02f": "EICAR test (training)",
     "9b8c1bdc1f3f3e6c9e4b8c1bdc1f3f3e": "Cobalt Strike beacon (sample)",
 }
+_IOC_SHA256: dict[str, str] = {}
+_IOC_SHA1: dict[str, str] = {}
 _IOC_DOMAINS = {"evil.example.com", "c2.attacker.test"}
 _IOC_IPS = {"203.0.113.66", "198.51.100.99",
             # HF/ModelScope model-loader cryptominer campaign (AEGIS-TI-2026-HF-LOADER):
@@ -169,17 +171,56 @@ _IOC_IPS = {"203.0.113.66", "198.51.100.99",
             "212.32.253.3", "2.28.9.199", "8.137.187.63"}
 
 
-def ioc_match(file_hash: str | None, dest_domain: str | None, dest_ip: str | None) -> ToolResult:
+def _canon_ip(v: str) -> str:
+    """``::ffff:203.0.113.66`` / ``[2001:db8::1]`` / ``203.0.113.66:443`` → one spelling."""
+    t = str(v or "").strip().strip("[]")
+    try:
+        ip = ipaddress.ip_address(t)
+    except ValueError:
+        host, _, port = t.rpartition(":")
+        if port.isdigit() and host.count(":") == 0:
+            try:
+                ip = ipaddress.ip_address(host)
+            except ValueError:
+                return t
+        else:
+            return t
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return str(ip)
+
+
+def _hash_hit(fh: str) -> tuple[str, str] | None:
+    """md5 / sha1 / sha256 — every length the feeds distribute (only md5 used to reach the EDR, round 7 D-12)."""
+    for table in (_IOC_HASHES, _IOC_SHA256, _IOC_SHA1):
+        if fh in table:
+            return fh, table[fh]
+    return None
+
+
+def ioc_match(file_hash: str | None, dest_domain: str | None, dest_ip: str | None,
+              *, hashes: dict | None = None) -> ToolResult:
     matches: list[str] = []
     # case-insensitive: Sysmon writes hashes upper-case, DNS names arrive with any case and a trailing dot
-    fh = str(file_hash or "").strip().lower()
+    cands = [str(file_hash or "").strip().lower()]
+    if isinstance(hashes, dict):                         # Sysmon Hashes / OCSF: every algorithm the event carries
+        cands += [str(v).strip().lower() for v in hashes.values() if v]
+    for fh in dict.fromkeys(c for c in cands if c):
+        hit = _hash_hit(fh)
+        if hit:
+            matches.append(f"hash:{hit[0]}={hit[1]}")
     dom = str(dest_domain or "").strip().lower().rstrip(".")
-    if fh and fh in _IOC_HASHES:
-        matches.append(f"hash:{fh}={_IOC_HASHES[fh]}")
-    if dom and dom in _IOC_DOMAINS:
-        matches.append(f"domain:{dom}")
-    if dest_ip and str(dest_ip).strip() in _IOC_IPS:
-        matches.append(f"ip:{str(dest_ip).strip()}")
+    if dom:
+        # suffix match on whole labels: `x7f3a.c2.attacker.test` is the IOC `c2.attacker.test` (D-12)
+        labels = dom.split(".")
+        for i in range(len(labels) - 1):
+            parent = ".".join(labels[i:])
+            if parent in _IOC_DOMAINS:
+                matches.append(f"domain:{dom}" + (f" (under {parent})" if parent != dom else ""))
+                break
+    ip = _canon_ip(dest_ip) if dest_ip else ""
+    if ip and ip in {_canon_ip(x) for x in _IOC_IPS}:
+        matches.append(f"ip:{ip}")
     return ToolResult(
         name="ioc_match",
         data={"matches": matches, "n": len(matches)},
@@ -226,25 +267,49 @@ def _entropy(s: str) -> float:
     return -sum((c / n) * log2(c / n) for c in counts.values() if c > 0)
 
 
+#: two-label public suffixes (a small, sector-relevant slice of the PSL — production: the full list)
+_TWO_LABEL_SUFFIXES = frozenset({
+    "co.in", "net.in", "org.in", "gov.in", "nic.in", "ac.in", "edu.in", "res.in", "firm.in", "gen.in", "ind.in",
+    "mil.in", "bank.in", "fin.in", "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "com.sg",
+    "co.jp", "ne.jp", "com.br", "com.cn", "com.hk", "co.za", "co.nz", "com.my", "co.id", "com.ae",
+    "s3.amazonaws.com", "cloudfront.net", "azurewebsites.net", "blob.core.windows.net", "appspot.com",
+    "herokuapp.com", "github.io", "workers.dev", "pages.dev", "vercel.app", "netlify.app", "ngrok.io",
+    "duckdns.org", "no-ip.com", "trycloudflare.com",
+})
+
+
+def _registrable(labels: list[str]) -> str:
+    labels = [x for x in labels if x]
+    for n in (3, 2):
+        if len(labels) > n and ".".join(labels[-n:]) in _TWO_LABEL_SUFFIXES:
+            return ".".join(labels[-(n + 1):])
+    if len(labels) >= 2 and ".".join(labels[-2:]) in _TWO_LABEL_SUFFIXES:
+        return ".".join(labels[-2:])
+    return ".".join(labels[-2:]) if len(labels) >= 2 else ""
+
+
 def dns_exfil_check(dns_queries: list[str] | None,
                     dns_query_count_5min: int | None = None) -> ToolResult:
     if not dns_queries:
         return ToolResult(name="dns_exfil", data={"verdict": "no_data"}, weight="low")
     long_label_count = 0
     high_entropy_count = 0
-    domains_seen: dict[str, int] = {}
+    domains_seen: dict[str, set[str]] = {}
     for q in dns_queries:
         labels = q.lower().rstrip(".").split(".")
         if labels and len(labels[0]) >= 40:
             long_label_count += 1
         if labels and _entropy(labels[0]) >= 4.0:
             high_entropy_count += 1
-        # Count by registered second-level + TLD
-        if len(labels) >= 2:
-            sld = ".".join(labels[-2:])
-            domains_seen[sld] = domains_seen.get(sld, 0) + 1
-    top_domain, top_count = (max(domains_seen.items(), key=lambda kv: kv[1])
-                              if domains_seen else (None, 0))
+        # Count by registrable domain: "co.in" is a suffix, so 60 lookups across seven banks under it were one
+        # "concentrated" domain (round 7 D-15). Repeats of one name are a cache miss, not a tunnel: concentration
+        # counts the distinct names under the domain.
+        reg = _registrable(labels)
+        if reg:
+            domains_seen.setdefault(reg, set()).add(".".join(labels))
+    top_domain, top_names = (max(domains_seen.items(), key=lambda kv: len(kv[1]))
+                             if domains_seen else (None, set()))
+    top_count = len(top_names)
     burst = bool(dns_query_count_5min and dns_query_count_5min >= 200)
     high_concentration = top_count >= 50
 
@@ -395,18 +460,44 @@ _TCC_ALLOWLIST = ("com.apple.", "/System/", "/Applications/zoom.us.app",
                   "/Applications/Microsoft Teams.app")
 
 
+# code-signing authority that vouches for a bundle-id namespace (osquery's signature table / the TCC csreq)
+_NAMESPACE_SIGNERS = {"com.apple.": ("apple", "software signing", "apple inc.", "apple code signing certification authority")}
+
+
 def tcc_grant(service: str | None, client: str | None, allowed: object = None,
-              allowlist=None) -> ToolResult:
+              allowlist=None, authority: str | None = None) -> ToolResult:
     """Sensitive macOS privacy grant (mic/camera/screen/full-disk/accessibility) to a
     non-allowlisted client — a surveillance/spyware tell (T1123 / T1113)."""
     if not service or service not in _TCC_SENSITIVE or not allowed:
         return ToolResult(name="tcc_grant", data={"service": service, "applicable": False}, weight="low")
     al = allowlist if allowlist is not None else _TCC_ALLOWLIST
-    trusted = any((client or "").startswith(p) for p in al)
+    c = str(client or "").strip()
+    trusted = False
+    namespace_only = False
+    for entry in al:
+        e = str(entry)
+        if e.startswith("/"):
+            # a path: the bundle itself or something inside it — `/Applications/zoom.us.app.evil/…` used to pass
+            # a raw prefix check (review round 7 D-12)
+            root = e.rstrip("/")
+            if c == root or c.startswith(root + "/"):
+                trusted = True
+        elif e.endswith("."):
+            # a bundle-id namespace (`com.apple.`): anyone can declare `com.apple.evil-updater`, so without a
+            # code-signing authority it is only "unverified", never trusted
+            if c.startswith(e):
+                if authority and str(authority).strip().lower() in _NAMESPACE_SIGNERS.get(e, ()):
+                    trusted = True
+                else:
+                    namespace_only = True
+        elif c == e:
+            trusted = True                               # an exact bundle id
+    weight = "low" if trusted else ("medium" if namespace_only else "high")
     return ToolResult(
         name="tcc_grant",
-        data={"service": service, "client": client, "trusted": trusted},
-        weight="low" if trusted else "high",
+        data={"service": service, "client": client, "trusted": trusted,
+              "unverified_namespace": namespace_only and not trusted},
+        weight=weight,
     )
 
 
@@ -442,14 +533,16 @@ def run_all_tools(alert: dict) -> list[ToolResult]:
             alert.get("dst_port"),
             alert.get("uses_smb_or_winrm", False),
         ), "lateral_movement_check", ToolResult),
-        isolated(lambda: ioc_match(alert.get("file_hash"), alert.get("dest_domain"), alert.get("dest_ip")), "ioc_match", ToolResult),
+        isolated(lambda: ioc_match(alert.get("file_hash"), alert.get("dest_domain"), alert.get("dest_ip"),
+                                   hashes=alert.get("file_hashes") if isinstance(alert.get("file_hashes"), dict) else None),
+                 "ioc_match", ToolResult),
         isolated(lambda: file_integrity_diff(alert.get("file_path"), alert.get("file_hash_current")), "file_integrity_diff", ToolResult),
         isolated(lambda: dns_exfil_check(alert.get("dns_queries"), alert.get("dns_query_count_5min")), "dns_exfil_check", ToolResult),
         isolated(lambda: autostart_persistence(alert.get("autostart_entries"), HOST_BASELINES.autostart(hc)), "autostart_persistence", ToolResult),
         isolated(lambda: webshell_drop(alert.get("file_path"), alert.get("file_content_tokens")), "webshell_drop", ToolResult),
         isolated(lambda: beacon_periodicity(alert.get("egress_connect_times"), alert.get("dest_ip")), "beacon_periodicity", ToolResult),
         isolated(lambda: tcc_grant(alert.get("tcc_service"), alert.get("tcc_client"), alert.get("tcc_allowed"),
-                  HOST_BASELINES.tcc_allowlist(hc)), "tcc_grant", ToolResult),
+                  HOST_BASELINES.tcc_allowlist(hc), authority=alert.get("tcc_authority")), "tcc_grant", ToolResult),
         isolated(lambda: ssh_key_added(alert.get("ssh_key_fingerprint"), alert.get("ssh_key_uid"),
                       HOST_BASELINES.ssh_keys(hc)), "ssh_key_added", ToolResult),
     ]

@@ -17,12 +17,12 @@ import re
 
 from ..shared.netguard import never_block_target
 
-KINDS = frozenset({"ip", "domain", "url", "hash_md5", "hash_sha256", "email", "asn", "cve", "config"})
+KINDS = frozenset({"ip", "domain", "url", "hash_md5", "hash_sha1", "hash_sha256", "email", "asn", "cve", "config"})
 
 _OWN_NETS = [ipaddress.ip_network(n) for n in (
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8",
     "0.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10", "::1/128", "::/128", "ff00::/8")]
-_HEX = {"hash_md5": 32, "hash_sha256": 64}
+_HEX = {"hash_md5": 32, "hash_sha1": 40, "hash_sha256": 64}
 _DOMAIN = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9_](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,7}$")
 _EMAIL = re.compile(r"^[^@\s]{1,64}@([^@\s]{1,253})$")
@@ -42,7 +42,27 @@ _SHARED_SUFFIXES = frozenset({
     "cloudflare.com", "workers.dev", "pages.dev", "akamaihd.net", "akamaized.net", "edgekey.net", "edgesuite.net",
     "fastly.net", "github.com", "githubusercontent.com", "github.io", "herokuapp.com", "vercel.app", "netlify.app",
     "ngrok.io", "ngrok-free.app", "duckdns.org", "no-ip.com", "dropbox.com", "dropboxusercontent.com",
+    # round 7 D-5: more SaaS / CDN / cloud apexes a bank's own traffic rides on, plus Indian sector suffixes
+    "sharepoint.com", "onmicrosoft.com", "microsoftonline.com", "msftauth.net", "azure-api.net", "azure.com",
+    "azurecr.io", "servicebus.windows.net", "database.windows.net", "vault.azure.net", "core.windows.net",
+    "akamaiedge.net", "akamai.net", "akamaitechnologies.com", "edgecastcdn.net", "cdn77.org", "b-cdn.net",
+    "cloudflare.net", "cloudflare-dns.com", "r2.dev", "firebaseapp.com", "web.app", "firebaseio.com",
+    "run.app", "cloudfunctions.net", "storage.googleapis.com", "blogspot.com", "wordpress.com", "wixsite.com",
+    "salesforce.com", "force.com", "my.salesforce.com", "zendesk.com", "atlassian.net", "slack.com",
+    "zoom.us", "okta.com", "oktapreview.com", "auth0.com", "box.com", "icloud.com", "apple.com",
+    "execute-api.amazonaws.com", "lambda-url.amazonaws.com", "elasticbeanstalk.com", "amplifyapp.com",
+    "awsapprunner.com", "digitaloceanspaces.com", "ondigitalocean.app", "linodeobjects.com", "oraclecloud.com",
+    "npci.org.in", "rbi.org.in", "res.in", "mil.in", "uidai.gov.in", "sbi.co.in",
 })
+_AWS_REGIONAL = re.compile(r"^(?:s3|s3-website|s3-accesspoint|execute-api|elb|ec2|compute|lambda-url|vpce)"
+                           r"[.-](?:[a-z]{2}(?:-gov)?-[a-z]+-\d)\.amazonaws\.com(?:\.cn)?$"
+                           r"|^(?:[a-z]{2}-[a-z]+-\d)\.(?:compute|elb)\.amazonaws\.com$"
+                           r"|^(?:[a-z0-9-]+\.)?(?:[a-z]{2}-[a-z]+-\d)\.compute\.internal$")
+
+
+def _shared(d: str) -> bool:
+    """A public suffix / provider apex, including AWS's regional service apexes (``s3.ap-south-1.amazonaws.com``)."""
+    return d in _SHARED_SUFFIXES or bool(_AWS_REGIONAL.match(d))
 _SHARED_IPS = frozenset({"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112",
                          "208.67.222.222", "208.67.220.220", "2001:4860:4860::8888", "2001:4860:4860::8844",
                          "2606:4700:4700::1111", "2606:4700:4700::1001"})
@@ -91,7 +111,7 @@ def _domain(value: str) -> tuple[str | None, str]:
         return None, "not a domain name"
     if _own_domain(d):
         return None, f"{d} is the bank's own domain"
-    if d in _SHARED_SUFFIXES or "." not in d:
+    if _shared(d) or "." not in d:
         return None, f"{d} is a public suffix or shared provider domain, not an indicator"
     return d, ""
 

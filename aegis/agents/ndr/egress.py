@@ -366,7 +366,12 @@ class EgressDetector:
             if status in ("unregistered", "unapproved"):
                 out.append(self._emit("shadow_ai", p, ts, 1, indicator=svc.endpoint,
                                       shadow_ai={**u.to_dict(), "level": "use"}))
-            return out                       # an AI service is judged as AI usage, not as a beacon
+                # an AI SNI is client-chosen too: a C2 that names api.openai.com while talking to its own IP on a
+                # fixed period was only ever "shadow AI, low" (round 7 D-6). The destination IP's own cadence is
+                # still judged; a registered / approved AI system keeps the old quiet path.
+                if ip_pair is not None and not ip_pair.beacon:
+                    out.append(self._check_beacon(ip_pair, ts))
+            return out                       # the SNI itself is judged as AI usage, not as a beacon
         hit_b = self._check_beacon(p, ts)
         if hit_b is None and ip_pair is not None and not p.beacon:
             hit_b = self._check_beacon(ip_pair, ts)
@@ -388,10 +393,14 @@ class EgressDetector:
             return None
         from .tls_intel import TlsIndicator
         try:
+            from aegis.agents.threat_intel.store import SUBDOMAIN_TAG
             labels = sni.split(".") if sni else []
+            any_parent = os.environ.get("AEGIS_NDR_IOC_SUBDOMAINS", "0") == "1"
             for i in range(max(0, len(labels) - 1)):
                 ioc = self.ioc_store.lookup(".".join(labels[i:]), "domain")
-                if ioc is not None:
+                # a parent label matches only when the IOC opts in (round 7 D-5): a feed naming a provider apex
+                # must not turn every tenant under it into "known bad"
+                if ioc is not None and (i == 0 or any_parent or SUBDOMAIN_TAG in ioc.tags):
                     return TlsIndicator("domain", ioc.value, ",".join(ioc.tags) or "threat-intel feed", ioc.confidence, ioc.source)
             ioc = self.ioc_store.lookup(dst, "ip")
             if ioc is not None:

@@ -1,6 +1,7 @@
 """Tools for the Wireless specialist."""
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 
 from ..shared.tool_guard import isolated
@@ -24,6 +25,59 @@ _AUTHORIZED_SSIDS = {
 _AUTHORIZED_AP_OUIS = {"00-1A-1E", "B4-99-BA", "F4-EA-67"}   # Aruba, Cisco, Meraki examples
 
 
+# Latin look-alikes an attacker swaps into a broadcast SSID ("BankWiFi-PоS" with a Cyrillic о).
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j", "ѕ": "s",
+    "А": "a", "В": "b", "Е": "e", "К": "k", "М": "m", "Н": "h", "О": "o", "Р": "p", "С": "c", "Т": "t",
+    "Х": "x", "І": "i", "Ј": "j", "Ѕ": "s", "ο": "o", "Ο": "o", "α": "a", "Α": "a", "Β": "b", "Ε": "e",
+    "Ζ": "z", "Η": "h", "Ι": "i", "Κ": "k", "Μ": "m", "Ν": "n", "Ρ": "p", "Τ": "t", "Υ": "y", "Χ": "x",
+    "ν": "v", "ρ": "p", "τ": "t", "υ": "u", "ι": "i", "κ": "k", "‐": "-", "‑": "-", "‒": "-", "–": "-",
+    "—": "-", "−": "-", "_": "-", "0": "o", "1": "l", "|": "l",
+})
+
+
+def _ssid_key(ssid: str) -> str:
+    """NFKC, drop invisible / whitespace characters, fold case and look-alikes (round 7 D-13)."""
+    t = unicodedata.normalize("NFKC", str(ssid or ""))
+    t = "".join(c for c in t if not c.isspace() and unicodedata.category(c) not in ("Cf", "Cc", "Mn", "Zs"))
+    return t.casefold().translate(_CONFUSABLES)
+
+
+def _edit1(a: str, b: str) -> bool:
+    if a == b or abs(len(a) - len(b)) > 1:
+        return a == b
+    if len(a) == len(b):
+        diff = [i for i in range(len(a)) if a[i] != b[i]]
+        return len(diff) == 1 or (len(diff) == 2 and diff[1] == diff[0] + 1 and a[diff[0]] == b[diff[1]]
+                                  and a[diff[1]] == b[diff[0]])
+    if len(a) > len(b):
+        a, b = b, a
+    return any(b[:i] + b[i + 1:] == a for i in range(len(b)))
+
+
+_AUTH_KEYS = None
+
+
+def _ssid_match(ssid: str) -> tuple[str | None, str]:
+    """Return (authorised SSID it names, how): ``exact``, ``normalised`` (same after folding invisibles / case /
+    look-alikes) or ``lookalike`` (one edit away). A trailing zero-width space or a Cyrillic letter made a PoS
+    evil twin "not an authorised SSID" and so not a twin at all (round 7 D-13)."""
+    global _AUTH_KEYS
+    if ssid in _AUTHORIZED_SSIDS:
+        return ssid, "exact"
+    if _AUTH_KEYS is None:
+        _AUTH_KEYS = {_ssid_key(k): k for k in _AUTHORIZED_SSIDS}
+    k = _ssid_key(ssid)
+    if not k:
+        return None, ""
+    if k in _AUTH_KEYS:
+        return _AUTH_KEYS[k], "normalised"
+    for ak, name in _AUTH_KEYS.items():
+        if len(ak) >= 6 and _edit1(k, ak):
+            return name, "lookalike"
+    return None, ""
+
+
 def _mac(v: object) -> str:
     return "".join(c for c in str(v or "").upper() if c in "0123456789ABCDEF")
 
@@ -33,18 +87,33 @@ def rogue_ap_check(ap_record: dict | None) -> ToolResult:
         return ToolResult(name="rogue_ap", data={"verdict": "no_data"}, weight="low")
     bssid = str(ap_record.get("bssid") or "").upper()
     ssid = ap_record.get("ssid") or ""
-    is_authorized_ssid = ssid in _AUTHORIZED_SSIDS
+    named, how = _ssid_match(ssid)
+    is_authorized_ssid = named is not None
+    lookalike = how in ("normalised", "lookalike")
     # controllers write BSSIDs as b4:99:ba:…, B4-99-BA-…, b499.ba… or b499ba…; the table uses dashes. Comparing
     # the first 8 characters raw flagged every colon-formatted authorised AP as rogue (review round 3 G7-12).
     hexes = "".join(c for c in bssid if c in "0123456789ABCDEF")
     oui = "-".join(hexes[i:i + 2] for i in (0, 2, 4)) if len(hexes) >= 6 else ""
     is_authorized_oui = oui in _AUTHORIZED_AP_OUIS
-    rogue_announcing_authorized_ssid = is_authorized_ssid and not is_authorized_oui
-    weight = "high" if rogue_announcing_authorized_ssid else "low"
+    # The OUI is three bytes the attacker types: when the controller sent its list of real BSSIDs, that list is
+    # the authority (round 7 D-13); without it a PoS SSID on a "vendor" OUI is unverified, not trusted.
+    known_raw = ap_record.get("known_bssids") or ()
+    known = {_mac(k) for k in ([known_raw] if isinstance(known_raw, str) else known_raw)}
+    not_known = bool(known) and _mac(bssid) not in known
+    rogue_announcing_authorized_ssid = is_authorized_ssid and (not is_authorized_oui or not_known or lookalike)
+    unverified = is_authorized_ssid and not known and is_authorized_oui and not lookalike
+    if rogue_announcing_authorized_ssid:
+        weight = "high"
+    elif unverified and named == "BankWiFi-PoS":
+        weight = "medium"
+    else:
+        weight = "low"
     return ToolResult(name="rogue_ap", data={
         "bssid": bssid, "ssid": ssid,
         "ssid_authorized": is_authorized_ssid,
+        "ssid_named": named, "ssid_match": how,
         "oui_authorized": is_authorized_oui,
+        "bssid_unverified": unverified,
         "rogue_with_authorized_ssid": rogue_announcing_authorized_ssid,
     }, weight=weight)
 
@@ -55,7 +124,8 @@ def evil_twin_check(ap_record: dict | None) -> ToolResult:
     ssid = ap_record.get("ssid") or ""
     bssid = (ap_record.get("bssid") or "").upper()
     captive_portal = bool(ap_record.get("captive_portal_detected"))
-    matches_pos = ssid == "BankWiFi-PoS"
+    named, how = _ssid_match(ssid)
+    matches_pos = named == "BankWiFi-PoS"
     # Evil-twin shape: identical SSID to authorized but different BSSID,
     # or a captive portal added to a branch SSID (the customer-facing
     # phishing pattern).
@@ -63,7 +133,8 @@ def evil_twin_check(ap_record: dict | None) -> ToolResult:
     # made every authorised PoS AP an evil twin (round 4 S4-16 / G7-12)
     known = ap_record.get("known_bssids") or ()
     known = {_mac(k) for k in ([known] if isinstance(known, str) else known)}
-    twin_match = ssid in _AUTHORIZED_SSIDS and _mac(bssid) not in known
+    # a look-alike of an authorised SSID is a twin whatever its BSSID (round 7 D-13)
+    twin_match = named is not None and (_mac(bssid) not in known or how != "exact")
     if twin_match and matches_pos:
         weight = "high"
     elif twin_match:
@@ -73,6 +144,7 @@ def evil_twin_check(ap_record: dict | None) -> ToolResult:
     return ToolResult(name="evil_twin", data={
         "ssid": ssid, "bssid": bssid,
         "twin_match": twin_match,
+        "ssid_named": named, "ssid_match": how,
         "captive_portal": captive_portal,
         "targets_pos_ssid": matches_pos,
     }, weight=weight)

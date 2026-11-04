@@ -61,6 +61,39 @@ def registry_with_stacks(stacks: list[str] | None = None, base: list[Honeytoken]
     return out
 
 
+# where a decoy can show up: the WAF ingest renames username -> user_id, Imperva maps qstr / postbody to
+# query_string / post_body, and a decoy key is most often presented in a request header (review round 7 D-2)
+_FIELDS = ("payload", "url", "uri", "path", "request_uri", "username", "user_id", "user", "principal", "account",
+           "query", "query_string", "post_body", "body", "request_body", "raw", "db_name", "database", "cmdline")
+_HEADER_FIELDS = ("headers", "request_headers", "http_headers")
+
+
+def _haystack(alert: dict) -> str:
+    parts = [str(alert.get(f, "")) for f in _FIELDS if alert.get(f) not in (None, "")]
+    for hf in _HEADER_FIELDS:
+        hv = alert.get(hf)
+        if isinstance(hv, dict):
+            parts.extend(f"{k}: {v}" for k, v in list(hv.items())[:100])
+        elif isinstance(hv, (list, tuple)):
+            parts.extend(str(x) for x in hv[:100])
+        elif hv:
+            parts.append(str(hv))
+    return " ".join(parts)[:200_000]
+
+
+def _normalise(s: str) -> str:
+    import re
+    from urllib.parse import unquote
+    out = s
+    for _ in range(3):                                   # double-encoding: %252e → %2e → .
+        nxt = unquote(out)
+        if nxt == out:
+            break
+        out = nxt
+    out = re.sub(r"/{2,}", "/", out.replace("\\", "/"))
+    return out.lower()
+
+
 class HoneytokenMonitor:
     name = "deception"
 
@@ -71,12 +104,15 @@ class HoneytokenMonitor:
         return self._match(alert) is not None
 
     def _match(self, alert: dict) -> Honeytoken | None:
-        haystack = " ".join(
-            str(alert.get(field, ""))
-            for field in ("payload", "url", "username", "query", "raw")
-        )
+        raw = _haystack(alert)
+        norm = _normalise(raw)
         for token in self._registry:
-            if token.value in haystack:
+            if token.value in raw:
+                return token
+            # URL paths and account names compare case-insensitively after percent-decoding and collapsing
+            # repeated slashes: `/Admin-Internal-Debug`, `/%2egit/config`, `/.git//config`, `SVC_BANKING_LEGACY`
+            # all touch the decoy (review round 7 D-2). Keys / DB names keep an exact, case-sensitive match too.
+            if _normalise(token.value) in norm:
                 return token
         return None
 

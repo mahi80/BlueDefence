@@ -46,7 +46,7 @@ _TYPE_MAP: dict[str, str] = {
     "hostname":   "domain",
     "url":        "url",
     "md5":        "hash_md5",
-    "sha1":       "hash_sha256",   # we coalesce sha1/sha256 under hash_sha256
+    "sha1":       "hash_sha1",     # was coalesced into hash_sha256 and then rejected for being 40 hex (round 7 D-12)
     "sha256":     "hash_sha256",
     "email-src":  "email",
     "email-dst":  "email",
@@ -110,6 +110,9 @@ class MISPClient:
                 "page": page,
                 "type": types,
                 "to_ids": 1 if to_ids_only else 0,
+                # MISP warninglists (top sites, CDNs, cloud ranges, public resolvers): an event that lists
+                # sharepoint.com or a CDN must not turn the whole provider "known bad" (round 7 D-5)
+                "enforceWarninglist": True,
             }
             if since:
                 body["last"] = since
