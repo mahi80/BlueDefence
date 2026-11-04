@@ -9,8 +9,11 @@ info:
 
     Security — the adapter MUST:
       * require `Authorization: Bearer <token>` (AEGIS_PAYHOLD_TOKEN);
-      * verify `X-AEGIS-Signature: sha256=<hex HMAC-SHA256(signing key, X-AEGIS-Timestamp + "." + raw body)>`
-        (GET / DELETE sign an empty body) and refuse a timestamp more than 300 s from its clock;
+      * verify `X-AEGIS-Signature: sha256=<hex HMAC-SHA256(signing key, METHOD + "\n" + path?query + "\n" +
+        X-AEGIS-Timestamp + "\n" + X-AEGIS-Nonce + "\n" + raw body)>` (GET / DELETE sign an empty body; the path is
+        the request path as the adapter receives it, e.g. /aegis/v1/holds/H1001);
+      * refuse a timestamp more than 300 s from its clock, and a nonce (32 hex) it has already seen in that window —
+        a signed request can then neither be replayed nor re-pointed at another hold or method;
       * be reachable only from the AEGIS host (network allowlist) over TLS.
     A hold only parks payments; it never reverses, debits or credits anything. Release returns the payment to
     normal processing. A hold must lapse on its own at `expires_at` if AEGIS never releases it.

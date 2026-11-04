@@ -47,7 +47,8 @@ def test_trend_isolates_restores_and_reads_the_task():
     r = c.apply(_act("isolate", "host:app-ledger-07"))
     assert r.status == "applied", r.error
     guid = "11111111-2222-3333-4444-555555555555"
-    assert m.isolated == {guid} and r.vendor_ref.startswith(guid + "#") and c.verify(r) is True
+    # round 6 C-10: a succeeded task does not prove the endpoint is still isolated -> not verifiable (None)
+    assert m.isolated == {guid} and r.vendor_ref.startswith(guid + "#") and c.verify(r) is None
     assert c.rollback(r).status == STATUS_ROLLED_BACK and m.isolated == set()
     assert c.apply(_act("isolate", "ghost")).status == "failed"
     task = r.vendor_ref.partition("#")[2]

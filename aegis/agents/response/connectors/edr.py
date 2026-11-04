@@ -55,6 +55,7 @@ class CrowdStrikeConnector(Connector):
     name = "crowdstrike"
     reapply_on_human_approval = True
     actions = frozenset({"isolate", "kill_process"})
+    one_shot_actions = frozenset({"kill_process"})     # a kill runs every time it is approved; nothing stays in force
 
     def __init__(self, *, base_url: str, token_provider: Callable[[], str],
                  transport: Optional[Transport] = None, **kw: Any):
@@ -69,11 +70,6 @@ class CrowdStrikeConnector(Connector):
         if t.lower().startswith(("agent:", "sandbox:")):
             return False                # an AI agent's sandbox, not a Falcon host (OpenShell quarantines it)
         return bool(t) and not is_fingerprint_target(t) and not _looks_like_ip(t.split(":", 1)[0])
-
-    def apply(self, action: Any, **kw: Any) -> Receipt:
-        if action.action_type == "kill_process":
-            kw["ttl_sec"] = 0          # a kill is one-shot: permanent receipt, no TTL auto-rollback
-        return super().apply(action, **kw)
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self._token_provider()}",
@@ -218,22 +214,35 @@ class DefenderConnector(_HostEdr):
 
     def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
         mid = self._machine(action.target)
+        # read before acting: a device someone else isolated is recorded as pre-existing, and AEGIS's undo then
+        # leaves it isolated instead of releasing it (round 6 C-7)
+        if self._isolated(mid) is True:
+            note = f"[defender] {action.target} ({mid}) was already isolated; AEGIS's undo will not release it"
+            return mid, note, f"pre-existing:{mid}"
         res = call(self._transport, "POST", f"{self.base_url}/api/machines/{mid}/isolate",
                    json_body={"Comment": f"AEGIS {key[:16]}: {str(getattr(action, 'reasoning', ''))[:200]}",
                               "IsolationType": "Full"}, headers=self._h(), expect=(200, 201, 400))
-        if res.status == 400 and "already" not in str(res.body).lower():
-            raise ConnectorError(f"Defender refused isolation: {str(res.body)[:200]}")
+        if res.status == 400:
+            if "already" not in str(res.body).lower():
+                raise ConnectorError(f"Defender refused isolation: {str(res.body)[:200]}")
+            note = f"[defender] an isolation of {action.target} ({mid}) was already in progress; AEGIS's undo will not release it"
+            return mid, note, f"pre-existing:{mid}"
         return mid, f"[defender] isolated device {action.target} ({mid}); only Defender cloud traffic is allowed", mid
 
     def _do_rollback(self, receipt: Receipt) -> str:
+        if receipt.rollback_token.startswith("pre-existing"):
+            return f"[defender] {receipt.target} was isolated before AEGIS acted; left isolated"
         mid = receipt.vendor_ref or self._machine(receipt.target)
         call(self._transport, "POST", f"{self.base_url}/api/machines/{mid}/unisolate",
              json_body={"Comment": f"AEGIS release of {receipt.receipt_id}"}, headers=self._h(), expect=(200, 201))
         return f"[defender] released isolation of {receipt.target}"
 
     def _do_verify(self, receipt: Receipt) -> bool | None:
+        return self._isolated(receipt.vendor_ref)
+
+    def _isolated(self, mid: str) -> bool | None:
         from urllib.parse import quote
-        flt = quote(f"machineId eq '{receipt.vendor_ref}'", safe="")
+        flt = quote(f"machineId eq '{mid}'", safe="")
         res = call(self._transport, "GET", f"{self.base_url}/api/machineactions?$filter={flt}", headers=self._h())
         acts = [a for a in (res.json().get("value") or []) if isinstance(a, dict)
                 and a.get("type") in ("Isolate", "Unisolate") and a.get("status") not in ("Failed", "Cancelled", "TimeOut")]
@@ -282,17 +291,24 @@ class SentinelOneConnector(_HostEdr):
 
     def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
         aid = self._agent(action.target)
+        if self._disconnected(aid) is True:                         # someone else's isolation: not ours to undo (C-7)
+            note = f"[sentinelone] {action.target} (agent {aid}) was already disconnected; AEGIS's undo will not reconnect it"
+            return aid, note, "pre-existing"
         if self._act(aid, "disconnect") < 1:
             raise ConnectorError(f"SentinelOne disconnected no agent for {action.target}")
         return aid, f"[sentinelone] disconnected {action.target} (agent {aid}) from the network", aid
 
     def _do_rollback(self, receipt: Receipt) -> str:
+        if receipt.rollback_token == "pre-existing":
+            return f"[sentinelone] {receipt.target} was disconnected before AEGIS acted; left disconnected"
         self._act(receipt.vendor_ref or self._agent(receipt.target), "connect")
         return f"[sentinelone] reconnected {receipt.target}"
 
     def _do_verify(self, receipt: Receipt) -> bool | None:
-        res = call(self._transport, "GET", f"{self.base_url}/web/api/v2.1/agents?ids={receipt.vendor_ref}",
-                   headers=self._h())
+        return self._disconnected(receipt.vendor_ref)
+
+    def _disconnected(self, aid: str) -> bool | None:
+        res = call(self._transport, "GET", f"{self.base_url}/web/api/v2.1/agents?ids={aid}", headers=self._h())
         rows = res.json().get("data") or []
         if not rows:
             return None
@@ -307,9 +323,12 @@ class TrendVisionOneConnector(_HostEdr):
         resolve  GET  /v3.0/endpointSecurity/endpoints    header TMV1-Query: endpointName eq '<host>'  → items[].agentGuid
         isolate  POST /v3.0/response/endpoints/isolate    [{"agentGuid", "description"}]  → 207, Operation-Location
         restore  POST /v3.0/response/endpoints/restore    [{"agentGuid", "description"}]
-        verify   GET  /v3.0/response/tasks/{id}           status succeeded / failed / running
+        task     GET  /v3.0/response/tasks/{id}           status succeeded / failed / running
 
-    The read-back follows the isolation task, so a restore made in the Trend console is not seen as drift.
+    The read-back can only report a FAILED isolation task (False). A succeeded task does not say the endpoint is still
+    isolated now — a restore in the Trend console would not show — so otherwise it reports "not verifiable" (None)
+    rather than a "verified" that never changes (round 6 C-10). For the same reason AEGIS cannot see an isolation
+    someone else placed before it acted; its undo restores the endpoint.
     """
 
     name = "trend"
@@ -358,7 +377,7 @@ class TrendVisionOneConnector(_HostEdr):
             return None
         res = call(self._transport, "GET", f"{self.base_url}/v3.0/response/tasks/{task}", headers=self._h())
         st = str(res.json().get("status") or "").lower()
-        return True if st == "succeeded" else False if st in ("failed", "rejected", "canceled", "cancelled") else None
+        return False if st in ("failed", "rejected", "canceled", "cancelled") else None
 
 
 class _FalconToken:

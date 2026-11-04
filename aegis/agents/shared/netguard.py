@@ -57,7 +57,25 @@ def _never_block_hosts() -> set:
     return {h.strip().lower() for h in os.environ.get("AEGIS_NEVER_BLOCK_HOSTS", "").split(",") if h.strip()}
 
 
-_TARGET_PREFIXES = ("host:", "ip:", "url:", "domain:", "device:", "outbound:", "principal:", "user:", "account:", "session:")
+_TARGET_PREFIXES = ("host:", "ip:", "src:", "dst:", "url:", "domain:", "device:", "outbound:", "principal:", "user:",
+                    "account:", "session:", "agent:", "sandbox:")
+ADDRESS_PREFIXES = ("ip:", "src:", "dst:", "outbound:")
+
+
+def strip_prefixes(target: str, prefixes: tuple[str, ...] = _TARGET_PREFIXES) -> str:
+    """``target`` without its kind prefixes, stripped until stable: ``ip:src:127.0.0.1`` → ``127.0.0.1``. The guard,
+    the protected-target check, the idempotency key and the connectors all use this one rule, so a prefix one of
+    them did not know can no longer get a target past another (review round 6 C-6 / C-8 / C-15)."""
+    t = str(target or "").strip()
+    for _ in range(8):
+        low = t.lower()
+        for p in prefixes:
+            if low.startswith(p):
+                t = t[len(p):].strip()
+                break
+        else:
+            return t
+    return t
 
 
 def never_block_target(target: str) -> Tuple[bool, str]:
@@ -66,14 +84,10 @@ def never_block_target(target: str) -> Tuple[bool, str]:
     Only IP / CIDR targets and operator-named hosts match; attacker host names, fingerprints
     and principals return ``(False, "")`` — out of scope for this guard.
     """
-    t = str(target or "").strip()
     # `host:` / `ip:` / `url:` / `domain:` prefixes are stripped by grounding and the connectors, so the guard
-    # strips them too: `isolate host:soc-ingest…` used to sail past it (review round 3 G1-8)
-    low = t.lower()
-    for p in _TARGET_PREFIXES:
-        if low.startswith(p):
-            t = t[len(p):].strip()
-            break
+    # strips them too: `isolate host:soc-ingest…` used to sail past it (review round 3 G1-8); every prefix, until
+    # stable, so `src:127.0.0.1` / `ip:src:…` / `agent:<sandbox>` are judged too (round 6 C-6 / C-15)
+    t = strip_prefixes(target)
     if not t:
         return False, ""
     hosts = _never_block_hosts()

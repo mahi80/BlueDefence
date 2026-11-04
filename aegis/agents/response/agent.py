@@ -87,7 +87,9 @@ def _protected_targets_from_env() -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
-_DEVICE_ID = __import__("re").compile(r"^[0-9a-f]{32}$")
+# opaque EDR device ids: Falcon aid (32 hex), Defender machine id (40 hex), SentinelOne agent id (numeric), Trend
+# agent GUID — none can be tied to a host name here (round 6 C-6)
+_DEVICE_ID = __import__("re").compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|\d{4,24}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 
 
 def _target_matches(target: str, patterns: list[str]) -> bool:
@@ -100,13 +102,9 @@ def _target_matches(target: str, patterns: list[str]) -> bool:
     from .grounding import unwrap
     if not patterns:
         return False
-    t = str(target).strip()
+    from ..shared.netguard import strip_prefixes
+    t = strip_prefixes(target)                 # every kind prefix, until stable (src:/dst:/ip:… too — round 6 C-6)
     low = t.lower()
-    for p in ("host:", "device:", "user:", "account:"):
-        if low.startswith(p):
-            t = t[len(p):].strip()
-            low = t.lower()
-            break
     if _DEVICE_ID.match(low):
         return True
     net = None

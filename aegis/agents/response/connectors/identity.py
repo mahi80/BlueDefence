@@ -59,10 +59,17 @@ def _protected() -> set[str]:
     return {x.strip().lower() for x in os.environ.get("AEGIS_IDP_PROTECTED", "").split(",") if x.strip()}
 
 
-def _refuse_protected(who: str) -> None:
-    low = who.lower()
-    if low in _protected() or low.split("@", 1)[0] in _protected():
-        raise ConnectorError(f"{who} is a protected (break-glass) principal on AEGIS_IDP_PROTECTED; a person acts on it")
+def _refuse_protected(*names: Any) -> None:
+    """Refuse when any name the RESOLVED principal goes by — the target as given, the directory's object id, UPN,
+    sAMAccountName / mail nickname — or its local part is on ``AEGIS_IDP_PROTECTED``. Checking only the target string
+    let ``u-1003`` (the break-glass account's object id) or ``priya.sharma`` (protected as a UPN) through (round 6 C-5)."""
+    prot = _protected()
+    if not prot:
+        return
+    for n in names:
+        low = str(n or "").strip().lower()
+        if low and (low in prot or low.split("@", 1)[0] in prot):
+            raise ConnectorError(f"{names[0]} is a protected (break-glass) principal on AEGIS_IDP_PROTECTED; a person acts on it")
 
 
 class EntraConnector(Connector):
@@ -70,6 +77,9 @@ class EntraConnector(Connector):
 
     name = "entra"
     actions = frozenset({"revoke_sessions", "force_logout", "lock_account"})
+    # a revoke runs at Entra every time it is approved — a second phish a week later is revoked again (round 6 C-1)
+    one_shot_actions = frozenset({"revoke_sessions", "force_logout"})
+    reapply_on_human_approval = True          # a lock re-approved after someone re-enabled the account locks it again
 
     def __init__(self, *, token_provider: Callable[[], str], base_url: str = GRAPH,
                  transport: Transport | None = None, **kw: Any):
@@ -85,17 +95,13 @@ class EntraConnector(Connector):
         except ConnectorError:
             return False
 
-    def apply(self, action: Any, **kw: Any) -> Receipt:
-        if action.action_type in ("revoke_sessions", "force_logout"):
-            kw["ttl_sec"] = 0                   # one-shot: permanent receipt, no TTL auto-rollback
-        return super().apply(action, **kw)
-
     def _h(self) -> dict:
         return {"Authorization": f"Bearer {self._token()}", "Content-Type": "application/json"}
 
     def _user(self, upn: str) -> dict:
         res = call(self._transport, "GET",
-                   f"{self.base_url}/users/{quote(upn, safe='@')}?$select=id,userPrincipalName,accountEnabled",
+                   f"{self.base_url}/users/{quote(upn, safe='@')}"
+                   "?$select=id,userPrincipalName,accountEnabled,mailNickname,onPremisesSamAccountName",
                    headers=self._h(), expect=(200, 404))
         if res.status == 404 or not res.json().get("id"):
             raise ConnectorError(f"no Entra user {upn}")
@@ -110,6 +116,8 @@ class EntraConnector(Connector):
         _refuse_protected(upn)
         user = self._user(upn)
         uid = str(user["id"])
+        _refuse_protected(upn, uid, user.get("userPrincipalName"), user.get("mailNickname"),
+                          user.get("onPremisesSamAccountName"))
         if action.action_type in ("revoke_sessions", "force_logout"):
             self._revoke(uid)
             return uid, f"[entra] revoked every sign-in session of {upn}: it must sign in again (MFA / CA apply)", ""
@@ -169,6 +177,7 @@ class CyberArkConnector(Connector):
 
     name = "cyberark"
     actions = frozenset({"rotate_credential"})
+    one_shot_actions = frozenset({"rotate_credential"})   # a re-leaked secret is rotated again (round 6 C-1)
 
     def __init__(self, *, base_url: str, session: Callable[[], str], transport: Transport | None = None, **kw: Any):
         super().__init__(**kw)
@@ -184,10 +193,6 @@ class CyberArkConnector(Connector):
                 break
         return bool(re.match(r"^[A-Za-z0-9._%+$'-]{1,128}(@[A-Za-z0-9.-]{1,190})?$", t.strip()))
 
-    def apply(self, action: Any, **kw: Any) -> Receipt:
-        kw["ttl_sec"] = 0                         # a rotation is permanent: the old secret is gone
-        return super().apply(action, **kw)
-
     def _h(self) -> dict:
         return {"Authorization": self._session(), "Content-Type": "application/json"}
 
@@ -198,11 +203,25 @@ class CyberArkConnector(Connector):
                 t = t[len(p):].strip()
                 break
         user, _, address = t.partition("@")
-        res = call(self._transport, "GET",
-                   f"{self.base_url}/PasswordVault/API/Accounts?{urlencode({'search': user, 'limit': 50})}",
-                   headers=self._h())
-        rows = [r for r in (res.json().get("value") or []) if isinstance(r, dict)
-                and str(r.get("userName", "")).lower() == user.lower()
+        # every page of the search, not the first 50 hits: one exact match on page 1 with more on later pages used to
+        # rotate the wrong account (round 6 C-12)
+        found: list[dict] = []
+        offset, total, limit = 0, None, 100
+        for _ in range(50):
+            res = call(self._transport, "GET", f"{self.base_url}/PasswordVault/API/Accounts?"
+                       f"{urlencode({'search': user, 'limit': limit, 'offset': offset})}", headers=self._h())
+            body = res.json()
+            page = [r for r in (body.get("value") or []) if isinstance(r, dict)]
+            found += page
+            if isinstance(body.get("count"), int):
+                total = body["count"]
+            offset += len(page)
+            if not page or not body.get("nextLink") or (total is not None and offset >= total):
+                break
+        if total is not None and len(found) < total:
+            raise ConnectorError(f"CyberArk search for {user!r} has {total} hits; only {len(found)} could be read — "
+                                 f"name it exactly: account:{user}@<address>")
+        rows = [r for r in found if str(r.get("userName", "")).lower() == user.lower()
                 and (not address or str(r.get("address", "")).lower() == address.lower())]
         if not rows:
             raise ConnectorError(f"no CyberArk account {t!r}")
@@ -213,7 +232,7 @@ class CyberArkConnector(Connector):
     def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
         acct = self._account(action.target)
         who = f"{acct.get('userName')}@{acct.get('address')}"
-        _refuse_protected(str(acct.get("userName", "")))
+        _refuse_protected(action.target, acct.get("userName"), who)
         aid = str(acct["id"])
         call(self._transport, "POST", f"{self.base_url}/PasswordVault/API/Accounts/{quote(aid, safe='')}/Change",
              json_body={"ChangeEntireGroup": False}, headers=self._h())
@@ -259,7 +278,12 @@ class Directory:
             import ldap3  # type: ignore
         except ImportError:
             raise ConnectorError("ldap3 is not installed: pip install 'aegis[ad]'") from None
-        server = ldap3.Server(self.url, use_ssl=True, connect_timeout=self.timeout)
+        import ssl
+        # verify the DC's certificate: ldap3's default Tls() is CERT_NONE, which hands the bind password to anyone in
+        # the path (round 6 C-2). AEGIS_AD_CA names the bank's CA bundle; otherwise the system store is used.
+        tls = ldap3.Tls(validate=ssl.CERT_REQUIRED, version=ssl.PROTOCOL_TLS_CLIENT,
+                        ca_certs_file=os.environ.get("AEGIS_AD_CA", "").strip() or None)
+        server = ldap3.Server(self.url, use_ssl=True, tls=tls, connect_timeout=self.timeout)
         return ldap3.Connection(server, user=self._dn, password=self._pw, auto_bind=True, receive_timeout=self.timeout)
 
     def search(self, base: str, flt: str, attrs: list[str]) -> list[tuple[str, dict]]:
@@ -293,7 +317,9 @@ class ActiveDirectoryConnector(Connector):
 
     name = "ad"
     actions = frozenset({"lock_account"})
+    reapply_on_human_approval = True
     _NEVER = frozenset({"administrator", "krbtgt", "guest"})
+    _NEVER_RIDS = ("-500", "-501", "-502")          # built-in Administrator, Guest, krbtgt — even when renamed
 
     def __init__(self, *, directory: Any, base_dn: str, **kw: Any):
         super().__init__(**kw)
@@ -309,12 +335,14 @@ class ActiveDirectoryConnector(Connector):
     def _find(self, who: str) -> tuple[str, int]:
         e = _ldap_escape(who)
         flt = f"(&(objectCategory=person)(objectClass=user)(|(sAMAccountName={e})(userPrincipalName={e})))"
-        rows = self.dir.search(self.base_dn, flt, ["userAccountControl", "sAMAccountName"])
+        rows = self.dir.search(self.base_dn, flt, ["userAccountControl", "sAMAccountName", "userPrincipalName", "objectSid"])
         if len(rows) != 1:
             raise ConnectorError(f"{len(rows)} AD accounts match {who!r}; give the sAMAccountName or UPN")
         dn, attrs = rows[0]
-        if str(attrs.get("sAMAccountName", "")).lower() in self._NEVER:
+        sam, upn, sid = (str(attrs.get(k) or "") for k in ("sAMAccountName", "userPrincipalName", "objectSid"))
+        if sam.lower() in self._NEVER or sid.endswith(self._NEVER_RIDS):
             raise ConnectorError(f"{who} is a built-in privileged account; a person acts on it")
+        _refuse_protected(who, sam, upn, dn)          # the resolved names, in every form (round 6 C-5)
         return dn, int(attrs.get("userAccountControl") or 512)
 
     def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:

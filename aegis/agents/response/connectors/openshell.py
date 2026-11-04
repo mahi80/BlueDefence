@@ -65,6 +65,9 @@ class OpenShellConnector(Connector):
 
     name = "openshell"
     actions = frozenset({"isolate"})
+    # a read-back that sees endpoints back on the policy only REPORTS drift: restoring the saved pre-quarantine policy
+    # would re-open endpoints an operator had deliberately left closed (round 6 C-9); a re-approval re-quarantines
+    reapply_on_human_approval = True
 
     def __init__(self, *, runner: Runner | None = None, state_dir: str | Path | None = None, **kw: Any):
         super().__init__(**kw)
