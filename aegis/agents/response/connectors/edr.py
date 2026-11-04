@@ -66,6 +66,8 @@ class CrowdStrikeConnector(Connector):
     def supports_target(self, target: str) -> bool:
         # a host (name or Falcon device id); not a source fingerprint, not a bare IP
         t = str(target).strip()
+        if t.lower().startswith(("agent:", "sandbox:")):
+            return False                # an AI agent's sandbox, not a Falcon host (OpenShell quarantines it)
         return bool(t) and not is_fingerprint_target(t) and not _looks_like_ip(t.split(":", 1)[0])
 
     def apply(self, action: Any, **kw: Any) -> Receipt:

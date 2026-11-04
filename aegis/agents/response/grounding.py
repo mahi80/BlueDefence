@@ -24,7 +24,7 @@ from typing import Any
 from ..shared.netguard import unwrap
 
 _IP_RX = re.compile(r"(?<![\w.:])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|(?<![\w:])[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}(?![\w:])")
-_PREFIXES = ("host:", "user:", "session:", "device:", "account:", "outbound:", "principal:", "url:", "domain:")
+_PREFIXES = ("host:", "user:", "session:", "device:", "account:", "outbound:", "principal:", "url:", "domain:", "agent:", "sandbox:")
 
 _INTERNAL = [ipaddress.ip_network(n) for n in (
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
@@ -134,6 +134,8 @@ _KIND_KEYS: dict[str, set[str]] = {
     "session": {_norm_key(k) for k in ("session_id", "session_token_hash", "sid")},
     "destination": {_norm_key(k) for k in (
         "dst_host", "dest_host", "dst_domain", "domain", "sni", "server_name", "query_name", "qname", "destination")},
+    # an AI agent / its OpenShell sandbox (quarantine target `agent:<name>`)
+    "agent": {_norm_key(k) for k in ("agent_id", "agent_name", "ai_agent", "ai_agent_id", "sandbox", "sandbox_name")},
     "fingerprint": {_norm_key(k) for k in ("ja3", "ja4", "ja3_hash", "ja4_hash", "tls_ja3", "tls_ja4")},
     # only qualifies a fingerprint target (the UA a fingerprint was seen with); never grounds anything by itself
     "ua": {_norm_key(k) for k in ("user_agent", "useragent", "ua")},
@@ -225,6 +227,8 @@ def _kinds_for(target: str, action_type: str) -> set[str]:
         return {"session", "principal"}
     if low.startswith(("domain:", "url:")):
         return {"destination"}
+    if low.startswith(("agent:", "sandbox:")):
+        return {"agent"}
     if action_type in _PRINCIPAL_ACTIONS:
         return {"principal", "session"}
     if action_type in _HOST_ACTIONS:
