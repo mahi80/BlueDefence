@@ -42,7 +42,9 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "device": ("device", "host", "hostname"),
     "url": ("url",),
     "endpoint": ("url", "endpoint", "path"),
-    "domain": ("domain", "sender_domain", "host"),
+    # never `host`: on WAF / proxy alerts it is the bank's own virtual host, on EDR the victim — "block_egress ->
+    # domain" became an action on the bank's own site (review round 7 O-7). Unresolved is the safe outcome.
+    "domain": ("domain", "sender_domain"),
     "sender": ("sender", "from"),
     "process": ("process", "process_name"),
     "hash": ("hash", "sha256", "file_hash"),

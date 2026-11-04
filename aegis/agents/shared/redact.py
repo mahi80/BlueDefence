@@ -58,7 +58,10 @@ _PAIR_KEYS = rf"(?:[A-Za-z0-9]*[_-]?)?(?:password|passwd|passphrase|secret(?:[_-
 # and an attack-shaped value (the whole of it) is kept by redact_value.
 # The value stops at the next " key=" on the same log line, so one credential followed by an attack string
 # (kept whole) is not stored in clear with it.
-_KV_RX = re.compile(rf"(?i)(?<![A-Za-z0-9_-])((?:{_PAIR_KEYS})\s*=\s*)([^&\r\n]+?)(?=\s+[A-Za-z_][\w.-]*=|&|\r|\n|$)")
+# The terminator is bounded ([ \t]{1,64}, key ≤ 64 chars): an unbounded \s+ re-scanned the whole whitespace run at
+# every position of the lazy value — 40 KB of spaces after "password=" took 15 s per call (review round 7 O-1).
+_KV_RX = re.compile(rf"(?i)(?<![A-Za-z0-9_-])((?:{_PAIR_KEYS})[ \t]{{0,64}}=[ \t]{{0,64}})([^&\r\n]+?)"
+                    rf"(?=[ \t]{{1,64}}[A-Za-z_][\w.-]{{0,64}}=|&|\r|\n|$)")
 # "key": "value" inside JSON text, and 'key': 'value' in a Python repr of a dict
 _JSON_RX = re.compile(rf"(?i)(([\"'])(?:{_PAIR_KEYS})\2\s*:\s*([\"']))((?:(?!\3)[^\\]|\\.)*)(\3)")
 # header lines: "X-Api-Key: …", "Authorization: ApiKey …", "X-Auth-Token: …"

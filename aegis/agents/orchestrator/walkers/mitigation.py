@@ -24,6 +24,7 @@ executes anything.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from itertools import combinations
 
 from ...shared.evidence_chain import EvidenceChain, EvidenceItem, ReasoningStep, RecommendedAction
@@ -51,7 +52,7 @@ SEVER = {
     "linked_to":       ("monitor",         "b", 0.0,  "—"),
 }
 IMMEDIATE = [("throttle", 0.05, "slow the source"), ("challenge", 0.1, "step-up the session"), ("monitor", 0.0, "watch the frontier")]
-_HITL = {"block", "isolate", "lock_account", "revoke_sessions", "trigger_self_heal", "kill_process", "quarantine_file",
+_HITL = {"block", "force_logout", "isolate", "lock_account", "revoke_sessions", "trigger_self_heal", "kill_process", "quarantine_file",
          "escalate_to_fraud_team", "hold", "block_export", "recall_message", "rotate_credential", "escalate_to_hr", "snapshot_forensic"}
 
 
@@ -122,8 +123,18 @@ def _candidates(g: BlastGraph, crit: set[str]) -> dict[tuple[str, str], list[Edg
     """Unique (action, target) pairs on some path to a critical node, with the edges each severs.
     One action removes *every* edge it maps to — revoking a user's sessions cuts all of them."""
     out: dict[tuple[str, str], list[Edge]] = {}
+    # nodes that can reach a critical asset, by one reverse walk — a forward reach per edge was O(E²)
+    radj: dict[str, list[str]] = {}
     for e in g.edges:
-        if not (crit & g._reach({e.b}, g.edges)) and e.b not in crit:
+        radj.setdefault(e.b, []).append(e.a)
+    leads = set(crit); stack = list(crit)
+    while stack:
+        x = stack.pop()
+        for y in radj.get(x, ()):
+            if y not in leads:
+                leads.add(y); stack.append(y)
+    for e in g.edges:
+        if e.b not in leads:
             continue
         act, target, _cost, _rb = _sever(e)
         if act == "monitor":
@@ -142,7 +153,15 @@ def _fallback_action(g: BlastGraph, node_id: str) -> str:
     return "block"
 
 
-def plan_mitigation(g: BlastGraph, *, max_steps: int = 4, max_combo: int = 2) -> Plan:
+#: pairs are only tried among this many best single cuts, and the whole search is wall-clock bounded: a 391-node
+#: graph used to take 35 s of CPU (all pairs × full reach × list-membership removal) on the investigation pool and
+#: the containment loop (review round 7 O-6)
+MAX_PAIR_POOL = 20
+PLAN_MAX_SECONDS = 2.0
+
+
+def plan_mitigation(g: BlastGraph, *, max_steps: int = 4, max_combo: int = 2,
+                    max_seconds: float = PLAN_MAX_SECONDS) -> Plan:
     """Greedy minimum cut over *actions*: each candidate is an (action, target) pair that severs
     every edge it maps to; pick the single action or pair with the best protected-sensitivity ÷
     disruption, repeat on what is still reachable, stop at ``max_steps`` or when everything
@@ -157,26 +176,47 @@ def plan_mitigation(g: BlastGraph, *, max_steps: int = 4, max_combo: int = 2) ->
     cands = _candidates(g, crit)
     plan.candidates_considered = len(cands)
     cut_edges: list[Edge] = []; used: set[tuple[str, str]] = set(); remaining = set(base)
-    while remaining and len(plan.steps) < max_steps:
+    deadline = time.monotonic() + max_seconds
+
+    def _rest(removed: list[Edge]) -> list[Edge]:
+        gone = {id(e) for e in removed}
+        return [x for x in g.edges if id(x) not in gone]
+
+    def _score(combo: tuple) -> tuple[float, set[str]]:
+        protected = remaining - (g._reach(seeds, _rest(cut_edges + [e for key in combo for e in cands[key]])) & remaining)
+        if not protected:
+            return 0.0, protected
+        sens = sum(g.nodes[c].sensitivity for c in protected)
+        cost = sum(SEVER.get(cands[key][0].relation, ("", "", 0.0, ""))[2] for key in combo) + 0.05 * (len(combo) - 1)
+        return sens / (cost + 0.1), protected
+
+    timed_out = False
+    while remaining and len(plan.steps) < max_steps and not timed_out:
         best = None; best_score = 0.0
         pool = [k for k in cands if k not in used]
-        for k in range(1, max_combo + 1):
-            for combo in combinations(pool, k):
-                removed = cut_edges + [e for key in combo for e in cands[key]]
-                rest = [x for x in g.edges if x not in removed]
-                protected = remaining - (g._reach(seeds, rest) & remaining)
-                if not protected:
-                    continue
-                sens = sum(g.nodes[c].sensitivity for c in protected)
-                cost = sum(SEVER.get(cands[key][0].relation, ("", "", 0.0, ""))[2] for key in combo) + 0.05 * (k - 1)
-                score = sens / (cost + 0.1)
-                if score > best_score:
-                    best, best_score = combo, score
+        singles: list[tuple[float, tuple]] = []
+        for key in pool:
+            if time.monotonic() > deadline:
+                timed_out = True; break
+            sc, _ = _score((key,))
+            singles.append((sc, key))
+            if sc > best_score:
+                best, best_score = (key,), sc
+        if max_combo >= 2 and not timed_out:
+            # a pair can protect what neither cut does alone, so pair candidates are ranked by what their edges
+            # lead to (single score, then edge count) — but only the top MAX_PAIR_POOL are paired
+            ranked = [k for _, k in sorted(singles, key=lambda t: (-t[0], -len(cands[t[1]])))][:MAX_PAIR_POOL]
+            for combo in combinations(ranked, 2):
+                if time.monotonic() > deadline:
+                    timed_out = True; break
+                sc, _ = _score(combo)
+                if sc > best_score:
+                    best, best_score = combo, sc
         if best is None:
             break
         # the combo protects as a unit: every key in it becomes a step (a pair's second cut is not optional)
         removed = cut_edges + [e for key in best for e in cands[key]]
-        rest = [x for x in g.edges if x not in removed]
+        rest = _rest(removed)
         protected_now = sorted(remaining - (g._reach(seeds, rest) & remaining))
         first_order = len(plan.steps) + 1
         for key in best:
@@ -191,6 +231,8 @@ def plan_mitigation(g: BlastGraph, *, max_steps: int = 4, max_combo: int = 2) ->
             plan.disruption += cost
         cut_edges = removed
         remaining -= set(protected_now)
+    if timed_out:
+        plan.note = (plan.note + "; " if plan.note else "") + f"search stopped at its {max_seconds:.0f} s budget — plan may not be minimal"
     plan.protected = sorted(base - remaining); plan.unprotected = sorted(remaining)
     plan.protected_sensitivity = sum(g.nodes[c].sensitivity for c in plan.protected)
     for n in plan.unprotected[:2]:

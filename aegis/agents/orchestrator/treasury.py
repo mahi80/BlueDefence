@@ -135,13 +135,14 @@ class _Ledger:
     transfers cannot evict the high-value ones (a 1,000-entry deque did: a 3 x INR 2 crore drain with a 1,098-payout
     run between the transfers read as no burst — review round 5 Y5-5)."""
 
-    __slots__ = ("high", "small", "small_total", "split_alerted_at")
+    __slots__ = ("high", "small", "small_total", "split_alert_txn", "split_alerted_at")
 
     def __init__(self) -> None:
         self.high: OrderedDict[str, tuple[float, float]] = OrderedDict()     # txn id -> (ts, amount), oldest first
         self.small: OrderedDict[str, tuple[float, float]] = OrderedDict()
         self.small_total = 0.0
         self.split_alerted_at: float | None = None   # when this window's split total last raised a chain
+        self.split_alert_txn = ""                     # the transfer that raised it (re-evaluating it says True again)
 
     def expire(self, now: float, window: float) -> None:
         cutoff = now - window
@@ -208,16 +209,19 @@ class _OutflowBook:
                 self._by_sender.pop(sender, None)
             return out
 
-    def claim_split_alert(self, sender: str, ts: float, window: float) -> bool:
+    def claim_split_alert(self, sender: str, ts: float, window: float, txn: str = "") -> bool:
         """True the first time in a window that the split total raises a chain for ``sender``; False after. A
-        payout run of 400 small transfers used to raise 201 chains, one per transfer past the line (Y5-5)."""
+        payout run of 400 small transfers used to raise 201 chains, one per transfer past the line (Y5-5).
+        Evaluating the SAME transfer again gives the same answer: storm mode asks ``is_fast_path`` and then
+        ``_route`` asks again, and the second question used to find the claim spent (review round 7 O-2)."""
         with self._lock:
             led = self._by_sender.get(sender)
             if led is None:
                 return True
             if led.split_alerted_at is not None and ts - led.split_alerted_at < window:
-                return False
+                return bool(txn) and led.split_alert_txn == txn
             led.split_alerted_at = ts
+            led.split_alert_txn = txn
             return True
 
     def reset(self) -> None:
@@ -266,7 +270,7 @@ def is_treasury_outflow(alert: dict) -> bool:
     sender, ts = _sender(alert), _ts(alert)
     _n, total = BOOK.add(sender, ts, amount, _txn_id(alert), _window_s())
     # once per window per sender: the split total crossing the line is one finding, not one per later transfer
-    return total >= high_value_inr() and BOOK.claim_split_alert(sender, ts, _window_s())
+    return total >= high_value_inr() and BOOK.claim_split_alert(sender, ts, _window_s(), _txn_id(alert))
 
 
 def _crore(inr: float) -> str:

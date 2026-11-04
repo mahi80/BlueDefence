@@ -173,6 +173,20 @@ def _auto_close_context(alert: Any, triage: dict) -> str:
     return f"triage reason: {str(triage.get('reason', ''))[:300]} | alert: {body}"
 
 
+_CAMPAIGN_KEYS = ("events_in_window", "window_minutes", "enumeration", "waf", "timeline", "identity", "adaptation")
+
+
+def _attach_derived(alert: dict, chain: EvidenceChain) -> None:
+    """AEGIS's own derived context (TLS client judgement, campaign context) onto the chain, from an alert the
+    swarm's attach step produced. It used to be copied after the chain was sealed, so on a verdict with no fan-out
+    the chain handed to the response agent and the HITL card differed from the audited row (review round 7 O-9)."""
+    if isinstance(alert.get("tls_client"), dict) and "tls_client" not in chain.metadata:
+        chain.metadata["tls_client"] = alert["tls_client"]
+    cc = alert.get("campaign_context")
+    if isinstance(cc, dict) and "campaign_context" not in chain.metadata:
+        chain.metadata["campaign_context"] = {k: cc[k] for k in _CAMPAIGN_KEYS if k in cc}
+
+
 class SOCOrchestrator:
     name = "soc_orchestrator"
 
@@ -242,6 +256,8 @@ class SOCOrchestrator:
                 chain = self._degraded_chain(alert, exc)   # odd alert shape, must not drop the alert: it gets an uncertain chain + HITL
                 sp.attributes["specialist"] = "degraded"
                 sp.attributes["verdict"] = chain.verdict
+            if TRUSTED_CONTEXT.get() is alert:
+                _attach_derived(alert, chain)        # before the seal, so the audited row carries it (round 7 O-9)
             return self.record(alert, chain)
 
     def _route(self, alert: dict, sp: Any) -> EvidenceChain:

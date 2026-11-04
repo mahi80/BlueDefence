@@ -37,7 +37,11 @@ from dataclasses import dataclass
 _BUILTIN_PATTERNS: list[tuple[str, str]] = [
     # India-specific (DPDP Act 2023 in scope)
     # 12-digit ID, first digit 2-9; written with spaces or hyphens too (round 4 O4-6)
-    ("AADHAAR",  r"\b[2-9]\d{3}[\s-]?\d{4}[\s-]?\d{4}\b"),
+    # a Luhn-valid card PAN first: a spaced 4-4-4-4 card used to be tokenized as AADHAAR for its first 12 digits
+    # (review round 7 O-3)
+    ("PAN_CC",   r"\b(?:\d[ .-]*?){13,19}\b"),          # credit-card PAN (Luhn-validated below), any separator
+    # never the first 12 digits of a longer grouped number (a card that failed Luhn is not an Aadhaar either)
+    ("AADHAAR",  r"\b[2-9]\d{3}[\s-]?\d{4}[\s-]?\d{4}\b(?![\s-]?\d)"),
     ("PAN_IN",   r"(?i)\b[A-Z]{3}[ABCEFGHJLPT][A-Z]\d{4}[A-Z]\b"),  # 10-char India PAN, any case
     ("IFSC",     r"\b[A-Z]{4}0[A-Z0-9]{6}\b"),          # bank routing code
     # Internal IDs — match BEFORE PHONE so digit-runs don't get eaten
@@ -46,16 +50,17 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
     # names it an account (review round 3 G2-4). Only the `v` group is replaced.
     ("ACCOUNT",  r"(?i)(?:acc(?:oun)?t|a/c|beneficiary)[\w ]{0,20}?[\"']?\s*[:=#]?\s*[\"']?(?P<v>\d{9,18})\b"),
     # Global
-    ("PAN_CC",   r"\b(?:\d[ .-]*?){13,19}\b"),          # credit-card PAN (Luhn-validated below), any separator
     ("EMAIL",    r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
     # UPI VPA (name@okhdfcbank, 98xxxxxx@ybl): an e-mail-like handle with no dot in the provider
     ("UPI_VPA",  r"\b[\w.-]{2,64}@[A-Za-z][A-Za-z0-9]{1,31}\b(?![.@\w-])"),
     # Indian mobile: 10 digits starting 6–9, optional +91 / 0 prefix
-    ("PHONE_IN", r"(?<![\w+.])(?:\+91[ -]?|0)?[6-9]\d{9}\b"),
+    # Indian mobile written with separators too ("+91 98765 43210", "+91-98765-43210", "098765 43210")
+    ("PHONE_IN", r"(?<![\w+.])(?:\+?91[ -]?|0)?[6-9]\d{4}[ -]?\d{5}\b"),
     # Phone: require a separator (space/dash) inside so raw digit
     # strings (account numbers, IDs) don't match. Leading "+" allowed
     # without preceding word boundary.
-    ("PHONE",    r"(?:(?<=\s)|(?<=^))\+?\d{1,3}[ -]\(?\d{3,5}\)?[ -]\d{3,5}\b"),
+    # not only after whitespace: inside a JSON string the number follows a quote (review round 7 O-3)
+    ("PHONE",    r"(?<![\w.+])\+?\d{1,3}[ -]\(?\d{3,5}\)?[ -]\d{3,5}\b"),
     ("SSN_US",   r"\b\d{3}-\d{2}-\d{4}\b"),
 ]
 
