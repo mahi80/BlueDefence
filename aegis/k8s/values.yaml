@@ -7,9 +7,27 @@ image:
   tag: "0.1.0"
   pullPolicy: IfNotPresent
 
-# Replica count — scale horizontally; orchestrator is stateless, audit
-# log is per-pod local + flushed to S3 (audit-storage Terraform module).
-replicas: 3
+# Single replica, by design (review R-3): the service owns one audit hash chain, one
+# alert checkpoint and one HITL queue, so a second pod would fork the chain and poll
+# every source twice. The StatefulSet hard-codes replicas: 1 and the chart ships no HPA.
+# Scale with `resources`, not pods.
+
+# Push receiver — serves /healthz (probes), /metrics and /ingest/*. Needs
+# AEGIS_INGEST_TOKEN in the aegis-runtime-credentials secret (bind is non-loopback).
+receiver:
+  port: 8787
+  # NetworkPolicy peers allowed to push to /ingest/* (the OTel collector is always
+  # allowed, for /metrics). Empty = only the collector. Example:
+  #   ingressFrom:
+  #   - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: logging}}
+  ingressFrom: []
+
+# Persistent state (PVC via volumeClaimTemplates): audit chain, checkpoint, HITL
+# queue, ACP_HOME, caches. Everything else is read-only.
+state:
+  mountPath: /var/aegis
+  size: 10Gi
+  storageClassName: ""
 
 # IRSA — service account assumes an IAM role with bedrock:Invoke +
 # secretsmanager:GetSecretValue + s3:PutObject on the audit bucket.
@@ -29,13 +47,6 @@ resources:
   limits:
     cpu: "2"
     memory: "4Gi"
-
-# Horizontal Pod Autoscaler
-hpa:
-  enabled: true
-  minReplicas: 3
-  maxReplicas: 20
-  targetCPUUtilization: 70
 
 # LLM backend selection — read by aegis.agents.shared.llm_client.get_client()
 # AWS deployments typically use bedrock for in-VPC Claude access.
@@ -79,5 +90,5 @@ securityContext:
 # Annotations to enable Prometheus scrape (paired with the OTel chart)
 podAnnotations:
   prometheus.io/scrape: "true"
-  prometheus.io/port: "9090"
+  prometheus.io/port: "8787"   # /metrics is on the receiver; set AEGIS_METRICS_TOKEN + a bearer in the scrape job
   prometheus.io/path: "/metrics"

@@ -16,8 +16,16 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--audit", default=os.environ.get("AEGIS_AUDIT_PATH", "aegis/_audit_log.jsonl"))
     v.add_argument("--all", action="store_true", help="include rotated segments (audit.jsonl.<ts>) as one chain")
     v.add_argument("--json", action="store_true")
+    r = sub.add_parser("retire", help="drop the N oldest rotated segments (retention) after verifying them and "
+                                      "recording a retention checkpoint, so verify --all keeps working")
+    r.add_argument("--audit", default=os.environ.get("AEGIS_AUDIT_PATH", "aegis/_audit_log.jsonl"))
+    r.add_argument("--segments", type=int, required=True)
     args = ap.parse_args(argv)
     path = Path(args.audit)
+    if args.cmd == "retire":
+        res = AuditLog(path, repair=False).retire_segments(args.segments)
+        print(json.dumps(res))
+        return 0 if res.get("ok") else 1
     if not path.exists() and not any(path.parent.glob(path.name + ".*")):
         # a typo'd path or a cron with the wrong cwd printed "intact: 0 entries" and exited 0 (review round 4 D4-13)
         print(f"no audit log at {path} — nothing was verified", file=sys.stderr)

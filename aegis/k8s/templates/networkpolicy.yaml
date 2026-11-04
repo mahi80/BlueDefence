@@ -72,5 +72,13 @@ spec:
         matchLabels:
           app.kubernetes.io/name: aegis-otel-collector
     ports:
-    - port: 9090
+    - port: {{ .Values.receiver.port }}     # /metrics lives on the receiver
       protocol: TCP
+{{- with .Values.receiver.ingressFrom }}
+  # push senders (log forwarders, Firehose relay, console) that may call /ingest/*
+  - from:
+{{ toYaml . | indent 4 }}
+    ports:
+    - port: {{ $.Values.receiver.port }}
+      protocol: TCP
+{{- end }}

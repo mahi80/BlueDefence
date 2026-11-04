@@ -171,7 +171,7 @@ A bank installation (Community):
 ```bash
 python -m aegis.license install-id                                   # the id the licence is bound to
 # self-serve: POST {org, email, installation_id, accept_terms:true} to <licence service>/signup → license.jwt
-AEGIS_LICENSE=/etc/aegis/license.jwt AEGIS_LICENSE_ENFORCE=1 AEGIS_LICENSE_SERVER=https://… \
+AEGIS_LICENSE=/var/lib/aegis/license.jwt AEGIS_LICENSE_ENFORCE=1 AEGIS_LICENSE_SERVER=https://… \
   AEGIS_SOURCES=sentinel,waf,netops python -m aegis.service          # contributes hourly, heartbeats daily, pulls model updates
 ```
 

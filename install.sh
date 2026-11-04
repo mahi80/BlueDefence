@@ -23,7 +23,10 @@ PREFIX=/opt/aegis
 ETC=/etc/aegis
 VAR=/var/lib/aegis
 ENV_FILE="$ETC/aegis.env"
-LIC_FILE="$ETC/license.jwt"
+# the licence lives under $VAR: the service renews it itself (/renew, 7 days before expiry) and the unit's
+# ProtectSystem=strict makes $ETC read-only to it — a token in $ETC could never be rewritten (review round 7 R-2)
+LIC_FILE="$VAR/license.jwt"
+LEGACY_LIC="$ETC/license.jwt"
 UNIT=/etc/systemd/system/aegis-soc.service
 DEFAULT_SERVER="${AEGIS_LICENSE_SERVER:-}"
 
@@ -142,6 +145,9 @@ say "licence"
 INSTALL_ID=$( { grep -s '^AEGIS_INSTALL_ID=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1)
 [[ -n "$INSTALL_ID" ]] || INSTALL_ID=$(cd "$PREFIX/app" && $AEGIS aegis.license install-id)     # derived once, then pinned in aegis.env
 echo "   installation id: $INSTALL_ID"
+if [[ -f "$LEGACY_LIC" && ! -f "$LIC_FILE" ]]; then          # older installs kept it in $ETC, where renewal cannot write
+  mv "$LEGACY_LIC" "$LIC_FILE"; ok "moved the licence to $LIC_FILE (renewable by the service)"
+fi
 if [[ -z "$MODE" ]]; then
   if [[ -f "$LIC_FILE" ]]; then MODE=keep
   elif [[ $NONINTERACTIVE -eq 1 ]]; then MODE=none

@@ -21,6 +21,7 @@ service a role with INSERT + SELECT only; retention is by dropping whole audit s
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -262,8 +263,17 @@ class IndexStore:
         audit = Path(audit_path)
         segments = sorted((p for p in audit.parent.glob(audit.name + ".*") if p.name[len(audit.name) + 1:].isdigit()),
                           key=lambda p: p.name) + [audit]
-        added, seen, prev = 0, 0, "0" * 64
+        # the chain is re-verified while indexing (review round 7 R-7): a row whose hash does not follow from the
+        # previous one is never served from the index, and any failed insert leaves the index marked stale
+        try:
+            from aegis.agents.shared.audit import AuditLog
+            prev = AuditLog(audit, repair=False).chain_seed() if audit.exists() or segments[:-1] else "0" * 64
+        except Exception:  # noqa: BLE001
+            prev = "0" * 64
+        added, seen, errors, broken = 0, 0, 0, None
         for seg in segments:
+            if broken:
+                break
             if not seg.exists():
                 continue
             try:
@@ -284,9 +294,19 @@ class IndexStore:
                         continue
                     if not isinstance(chain, dict) or not chain.get("integrity_hash"):
                         continue
+                    body = {k: v for k, v in chain.items() if k != "integrity_hash"}
+                    actual = hashlib.sha256((prev + json.dumps(body, sort_keys=True, separators=(",", ":"))).encode()).hexdigest()
+                    if actual != chain["integrity_hash"]:
+                        broken = f"{seg.name} at byte {pos}"
+                        logger.error("[store] audit chain breaks at %s — rows from there on are not indexed; "
+                                     "run python -m aegis.audit verify --all", broken)
+                        break
                     seen += 1
-                    if self._index(chain, prev_hash=prev, segment=ino, offset=pos) == "inserted":
+                    res = self._index(chain, prev_hash=prev, segment=ino, offset=pos)
+                    if res == "inserted":
                         added += 1
+                    elif res == "error":
+                        errors += 1
                     prev = str(chain.get("integrity_hash") or prev)
         dec = 0
         if hitl_dir:
@@ -302,8 +322,9 @@ class IndexStore:
                                             rationale=str(d.get("reason") or d.get("rationale") or ""), via=str(d.get("via") or "file"),
                                             decided_at=d.get("ts")):
                         dec += 1
-        self.stale = False
-        return {"segments": len(segments), "chains_seen": seen, "chains_added": added, "decisions": dec}
+        self.stale = bool(errors or broken)
+        return {"segments": len(segments), "chains_seen": seen, "chains_added": added, "decisions": dec,
+                "errors": errors, "broken_at": broken, "stale": self.stale}
 
     # ---------------------------------------------------------------- helpers --
     @staticmethod

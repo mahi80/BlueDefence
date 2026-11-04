@@ -109,10 +109,7 @@ class Pipeline:
         try:
             if state.status == "expired" and state.enforce:
                 # a RUNNING service past grace degrades instead of dying: shadow + evaluation features until renewed
-                for k, v in licensing.SHADOW_ENV.items():
-                    os.environ[k] = v
-                for offs in licensing.FEATURE_ENV_OFF.values():
-                    os.environ.update(offs)
+                licensing.degrade()                  # remembers the configured values; a renewal restores them
                 logger.error("[license] %s — running in evaluation mode; the service will refuse to START until renewed", state.reason)
             else:
                 licensing.apply(state)
@@ -747,7 +744,18 @@ class Service:
                 else:
                     logger.warning("[license] renewed token received but AEGIS_LICENSE is inline — set it to the new value: %s…", res["token"][:24])
         except Exception as e:  # noqa: BLE001
-            logger.warning("[license] renewal failed: %s", str(e)[:200])
+            # a renewal that keeps failing ends in evaluation mode at expiry: say so loudly as the date approaches
+            # (review round 7 R-2: an unwritable token path failed silently every day until the licence ran out)
+            days = lic.days_left if lic.license is not None and lic.days_left is not None else None
+            urgent = days is not None and days < _envf("AEGIS_LICENSE_RENEW_ALERT_DAYS", 3)
+            (logger.error if urgent else logger.warning)(
+                "[license] renewal failed%s: %s", f" — the licence expires in {days:.1f} days" if days is not None else "",
+                str(e)[:200])
+            try:
+                from aegis.agents.shared.observability import METRICS
+                METRICS.inc("aegis_license_renewal_failures_total")
+            except Exception:  # noqa: BLE001, S110
+                pass
 
     def _maybe_contribute(self) -> None:
         """Community licence (``AEGIS_CONTRIB=1``): every ``AEGIS_CONTRIB_INTERVAL_S`` (3600) build the scrubbed

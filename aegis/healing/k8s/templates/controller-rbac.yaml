@@ -1,9 +1,16 @@
----
 # ServiceAccount + RBAC for the AEGIS Self-Healing controller.
-# Scoped to the absolute minimum: it can label pods (for quarantine),
-# create Jobs (forensic snapshot), and patch Argo Rollouts (respawn).
-# Critically: NO 'delete' on Deployments, NO 'create' on Pods directly,
-# NO cluster-admin. All deletion happens via the Rollout abstraction.
+# It can label pods (for quarantine), create Jobs (forensic snapshot) and
+# patch Argo Rollouts (respawn); no delete on Deployments, no cluster-admin.
+#
+# Be clear about what "create jobs" means (review R-5): a Job creates pods, so
+# by RBAC alone this Role could start ANY pod in the namespace — any image, any
+# ServiceAccount, hostPath, hostPID, privileged. RBAC does not bound that; the
+# ValidatingAdmissionPolicy in templates/forensic-admission-policy.yaml does:
+# a Job created by this ServiceAccount must use the forensic image and the
+# token-less forensic ServiceAccount, with no hostPath volumes, no privileged
+# container, no hostNetwork/hostIPC and no added capabilities beyond
+# SYS_PTRACE/SYS_ADMIN. Do not deploy this Role without that policy (or an
+# equivalent Kyverno/Gatekeeper rule) in place.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

@@ -6,6 +6,15 @@
 # This template is rendered by the controller dynamically with the
 # specific pod name; the rendered manifest is recorded in the audit log.
 # The template here is the canonical contract.
+#
+# Identity (review R-5): the Job runs as its OWN ServiceAccount
+# ({{ .Values.forensics.serviceAccount }}) with no API token mounted — it needs no
+# Kubernetes API access, and running it as the controller's SA handed a pod with
+# hostPID + SYS_ADMIN the controller's credentials. There is no container-runtime
+# socket mount: process state is read through hostPID + SYS_PTRACE, and the
+# runtime socket would have been node-root for anyone who reached this container.
+# templates/forensic-admission-policy.yaml rejects any Job the controller creates
+# that deviates from this shape.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -23,13 +32,13 @@ spec:
 {{ include "aegis.labels" . | indent 8 }}
         aegis.bank/role: forensic-snapshot
     spec:
-      serviceAccountName: aegis-healing-controller
+      serviceAccountName: {{ .Values.forensics.serviceAccount }}
       restartPolicy: Never
-      automountServiceAccountToken: true
+      automountServiceAccountToken: false
       hostPID: true     # required to read process state of suspect pod
       containers:
       - name: snapshot
-        image: registry.bank.internal/aegis/forensic-tools:0.1.0
+        image: {{ .Values.forensics.image }}
         securityContext:
           privileged: false
           capabilities:
@@ -48,17 +57,10 @@ spec:
         volumeMounts:
         - name: forensic-store
           mountPath: /forensic
-        - name: docker-sock
-          mountPath: /var/run/docker.sock
-          readOnly: true
       volumes:
       - name: forensic-store
         persistentVolumeClaim:
           claimName: aegis-forensic-pvc
-      - name: docker-sock
-        hostPath:
-          path: /var/run/docker.sock
-          type: Socket
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -73,3 +75,13 @@ spec:
   resources:
     requests:
       storage: {{ .Values.forensics.pvcSize }}
+---
+# The forensic Job's identity: no RBAC binding, no token mounted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.forensics.serviceAccount }}
+  namespace: {{ .Values.target.namespace }}
+  labels:
+{{ include "aegis.labels" . | indent 4 }}
+automountServiceAccountToken: false
