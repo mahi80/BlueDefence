@@ -82,7 +82,9 @@ def test_fortigate_bans_with_expiry_and_clears():
     assert r.status == "applied" and m.banned == {"203.0.113.9": 900}
     assert "vdom=root" in m.calls[0][1]
     assert c.verify(r) is True
-    assert c.apply(_act("block_egress", "2001:db8::5"), ttl_sec=60).status == "applied"
+    # round 6 C-11: the banned list blocks traffic FROM an IP, so FortiGate no longer claims block_egress
+    assert c.apply(_act("block_egress", "2001:db8::5"), ttl_sec=60).status == "unsupported"
+    assert c.apply(_act("block", "2001:db8::5"), ttl_sec=60).status == "applied"
     assert "2001:db8::5" in m.banned
     c.rollback(r)
     assert "203.0.113.9" not in m.banned and c._do_verify(r) is False

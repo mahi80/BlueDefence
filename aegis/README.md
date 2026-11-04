@@ -745,7 +745,7 @@ AEGIS_EDR_VENDOR=trend     AEGIS_EDR_URL (regional API, e.g. https://api.in.xdr.
 AEGIS_FW_VENDOR=panos      AEGIS_FW_URL  AEGIS_FW_TOKEN (API key)  [AEGIS_FW_TAG_SRC=aegis-block-src  AEGIS_FW_TAG_DST=aegis-block-dst]
 AEGIS_FW_VENDOR=fortigate  AEGIS_FW_URL  AEGIS_FW_TOKEN (REST admin token)  [AEGIS_FW_VDOM]
 AEGIS_IDP_VENDOR=entra     AEGIS_IDP_TENANT_ID  AEGIS_IDP_CLIENT_ID  AEGIS_IDP_CLIENT_SECRET  [AEGIS_IDP_PROTECTED=breakglass@bank.in,…]
-AEGIS_IDP_VENDOR=ad        AEGIS_AD_URL (ldaps://)  AEGIS_AD_BASE_DN  AEGIS_AD_BIND_DN  AEGIS_AD_BIND_PASSWORD   (pip install 'aegis[ad]')
+AEGIS_IDP_VENDOR=ad        AEGIS_AD_URL (ldaps://)  AEGIS_AD_BASE_DN  AEGIS_AD_BIND_DN  AEGIS_AD_BIND_PASSWORD  [AEGIS_AD_CA]   (pip install 'aegis[ad]')
 AEGIS_PAM_VENDOR=cyberark  AEGIS_PAM_URL  AEGIS_PAM_USERNAME  AEGIS_PAM_PASSWORD
 AEGIS_PAYHOLD_VENDOR=api   AEGIS_PAYHOLD_URL (https)  AEGIS_PAYHOLD_TOKEN  AEGIS_PAYHOLD_SIGNING_KEY   (the bank's adapter: deploy/payment-hold/openapi.yaml)
 AEGIS_BLOCK_FEED=1         firewalls pull GET /ingest/blocklist?format=txt[&kind=dst] (read token; bearer or basic auth)
@@ -757,14 +757,14 @@ The bank stack (each has a `mock…` vendor for a lab; a private CA → `SSL_CER
 | Control point | Vendor | Actions | What AEGIS changes | Undo / read-back | Least privilege |
 |---|---|---|---|---|---|
 | Firewall | Palo Alto PAN-OS | block (source), block_egress (destination), one IP | registers the IP with a timed tag (TTL) in two Dynamic Address Groups the bank wires to deny rules once; never edits rules or commits | unregister / `show object registered-ip` | API role: User-ID + operational show only |
-| Firewall | Fortinet FortiGate | block, block_egress, one IP | banned-IP quarantine list with an expiry (TTL) | clear / list banned | REST admin profile limited to user-quarantine |
-| EDR | Defender for Endpoint | isolate (Full) | device isolation (resolves host name → one device, or the device id) | unisolate / newest machine action | `Machine.Isolate`, `Machine.Read.All` |
-| EDR | SentinelOne | isolate | agent network disconnect | connect / `networkStatus` | API user with disconnect / connect |
-| Identity | Entra ID | revoke_sessions, force_logout (one-shot); lock_account | revoke all refresh tokens; disable the account + revoke | re-enables only an account AEGIS disabled / `accountEnabled` | `User.RevokeSessions.All`, `User.EnableDisableAccount.All` |
+| Firewall | Fortinet FortiGate | block (source), one IP — the banned list drops traffic *from* an address, so not egress | banned-IP quarantine list with an expiry (TTL); an IP that is already banned is left as it is (never shortened) | clear (not a pre-existing ban) / list banned | REST admin profile limited to user-quarantine |
+| EDR | Defender for Endpoint | isolate (Full) | device isolation (resolves host name → one device, or the device id); a device already isolated is recorded as pre-existing | unisolate (not a pre-existing isolation) / newest machine action | `Machine.Isolate`, `Machine.Read.All` |
+| EDR | SentinelOne | isolate | agent network disconnect; an agent already disconnected is recorded as pre-existing | connect (not a pre-existing one) / `networkStatus` | API user with disconnect / connect |
+| Identity | Entra ID | revoke_sessions, force_logout (one-shot); lock_account | revoke all refresh tokens; disable the account + revoke | re-enables only an account AEGIS disabled / `accountEnabled` | `User.Read.All`, `User.RevokeSessions.All`, `User.EnableDisableAccount.All` |
 | Firewall | Check Point / any NGFW, by pull | block, block_egress (IP / CIDR) | nothing on the firewall: live blocks are listed at `/ingest/blocklist?format=txt` (`&kind=dst` for egress); a Network Feed object (R81.20+), PAN-OS EDL or FortiGate threat feed fetches it and one deny rule uses it | drops off the next fetch / not verifiable (AEGIS cannot see the last fetch) | the feed's read token only (basic-auth password) |
-| EDR | Trend Vision One | isolate | endpoint isolation (resolves endpoint name → one agent GUID) | restore / the isolation task's status | API key with Response permissions |
-| Identity | Active Directory (on-prem) | lock_account | sets `userAccountControl` ACCOUNTDISABLE over LDAPS; built-in privileged accounts (Administrator, krbtgt) refused | re-enables only an account AEGIS disabled / the bit | delegated write of `userAccountControl` on the user OUs |
-| Money | **AEGIS Payment Hold API** (the bank's adapter on its payment hub / switch / fraud engine) | hold: `outbound:<account>` (every outbound payment) or one transfer (`txn:<UTR / RRN / UETR>`) | a TTL'd hold that parks payments; never debits, credits or reverses. Requests are HMAC-signed with a timestamp, and the adapter refuses anything else. A transfer that already settled is reported as too late (escalate for recall), never as applied | release / the hold's state | a token and signing key for that one API, reachable only from the AEGIS host |
+| EDR | Trend Vision One | isolate | endpoint isolation (resolves endpoint name → one agent GUID) | restore / a failed isolation task only (otherwise not verifiable) | API key with Response permissions |
+| Identity | Active Directory (on-prem) | lock_account | sets `userAccountControl` ACCOUNTDISABLE over LDAPS with the DC certificate verified (`AEGIS_AD_CA` for a private CA); built-in Administrator / Guest / krbtgt refused, by name or RID even when renamed | re-enables only an account AEGIS disabled / the bit | delegated write of `userAccountControl` on the user OUs |
+| Money | **AEGIS Payment Hold API** (the bank's adapter on its payment hub / switch / fraud engine) | hold: `outbound:<account>` (every outbound payment) or one transfer (`txn:<UTR / RRN / UETR>`) | a TTL'd hold that parks payments; never debits, credits or reverses. Each request is HMAC-signed over its method, path, timestamp, a one-time nonce and its body; the adapter refuses a stale timestamp or a reused nonce. A bare reference is refused (say `outbound:` or `txn:`). A transfer that already settled is reported as too late (escalate for recall), never as applied | release / the hold's state | a token and signing key for that one API, reachable only from the AEGIS host |
 | PAM | CyberArk PVWA | rotate_credential (permanent, two-person) | immediate CPM password change of exactly one vaulted account (`account:<user>[@<address>]`) | cannot be undone / last-modified time | vault user allowed to initiate CPM changes only |
 
 AD has no session revoke: Kerberos tickets that were already issued stay valid until they expire (10 h by default).
@@ -772,7 +772,16 @@ When that matters, pair an AD lock with `rotate_credential` or an EDR isolate. C
 not by a Management API connector, because a direct write would need a publish and a policy install, which is a
 change-window operation.
 
-Principals on `AEGIS_IDP_PROTECTED` (break-glass accounts) are never locked, revoked or rotated by AEGIS. Whether an
+Principals on `AEGIS_IDP_PROTECTED` (break-glass accounts) are never locked, revoked or rotated by AEGIS. The list is
+checked against every name the resolved account goes by (object id, UPN, sAMAccountName, mail nickname, vault user
+name), not only the target as written. One-shot actions (revoke sessions, rotate a password, kill a process) run at
+the vendor every time they are approved; they never leave an "active" receipt behind that a later apply would treat as
+already done.
+
+Routing precedence: OpenShell, WAF, payment hold, SOAR, EDR, SWG, firewall, identity, PAM, then the pull feed. A WAF
+therefore takes IP `block` and a SWG (Zscaler) takes `block_egress` before the firewall connector;
+`AEGIS_PREFER_FIREWALL=1` puts PAN-OS / FortiGate right after OpenShell instead. Direction prefixes are honoured: a
+`src:` target is only blocked inbound, a `dst:` one only outbound. Whether an
 action may run unattended is decided by its action contract and the autonomy tier, the same as for every other
 connector. `isolate` is SEVERE. `rotate_credential` is IRREVERSIBLE and needs two people. Everything runs in shadow
 until `AEGIS_ENFORCEMENT_MODE=live`.

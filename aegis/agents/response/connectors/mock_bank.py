@@ -260,10 +260,11 @@ class MockDirectory:
 
     def __init__(self):
         self.users = {
-            "CN=Priya Sharma,OU=Staff,DC=bank,DC=local": {"sAMAccountName": "priya.sharma", "userPrincipalName": "priya.sharma@bank.local", "userAccountControl": 512},
-            "CN=svc_loan,OU=Service,DC=bank,DC=local": {"sAMAccountName": "svc_loan", "userPrincipalName": "svc_loan@bank.local", "userAccountControl": 66048},
-            "CN=Old Leaver,OU=Staff,DC=bank,DC=local": {"sAMAccountName": "old.leaver", "userPrincipalName": "old.leaver@bank.local", "userAccountControl": 514},
-            "CN=Administrator,CN=Users,DC=bank,DC=local": {"sAMAccountName": "Administrator", "userPrincipalName": "", "userAccountControl": 512},
+            "CN=Priya Sharma,OU=Staff,DC=bank,DC=local": {"sAMAccountName": "priya.sharma", "userPrincipalName": "priya.sharma@bank.local", "userAccountControl": 512, "objectSid": "S-1-5-21-1-2-3-1104"},
+            "CN=svc_loan,OU=Service,DC=bank,DC=local": {"sAMAccountName": "svc_loan", "userPrincipalName": "svc_loan@bank.local", "userAccountControl": 66048, "objectSid": "S-1-5-21-1-2-3-1105"},
+            "CN=Old Leaver,OU=Staff,DC=bank,DC=local": {"sAMAccountName": "old.leaver", "userPrincipalName": "old.leaver@bank.local", "userAccountControl": 514, "objectSid": "S-1-5-21-1-2-3-1106"},
+            "CN=Administrator,CN=Users,DC=bank,DC=local": {"sAMAccountName": "Administrator", "userPrincipalName": "", "userAccountControl": 512, "objectSid": "S-1-5-21-1-2-3-500"},
+            "CN=Root Ops,CN=Users,DC=bank,DC=local": {"sAMAccountName": "rootops", "userPrincipalName": "rootops@bank.local", "userAccountControl": 512, "objectSid": "S-1-5-21-1-2-3-500"},
         }
         self.filters: list[str] = []
 
@@ -290,11 +291,19 @@ class MockPaymentHub(_MockBase):
         self.rejected_signatures = 0
 
     def __call__(self, method: str, url: str, body: object, headers: dict, timeout: float) -> HttpResult:
-        from .payhold import verify_signature
+        from urllib.parse import urlsplit
+
+        from .payhold import NonceCache, verify_signature
+        if not hasattr(self, "nonces"):
+            self.nonces = NonceCache()
         raw = bytes(body) if isinstance(body, (bytes, bytearray)) else b""
         if headers.get("Authorization") != f"Bearer {self.token}":
             return HttpResult(401, {"error": "unauthorized"})
-        if not verify_signature(self.key, headers.get("X-AEGIS-Timestamp", ""), raw, headers.get("X-AEGIS-Signature", "")):
+        u = urlsplit(url)
+        path = u.path + (f"?{u.query}" if u.query else "")
+        if not verify_signature(self.key, method, path, headers.get("X-AEGIS-Timestamp", ""),
+                                headers.get("X-AEGIS-Nonce", ""), raw, headers.get("X-AEGIS-Signature", ""),
+                                nonces=self.nonces):
             self.rejected_signatures += 1
             return HttpResult(401, {"error": "bad signature"})
         return super().__call__(method, url, body.json() if isinstance(body, RawBody) else None, headers, timeout)

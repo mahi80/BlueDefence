@@ -55,7 +55,7 @@ def test_transaction_hold_and_settled_is_never_applied():
     c = _conn(hub)
     assert c.apply(_act("txn:UTR123456789")).status == "applied"
     assert next(iter(hub.holds.values()))["scope"] == "transaction"
-    late = c.apply(_act("TXN-SETTLED-1"))
+    late = c.apply(_act("txn:TXN-SETTLED-1"))
     assert late.status == "failed" and "already settled" in (late.error or "") and "fraud team" in late.error
 
 
@@ -69,13 +69,20 @@ def test_every_request_is_signed_and_a_bad_key_is_refused():
         PaymentHoldConnector(base_url="https://x", token="t", signing_key="short")
 
 
-def test_signature_helpers_reject_stale_and_tampered():
-    key, body = b"k" * 32, b'{"a":1}'
-    sig = sign(key, "1000", body)
-    assert verify_signature(key, "1000", body, sig, now=1100)
-    assert not verify_signature(key, "1000", body, sig, now=2000)             # replay outside 300 s
-    assert not verify_signature(key, "1000", b'{"a":2}', sig, now=1000)       # tampered body
-    assert not verify_signature(key, "nan", body, sig)
+def test_signature_helpers_reject_stale_tampered_and_replayed():
+    from aegis.agents.response.connectors.payhold import NonceCache
+    key, body, n = b"k" * 32, b'{"a":1}', "ab" * 16
+    sig = sign(key, "POST", "/aegis/v1/holds", "1000", n, body)
+    assert verify_signature(key, "POST", "/aegis/v1/holds", "1000", n, body, sig, now=1100)
+    assert not verify_signature(key, "POST", "/aegis/v1/holds", "1000", n, body, sig, now=2000)   # stale
+    assert not verify_signature(key, "POST", "/aegis/v1/holds", "1000", n, b'{"a":2}', sig, now=1000)  # body
+    assert not verify_signature(key, "POST", "/aegis/v1/holds", "nan", n, body, sig)
+    # round 6 C-3: the signature is bound to method + path + nonce, and a nonce is good once
+    assert not verify_signature(key, "DELETE", "/aegis/v1/holds", "1000", n, body, sig, now=1000)
+    assert not verify_signature(key, "POST", "/aegis/v1/holds/H2", "1000", n, body, sig, now=1000)
+    cache = NonceCache()
+    assert verify_signature(key, "POST", "/aegis/v1/holds", "1000", n, body, sig, nonces=cache, now=1000)
+    assert not verify_signature(key, "POST", "/aegis/v1/holds", "1000", n, body, sig, nonces=cache, now=1001)
 
 
 def test_bad_refs_and_idempotent_reapply():

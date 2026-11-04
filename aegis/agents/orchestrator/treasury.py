@@ -330,7 +330,7 @@ def treasury_outflow_chain(alert: dict) -> EvidenceChain:
                        "and who had interactive access to it in the last 48 h")))
     else:
         chain.recommended_actions.append(RecommendedAction(
-            action_type="hold", target=txn, requires_hitl=True, confidence=conf,
+            action_type="hold", target=f"txn:{txn}", requires_hitl=True, confidence=conf,
             reasoning=f"Hold this transfer pending a call-back to a known contact: {why}"))
         chain.recommended_actions.append(RecommendedAction(
             action_type="escalate_to_fraud_team", target=sender, requires_hitl=True, confidence=conf,

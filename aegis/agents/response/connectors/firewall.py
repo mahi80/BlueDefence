@@ -17,7 +17,7 @@ rule or commits config. ::
     read-back  type=op, cmd=<show><object><registered-ip><ip>…</ip></registered-ip></object></show>
     auth       X-PAN-KEY: <API key of a role limited to User-ID + operational show>
 
-**FortiGate** — the quarantine ("banned users") list, with an expiry. ::
+**FortiGate** — the quarantine ("banned users") list, with an expiry; ``block`` (sources) only. ::
 
     POST {base}/api/v2/monitor/user/banned/add_users     {"ip_addresses": [ip], "expiry": ttl}
     POST {base}/api/v2/monitor/user/banned/clear_users   {"ip_addresses": [ip]}
@@ -47,15 +47,35 @@ _MAX_PANOS_TIMEOUT = 2_592_000            # PAN-OS tag timeout ceiling (30 days)
 _TAG_RX = re.compile(r"^[A-Za-z0-9_.-]{1,127}$")
 
 
+def _bare(target: str) -> str:
+    from ...shared.netguard import ADDRESS_PREFIXES, strip_prefixes
+    return strip_prefixes(target, ADDRESS_PREFIXES)
+
+
 def _ip(target: str) -> str:
-    t = str(target).strip()
-    for p in ("ip:", "src:", "dst:", "outbound:"):
-        if t.lower().startswith(p):
-            t = t[len(p):].strip()
+    t = _bare(target)
     try:
         return str(ipaddress.ip_address(t.strip("[]")))
     except ValueError:
         raise ConnectorError(f"firewall block needs one IP address, got {target!r}") from None
+
+
+def _direction_ok(action_type: str, target: str) -> bool:
+    """A ``dst:`` target is a destination (``block_egress`` only) and a ``src:`` one a source (``block`` only): a
+    ``block dst:x`` used to tag x as a blocked SOURCE (round 6 C-8)."""
+    low = str(target).strip().lower()
+    seen = set()
+    for _ in range(8):
+        for p in ("ip:", "src:", "dst:", "outbound:"):
+            if low.startswith(p):
+                seen.add(p)
+                low = low[len(p):].strip()
+                break
+        else:
+            break
+    if "dst:" in seen and action_type != "block_egress":
+        return False
+    return not ("src:" in seen and action_type != "block")
 
 
 def _is_ip(target: str) -> bool:
@@ -77,6 +97,9 @@ class _Firewall(Connector):
 
     def supports_target(self, target: str) -> bool:
         return _is_ip(target)
+
+    def supports_action_target(self, action_type: str, target: str) -> bool:
+        return self.supports_target(target) and _direction_ok(action_type, target)
 
 
 class PanosConnector(_Firewall):
@@ -128,9 +151,15 @@ class PanosConnector(_Firewall):
 
 
 class FortiGateConnector(_Firewall):
-    """Fortinet FortiGate: the banned-IP quarantine list, with an expiry."""
+    """Fortinet FortiGate: the banned-IP quarantine list, with an expiry.
+
+    ``block`` only: the banned list drops traffic FROM an address, so it cannot stop outbound sessions TO a C2 host —
+    ``block_egress`` falls through to another connector (a SWG, the pull feed) or to a person (round 6 C-11). A ban
+    that is already there (an IPS or admin ban, or an earlier one) is left as it is — never shortened — and recorded
+    as pre-existing, so AEGIS's undo does not clear a ban it did not place (round 6 C-7)."""
 
     name = "fortigate"
+    actions = frozenset({"block"})
 
     def __init__(self, *, token: str, vdom: str = "", **kw: Any):
         super().__init__(**kw)
@@ -140,8 +169,16 @@ class FortiGateConnector(_Firewall):
     def _h(self) -> dict:
         return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json", "Accept": "application/json"}
 
+    def _banned(self, ip: str) -> bool:
+        res = call(self._transport, "GET", f"{self.base_url}/api/v2/monitor/user/banned{self._q}", headers=self._h())
+        rows = res.json().get("results") or []
+        return any(ip in (str(r.get("ipv4_address") or ""), str(r.get("ipv6_address") or "")) for r in rows
+                   if isinstance(r, dict))
+
     def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
         ip = _ip(action.target)
+        if self._banned(ip):
+            return ip, f"[fortigate] {ip} was already banned; left as it is (AEGIS's undo will not clear it)", "pre-existing"
         expiry = 0 if not ttl_sec else int(ttl_sec)
         res = call(self._transport, "POST", f"{self.base_url}/api/v2/monitor/user/banned/add_users{self._q}",
                    json_body={"ip_addresses": [ip], "expiry": expiry}, headers=self._h())
@@ -152,16 +189,22 @@ class FortiGateConnector(_Firewall):
 
     def _do_rollback(self, receipt: Receipt) -> str:
         ip = _ip(receipt.target)
+        if receipt.rollback_token == "pre-existing":
+            return f"[fortigate] {ip} was banned before AEGIS acted; ban left in place"
         call(self._transport, "POST", f"{self.base_url}/api/v2/monitor/user/banned/clear_users{self._q}",
              json_body={"ip_addresses": [ip]}, headers=self._h())
         return f"[fortigate] cleared ban on {ip}"
 
     def _do_verify(self, receipt: Receipt) -> bool | None:
+        return self._banned(_ip(receipt.target))
+
+    def _do_renew(self, receipt: Receipt, ttl_sec: int) -> str:
+        if receipt.rollback_token == "pre-existing":
+            return f"[fortigate] {receipt.target} still banned (pre-existing ban)"
         ip = _ip(receipt.target)
-        res = call(self._transport, "GET", f"{self.base_url}/api/v2/monitor/user/banned{self._q}", headers=self._h())
-        rows = res.json().get("results") or []
-        return any(ip in (str(r.get("ipv4_address") or ""), str(r.get("ipv6_address") or "")) for r in rows
-                   if isinstance(r, dict))
+        call(self._transport, "POST", f"{self.base_url}/api/v2/monitor/user/banned/add_users{self._q}",
+             json_body={"ip_addresses": [ip], "expiry": int(ttl_sec)}, headers=self._h())
+        return f"[fortigate] ban on {ip} extended to {ttl_sec}s"
 
 
 class FeedConnector(Connector):
@@ -177,15 +220,14 @@ class FeedConnector(Connector):
     actions = frozenset({"block", "block_egress"})
 
     def supports_target(self, target: str) -> bool:
-        t = str(target).strip()
-        for p in ("ip:", "src:", "dst:", "outbound:"):
-            if t.lower().startswith(p):
-                t = t[len(p):].strip()
         try:
-            ipaddress.ip_network(t, strict=False)
+            ipaddress.ip_network(_bare(target).strip("[]"), strict=False)
             return True
         except ValueError:
             return False
+
+    def supports_action_target(self, action_type: str, target: str) -> bool:
+        return self.supports_target(target) and _direction_ok(action_type, target)
 
     def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
         kind = "dst" if action.action_type == "block_egress" else "src"

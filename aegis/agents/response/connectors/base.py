@@ -120,8 +120,14 @@ def canonical_target(target: str) -> str:
     (review W6)."""
     import ipaddress
 
-    from aegis.agents.shared.netguard import unwrap
+    from aegis.agents.shared.netguard import strip_prefixes, unwrap
     t = str(target).strip().lower()
+    bare = strip_prefixes(t, ("ip:", "src:", "dst:"))
+    try:
+        ipaddress.ip_network(bare.strip("[]"), strict=False)
+        t = bare                       # `src:1.2.3.4` and `1.2.3.4` are one address: one key (round 6 C-8)
+    except ValueError:
+        pass
     try:
         net = unwrap(ipaddress.ip_network(t.strip("[]"), strict=False))
         return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
@@ -140,6 +146,10 @@ class Connector:
     # active permanent receipt calls the vendor again instead of a no-op renewal. Set where the vendor call is
     # idempotent or re-running it is the point (EDR contain, SOAR playbooks, SWG category add).
     reapply_on_human_approval: bool = False
+    # Actions that happen once and leave nothing in force (revoke sessions, rotate a password, kill a process). Their
+    # receipt is settled on apply — never kept active — so a later apply on the same target calls the vendor again
+    # instead of becoming a no-op "renewal" of the first one (review round 6 C-1).
+    one_shot_actions: frozenset[str] = frozenset()
     fallback: bool = False               # set on the registry's catch-all connector
 
     def __init__(self, *, dry_run: Optional[bool] = None, default_ttl_sec: int = DEFAULT_TTL_SEC,
@@ -259,6 +269,11 @@ class Connector:
         routes an action to the first connector that supports both its type and its target."""
         return True
 
+    def supports_action_target(self, action_type: str, target: str) -> bool:
+        """``supports_target`` for one action type — where the direction a prefix names matters (``dst:`` on an
+        inbound ``block``). Defaults to ``supports_target``."""
+        return self.supports_target(target)
+
     def idempotency_key(self, action: Any) -> str:
         raw = f"{self.name}:{action.action_type}:{canonical_target(str(action.target))}"
         return hashlib.sha256(raw.encode()).hexdigest()[:24]
@@ -268,7 +283,7 @@ class Connector:
         now = self._clock()
         ttl = self.default_ttl_sec if ttl_sec is None else int(ttl_sec)
         key = self.idempotency_key(action)
-        if self.supports(action.action_type) and not self.supports_target(str(action.target)):
+        if self.supports(action.action_type) and not self.supports_action_target(action.action_type, str(action.target)):
             return self._record(Receipt(
                 receipt_id=_rid(), connector=self.name, action_type=action.action_type,
                 target=str(action.target), idempotency_key=key, status=STATUS_UNSUPPORTED,
@@ -282,6 +297,8 @@ class Connector:
                 dry_run=self.dry_run, applied_at=now, expires_at=None, alert_id=alert_id,
                 approver=approver, error=f"{self.name} does not support {action.action_type}",
             ))
+        if action.action_type in self.one_shot_actions:
+            return self._apply_one_shot(action, key, now, alert_id=alert_id, approver=approver)
         with self._lock:
             stale = self._active.get(key)
         if stale is not None and stale.expired(now):
@@ -331,13 +348,32 @@ class Connector:
                 self._active[key] = receipt
         return self._record(receipt)
 
+    def _apply_one_shot(self, action: Any, key: str, now: float, *, alert_id: str, approver: str) -> Receipt:
+        """Run a one-shot action at the vendor every time; the receipt is permanent and never kept active, so
+        neither a TTL sweep nor a read-back nor a later apply treats it as something still in force."""
+        receipt = Receipt(
+            receipt_id=_rid(), connector=self.name, action_type=action.action_type, target=str(action.target),
+            idempotency_key=key, status=STATUS_DRY_RUN if self.dry_run else STATUS_APPLIED, dry_run=self.dry_run,
+            applied_at=now, expires_at=None, alert_id=alert_id, approver=approver)
+        if self.dry_run:
+            receipt.detail = f"[shadow] would {action.action_type} {action.target} via {self.name} (one-shot)"
+            return self._record(receipt)
+        try:
+            ref, detail, token = self._do_apply(action, key, None)
+            receipt.vendor_ref, receipt.detail, receipt.rollback_token = str(ref), str(detail), str(token)
+        except Exception as e:  # noqa: BLE001 — a vendor failure is a receipt, never a crash
+            receipt.status = STATUS_FAILED
+            receipt.error = f"{type(e).__name__}: {str(e)[:200]}"
+            logger.warning("[connector:%s] apply %s %s failed: %s", self.name, action.action_type, action.target, receipt.error)
+        return self._record(receipt)
+
     def preview(self, action: Any, *, alert_id: str = "", approver: str = "", ttl_sec: Optional[int] = None,
                 note: str = "") -> Receipt:
         """A dry-run receipt for what ``apply`` would do — never calls the vendor and never
         becomes an active enforcement (used to score a policy before it acts, e.g. auto-block)."""
         now = self._clock()
         ttl = self.default_ttl_sec if ttl_sec is None else int(ttl_sec)
-        target_ok = self.supports(action.action_type) and self.supports_target(str(action.target))
+        target_ok = self.supports(action.action_type) and self.supports_action_target(action.action_type, str(action.target))
         receipt = Receipt(
             receipt_id=_rid(), connector=self.name, action_type=action.action_type, target=str(action.target),
             idempotency_key=self.idempotency_key(action), status=STATUS_DRY_RUN if target_ok else STATUS_UNSUPPORTED,
@@ -548,7 +584,7 @@ class ConnectorRegistry:
         n = 0
         for (cname, ikey), e in last.items():
             c = by_name.get(cname)
-            if c is None or e.get("status") not in ACTIVE_STATUSES:
+            if c is None or e.get("status") not in ACTIVE_STATUSES or e.get("action_type") in c.one_shot_actions:
                 continue
             try:
                 r = Receipt(**{k: v for k, v in e.items() if k in names})
@@ -577,7 +613,7 @@ class ConnectorRegistry:
         target = str(action.target)
         typed = [c for c in self._connectors if c.supports(action.action_type)]
         for c in typed:
-            if c.supports_target(target):
+            if c.supports_action_target(str(action.action_type), target):
                 return c
         return typed[0] if typed else self.fallback
 
@@ -660,6 +696,7 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
     - ``AEGIS_IDP_VENDOR``  = entra | ad | mock → revoke_sessions / force_logout / lock_account on a user principal
     - ``AEGIS_PAM_VENDOR``  = cyberark | mock → rotate_credential of one vaulted account
     - ``AEGIS_PAYHOLD_VENDOR`` = api | mock → hold an account's outbound payments / one transfer (AEGIS Payment Hold API)
+    - ``AEGIS_PREFER_FIREWALL`` = 1 → the firewall connector routes IP ``block`` / ``block_egress`` ahead of the WAF / SWG
     - ``AEGIS_BLOCK_FEED``  = 1 → block / block_egress listed on the pull feed firewalls fetch (registered last)
     - ``AEGIS_AGENT_SANDBOX`` = openshell | mock → NVIDIA OpenShell network quarantine of an AI agent (isolate agent:<sandbox>)
     - ``AEGIS_ENFORCEMENT_MODE`` = shadow (default) | live — shadow makes every vendor connector dry-run
@@ -723,6 +760,13 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
                 connectors.append(c)
         except Exception as e:  # noqa: BLE001
             logger.warning("[connectors] %s connector not built: %s", label, str(e)[:160])
+    if os.environ.get("AEGIS_PREFER_FIREWALL", "0").strip() == "1":
+        # the WAF (block) and the SWG (block_egress) are registered before the firewall, so with them configured a
+        # direct firewall connector never routed an IP block; this puts the firewall right after OpenShell (round 6 C-16)
+        fw = [c for c in connectors if c.name in ("panos", "fortigate")]
+        rest = [c for c in connectors if c not in fw]
+        head = [c for c in rest[:1] if c.name == "openshell"]
+        connectors = head + fw + rest[len(head):]
     reg = ConnectorRegistry(connectors, on_receipt=on_receipt)
     if connectors:
         logger.info("[connectors] %s mode: %s", reg.mode, ", ".join(f"{c.name}({'dry-run' if c.dry_run else 'LIVE'})" for c in connectors))

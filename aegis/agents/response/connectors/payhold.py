@@ -9,7 +9,7 @@ the adapter can refuse anything that did not come from AEGIS.
 Targets (from the treasury / outflow guard and the walkers):
 
 * ``outbound:<account>`` — hold every outbound payment from an account (a drained treasury or compromised signer);
-* ``txn:<id>`` or a bare transaction id — hold one transfer pending a call-back.
+* ``txn:<id>`` — hold one transfer pending a call-back. A bare reference is refused (say which scope).
 
 API::
 
@@ -19,7 +19,8 @@ API::
     DELETE {base}/holds/{hold_id}                                          → 200 {"state": "released"}
     GET    {base}/holds/{hold_id}                                          → 200 {"state": "active"|"released"|"expired"}
     auth   Authorization: Bearer <token>
-    sign   X-AEGIS-Timestamp: <unix s>; X-AEGIS-Signature: sha256=<hex HMAC-SHA256(key, timestamp + "." + body)>
+    sign   X-AEGIS-Timestamp: <unix s>; X-AEGIS-Nonce: <32 hex, once>; X-AEGIS-Signature: sha256=<hex HMAC-SHA256(key,
+           METHOD \n path?query \n timestamp \n nonce \n body)>; the adapter refuses a stale timestamp or a reused nonce
 
 A hold is TTL'd (``expires_at``), so one the sweep never reaches still lapses at the bank; undo releases it; the
 read-back reads its state. A transfer that already settled is reported as such (a hold cannot stop it — recall
@@ -53,30 +54,62 @@ logger = logging.getLogger("aegis.connectors.payhold")
 _REF = re.compile(r"^[A-Za-z0-9._:/@-]{1,128}$")
 
 
-def sign(key: bytes, ts: str, body: bytes) -> str:
-    return "sha256=" + hmac.new(key, ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+def signing_input(method: str, path: str, ts: str, nonce: str, body: bytes) -> bytes:
+    """What is signed: the method, the path with its query, the timestamp, a one-time nonce, and the body. The
+    signature used to cover only timestamp + body, so a captured GET could be replayed as ``DELETE /holds/<any>``
+    within the window and release every hold (round 6 C-3)."""
+    return f"{method.upper()}\n{path}\n{ts}\n{nonce}\n".encode() + body
 
 
-def verify_signature(key: bytes, ts: str, body: bytes, presented: str, *, max_skew_s: int = 300,
-                     now: float | None = None) -> bool:
-    """For the bank's adapter (and the mock): signature matches and the timestamp is fresh."""
+def sign(key: bytes, method: str, path: str, ts: str, nonce: str, body: bytes) -> str:
+    return "sha256=" + hmac.new(key, signing_input(method, path, ts, nonce, body), hashlib.sha256).hexdigest()
+
+
+class NonceCache:
+    """For the bank's adapter: nonces seen inside the replay window (a reused one is refused)."""
+
+    def __init__(self, window_s: int = 300, max_size: int = 100_000):
+        self.window_s, self.max_size = window_s, max_size
+        self._seen: dict[str, float] = {}
+
+    def fresh(self, nonce: str, now: float | None = None) -> bool:
+        t = now if now is not None else time.time()
+        if len(self._seen) > self.max_size:
+            self._seen = {n: s for n, s in self._seen.items() if t - s <= self.window_s}
+        if not nonce or nonce in self._seen and t - self._seen[nonce] <= self.window_s:
+            return False
+        self._seen[nonce] = t
+        return True
+
+
+def verify_signature(key: bytes, method: str, path: str, ts: str, nonce: str, body: bytes, presented: str, *,
+                     nonces: NonceCache | None = None, max_skew_s: int = 300, now: float | None = None) -> bool:
+    """For the bank's adapter (and the mock): the signature matches this exact request, the timestamp is fresh, and
+    (with a ``NonceCache``) the nonce was not seen before."""
     try:
         if abs((now if now is not None else time.time()) - int(ts)) > max_skew_s:
             return False
     except ValueError:
         return False
-    return hmac.compare_digest(sign(key, ts, body), presented or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce or ""):
+        return False
+    if not hmac.compare_digest(sign(key, method, path, ts, nonce, body), presented or ""):
+        return False
+    return nonces is None or nonces.fresh(nonce, now)
 
 
 def _scope_ref(target: str) -> tuple[str, str]:
+    """``outbound:`` / ``account:`` → every outbound payment of an account; ``txn:`` / ``transaction:`` → one transfer.
+    A bare reference is refused: it used to default to a transfer hold, so an account id reached the bank as a
+    transaction reference (round 6 C-14)."""
     t = str(target).strip()
     low = t.lower()
-    if low.startswith("outbound:"):
-        scope, ref = "account", t[9:].strip()
+    if low.startswith(("outbound:", "account:")):
+        scope, ref = "account", t.split(":", 1)[1].strip()
     elif low.startswith(("txn:", "transaction:")):
         scope, ref = "transaction", t.split(":", 1)[1].strip()
     else:
-        scope, ref = "transaction", t
+        raise ConnectorError(f"a payment hold needs outbound:<account> or txn:<reference>, got {target!r}")
     if not _REF.match(ref):
         raise ConnectorError(f"not a payment account or transaction reference: {target!r}")
     return scope, ref
@@ -107,10 +140,14 @@ class PaymentHoldConnector(Connector):
             return False
 
     def _req(self, method: str, path: str, body: dict | None = None, expect: tuple[int, ...] = ()) -> Any:
+        import secrets
+        from urllib.parse import urlsplit
         raw = json.dumps(body, separators=(",", ":"), sort_keys=True).encode() if body is not None else b""
-        ts = str(int(self._now()))
+        ts, nonce = str(int(self._now())), secrets.token_hex(16)
+        signed_path = urlsplit(self.base_url).path.rstrip("/") + path       # the path the adapter sees, with the query
         headers = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json",
-                   "X-AEGIS-Timestamp": ts, "X-AEGIS-Signature": sign(self._key, ts, raw)}
+                   "X-AEGIS-Timestamp": ts, "X-AEGIS-Nonce": nonce,
+                   "X-AEGIS-Signature": sign(self._key, method, signed_path, ts, nonce, raw)}
         return call(self._transport, method, f"{self.base_url}{path}", json_body=RawBody(raw) if body is not None else None,
                     headers=headers, expect=expect)
 
@@ -127,6 +164,9 @@ class PaymentHoldConnector(Connector):
         hold_id = str(body.get("hold_id") or "")
         if not hold_id:
             raise ConnectorError("payment hold API returned no hold_id")
+        if str(body.get("state", "")).lower() != "active":
+            # a released / expired hold returned for a replayed idempotency key is not a hold (round 6 C-13)
+            raise ConnectorError(f"payment hold API returned hold {hold_id} in state {body.get('state')!r}, not active")
         what = "every outbound payment from account" if scope == "account" else "transfer"
         life = f"until {expires}" if expires else "until released"
         return hold_id, f"[payhold] holding {what} {ref} {life} (hold {hold_id})", hold_id
@@ -144,8 +184,14 @@ class PaymentHoldConnector(Connector):
         return True if st == "active" else False if st in ("released", "expired", "cancelled") else None
 
     def _do_renew(self, receipt: Receipt, ttl_sec: int) -> str:
-        ref, detail, _ = self._do_apply(_View(receipt), receipt.idempotency_key, ttl_sec)
-        return detail or f"[payhold] renewed {ref}"
+        hold_id, detail, _ = self._do_apply(_View(receipt), receipt.idempotency_key, ttl_sec or None)
+        if hold_id != receipt.vendor_ref:
+            # the bank released the old hold and the renewal placed a new one: the receipt must follow it, or undo
+            # and read-back keep addressing the dead hold while the live one freezes the account (round 6 C-4)
+            old = receipt.vendor_ref
+            receipt.vendor_ref = receipt.rollback_token = hold_id
+            detail = f"{detail} (replaces hold {old}, which was no longer active)"
+        return detail or f"[payhold] renewed {hold_id}"
 
 
 class _View:
@@ -175,4 +221,4 @@ def payhold_from_env(transport: Transport | None = None) -> Connector | None:
     return None
 
 
-__all__ = ["PaymentHoldConnector", "payhold_from_env", "sign", "verify_signature"]
+__all__ = ["NonceCache", "PaymentHoldConnector", "payhold_from_env", "sign", "signing_input", "verify_signature"]
