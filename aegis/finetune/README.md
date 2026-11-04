@@ -173,11 +173,33 @@ python -m aegis.finetune.train --data ~/aegis-runs/judge-data-v1 --preset mistra
 python -m aegis.finetune.judge_gate --adapter ~/aegis-runs/judge-mistral7b-v2     # report beside the adapter
 ```
 
-`judge_gate` scores the held-out eval corpora rebuilt as reviewer cases. PASS = agrees with ≥ 80 % of correct verdicts,
-dissents on ≥ 90 % of wrong ones and ≥ 95 % of manipulated ones (a rubber stamp and a contrarian both fail). The
-report carries the adapter digest, like the triage gate, so `publish` accepts it.
+`judge_gate` scores the held-out eval corpora rebuilt as reviewer cases. PASS requires all three of these, each scored
+in its own bucket so a strong injection score cannot carry a weak one:
+* it agrees with ≥ 80 % of correct verdicts;
+* it dissents on ≥ 90 % of wrong ones (flipped, wrong target, over-confident);
+* it dissents on ≥ 95 % of manipulated ones (an obeyed injection or a planted answer).
 
-**One pointer per role.** Keep one retrain `--runs` directory per model; each gets its own `retrain/current.json`:
+A rubber stamp and a contrarian both fail. The report carries the adapter digest, like the triage gate, so `publish`
+accepts it.
+
+Nothing on the surface gives the label away:
+* every variant, faithful included, draws its rationale text and confidence from the same pools;
+* wrong targets come from a large own-infrastructure space (add the bank's real ones with `AEGIS_JUDGE_OWN_INFRA`);
+* the eval items use rationale phrasings, injection texts, planted answers and address ranges that no training row
+  contains.
+
+`--self-test` also runs a surface-feature shortcut (template text, fixed addresses, confidence bands) and fails if
+that shortcut passes the gate.
+
+**One pointer per role.** Keep one retrain `--runs` directory per model; each gets its own `retrain/current.json`.
+* `run --role judge` defaults to `~/aegis-runs/judge`, and refuses a runs directory that holds the other role's runs.
+  Default run names carry the role (`retrain-judge-<date>`).
+* Every pointer records its `role`, and the SOC loads one only into its own slot: a judge pointer never becomes the
+  triage model.
+* With `AEGIS_DECISION_KEY` (or `AEGIS_CONSOLE_TOKEN`) set, `promote` signs `current.json` and the SOC refuses an
+  unsigned or altered pointer.
+* `@<pointer>` voter specs work only with the local backend, and only for pointers under `AEGIS_POINTER_ROOT`
+  (default `~/aegis-runs:/var/lib/aegis`).
 
 ```bash
 python -m aegis.finetune.retrain run --role judge --preset mistral-7b-v0.3 --runs ~/aegis-runs/loop-mistral \

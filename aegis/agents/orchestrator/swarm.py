@@ -38,7 +38,7 @@ from collections import deque
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -317,6 +317,75 @@ _DEPENDS_ON_IOCS = ("intel_enrich", "log_hunt")
 
 # ------------------------------------------------------------- orchestrator --
 
+class _DaemonPool:
+    """A small thread pool whose workers are DAEMON threads. ``ThreadPoolExecutor`` joins every worker thread at
+    interpreter exit, so one hung swarm worker held a clean shutdown (SIGTERM, ``--once``) until systemd's SIGKILL —
+    the normal path now that the swarm is on by default (review round 6 W-1). Futures, ``cancel()`` and
+    ``wait()`` behave as with the stdlib executor."""
+
+    _STOP = object()
+
+    def __init__(self, max_workers: int, thread_name_prefix: str = "aegis-swarm"):
+        import queue
+        self._q: Any = queue.SimpleQueue()
+        self._max, self._prefix = max(1, int(max_workers)), thread_name_prefix
+        self._threads: list[threading.Thread] = []
+        self._idle = 0
+        self._lock = threading.Lock()
+        self._shutdown = False
+
+    def submit(self, fn: Callable[..., Any], *args: Any) -> Future:
+        f: Future = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("swarm pool is shut down")
+            self._q.put((f, fn, args))
+            if self._idle == 0 and len(self._threads) < self._max:
+                t = threading.Thread(target=self._work, args=(True,), name=f"{self._prefix}_{len(self._threads)}",
+                                     daemon=True)
+                self._threads.append(t)
+                t.start()
+            else:
+                self._idle = max(0, self._idle - 1)
+        return f
+
+    def _work(self, first: bool = False) -> None:
+        while True:
+            if not first:                      # a new thread goes straight to the item that spawned it
+                with self._lock:
+                    self._idle += 1
+            first = False
+            item = self._q.get()
+            if item is self._STOP:
+                return
+            f, fn, args = item
+            if not f.set_running_or_notify_cancel():
+                continue
+            try:
+                f.set_result(fn(*args))
+            except BaseException as e:  # noqa: BLE001 — delivered to the waiter, as ThreadPoolExecutor does
+                f.set_exception(e)
+
+    def shutdown(self, wait: bool = False, cancel_futures: bool = True) -> None:
+        with self._lock:
+            self._shutdown = True
+        if cancel_futures:
+            pending = []
+            while True:
+                try:
+                    item = self._q.get_nowait()
+                except Exception:  # noqa: BLE001 — queue.Empty
+                    break
+                if item is not self._STOP:
+                    item[0].cancel()
+                pending.append(item)
+        for _ in self._threads:
+            self._q.put(self._STOP)
+        if wait:
+            for t in self._threads:
+                t.join()
+
+
 class SwarmOrchestrator:
     """Wraps a SOCOrchestrator: first pass as usual, then the swarm on the
     verdicts worth it. Drop-in: ``handle(alert) -> EvidenceChain``."""
@@ -343,7 +412,7 @@ class SwarmOrchestrator:
         # otherwise inherit the orchestrator's extras. The panel is assembled live at
         # vote time so a voter swapped in after construction is honored.
         self._extra_voters = [] if voter is not None else list(getattr(orchestrator, "_extra_voters", None) or [])
-        self._pool = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="aegis-swarm")
+        self._pool = _DaemonPool(self.max_workers, thread_name_prefix="aegis-swarm")
         self._hung: set = set()             # workers that outlived their time box and still hold a pool thread
         self._abandoned: set = set()          # futures of replaced pools still running (capped)
         self._cap_logged = False
@@ -417,6 +486,10 @@ class SwarmOrchestrator:
         self._reseal(alert, chain)
         return chain
 
+    def close(self) -> None:
+        """Stop the worker pool without waiting for a hung worker (Pipeline.close calls this)."""
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
     def _replace_pool_if_wedged(self) -> None:
         """A hung worker keeps its thread: once they fill the pool every later fan-out "times out after 0 s"
         (review E10). Abandon a wedged pool for a fresh one; the stuck threads finish (or not) on their own."""
@@ -439,7 +512,7 @@ class SwarmOrchestrator:
             return
         self._cap_logged = False
         logger.error("[swarm] %d worker(s) hung past the time box — replacing the worker pool", len(self._hung))
-        old, self._pool = self._pool, ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="aegis-swarm")
+        old, self._pool = self._pool, _DaemonPool(self.max_workers, thread_name_prefix="aegis-swarm")
         self._abandoned |= self._hung
         self._hung = set()
         old.shutdown(wait=False, cancel_futures=True)
@@ -585,7 +658,8 @@ class SwarmOrchestrator:
 
 def swarm_from_env(orchestrator: Any, **kw: Any) -> Any:
     """Wrap unless AEGIS_SWARM=0 (default ON: the post-verdict fan-out + re-vote is what the platform is built
-    around; a licence without the "swarm" feature still forces it off); caps from AEGIS_SWARM_MAX_WORKERS / _MAX_SECONDS.
+    around; with AEGIS_LICENSE_ENFORCE=1 a licence without the "swarm" feature forces it off — unenforced, the licence
+    only reports it); caps from AEGIS_SWARM_MAX_WORKERS / _MAX_SECONDS.
 
     Campaign context (``AEGIS_CAMPAIGN_CONTEXT``, default on) is independent of the swarm: it is
     cheap and in-memory, and the adaptive-attacker fast path depends on it. With the swarm off,

@@ -36,6 +36,7 @@ import os
 import re
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -110,7 +111,12 @@ class RemoteBackend:
             raise ValueError("AEGIS_MCP_TOKEN (the AEGIS read token) is required for a remote AEGIS")
         self.base = f"{u.scheme}://{u.netloc}{u.path.rstrip('/')}"
         self.token, self.console_token, self.timeout = token, console_token, timeout
-        self._open = opener or urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        # Never follow a redirect (urllib copies the bearer token onto the redirected request, even to another host
+        # or down to http — review round 6 M-1), and never route a loopback AEGIS through an environment proxy.
+        handlers: list[Any] = [_NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context())]
+        if _loopback(u.hostname):
+            handlers.append(urllib.request.ProxyHandler({}))
+        self._open = opener or urllib.request.build_opener(*handlers)
 
     def _call(self, method: str, path: str, *, token: str, body: dict | None = None,
               headers: dict | None = None) -> tuple[int, dict]:
@@ -122,11 +128,15 @@ class RemoteBackend:
             req.add_header("Content-Type", "application/json")
         for k, v in (headers or {}).items():
             req.add_header(k, v)
+        deadline = time.monotonic() + self.timeout
         try:
             with self._open.open(req, timeout=self.timeout) as r:
-                raw = r.read(8 * 1024 * 1024 + 1)
                 status = r.status
+                raw = _read_until(r, 8 * 1024 * 1024 + 1, deadline)
         except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                raise RuntimeError(f"AEGIS answered a redirect ({e.code}); redirects are never followed — set "
+                                   "AEGIS_MCP_URL to the final address") from None
             raw, status = e.read(65536), e.code
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise RuntimeError(f"AEGIS unreachable: {str(getattr(e, 'reason', e))[:160]}") from None
@@ -161,9 +171,36 @@ class RemoteBackend:
     def reject(self, approval_id: str, *, decided_by: str, reason: str) -> tuple[int, dict]:
         if not self.console_token:
             return 503, {"error": "AEGIS_MCP_CONSOLE_TOKEN is not set; rejecting needs the console token"}
-        return self._call("POST", f"/api/approvals/{urllib.parse.quote(approval_id, safe='')}/reject",
-                          token=self.console_token, body={"reason": reason},
-                          headers={"X-AEGIS-User": decided_by})
+        status, out = self._call("POST", f"/api/approvals/{urllib.parse.quote(approval_id, safe='')}/reject",
+                                 token=self.console_token, body={"reason": reason},
+                                 headers={"X-AEGIS-User": decided_by})
+        # a 200 alone is not a rejection: the receiver confirms what it recorded (round 6 M-1)
+        if status == 200 and not (out.get("ok") is True and str(out.get("approval_id")) == approval_id
+                                  and str(out.get("status")) == "rejected"):
+            return 502, {"error": "AEGIS answered 200 without confirming the rejection; treat it as not rejected"}
+        return status, out
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None                                   # urllib then raises HTTPError(3xx), handled in _call
+
+
+def _read_until(resp: Any, limit: int, deadline: float) -> bytes:
+    """Read at most ``limit`` bytes, giving up at ``deadline`` (a server trickling bytes must not stall the gateway:
+    urllib's timeout is per socket operation — round 6 M-4)."""
+    chunks: list[bytes] = []
+    got = 0
+    while got < limit:
+        if time.monotonic() > deadline:
+            raise TimeoutError("AEGIS answer took longer than the gateway's deadline")
+        rd = getattr(resp, "read1", None) or resp.read       # read1: whatever has arrived, not a full 64 KB block
+        b = rd(min(65536, limit - got))
+        if not b:
+            break
+        chunks.append(b)
+        got += len(b)
+    return b"".join(chunks)
 
 
 # ------------------------------------------------------------------------------------------------- tools --
@@ -213,7 +250,9 @@ def _tools(allow_reject: bool) -> list[dict]:
 
 def _untrusted(label: str, payload: Any) -> str:
     from aegis.agents.shared.injection_defense import wrap_untrusted
-    text = json.dumps(payload, ensure_ascii=False, default=str, indent=1)
+    from aegis.agents.shared.redact import redact_text
+    # redact the whole text first, then cut: a cut through a secret used to leave its head unredacted (round 6 M-3)
+    text = redact_text(json.dumps(payload, ensure_ascii=False, default=str, indent=1))
     if len(text) > MAX_RESULT_CHARS:
         text = text[:MAX_RESULT_CHARS] + "\n… [truncated]"
     w = wrap_untrusted(label, text)
@@ -290,12 +329,14 @@ class Gateway:
         method, mid, params = msg["method"], msg.get("id"), msg.get("params") or {}
         if "id" not in msg:                                  # a notification: never answered
             return None
+        if not isinstance(params, dict):
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "params must be an object"}}
 
         def ok(result: dict) -> dict:
             return {"jsonrpc": "2.0", "id": mid, "result": result}
 
         if method == "initialize":
-            asked = str((params or {}).get("protocolVersion") or "")
+            asked = str(params.get("protocolVersion") or "")
             return ok({"protocolVersion": asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
                        "capabilities": {"tools": {"listChanged": False}},
                        "serverInfo": {"name": SERVER_NAME, "version": _version()},
@@ -312,6 +353,16 @@ class Gateway:
             return ok({"content": [{"type": "text", "text": text}], "isError": err})
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"method not found: {method}"}}
 
+    def _safe_handle(self, msg: Any) -> dict | None:
+        """One message never ends the session: an unexpected failure is a -32603 error, with no traceback."""
+        try:
+            return self.handle(msg)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[mcp] request failed: %s", type(e).__name__)
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            return {"jsonrpc": "2.0", "id": mid if isinstance(mid, (str, int)) else None,
+                    "error": {"code": -32603, "message": "internal error"}}
+
     def serve(self, stdin: TextIO, stdout: TextIO) -> None:
         for line in stdin:
             if not line.strip():
@@ -321,11 +372,15 @@ class Gateway:
             else:
                 try:
                     msg = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
                 else:
-                    reply = ([r for r in (self.handle(m) for m in msg) if r is not None] or None) \
-                        if isinstance(msg, list) else self.handle(msg)
+                    if isinstance(msg, list) and not msg:
+                        reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "empty batch"}}
+                    elif isinstance(msg, list):
+                        reply = [r for r in (self._safe_handle(m) for m in msg) if r is not None] or None
+                    else:
+                        reply = self._safe_handle(msg)
             if reply is not None:
                 stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
                 stdout.flush()

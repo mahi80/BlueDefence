@@ -1352,17 +1352,65 @@ def _json(d: dict) -> str:
     return json.dumps(d, indent=2)
 
 
-def _promoted_model(var: str = "AEGIS_MODEL_POINTER", *, path: str | None = None) -> str | None:
+_POINTER_SIGNED = ("run", "role", "adapter", "sha256", "approved_by", "promoted_at")
+
+
+def pointer_signature(cur: dict) -> str | None:
+    """HMAC over a promotion pointer's identity fields, with the decision-signing key (``AEGIS_DECISION_KEY`` or one
+    derived from ``AEGIS_CONSOLE_TOKEN``). None when no key is configured. The adapter digest inside an unsigned
+    pointer only proved the pointer agreed with itself (review round 6 J-3)."""
+    import hashlib as _hl
+    import hmac as _hm
+    import json as _js
+
+    from aegis.hitl.signing import _key
+    k = _key()
+    if k is None:
+        return None
+    body = _js.dumps({f: cur.get(f) for f in _POINTER_SIGNED}, sort_keys=True, separators=(",", ":"), default=str)
+    return _hm.new(k, b"aegis-model-pointer-v1|" + body.encode(), _hl.sha256).hexdigest()
+
+
+def _pointer_roots() -> list[str]:
+    """Where ``@<pointer>`` voter specs may point: ``AEGIS_POINTER_ROOT`` (path list), default ~/aegis-runs and
+    /var/lib/aegis."""
+    raw = os.environ.get("AEGIS_POINTER_ROOT", "").strip()
+    roots = [r for r in raw.split(os.pathsep) if r] if raw else [os.path.expanduser("~/aegis-runs"), "/var/lib/aegis"]
+    return [os.path.realpath(r) for r in roots]
+
+
+def _promoted_model(var: str = "AEGIS_MODEL_POINTER", *, path: str | None = None,
+                    expect_role: str | None = None) -> str | None:
     """Adapter path from a retrain pipeline's promotion pointer, if any. One pointer per role: ``AEGIS_MODEL_POINTER``
     (triage), ``AEGIS_VOTER_POINTER`` (the reviewer), or an explicit ``path`` (``@<pointer>`` in AEGIS_VOTER_MODELS).
-    Each role keeps its own retrain ``--runs`` directory, so promoting a judge never replaces the triage model."""
+
+    The pointer's ``role`` must match the slot (a judge pointer never loads as the triage model — round 6 J-2), and
+    when a signing key is configured the pointer must carry a valid signature from ``retrain promote`` (J-3)."""
     ptr = path or os.environ.get(var, "")
     if not ptr:
         return None
+    role_wanted = expect_role or ("judge" if var == "AEGIS_VOTER_POINTER" or path else "triage")
     try:
+        import hmac as _hm
         import json as _json
         with open(ptr, encoding="utf-8") as fh:
             cur = _json.load(fh)
+        if not isinstance(cur, dict):
+            raise TypeError("not a pointer object")
+        role = str(cur.get("role") or "triage")
+        if role != role_wanted:
+            _log.error("%s %s is a %s pointer, not %s; refused (one pointer per role)", path or var, ptr, role,
+                       role_wanted)
+            return None
+        want_sig = pointer_signature(cur)
+        if want_sig is not None and not _hm.compare_digest(str(cur.get("sig") or ""), want_sig):
+            if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") != "1":
+                _log.error("%s %s is not signed by this installation's promotion key; refused", path or var, ptr)
+                return None
+            _log.warning("%s %s unsigned / bad signature, loaded anyway (AEGIS_ALLOW_UNVERIFIED_MODEL=1)", path or var, ptr)
+        elif want_sig is None:
+            _log.warning("promotion pointers are not signed (set AEGIS_DECISION_KEY or AEGIS_CONSOLE_TOKEN): anything "
+                         "that can write %s can choose the model", ptr)
         adapter = cur.get("adapter")
         if adapter and os.path.isdir(adapter):
             from aegis.finetune.digest import verify_adapter
@@ -1373,8 +1421,8 @@ def _promoted_model(var: str = "AEGIS_MODEL_POINTER", *, path: str | None = None
                 return None
             if not ok:
                 _log.warning("promoted adapter %s loaded UNVERIFIED (%s) — AEGIS_ALLOW_UNVERIFIED_MODEL=1", adapter, why)
-            _log.info("using promoted %s model %s (run %s, approved by %s)", cur.get("role") or "triage", adapter,
-                      cur.get("run"), cur.get("approved_by"))
+            _log.info("using promoted %s model %s (run %s, approved by %s)", role, adapter, cur.get("run"),
+                      cur.get("approved_by"))
             return adapter
         _log.warning("%s %s names no usable adapter; falling back to the configured model", path or var, ptr)
     except Exception as exc:  # noqa: BLE001 — a bad pointer keeps the configured model, never the SOC down
@@ -1566,8 +1614,16 @@ def get_extra_voter_clients(budget: Optional[TokenBudget] = None) -> list[LLMCli
         else:                                          # bare "model"
             backend, model = default_backend, spec
         if model.startswith("@"):
-            # `@/var/lib/aegis/judge-llama/retrain/current.json`: this voter follows its own promotion pointer
-            resolved = _promoted_model(path=model[1:])
+            # `@/var/lib/aegis/judge-llama/retrain/current.json`: this voter follows its own promotion pointer. Only a
+            # local backend can load an adapter path (round 6 J-5), and only a pointer under AEGIS_POINTER_ROOT (J-3).
+            if (backend or "") not in ("local", "gemma"):
+                _log.error("[voter] extra voter %r: a @pointer needs the local backend (local:@<pointer>); dropped", spec)
+                continue
+            real = os.path.realpath(model[1:])
+            if not any(real == r or real.startswith(r + os.sep) for r in _pointer_roots()):
+                _log.error("[voter] extra voter %r: pointer is outside AEGIS_POINTER_ROOT; dropped", spec)
+                continue
+            resolved = _promoted_model(path=real)
             if not resolved:
                 _log.error("[voter] extra voter %r: pointer has no verified promoted adapter; dropped", spec)
                 continue
