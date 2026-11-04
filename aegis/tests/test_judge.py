@@ -142,7 +142,9 @@ def test_voter_follows_its_own_pointer(tmp_path, monkeypatch):
 def test_extra_voter_at_pointer(tmp_path, monkeypatch):
     from aegis.agents.shared import llm_client as lc
     jud, jsha = _adapter(tmp_path / "llama")
-    jp = tmp_path / "llama.json"; jp.write_text(json.dumps({"run": "l", "adapter": jud, "sha256": jsha}))
+    # round 6: a voter pointer must say role=judge (J-2) and sit under AEGIS_POINTER_ROOT (J-3)
+    jp = tmp_path / "llama.json"; jp.write_text(json.dumps({"run": "l", "role": "judge", "adapter": jud, "sha256": jsha}))
+    monkeypatch.setenv("AEGIS_POINTER_ROOT", str(tmp_path))
     got = []
     monkeypatch.setattr(lc, "get_client", lambda prefer=None, budget=None, model=None, stream=False: got.append(model) or object())
     monkeypatch.setenv("AEGIS_VOTER_MODELS", f"local:@{jp},local:@{tmp_path / 'missing.json'}")

@@ -171,6 +171,12 @@ class Pipeline:
                     r.stop()
                 except Exception as e:  # noqa: BLE001
                     logger.warning("[service] receiver stop failed: %s", e)
+        closer = getattr(type(self.orch), "close", None)     # the swarm's worker pool (round 6 W-1)
+        if closer is not None:
+            try:
+                closer(self.orch)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[service] swarm pool shutdown failed: %s", e)
 
 
 def build_pipeline(audit_path: Path | str = DEFAULT_AUDIT, *, fresh: bool = False,

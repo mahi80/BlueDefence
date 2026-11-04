@@ -880,7 +880,8 @@ copilot) can ask AEGIS what it found. Tools: `aegis_recent_verdicts` (optionally
 `aegis_list_proposals`.
 
 * **Backends.** By default it reads this host's audit file (`AEGIS_AUDIT_PATH`) and HITL directory (`AEGIS_HITL_DIR`).
-  For a remote AEGIS, set `AEGIS_MCP_URL=https://…` and `AEGIS_MCP_TOKEN` (the read token); https only, http only to
+  For a remote AEGIS, set `AEGIS_MCP_URL=https://…` (redirects are never followed — the token goes only to that
+  address — and a loopback URL never goes through a proxy) and `AEGIS_MCP_TOKEN` (the read token); https only, http only to
   loopback.
 * **Untrusted output.** Every result is redacted and wrapped as untrusted data, with prompt-injection and obfuscation
   flags. Evidence carries attacker-written text, and the client's model must read it as evidence, not instructions.

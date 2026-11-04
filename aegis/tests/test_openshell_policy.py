@@ -46,7 +46,9 @@ def test_explicit_url_replaces_the_vendor_default_and_off_means_off():
 def test_protocols_filesystem_and_shape():
     pol = build_policy(ENV, extra=["siem.bank.internal:6514"], state_dirs=["/data"])
     assert pol["version"] == 1 and pol["landlock"] == {"compatibility": "best_effort"}
-    assert set(pol["filesystem_policy"]["read_write"]) == {"/data", "/var/lib/aegis/hitl", "/var/lib/aegis"}
+    # round 6 P-2: the threat-intel cache is writable too, and every path is absolute
+    assert {"/data", "/var/lib/aegis/hitl", "/var/lib/aegis"} <= set(pol["filesystem_policy"]["read_write"])
+    assert all(p.startswith("/") for p in pol["filesystem_policy"]["read_write"])
     kafka = pol["network_policies"]["kafka"]["endpoints"]
     assert all("protocol" not in e for e in kafka)                               # L4 for Kafka
     assert pol["network_policies"]["fw"]["endpoints"][0]["protocol"] == "rest"
@@ -63,3 +65,23 @@ def test_cli_and_range_sample(tmp_path, monkeypatch, capsys):
     assert yaml.safe_load(text)["network_policies"]
     rng = Path(__file__).resolve().parents[2] / "deploy" / "openshell" / "attack-range-policy.yaml"
     assert yaml.safe_load(rng.read_text())["network_policies"]["range_targets"]["endpoints"]
+
+
+def test_round6_microsoft_login_kafka_forms_other_urls_and_userinfo_trick(tmp_path):
+    hosts = {hp for v in collect({"AEGIS_EDR_VENDOR": "defender",
+                                  "AEGIS_EDR_URL": "https://api-eu.securitycenter.microsoft.com"}).values() for hp in v}
+    assert ("login.microsoftonline.com", 443) in hosts                     # P-1: OAuth still reachable
+    kafka = collect({"AEGIS_KAFKA_BOOTSTRAP": "SASL_SSL://b1.bank:9093,[2001:db8::1]:9092"})["kafka"]
+    assert kafka == [("b1.bank", 9093), ("2001:db8::1", 9092)]
+    other = {hp for v in collect({"AEGIS_LICENSE_SERVER": "https://license.acpgovernance.com", "MISP_URL": "https://misp.bank.in",
+                                  "TENABLE_ACCESS_KEY": "a", "RF_API_TOKEN": "t", "SENTINEL_API_BASE": "https://api.loganalytics.io/v1"}).values()
+             for hp in v}
+    assert {("license.acpgovernance.com", 443), ("misp.bank.in", 443), ("cloud.tenable.com", 443),
+            ("api.recordedfuture.com", 443), ("api.loganalytics.io", 443)} <= other
+    assert collect({"AEGIS_X_URL": "https://abc/def@host.example"}) == {}   # P-3: no token fragment as a host
+    assert collect({"AEGIS_Y_URL": "https://intranet"}) == {}               # dotless never, unless --extra
+    pol = build_policy({"AEGIS_AUDIT_PATH": "audit.jsonl"}, extra=["siem:6514"])
+    assert ("siem", 6514) in _hosts(pol)
+    assert all(p.startswith("/") for p in pol["filesystem_policy"]["read_write"])   # P-2: relative made absolute
+    assert build_policy({})["network_policies"] == {} and build_policy({})["filesystem_policy"]["read_write"]
+    assert all(b["path"] == "/usr/bin/python3" for p in build_policy(ENV)["network_policies"].values() for b in p["binaries"])

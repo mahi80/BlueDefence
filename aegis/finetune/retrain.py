@@ -80,6 +80,11 @@ class State:
         cur = self.path.parent / "current.json"
         if self.current:
             out = dict(self.current)
+            out.setdefault("role", "triage")
+            from aegis.agents.shared.llm_client import pointer_signature
+            sig = pointer_signature(out)                 # the SOC refuses an unsigned pointer when a key is set (J-3)
+            if sig:
+                out["sig"] = sig
             try:
                 on_disk = json.loads(cur.read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -352,11 +357,24 @@ def _accepted_model_rules(dry_run: bool) -> list[dict]:
 
 # --------------------------------------------------------------------------- commands
 
+def _runs_dir(a) -> Path:
+    return Path(a.runs or str(Path.home() / "aegis-runs")).expanduser()
+
+
 def cmd_run(a) -> int:
-    runs = Path(a.runs).expanduser(); st = State.load(runs)
-    run = a.run or f"retrain-{datetime.now(timezone.utc):%Y-%m-%d}"
-    root = runs / run; root.mkdir(parents=True, exist_ok=True)
     role = getattr(a, "role", "triage") or "triage"
+    runs = Path(a.runs or str(Path.home() / "aegis-runs" / ("judge" if role == "judge" else ""))).expanduser()
+    st = State.load(runs)
+    cur_role = (st.current or {}).get("role") or ("triage" if st.current else None)
+    other = {i.get("role") or "triage" for i in st.runs.values()} - {role}
+    if (cur_role and cur_role != role) or other:
+        # one --runs directory per model: a judge run in the triage directory used to overwrite the triage pointer
+        # and share its adapter dir and export watermark (review round 6 J-2)
+        print(f"refused: {runs} holds {cur_role or min(other)} runs; use a separate --runs directory for the "
+              f"{role} model (default for judge: ~/aegis-runs/judge)")
+        return 2
+    run = a.run or f"retrain-{role}-{datetime.now(timezone.utc):%Y-%m-%d}"
+    root = runs / run; root.mkdir(parents=True, exist_ok=True)
     st.runs[run] = {"created": _now(), "preset": a.preset, "base_data": a.base_data, "stage": "started", "role": role}
     since = a.since or st.last_export
     print(f"== retrain {run} (since {since or 'the beginning'})")
@@ -401,7 +419,7 @@ def cmd_run(a) -> int:
 
 
 def cmd_shadow(a, *, candidate_loader=_adapter_triage, current_loader=_adapter_triage) -> int:
-    runs = Path(a.runs).expanduser(); st = State.load(runs)
+    runs = _runs_dir(a); st = State.load(runs)
     run = a.run or _latest(st, "gated")
     if not run or run not in st.runs:
         print("no gated run to shadow"); return 1
@@ -426,7 +444,7 @@ def cmd_shadow(a, *, candidate_loader=_adapter_triage, current_loader=_adapter_t
 def cmd_propose(a, *, ship=None) -> int:
     if ship is None:
         ship = _ship if getattr(a, "dashboard", False) else (lambda p, d: _ship_local(p, d, _hitl_dir(a)))
-    runs = Path(a.runs).expanduser(); st = State.load(runs)
+    runs = _runs_dir(a); st = State.load(runs)
     run = a.run or _latest(st, "shadowed")
     if not run or run not in st.runs:
         print("no shadowed run to propose"); return 1
@@ -446,7 +464,7 @@ def cmd_sync(a, *, accepted=None) -> int:
     besides the offline `promote` (which records who approved it)."""
     if accepted is None:
         accepted = _accepted_model_rules if getattr(a, "dashboard", False) else (lambda d: _accepted_local(d, _hitl_dir(a)))
-    runs = Path(a.runs).expanduser(); st = State.load(runs)
+    runs = _runs_dir(a); st = State.load(runs)
     refused = 0
     for rule in accepted(a.dry_run):
         change = rule.get("change") or {}
@@ -496,7 +514,7 @@ def _shadow_ready(info: dict) -> bool:
 
 
 def cmd_promote(a) -> int:
-    runs = Path(a.runs).expanduser(); st = State.load(runs)
+    runs = _runs_dir(a); st = State.load(runs)
     if a.run not in st.runs:
         print(f"unknown run {a.run}"); return 1
     if st.runs[a.run].get("denied"):
@@ -531,7 +549,7 @@ def cmd_rollback(a) -> int:
     """Undo the current promotion: the previous model becomes current again (or the base model, if there was
     none) and the rolled-back run is recorded as denied, so neither ``sync`` nor ``promote`` brings it back.
     Hand-restoring ``current.json`` used to be overwritten by the next sync (review round 4 D4-8)."""
-    runs = Path(a.runs).expanduser(); st = State.load(runs)
+    runs = _runs_dir(a); st = State.load(runs)
     if not st.current:
         print("nothing is promoted"); return 1
     bad = st.current.get("run")
@@ -544,7 +562,8 @@ def cmd_rollback(a) -> int:
         if not ok:
             print(f"  previous model {prev.get('run')} cannot be restored ({why}); rolling back to the base model")
             prev = None
-    st.current = ({"run": prev["run"], "adapter": prev.get("adapter"), "sha256": prev.get("sha256"),
+    st.current = ({"run": prev["run"], "role": (st.runs.get(prev["run"]) or {}).get("role") or "triage",
+                   "adapter": prev.get("adapter"), "sha256": prev.get("sha256"),
                    "promoted_at": _now(), "approved_by": a.approved_by, "rationale": a.rationale[:500],
                    "rolled_back_from": bad, "previous": None} if prev else None)
     st.save()
@@ -553,7 +572,7 @@ def cmd_rollback(a) -> int:
 
 
 def cmd_status(a) -> int:
-    st = State.load(Path(a.runs).expanduser())
+    st = State.load(_runs_dir(a))
     print(f"current: {st.current['run'] + ' → ' + str(st.current['adapter']) if st.current else '(none promoted)'}")
     print(f"last export: {st.last_export or '-'}")
     for run, info in sorted(st.runs.items()):
@@ -571,7 +590,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Scheduled retrain: export → build → train → gate → shadow → human-approved promotion (roadmap 3.5).")
     sub = ap.add_subparsers(dest="cmd", required=True)
     def common(p):
-        p.add_argument("--runs", default=str(Path.home() / "aegis-runs"))
+        p.add_argument("--runs", default=None, help="runs directory (default ~/aegis-runs; ~/aegis-runs/judge for "
+                       "`run --role judge`) — one per model")
         p.add_argument("--run", default=None)
         p.add_argument("--dashboard", action="store_true", help="use the ACP dashboard (ACP_DASHBOARD_URL / ACP_API_KEY) "
                        "instead of this host's local queue")
