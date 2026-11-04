@@ -1,0 +1,17 @@
+{"pages": [
+  {"status": 200, "body": {"data": [
+    {"id": "1534287329104851111",
+     "threatInfo": {"threatName": "invoice.pdf.exe", "createdAt": "2026-11-04T00:12:00.000000Z", "confidenceLevel": "malicious",
+                    "classification": "Ransomware", "filePath": "\\Device\\HarddiskVolume3\\Users\\amit\\Downloads\\invoice.pdf.exe",
+                    "sha256": "9f2b5c1e0d4a7b3c2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d", "processUser": "EXAMPLEBANK\\amit",
+                    "mitigationStatus": "not_mitigated"},
+     "agentRealtimeInfo": {"agentComputerName": "br-mum-pc-114"}}],
+   "pagination": {"nextCursor": "YWdlbnRfaWQ6MTUz", "totalItems": 2}}},
+  {"status": 200, "body": {"data": [
+    {"id": "1534287329104852222",
+     "threatInfo": {"threatName": "mimikatz.exe", "createdAt": "2026-11-04T00:20:00.000000Z", "confidenceLevel": "suspicious",
+                    "classification": "Trojan", "filePath": "C:\\Temp\\m.exe", "sha256": "aa", "processUser": "EXAMPLEBANK\\svc_backup",
+                    "mitigationStatus": "mitigated"},
+     "agentRealtimeInfo": {"agentComputerName": "dc-01"}}],
+   "pagination": {"nextCursor": null, "totalItems": 2}}}
+]}

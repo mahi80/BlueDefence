@@ -469,6 +469,8 @@ class StreamConsumer(BaseConsumer):
         return out
 
     def _normalize(self, item: StreamItem) -> Any:
+        if item.source.startswith("ocsf") and not item.passthrough:
+            return self._ocsf(item)
         if item.source.startswith("edr") and not item.passthrough:
             return self._edr(item)
         if _is_apigw(item):
@@ -494,6 +496,25 @@ class StreamConsumer(BaseConsumer):
             alert["ingest_lag_ms"] = max(0, int((item.received_at - ts) * 1000))
         return alert
 
+
+    def _ocsf(self, item: StreamItem) -> Any:
+        """OCSF events (one per line, or a JSON array per line) → AEGIS alerts; non-OCSF records are dropped."""
+        from .ocsf import to_alert
+        obj = json.loads(item.line)
+        events = obj if isinstance(obj, list) else [obj]
+        out = []
+        hint = item.source[5:] if item.source.startswith("ocsf-") else ""
+        for ev in events[:1000]:
+            a = to_alert(ev, source_hint=hint) if isinstance(ev, dict) else None
+            if a is None:
+                continue
+            a["received_at"] = item.received_at
+            a["ingest_source"] = item.source
+            ts = _vendor_ts(a)
+            if ts is not None:
+                a["ingest_lag_ms"] = max(0, int((item.received_at - ts) * 1000))
+            out.append(a)
+        return out if out else None
 
     def _apigw(self, item: StreamItem) -> Optional[dict]:
         """API-gateway events feed the stateful object-walk detector; most produce no alert."""

@@ -1,6 +1,7 @@
 """Build the configured alert sources from the environment.
 
-    AEGIS_SOURCES   comma list of: sample | splunk | sentinel | waf | apigw | ndr | netops | acp | stream | eventhub   (default: sample)
+    AEGIS_SOURCES   comma list of: sample | splunk | sentinel | waf | apigw | ndr | netops | acp | stream | eventhub |
+                    kit:<name> (a declarative connector — ``python -m aegis.ingest.kit list``)   (default: sample)
     AEGIS_CHECKPOINT  path of the JSON checkpoint file (default: ./.aegis-ingest.json)
     WAF_EVENT_FILE  path of the WAF syslog/JSON export to read (for source "waf")
     APIGW_EVENT_FILE  API-gateway access log export (for source "apigw"; object-walk detector)
@@ -95,6 +96,11 @@ def sources_from_env() -> list[tuple[str, Iterator[dict]]]:
                     continue
                 out.append(("netops", NetopsConsumer(detector=netops_detector(), checkpoint=checkpoint).iter_alerts(
                     **_file_kw(checkpoint, files))))
+            elif name.startswith("kit:"):
+                # a declarative connector (aegis/ingest/connectors/<name>.yaml); its secrets come from the env
+                from .kit import consumer_for
+                c = consumer_for(name[4:], checkpoint=checkpoint)
+                out.append((c.name, c.iter_alerts()))
             elif name in ("stream", "eventhub"):
                 pass                                         # drained once below, after the loop
             elif name == "acp":

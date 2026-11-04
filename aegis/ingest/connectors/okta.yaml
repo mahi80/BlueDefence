@@ -1,0 +1,30 @@
+name: okta
+title: Okta System Log
+category: identity
+docs: https://developer.okta.com/docs/api/openapi/okta-management/management/tag/SystemLog/
+verified: recorded-sample (shape per the System Log API docs; not yet run against a live tenant)
+read_only: true
+auth: {type: header, name: Authorization, value: "SSWS {env:OKTA_API_TOKEN}"}
+config: {base_url: "{env:OKTA_BASE_URL}"}          # https://<org>.okta.com
+request:
+  method: GET
+  url: "{base_url}/api/v1/logs"
+  params: {since: "{watermark}", sortOrder: ASCENDING, limit: "{page_size}"}
+page_size: 500
+paging: {type: link_header}
+watermark: {format: iso, overlap_s: 300, initial_lookback_s: 3600}
+format: map
+map:
+  id: uuid
+  timestamp: published
+  alert_type: eventType
+  title: displayMessage
+  severity: severity
+  user_id: actor.alternateId
+  source_ip: client.ipAddress
+  user_agent: client.userAgent.rawUserAgent
+  curr_geo: client.geographicalContext.country
+  auth_result: outcome.result
+  auth_reason: outcome.reason
+severity_map: {DEBUG: low, INFO: low, WARN: medium, ERROR: high}
+constants: {source: Okta}

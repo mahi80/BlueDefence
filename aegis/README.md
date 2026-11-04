@@ -752,6 +752,29 @@ before any model call.
 
 ---
 
+### OCSF and declarative connectors
+
+* **OCSF in:** `POST /ingest/ocsf?product=<name>` takes OCSF events of any class (NDJSON, or JSON arrays per line) —
+  AWS Security Lake subscribers, CrowdStrike, Okta, Cribl, Vector / Fluent Bit OCSF outputs — and maps them onto the
+  alert fields the specialists read (`aegis/ingest/ocsf.py`). **OCSF out:** `GET /ingest/verdicts?format=ocsf`
+  serves every verdict as an OCSF Detection Finding (class 2004) for a SIEM or data lake.
+* **Declarative pull connectors:** a connector is a YAML spec plus a recorded sample in `aegis/ingest/connectors/`.
+  Enable with `AEGIS_SOURCES=kit:<name>`; credentials only from the environment (`{env:NAME}`); specs must be
+  `read_only: true` (GET, or POST to a declared search endpoint), https only, bounded pages, next-links never followed
+  to another host. `python -m aegis.ingest.kit list` shows the catalogue and each spec's verification level;
+  `… kit test <name>` replays the sample with no network.
+
+| Spec | Source | Verified |
+|---|---|---|
+| `okta` | Okta System Log | recorded sample |
+| `msdefender` | Microsoft Defender XDR (Graph `alerts_v2`, OAuth client credentials) | recorded sample |
+| `sentinelone` | SentinelOne threats | recorded sample |
+| `qradar` | IBM QRadar offenses | recorded sample |
+| `elastic` | Elastic Security detection alerts | recorded sample |
+
+"Recorded sample" = the response shape from the vendor's API documentation, replayed in CI; a spec becomes
+`live-tenant` only after a pull against a real tenant.
+
 ## ACP integration (full edition)
 
 - **The SOC brain is a governed agent** (`governance.py`, `SOC-AGENTQ-01`): every specialist,

@@ -1,0 +1,37 @@
+name: msdefender
+title: Microsoft Defender XDR alerts (Graph security alerts_v2)
+category: xdr
+docs: https://learn.microsoft.com/en-us/graph/api/security-list-alerts_v2
+verified: recorded-sample (shape per the Graph alerts_v2 docs; not yet run against a live tenant)
+read_only: true
+auth:
+  type: oauth2_client_credentials
+  token_url: "https://login.microsoftonline.com/{env:MSDE_TENANT_ID}/oauth2/v2.0/token"
+  client_id: "{env:MSDE_CLIENT_ID}"
+  client_secret: "{env:MSDE_CLIENT_SECRET}"
+  scope: "https://graph.microsoft.com/.default"
+request:
+  method: GET
+  url: "https://graph.microsoft.com/v1.0/security/alerts_v2"
+  params: {"$filter": "lastUpdateDateTime gt {watermark}", "$top": "{page_size}"}
+page_size: 200
+records: value
+paging: {type: next_url, path: "@odata.nextLink"}
+watermark: {format: iso, overlap_s: 300, initial_lookback_s: 3600}
+format: map
+map:
+  id: id
+  timestamp: createdDateTime
+  title: title
+  description: description
+  alert_type: category
+  severity: severity
+  techniques: mitreTechniques
+  vendor_source: serviceSource
+  user_id: "evidence[@odata.type=#microsoft.graph.security.userEvidence].userAccount.userPrincipalName"
+  host: "evidence[@odata.type=#microsoft.graph.security.deviceEvidence].deviceDnsName"
+  source_ip: "evidence[@odata.type=#microsoft.graph.security.ipEvidence].ipAddress"
+  cmdline: "evidence[@odata.type=#microsoft.graph.security.processEvidence].processCommandLine"
+  file_hash: "evidence[@odata.type=#microsoft.graph.security.fileEvidence].fileDetails.sha256"
+severity_map: {informational: low, low: low, medium: medium, high: high, unknownFutureValue: medium}
+constants: {source: Microsoft Defender XDR}

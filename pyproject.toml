@@ -36,3 +36,6 @@ include = ["aegis*"]
 [tool.pytest.ini_options]
 testpaths = ["aegis/tests"]
 addopts = "-q"
+
+[tool.setuptools.package-data]
+"aegis.ingest" = ["connectors/*.yaml", "connectors/*.json"]
