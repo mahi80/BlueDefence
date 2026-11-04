@@ -32,7 +32,10 @@ export function loadUsers(): UsersFile | null {
   try {
     const raw = fs.readFileSync(usersPath(), "utf8");
     const j = JSON.parse(raw);
-    if (!j || typeof j !== "object" || typeof j.users !== "object") return null;
+    // {"users": null}, an array, or a non-object is unreadable (the intended 503), never "ok" — `null` passed the
+    // old typeof check and every session check then threw (review round 8 U8-6)
+    if (!j || typeof j !== "object" || Array.isArray(j)) return null;
+    if (!j.users || typeof j.users !== "object" || Array.isArray(j.users)) return null;
     return j as UsersFile;
   } catch {
     return null;

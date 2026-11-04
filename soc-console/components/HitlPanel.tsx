@@ -128,6 +128,34 @@ export default function HitlPanel({
                   {conf}
                   <span className="viewonly">Needs a human — the service has not filed an approval card yet</span>
                 </div>
+              ) : st.kind === "awaiting_execution" ? (
+                <>
+                  <div className="foot">
+                    {conf}
+                    <span className="decided">
+                      <b>Approved — awaiting execution</b>
+                      {st.approval.decided_by ? ` by ${st.approval.decided_by}` : ""}
+                      {st.note ? ` — ${st.note}` : ""}
+                    </span>
+                  </div>
+                  {canDecide && !fixtureMode && (
+                    <>
+                      <input
+                        className="btn"
+                        style={{ width: "100%", marginTop: 8, background: "var(--bg)", cursor: "text" }}
+                        placeholder="Reason to cancel (the service has not run it yet)"
+                        value={draft[st.approval.id] ?? ""}
+                        onChange={(e) => setDraft((d) => ({ ...d, [st.approval.id]: e.target.value }))}
+                      />
+                      <div className="foot">
+                        <span className="viewonly">Not run yet — a rejection still stops it</span>
+                        <span className="btns">
+                          <button className="btn btn-reject" disabled={busy === st.approval.id} onClick={() => decide(st.approval, "rejected")}>Reject</button>
+                        </span>
+                      </div>
+                    </>
+                  )}
+                </>
               ) : st.kind === "settled" ? (
                 <div className="foot">
                   {conf}

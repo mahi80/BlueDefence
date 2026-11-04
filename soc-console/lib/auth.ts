@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import crypto from "node:crypto";
 import { checkLocalSession, claimsCurrent, type SessionClaims } from "./session";
+import { consoleSecret } from "./secret";
 
 // Roles mirror the dashboard's model. The BACKEND is the enforcement point for
 // every high-impact action (isolate/block/revoke, model promotion) and audits
@@ -13,16 +14,7 @@ export interface Session {
 
 export const SESSION_COOKIE = "aegis_session";
 export const SESSION_TTL = 60 * 60 * 8; // 8h
-// Resolved on first use, not at import: `next build` evaluates modules without the runtime env.
-function secret(): string {
-  const v = process.env.AEGIS_CONSOLE_SECRET;
-  if (v && v.length >= 16) return v;
-  if (process.env.NODE_ENV === "production") {
-    // a known default would let anyone who has read the repo forge an admin cookie
-    throw new Error("AEGIS_CONSOLE_SECRET must be set (16+ chars) in production");
-  }
-  return "dev-insecure-change-me";
-}
+const secret = consoleSecret;
 const ROLES: Role[] = ["admin", "cio", "ciso", "bu_head", "analyst"];
 
 // "local": accounts from the users file (or the single demo account) — pilots and the weeks before SSO.

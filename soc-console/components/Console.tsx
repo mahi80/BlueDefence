@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Chain, Approval, Proposal, RecommendedAction, EvidenceItem } from "../lib/types";
 import { VERDICT_RANK } from "../lib/graph";
+import { stubChainFromApprovals } from "../lib/hitl";
 import BlastGraph from "./BlastGraph";
 import IncidentList from "./IncidentList";
 import HitlPanel from "./HitlPanel";
@@ -112,9 +113,16 @@ export default function Console({
     window.location.href = "/login";
   }
 
+  // A queue card whose incident the server did not hydrate (beyond its cap) opens a stub built from its cards, so
+  // every card in the queue is reachable (round 8). Dropped once the server's snapshot carries that alert.
+  const [opened, setOpened] = useState<string[]>([]);
+  const allChains = useMemo(() => {
+    const have = new Set(chains.map((c) => c.alert_id));
+    return [...chains, ...opened.filter((id) => !have.has(id)).map((id) => stubChainFromApprovals(id, approvals))];
+  }, [chains, opened, approvals]);
   const sorted = useMemo(
     () =>
-      [...chains].sort((a, b) => {
+      [...allChains].sort((a, b) => {
         // Triage order: worst verdict first, then by confidence (a 97% malicious outranks a 63% one),
         // then most recent — so the row an analyst should touch first is always at the top.
         const r = (VERDICT_RANK[b.verdict] ?? 0) - (VERDICT_RANK[a.verdict] ?? 0);
@@ -123,7 +131,7 @@ export default function Console({
         if (Math.abs(c) > 1e-9) return c;
         return b.started_at.localeCompare(a.started_at);
       }),
-    [chains],
+    [allChains],
   );
   const [selId, setSelId] = useState<string>(sorted[0]?.chain_id ?? "");
   const [focusKey, setFocusKey] = useState<string | null>(null);
@@ -176,8 +184,16 @@ export default function Console({
         <PendingQueue
           approvals={approvals}
           onOpen={(alertId, focus) => {
+            if (!alertId) return;
             const hit = sorted.find((c) => c.alert_id === alertId);
-            if (hit) { setSelId(hit.chain_id); setFocusKey(focus); }
+            if (!hit) {
+              const stub = stubChainFromApprovals(alertId, approvals);
+              setOpened((o) => (o.includes(alertId) ? o : [...o, alertId]));
+              setSelId(stub.chain_id);
+            } else {
+              setSelId(hit.chain_id);
+            }
+            setFocusKey(focus);
           }}
         />
         <IncidentList
