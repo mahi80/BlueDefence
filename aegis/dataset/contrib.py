@@ -57,14 +57,45 @@ def _h(salt: str, kind: str, value: str) -> str:
     return hashlib.sha256(f"{salt}|{kind}|{value}".encode()).hexdigest()[:12]
 
 
-def redact_for_contrib(obj: Any, salt: str) -> Any:
-    """What the Scrubber leaves (it keeps e-mail domains and, by default, public IPs — useful inside the
+# Host-name fields: kept inside the bank (a hostname is telemetry the local model learns from), tokenised before a
+# contribution leaves — `MUM-TELLER-07` has no dots, so the pattern below never saw it (round 7 T-1).
+_HOST_KEYS = frozenset({"host", "hostname", "host_name", "device_name", "devicename", "computer", "computername",
+                        "computer_name", "workstation", "workstationname", "src_host", "dst_host", "dest_host",
+                        "src_hostname", "dst_hostname", "machine", "machine_name", "netbios", "fqdn", "endpoint_name",
+                        "sourcehostname", "destinationhostname", "server_name", "client_name"})
+_HOST_PARENTS = frozenset({"device", "host", "src_endpoint", "dst_endpoint", "endpoint", "computer", "machine"})
+# Raw vendor copies of the event (OCSF / ECS / syslog): their identities sit under names nobody can enumerate in
+# advance, so they never leave — the normalised alert fields and the evidence chain carry the shape (round 7 T-1).
+# A bare ``raw`` is NOT here: evidence items keep their ``raw`` summary, which the privacy gate still checks.
+_RAW_COPY_KEYS = frozenset({"ocsf", "_raw", "raw_event", "raw_log", "original", "event_original", "rawdata"})
+
+
+def _is_host_key(key: str, parent: str | None) -> bool:
+    k = key.lower()
+    if k in _HOST_KEYS or k.endswith((".hostname", ".host_name")):
+        return True
+    return k in ("name", "hostname", "uid") and parent is not None and parent.lower() in _HOST_PARENTS
+
+
+def redact_for_contrib(obj: Any, salt: str, *, _parent: str | None = None, _top: bool = True) -> Any:
+    """What the Scrubber leaves (it keeps e-mail domains, host names and, by default, public IPs — useful inside the
     bank, not outside it) is replaced with salted tokens before anything leaves: ``email-…``, ``ip-…``,
-    ``host-…``. Consistent within one installation, so correlation survives; unlinkable across installations."""
+    ``host-…``. Consistent within one installation, so correlation survives; unlinkable across installations.
+    Raw vendor copies of the event (``ocsf``, ``raw`` …) are dropped."""
     if isinstance(obj, dict):
-        return {(redact_for_contrib(k, salt) if isinstance(k, str) else k): redact_for_contrib(v, salt) for k, v in obj.items()}
+        out = {}
+        for k, v in obj.items():
+            ks = str(k)
+            if ks.lower() in _RAW_COPY_KEYS or (ks == "raw" and _parent == "alert"):
+                continue                       # the alert's own raw vendor copy (acp ingest); evidence `raw` stays
+            nk = redact_for_contrib(k, salt, _top=False) if isinstance(k, str) else k
+            if isinstance(v, (str, int)) and not isinstance(v, bool) and _is_host_key(ks, _parent) and str(v).strip():
+                out[nk] = f"host-{_h(salt, 'host', str(v).strip().lower())}"
+            else:
+                out[nk] = redact_for_contrib(v, salt, _parent=ks, _top=False)
+        return out
     if isinstance(obj, list):
-        return [redact_for_contrib(v, salt) for v in obj]
+        return [redact_for_contrib(v, salt, _parent=_parent, _top=False) for v in obj]
     if isinstance(obj, str):
         s = _EMAIL_RX.sub(lambda m: f"email-{_h(salt, 'email', m.group(0).lower())}", obj)
         s = _IPV4_RX.sub(lambda m: f"ip-{_h(salt, 'ip', m.group(0))}", s)
@@ -422,7 +453,9 @@ def records_from_bundles(folder: Path | str, *, gate: bool = True,
                 report["skipped_gate"].append({"file": str(path), "findings": found[:5]})
                 continue
         report["bundles"] += 1
-        inst = str(b.get("installation_id") or "unknown")
+        # the receiving service stamps the installation it authenticated the upload from (licence token) as
+        # `_received_installation`; the bundle's own `installation_id` is only a claim (round 7 T-4)
+        inst = str(b.get("_received_installation") or b.get("installation_id") or "unknown")
         kept = report["by_installation"].get(inst, 0)
         for row in b.get("records") or []:
             if kept >= cap or len(recs) >= total_cap:
@@ -458,7 +491,7 @@ def _community_record(row: dict, inst: str, report: dict | None = None) -> Triag
     A bundle used to be imported with its own ``label`` (``ground_truth``!), ``split`` and ``origin``, so one
     Community install could label 30 SQLi alerts benign and push them into the fleet model's training set. Now
     the label is re-derived from the bundled analyst decisions (no decision → not imported: a model's own verdict
-    teaches nothing), never ``ground_truth``; the split is re-derived from the fingerprint; the origin is always
+    teaches nothing), never ``ground_truth``; benign / allow labels are never imported from outside (round 7 T-4); the split is re-derived from the fingerprint; the origin is always
     ``community_contrib``; and each installation is capped (``AEGIS_CONTRIB_MAX_PER_INSTALL``)."""
     from ..agents.shared.redact import looks_like_attack
     from .schema import _label_from_human, fingerprint
@@ -490,8 +523,16 @@ def _community_record(row: dict, inst: str, report: dict | None = None) -> Triag
     if source in ("human_corrected", "human_disputed"):
         _bump(report, "unverified_correction")
         return None
-    if verdict == "benign" and looks_like_attack(json.dumps(rec.alert, default=str)):
-        _bump(report, "benign_on_attack")
+    if verdict == "benign":
+        # A "benign, analyst-confirmed" label from another installation is never imported: the confirmation is the
+        # contributor's word, and looks_like_attack() only sees payload-shaped attacks — impossible travel, TOR +
+        # MFA bypass, beaconing or a treasury drain carry no payload and taught the fleet model `allow` (round 7
+        # T-4). Benign labels come only from this side's own analysts and corpora.
+        _bump(report, "benign_on_attack" if looks_like_attack(json.dumps(rec.alert, default=str)) else "community_benign")
+        return None
+    if any(str((a or {}).get("action_type") or "").lower() == "allow"
+           for a in (chain.get("recommended_actions") or []) if isinstance(a, dict)):
+        _bump(report, "community_allow")
         return None
     rec.label = {"verdict": verdict, "source": source, **({"disputed": True} if disputed else {})}
     rec.origin = "community_contrib"

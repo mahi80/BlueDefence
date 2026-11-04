@@ -327,13 +327,8 @@ def cmd_contrib(args: argparse.Namespace) -> int:
     st = licensing.check()
     token = ""
     if args.push:
-        raw = os.environ.get("AEGIS_LICENSE", "").strip()
-        if raw and raw.count(".") == 2 and not Path(raw).exists():
-            token = raw
-        elif raw and Path(raw).exists():
-            token = Path(raw).read_text().strip()
-        elif Path("/etc/aegis/license.jwt").exists():
-            token = Path("/etc/aegis/license.jwt").read_text().strip()
+        # the same lookup the licence check uses (AEGIS_LICENSE, then /var/lib/aegis, then /etc/aegis — #126)
+        token, _why = licensing._read_token(os.environ)
     res = contribute(audit_path=args.audit, installation_id=st.installation_id, license_token=token,
                      license_id=(st.license.license_id if st.license else ""), hitl_dir=args.hitl_dir,
                      cursor_path=args.cursor, server=args.push, out=args.out, min_records=args.min_records)

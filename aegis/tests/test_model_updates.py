@@ -72,7 +72,10 @@ def test_install_verifies_then_points_then_rolls_back(tmp_path, keys):
         r1 = mu.download_and_install({"manifest_token": _manifest(keys, "2026.11.1", v1), "url": url + "/v1.tgz"}, dest_root=mu.model_dir(env), keys=keys["pub"])
         assert Path(r1["adapter"]).name == "2026.11.1" and (Path(r1["adapter"]) / "adapter_config.json").exists()
         ptr = mu.write_pointer(r1, pointer=mu.pointer_path(env))
-        assert ptr["run"] == "2026.11.1" and ptr["served_model"] == "2026.11.1" and mu.current_version(env) == "2026.11.1"
+        # served_model is stamped only once the adapter is really loaded into vLLM (round 7 R-9); the pointer is
+        # signed and carries role=triage so startup / hot-reload / the register step accept it (round 7 R-8)
+        assert ptr["run"] == "2026.11.1" and "served_model" not in ptr and ptr["role"] == "triage"
+        assert mu.current_version(env) == "2026.11.1"
         # tampered archive (sha mismatch against the signed manifest) → nothing installed
         with pytest.raises(RuntimeError, match="sha256 mismatch|size mismatch"):
             mu.download_and_install({"manifest_token": _manifest(keys, "2026.11.2", v2), "url": url + "/bad.tgz"}, dest_root=mu.model_dir(env), keys=keys["pub"])

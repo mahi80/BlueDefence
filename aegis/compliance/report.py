@@ -27,15 +27,49 @@ import argparse
 import json
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from aegis.agents.shared.audit import AuditLog
 
 
-def _parse_date(s: str) -> datetime:
-    return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+def _parse_date(s: str, *, end_of_day: bool = False) -> datetime:
+    """A ``--since`` / ``--until`` bound. A date-only ``--until`` means the END of that day: midnight dropped every
+    decision taken during the day the auditor asked for (review round 7 T-7). An explicit offset is honoured."""
+    s = s.strip()
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    if end_of_day and len(s) == 10:                     # YYYY-MM-DD
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return dt
+
+
+_CUSTOMER_KEYS = frozenset({"user_id", "customer_id", "cust_id", "account_id", "src_user", "user"})
+
+
+def _customer_hit(e: dict, customer_id: str) -> bool:
+    """Exact customer-id match (review round 7 T-7: a substring test put CUST10 and CUST123 in CUST1's report)."""
+    alert = e.get("alert") if isinstance(e.get("alert"), dict) else {}
+    if customer_id in (str(e.get("user_id") or ""), str(alert.get("user_id") or "")):
+        return True
+    for a in e.get("recommended_actions", []) or []:
+        if isinstance(a, dict) and str(a.get("target") or "") == customer_id:
+            return True
+
+    def walk(o) -> bool:
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if str(k).lower() in _CUSTOMER_KEYS and not isinstance(v, (dict, list)) and str(v) == customer_id:
+                    return True
+                if isinstance(v, (dict, list)) and walk(v):
+                    return True
+        elif isinstance(o, list):
+            return any(walk(x) for x in o)
+        return False
+
+    return any(walk(it.get("raw_data", {})) for it in (e.get("evidence", []) or []) if isinstance(it, dict))
 
 
 def _load_entries(path: Path) -> list[dict]:
@@ -69,22 +103,20 @@ def _filter_entries(entries: list[dict], *,
                 ts = None
         else:
             ts = None
-        if since and ts and ts < since:
+        if (since or until) and ts is None:
+            continue                     # an undated decision cannot be shown to fall inside the window (T-7)
+        if ts is not None and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        if since and ts < since:
             continue
-        if until and ts and ts > until:
+        if until and ts > until:
             continue
         if verdict and e.get("verdict") != verdict:
             continue
         if specialist and e.get("investigated_by") != specialist:
             continue
-        if customer_id:
-            ev = e.get("evidence", []) or []
-            actions = e.get("recommended_actions", []) or []
-            hit = any(customer_id in (a.get("target") or "") for a in actions)
-            if not hit:
-                hit = any(customer_id in json.dumps(it.get("raw_data", {})) for it in ev)
-            if not hit:
-                continue
+        if customer_id and not _customer_hit(e, customer_id):
+            continue
         out.append(e)
     return out
 
@@ -204,7 +236,7 @@ def main() -> int:
     entries = [e for f in [*log.rotated_files(), audit_path] for e in _load_entries(f)]
 
     since = _parse_date(args.since) if args.since else None
-    until = _parse_date(args.until) if args.until else None
+    until = _parse_date(args.until, end_of_day=True) if args.until else None
     filtered = _filter_entries(
         entries, since=since, until=until,
         verdict=args.verdict, specialist=args.specialist,

@@ -122,6 +122,11 @@ def register_promoted_adapter(registry: VLLMAdapterRegistry, *, pointer_path: Op
     adapter = str(ptr.get("adapter") or "")
     if not name or not adapter:
         return RegisterResult(ok=False, action="error", detail="pointer has no run/adapter")
+    from aegis.finetune.pointer_trust import verify_pointer
+    tok, twhy = verify_pointer(ptr, role_wanted="triage", label=f"promotion pointer {path}")
+    if not tok:                                  # forged / wrong-role / rolled-back pointer (review round 7 R-1)
+        return RegisterResult(ok=False, action="error", served_model=name, adapter=adapter,
+                              detail=f"pointer refused: {twhy}")
     if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") != "1":
         # this is the host that loads the bytes, so it must be able to check them: a hub repo id or a path that is
         # not a local directory used to be loaded unchecked

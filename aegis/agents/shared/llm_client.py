@@ -1352,23 +1352,11 @@ def _json(d: dict) -> str:
     return json.dumps(d, indent=2)
 
 
-_POINTER_SIGNED = ("run", "role", "adapter", "sha256", "approved_by", "promoted_at")
-
-
 def pointer_signature(cur: dict) -> str | None:
-    """HMAC over a promotion pointer's identity fields, with the decision-signing key (``AEGIS_DECISION_KEY`` or one
-    derived from ``AEGIS_CONSOLE_TOKEN``). None when no key is configured. The adapter digest inside an unsigned
-    pointer only proved the pointer agreed with itself (review round 6 J-3)."""
-    import hashlib as _hl
-    import hmac as _hm
-    import json as _js
-
-    from aegis.hitl.signing import _key
-    k = _key()
-    if k is None:
-        return None
-    body = _js.dumps({f: cur.get(f) for f in _POINTER_SIGNED}, sort_keys=True, separators=(",", ":"), default=str)
-    return _hm.new(k, b"aegis-model-pointer-v1|" + body.encode(), _hl.sha256).hexdigest()
+    """HMAC over a promotion pointer's identity fields (re-exported from ``aegis.finetune.pointer_trust``, the one
+    verifier startup, hot-reload, the vLLM register step and model_updates share — review round 7 T-3 / R-1)."""
+    from aegis.finetune.pointer_trust import pointer_signature as _sig
+    return _sig(cur)
 
 
 def _pointer_roots() -> list[str]:
@@ -1391,26 +1379,16 @@ def _promoted_model(var: str = "AEGIS_MODEL_POINTER", *, path: str | None = None
         return None
     role_wanted = expect_role or ("judge" if var == "AEGIS_VOTER_POINTER" or path else "triage")
     try:
-        import hmac as _hm
         import json as _json
+
+        from aegis.finetune.pointer_trust import verify_pointer
         with open(ptr, encoding="utf-8") as fh:
             cur = _json.load(fh)
-        if not isinstance(cur, dict):
-            raise TypeError("not a pointer object")
-        role = str(cur.get("role") or "triage")
-        if role != role_wanted:
-            _log.error("%s %s is a %s pointer, not %s; refused (one pointer per role)", path or var, ptr, role,
-                       role_wanted)
+        ok, why = verify_pointer(cur, role_wanted=role_wanted, label=f"{path or var} {ptr}")
+        if not ok:
+            _log.error("%s; refused", why)
             return None
-        want_sig = pointer_signature(cur)
-        if want_sig is not None and not _hm.compare_digest(str(cur.get("sig") or ""), want_sig):
-            if os.environ.get("AEGIS_ALLOW_UNVERIFIED_MODEL", "") != "1":
-                _log.error("%s %s is not signed by this installation's promotion key; refused", path or var, ptr)
-                return None
-            _log.warning("%s %s unsigned / bad signature, loaded anyway (AEGIS_ALLOW_UNVERIFIED_MODEL=1)", path or var, ptr)
-        elif want_sig is None:
-            _log.warning("promotion pointers are not signed (set AEGIS_DECISION_KEY or AEGIS_CONSOLE_TOKEN): anything "
-                         "that can write %s can choose the model", ptr)
+        role = role_wanted
         adapter = cur.get("adapter")
         if adapter and os.path.isdir(adapter):
             from aegis.finetune.digest import verify_adapter
