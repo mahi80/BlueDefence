@@ -48,9 +48,17 @@ ROLE_ARN=$(terraform output -raw aegis_irsa_role_arn)
 helm install aegis-agent aegis/k8s \
     --namespace bank-prod \
     --set serviceAccount.roleArn="$ROLE_ARN" \
+    --set installation.id="$(python -m aegis.license install-id)" \
+    --set license.existingSecret=aegis-license \
+    --set license.server=https://licence.example \
+    --set 'license.serverCIDRs={203.0.113.10/32}' \
     --set llm.backend=bedrock \
     --set llm.voter_backend=gemma
 ```
+
+Required before install: `installation.id` (or `installation.idSecret`) — the chart refuses to
+render without it — and `AEGIS_AUDIT_KEY` in the `aegis-runtime-credentials` secret (or
+`audit.keySecret`); the pod does not start without it.
 
 ## What the chart does
 
@@ -79,6 +87,18 @@ helm install aegis-agent aegis/k8s \
   cannot exfiltrate to attacker C2.
 - Prometheus scrape annotations point at `/metrics` on the receiver port (8787); the
   scrape job needs the metrics bearer token.
+- Licence (review round 8 R8-13): `AEGIS_LICENSE` points at `/var/aegis/license/license.jwt` on
+  the PVC, because the service renews the token in place and the root filesystem is read-only.
+  `license.existingSecret` (key `license.jwt`) seeds it through the `license-seed` init container
+  (`python -m aegis.license seed`): copied when the PVC has no token or the Secret changed, never
+  over a renewal, and only if it verifies for this installation. `AEGIS_LICENSE_ENFORCE=1` by
+  default (`license.enforce`). `AEGIS_INSTALL_ID` is pinned from `installation.id` /
+  `installation.idSecret` — a pod's machine identity is not stable, and the licence is bound to
+  it. NetworkPolicy has no FQDN rules, so `license.serverCIDRs` (+ `serverPort`) opens egress to
+  the licence service (or your egress proxy); empty = heartbeat/renewal cannot leave the pod.
+- Audit retention key: `AEGIS_AUDIT_KEY` (from `audit.keySecret`) signs the retention checkpoint
+  written by `python -m aegis.audit retire`; retire refuses and verify reports "unverifiable"
+  without it. Rotate with `AEGIS_AUDIT_KEY_PREVIOUS` + `python -m aegis.audit resign`.
 
 ## Production extensions left for the bank's platform team
 
@@ -93,6 +113,7 @@ helm install aegis-agent aegis/k8s \
 
 ```bash
 helm lint aegis/k8s
-helm template aegis-agent aegis/k8s --set serviceAccount.roleArn=arn:aws:iam::000000000000:role/test > /tmp/rendered.yaml
+helm template aegis-agent aegis/k8s --set serviceAccount.roleArn=arn:aws:iam::000000000000:role/test \
+    --set installation.id=bd-test > /tmp/rendered.yaml
 kubectl apply --dry-run=server -f /tmp/rendered.yaml
 ```

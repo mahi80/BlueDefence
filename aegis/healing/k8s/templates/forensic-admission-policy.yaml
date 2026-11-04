@@ -1,7 +1,10 @@
 {{- if .Values.forensics.admissionPolicy }}
 # Bounds what the healing controller's "create jobs" grant can produce (review R-5).
 # RBAC lets the controller create Jobs; this policy rejects every Job it creates
-# that is not the forensic-snapshot shape in forensic-snapshot-job.yaml.
+# that is not the forensic-snapshot shape in forensic-snapshot-job.yaml (the
+# ConfigMap template): one container of the forensic image running its pinned
+# command, the token-less forensic SA, no Secret/projected/hostPath volumes or
+# secret env, placement only via podAffinity to the labelled target pod (R8-9).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -31,16 +34,60 @@ spec:
     message: "controller-created Jobs must not mount an API token"
   - expression: >-
       !has(object.spec.template.spec.volumes) ||
-      object.spec.template.spec.volumes.all(v, !has(v.hostPath))
-    message: "controller-created Jobs may not mount hostPath volumes"
+      object.spec.template.spec.volumes.all(v, has(v.emptyDir) ||
+        (has(v.ephemeral) && has(v.ephemeral.volumeClaimTemplate) &&
+         has(v.ephemeral.volumeClaimTemplate.spec.storageClassName) &&
+         v.ephemeral.volumeClaimTemplate.spec.storageClassName == "{{ .Values.forensics.storageClass }}"))
+    message: "controller-created Jobs may mount only emptyDir and an ephemeral claim in the WORM storage class (no hostPath, secret, projected, configMap or existing PVC)"
+  - expression: >-
+      object.spec.template.spec.containers.all(c,
+        !has(c.envFrom) &&
+        (!has(c.env) || c.env.all(e, !has(e.valueFrom) ||
+          (!has(e.valueFrom.secretKeyRef) && !has(e.valueFrom.configMapKeyRef)))))
+    message: "controller-created Jobs may not read Secrets or ConfigMaps into their environment"
+  - expression: >-
+      !has(object.spec.template.spec.nodeName) &&
+      !has(object.spec.template.spec.nodeSelector) &&
+      !has(object.spec.template.spec.tolerations) &&
+      (!has(object.spec.template.spec.schedulerName) || object.spec.template.spec.schedulerName == "default-scheduler")
+    message: "controller-created Jobs may not pick their node (nodeName bypasses taints): placement comes only from the podAffinity to the target pod"
+  - expression: >-
+      has(object.spec.template.spec.affinity) &&
+      !has(object.spec.template.spec.affinity.nodeAffinity) &&
+      !has(object.spec.template.spec.affinity.podAntiAffinity) &&
+      has(object.spec.template.spec.affinity.podAffinity) &&
+      !has(object.spec.template.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) &&
+      has(object.spec.template.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) &&
+      size(object.spec.template.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) == 1 &&
+      object.spec.template.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t,
+        t.topologyKey == "kubernetes.io/hostname" &&
+        !has(t.namespaces) && !has(t.namespaceSelector) &&
+        has(t.labelSelector) && !has(t.labelSelector.matchExpressions) &&
+        has(t.labelSelector.matchLabels) &&
+        "app.kubernetes.io/name" in t.labelSelector.matchLabels &&
+        t.labelSelector.matchLabels["app.kubernetes.io/name"] == "{{ .Values.target.name }}" &&
+        "aegis.bank/forensic-target" in t.labelSelector.matchLabels)
+    message: "controller-created Jobs must be placed by one required podAffinity to a labelled {{ .Values.target.name }} pod (same node), and nothing else"
+  - expression: >-
+      has(object.spec.template.metadata) && has(object.spec.template.metadata.labels) &&
+      "aegis.bank/role" in object.spec.template.metadata.labels &&
+      object.spec.template.metadata.labels["aegis.bank/role"] == "forensic-snapshot"
+    message: "controller-created Jobs must carry aegis.bank/role=forensic-snapshot (the deny-all NetworkPolicy selects on it)"
   - expression: >-
       (!has(object.spec.template.spec.hostNetwork) || object.spec.template.spec.hostNetwork == false) &&
       (!has(object.spec.template.spec.hostIPC) || object.spec.template.spec.hostIPC == false)
     message: "controller-created Jobs may not use hostNetwork or hostIPC"
   - expression: >-
+      size(object.spec.template.spec.containers) == 1 &&
       object.spec.template.spec.containers.all(c, c.image == "{{ .Values.forensics.image }}") &&
       (!has(object.spec.template.spec.initContainers) || size(object.spec.template.spec.initContainers) == 0)
-    message: "controller-created Jobs must run only the forensic-tools image"
+    message: "controller-created Jobs must run one container of the forensic-tools image"
+  - expression: >-
+      object.spec.template.spec.containers.all(c,
+        has(c.command) && c.command == {{ toJson .Values.forensics.command }} &&
+        ((!has(c.args) && size({{ toJson (default (list) .Values.forensics.args) }}) == 0) ||
+         (has(c.args) && c.args == {{ toJson (default (list) .Values.forensics.args) }})))
+    message: "controller-created Jobs must run the snapshot tool's pinned command and args (forensics.command / forensics.args)"
   - expression: >-
       object.spec.template.spec.containers.all(c,
         !has(c.securityContext) ||
@@ -57,6 +104,63 @@ metadata:
 {{ include "aegis.controllerLabels" . | indent 4 }}
 spec:
   policyName: aegis-forensic-job-shape
+  validationActions: [Deny, Audit]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Values.target.namespace }}
+---
+# The controller patches pods to quarantine them (aegis.bank/quarantined=true) and
+# to mark the snapshot target (aegis.bank/forensic-target). RBAC "patch pods" would
+# also let it change a running pod's container image or other labels; this policy
+# limits its pod updates to exactly those two labels (review round 8 R8-9).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: aegis-healing-pod-patch
+  labels:
+{{ include "aegis.controllerLabels" . | indent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["UPDATE"]
+      resources: ["pods"]
+  matchConditions:
+  - name: by-healing-controller
+    expression: >-
+      request.userInfo.username ==
+      "system:serviceaccount:{{ .Values.target.namespace }}:{{ .Values.controller.serviceAccount }}"
+  variables:
+  - name: newLabels
+    expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+  - name: oldLabels
+    expression: "has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}"
+  - name: mutable
+    expression: "['aegis.bank/quarantined', 'aegis.bank/forensic-target']"
+  validations:
+  - expression: "object.spec == oldObject.spec"
+    message: "the healing controller may not change a pod's spec (image, tolerations, …)"
+  - expression: >-
+      variables.newLabels.all(k, k in variables.mutable ||
+        (k in variables.oldLabels && variables.oldLabels[k] == variables.newLabels[k])) &&
+      variables.oldLabels.all(k, k in variables.mutable || k in variables.newLabels)
+    message: "the healing controller may only set aegis.bank/quarantined and aegis.bank/forensic-target on pods"
+  - expression: >-
+      has(object.metadata.annotations) == has(oldObject.metadata.annotations) &&
+      (!has(object.metadata.annotations) || object.metadata.annotations == oldObject.metadata.annotations)
+    message: "the healing controller may not change pod annotations"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: aegis-healing-pod-patch
+  labels:
+{{ include "aegis.controllerLabels" . | indent 4 }}
+spec:
+  policyName: aegis-healing-pod-patch
   validationActions: [Deny, Audit]
   matchResources:
     namespaceSelector:

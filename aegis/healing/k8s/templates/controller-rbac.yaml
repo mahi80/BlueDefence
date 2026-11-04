@@ -7,9 +7,10 @@
 # ServiceAccount, hostPath, hostPID, privileged. RBAC does not bound that; the
 # ValidatingAdmissionPolicy in templates/forensic-admission-policy.yaml does:
 # a Job created by this ServiceAccount must use the forensic image and the
-# token-less forensic ServiceAccount, with no hostPath volumes, no privileged
-# container, no hostNetwork/hostIPC and no added capabilities beyond
-# SYS_PTRACE/SYS_ADMIN. Do not deploy this Role without that policy (or an
+# token-less forensic ServiceAccount running its pinned command, with no
+# hostPath/secret/projected volumes or secret env, no node override (placement
+# only via podAffinity to the target), no privileged container, no
+# hostNetwork/hostIPC and no added capabilities beyond SYS_PTRACE/SYS_ADMIN. Do not deploy this Role without that policy (or an
 # equivalent Kyverno/Gatekeeper rule) in place.
 apiVersion: v1
 kind: ServiceAccount
@@ -25,10 +26,19 @@ metadata:
   name: {{ .Values.controller.serviceAccount }}
   namespace: {{ .Values.target.namespace }}
 rules:
-# Label / annotate pods to apply quarantine NetworkPolicy
+# Label pods: aegis.bank/quarantined=true (sever — the quarantine NetworkPolicy
+# selects on it) and aegis.bank/forensic-target=<artifact> (the snapshot Job's
+# podAffinity). `patch` is in use; forensic-admission-policy.yaml
+# (aegis-healing-pod-patch) limits it to those two labels — no spec, image or
+# annotation changes (review round 8 R8-9).
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch", "patch"]
+# Read the forensic Job template it instantiates (and nothing else in ConfigMaps)
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["aegis-forensic-job-template"]
+  verbs: ["get"]
 # Create forensic snapshot Jobs (cannot delete other resources)
 - apiGroups: ["batch"]
   resources: ["jobs"]

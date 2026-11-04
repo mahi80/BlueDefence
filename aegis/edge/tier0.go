@@ -24,6 +24,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"regexp"
 )
 
 // Policy: linear-feature classifier as a stand-in for a deployed PPO
@@ -185,6 +187,55 @@ func decide(p *Policy, ev Event) Decision {
 	return d
 }
 
+// idPattern: last-resort id recovery from a line that is not even valid JSON.
+var idPattern = regexp.MustCompile(`"id"\s*:\s*"((?:[^"\\]|\\.)*)"`)
+
+// bestEffortID recovers the event id from a line that failed to decode as an Event, so the fail-closed
+// decision can still be correlated by the consumer. Empty when nothing usable is found.
+func bestEffortID(line []byte) string {
+	var partial struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if json.Unmarshal(line, &partial) == nil && len(partial.ID) > 0 {
+		var s string
+		if json.Unmarshal(partial.ID, &s) == nil {
+			return s
+		}
+		return string(partial.ID) // numeric / other scalar id: keep its literal text
+	}
+	if m := idPattern.FindSubmatch(line); m != nil {
+		var s string
+		if json.Unmarshal(append(append([]byte{'"'}, m[1]...), '"'), &s) == nil {
+			return s
+		}
+	}
+	return ""
+}
+
+// decideLine turns one input line into exactly one encoded decision. An event that does not decode (bad
+// JSON, a string or out-of-range number where a feature belongs) is escalated with HITL, never skipped:
+// a skipped line left the consumer one decision short and mis-aligned (review round 8 R8-1).
+func decideLine(p *Policy, line []byte) []byte {
+	var ev Event
+	var d Decision
+	if err := json.Unmarshal(line, &ev); err != nil {
+		id := ev.ID
+		if id == "" {
+			id = bestEffortID(line)
+		}
+		fmt.Fprintf(os.Stderr, "undecodable event %q: %v — fail-closed escalate\n", id, err)
+		d = failClosed(id)
+	} else {
+		d = decide(p, ev)
+	}
+	out, merr := json.Marshal(d)
+	if merr != nil {
+		// never an empty line: the consumer must see a decision for every event
+		out, _ = json.Marshal(failClosed(d.ID))
+	}
+	return out
+}
+
 func main() {
 	policyPath := flag.String("policy", "policy.json", "Path to PPO/linear policy JSON")
 	flag.Parse()
@@ -209,19 +260,10 @@ func main() {
 			}
 			continue
 		}
-		var ev Event
-		if err := json.Unmarshal(line, &ev); err != nil {
-			fmt.Fprintf(os.Stderr, "skip bad event: %v\n", err)
-			continue
+		if len(bytes.TrimSpace(line)) > 0 { // a blank line is not an event; anything else gets one decision
+			wr.Write(decideLine(p, line))
+			wr.WriteByte('\n')
 		}
-		d := decide(p, ev)
-		out, merr := json.Marshal(d)
-		if merr != nil {
-			// never an empty line: the consumer must see a decision for every event
-			out, _ = json.Marshal(failClosed(ev.ID))
-		}
-		wr.Write(out)
-		wr.WriteByte('\n')
 		if err == io.EOF {
 			return
 		}

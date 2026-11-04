@@ -29,6 +29,39 @@ state:
   size: 10Gi
   storageClassName: ""
 
+# Installation identity (review round 8 R8-13). The licence is bound to AEGIS_INSTALL_ID; a pod's
+# hostname / machine-id is not stable across reschedules, so it is pinned here. One of the two is
+# required — the chart refuses to render without it. Get the id with
+# `python -m aegis.license install-id` once and send it with the licence order.
+installation:
+  id: ""
+  # or read it from a Secret: {name: aegis-installation, key: AEGIS_INSTALL_ID}
+  idSecret:
+    name: ""
+    key: AEGIS_INSTALL_ID
+
+# Licence. The service renews its token in place (7 days before expiry), so the token lives on the
+# state PVC (<state.mountPath>/license/license.jwt). `existingSecret` (key `license.jwt`) seeds it:
+# an init container copies it onto the PVC when the PVC has none or the Secret changed — never over
+# a renewal. No secret = evaluation mode (shadow, external edition, evaluation limits).
+license:
+  enforce: "1"
+  existingSecret: ""
+  server: ""            # https://… licence service (heartbeat, renewal, model updates); empty = offline
+  # NetworkPolicy has no FQDN rules: the CIDR(s) the licence server (or your egress proxy) resolves to.
+  # Empty = no egress rule, and heartbeat/renewal cannot leave the pod.
+  serverCIDRs: []
+  serverPort: 443
+
+# Audit retention key (review round 8 R8-3/R8-4). `python -m aegis.audit retire` signs its retention
+# checkpoint with AEGIS_AUDIT_KEY and refuses without it; verify reports "unverifiable" without it.
+# The pod will not start unless the Secret below has the key. Rotation: move the old value to
+# AEGIS_AUDIT_KEY_PREVIOUS (same Secret), set a new one, run `python -m aegis.audit resign`.
+audit:
+  keySecret:
+    name: aegis-runtime-credentials
+    key: AEGIS_AUDIT_KEY
+
 # IRSA — service account assumes an IAM role with bedrock:Invoke +
 # secretsmanager:GetSecretValue + s3:PutObject on the audit bucket.
 # Set `serviceAccount.roleArn` to the role ARN from the Terraform

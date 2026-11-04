@@ -214,6 +214,11 @@ ask INGEST_BIND "ingest receiver bind (host:port) for WAF/syslog/Kafka-bridge pu
 READ_TOKEN=$( { grep -s '^AEGIS_INGEST_READ_TOKEN=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$READ_TOKEN" ]] || READ_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 CONSOLE_TOKEN=$( { grep -s '^AEGIS_CONSOLE_TOKEN=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$CONSOLE_TOKEN" ]] || CONSOLE_TOKEN=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 SALT=$( { grep -s '^AEGIS_DATASET_SALT=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$SALT" ]] || SALT=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+AUDIT_KEY=$( { grep -s '^AEGIS_AUDIT_KEY=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1); [[ -n "$AUDIT_KEY" ]] || AUDIT_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+# keep an operator's rotation list; an upgrade over a log retired before round 8 (checkpoint signed with the
+# console-token-derived key) lists that key so verify --all keeps passing until the next retire/resign re-signs it
+AUDIT_PREV=$( { grep -s '^AEGIS_AUDIT_KEY_PREVIOUS=' "$ENV_FILE" || true; } | cut -d= -f2- | cut -d' ' -f1)
+if [[ -z "$AUDIT_PREV" && -f "$VAR/audit.jsonl.retention" ]] && ! grep -qs '"kid"' "$VAR/audit.jsonl.retention"; then AUDIT_PREV="console:$CONSOLE_TOKEN"; fi
 HOST_IP=$( { hostname -I 2>/dev/null || echo 127.0.0.1; } | awk '{print $1}')
 
 umask 027
@@ -240,6 +245,10 @@ umask 027
   echo "AEGIS_CONSOLE_TOKEN=$CONSOLE_TOKEN"
   echo "# keys the pseudonyms; never change it after go-live"
   echo "AEGIS_DATASET_SALT=$SALT"
+  echo "# signs audit retention checkpoints (python -m aegis.audit retire); separate from the console token. To rotate:"
+  echo "# move the old value to AEGIS_AUDIT_KEY_PREVIOUS, set a new one, run python -m aegis.audit resign"
+  echo "AEGIS_AUDIT_KEY=$AUDIT_KEY"
+  if [[ -n "$AUDIT_PREV" ]]; then echo "AEGIS_AUDIT_KEY_PREVIOUS=$AUDIT_PREV"; fi
   echo "# derived, rebuildable index of the audit chain for the console (python -m aegis.store reindex); duckdb | sqlite | postgresql | mssql"
   echo "AEGIS_INDEX_URL=duckdb:///$VAR/index.duckdb"
   echo "AEGIS_MODEL_DIR=$VAR/models"
@@ -250,9 +259,11 @@ umask 027
     anthropic) echo "LLM_BACKEND=anthropic"; echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY";;
     *) echo "# deterministic layer only until a model backend is configured"; echo "LLM_BACKEND=mock";;
   esac
+  # enforced on every install, licensed or not: with --no-license this is what makes evaluation mode real
+  # (shadow, external edition, evaluation limits) — unset, the service ran unlicensed with every feature (R8-12)
+  echo "AEGIS_LICENSE_ENFORCE=1"
   if [[ -f "$LIC_FILE" ]]; then
     echo "AEGIS_LICENSE=$LIC_FILE"
-    echo "AEGIS_LICENSE_ENFORCE=1"
     # heartbeat, renewal, contribution, model updates
     [[ -n "$SERVER" ]] && echo "AEGIS_LICENSE_SERVER=$SERVER"
   fi
@@ -345,13 +356,22 @@ cat > /usr/local/bin/aegis-backup <<'EOS'
 # aegis-backup [DEST_DIR] [--with-models]  — one tar.gz of everything that cannot be re-created:
 # config + licence + salt (/etc/aegis), audit chain + segments, HITL journals, ingest/contrib cursors,
 # netops checkpoint, deferred backlog, model pointer (+ adapters with --with-models). Safe while the service runs.
+# The archive holds the licence, every token in aegis.env and the dataset salt: it is written 0600 inside a
+# 0700 directory (review round 8 R8-8 — it used to be 0644 in a 0755 dir, readable by every local user).
 set -euo pipefail
+umask 077
 DEST=${1:-/var/backups/aegis}; WITH_MODELS=0; [[ "${2:-}" == "--with-models" || "${1:-}" == "--with-models" ]] && WITH_MODELS=1
 [[ "$DEST" == "--with-models" ]] && DEST=/var/backups/aegis
-mkdir -p "$DEST"; OUT="$DEST/aegis-$(hostname -s)-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+if [[ ! -d "$DEST" ]]; then mkdir -p -m 700 "$DEST"
+elif [[ "$DEST" == /var/backups/aegis ]]; then chmod 700 "$DEST"
+elif [[ -n "$(find "$DEST" -maxdepth 0 -perm /077 2>/dev/null)" ]]; then
+  echo "WARNING: $DEST is accessible to other users; the backup file itself is 0600 (chmod 700 $DEST to hide its name too)" >&2
+fi
+OUT="$DEST/aegis-$(hostname -s)-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 EX=(--exclude='models/*/*.safetensors' --exclude='models/*/*.bin' --exclude='models/*.part'); [[ $WITH_MODELS -eq 1 ]] && EX=()
-tar -czf "$OUT" "${EX[@]}" -C / etc/aegis var/lib/aegis 2>/dev/null
+tar -czf "$OUT" "${EX[@]}" -C "${AEGIS_BACKUP_ROOT:-/}" etc/aegis var/lib/aegis 2>/dev/null
 sha256sum "$OUT" > "$OUT.sha256"
+chmod 600 "$OUT" "$OUT.sha256"
 echo "backup: $OUT ($(du -h "$OUT" | cut -f1)); verify with: sha256sum -c $OUT.sha256"
 echo "contains: /etc/aegis (config, licence, salt) · /var/lib/aegis (audit, hitl, cursors, state$( [[ $WITH_MODELS -eq 1 ]] && echo ', model weights' ))"
 EOS

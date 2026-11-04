@@ -1,4 +1,7 @@
-"""``python -m aegis.store stats | reindex [--audit PATH] [--hitl DIR] [--url URL]``"""
+"""``python -m aegis.store stats | reindex [--audit PATH] [--hitl DIR] [--url URL]``
+
+``reindex`` exits 1 when the chain breaks or an insert failed (the index is then partial and marked stale).
+"""
 from __future__ import annotations
 
 import argparse
@@ -27,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     res = store.reindex(audit, hitl_dir=Path(a.hitl) if a.hitl else None)
     print(json.dumps({**res, **store.stats()}, indent=2))
+    # a broken chain or a failed insert leaves the index partial: cron / CI must see that (review round 8 R8-6)
+    if res.get("broken_at") or res.get("stale"):
+        print(f"reindex incomplete: broken_at={res.get('broken_at')} stale={res.get('stale')} — "
+              "run python -m aegis.audit verify --all", file=sys.stderr)
+        return 1
     return 0
 
 

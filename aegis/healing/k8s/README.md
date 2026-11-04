@@ -14,8 +14,11 @@ aegis/healing/k8s/
     _helpers.tpl
     rollout.yaml                  Argo Rollouts canary respawn + analysis
     networkpolicy.yaml            Egress allowlist + quarantine deny-all
-    forensic-snapshot-job.yaml    Pre-respawn LiME + criu Job + WORM PVC + its token-less ServiceAccount
-    forensic-admission-policy.yaml  ValidatingAdmissionPolicy bounding the Jobs the controller may create
+    forensic-snapshot-job.yaml    ConfigMap holding the pre-respawn LiME + criu Job template (the controller
+                                  instantiates it; nothing runs at install), its token-less ServiceAccount,
+                                  and a deny-all NetworkPolicy for forensic pods
+    forensic-admission-policy.yaml  ValidatingAdmissionPolicies bounding the Jobs the controller may create
+                                    and the pod patches it may make
     controller-rbac.yaml          Least-privilege ServiceAccount + Role
     controller-deployment.yaml    Healing controller (HA, leader-elected)
 ```
@@ -24,7 +27,7 @@ aegis/healing/k8s/
 
 | Pipeline stage (Python) | K8s artifact |
 |---|---|
-| `snapshot()` | Creates a `Job` from `forensic-snapshot-job.yaml`; LiME captures memory, criu captures process state, tcpdump replays from NetFlow. Output written to `aegis-forensic-pvc` (WORM-class storage). |
+| `snapshot()` | Labels the target pod `aegis.bank/forensic-target=<artifact>`, reads the Job template from the `aegis-forensic-job-template` ConfigMap, substitutes `${TARGET_POD}` / `${ARTIFACT_ID}` and creates the `Job`; a required podAffinity to the labelled pod puts it on the target's node. LiME captures memory, criu captures process state, tcpdump replays from NetFlow. Output goes to a per-snapshot ephemeral claim in the WORM storage class. |
 | `sever()` | Patches the suspect pod with label `aegis.bank/quarantined=true`. The `*-quarantine` NetworkPolicy denies all ingress/egress for any pod with this label. The pod is left running for forensics; quarantine is the active control. |
 | `respawn()` | Patches the Argo `Rollout` to bump replicas + abort the suspect; new pods come up from the immutable image with a fresh workload identity (the `aegis.bank/respawn-generation` annotation forces a rolling restart). |
 | `reonboard()` | Argo Rollouts canary steps gradually shift traffic to the new replicas; the AnalysisTemplate gates promotion on success-rate >= `successThreshold`. |
@@ -50,7 +53,13 @@ kubectl apply --dry-run=server -f /tmp/rendered.yaml
   apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml`.
 - **WORM storage class** (`worm-immutable` in values.yaml) needs to be
   provisioned by the cluster admin — typically a CSI driver mapping to
-  S3 Object Lock, Azure Blob immutability, or GCS Bucket Lock.
+  S3 Object Lock, Azure Blob immutability, or GCS Bucket Lock. It **must use
+  `reclaimPolicy: Retain`**: every snapshot gets its own generic ephemeral
+  claim (no shared ReadWriteOnce claim pinning snapshots to one node), and that
+  claim is deleted with the Job's pod — Retain is what keeps the evidence volume.
+- **Nothing forensic runs at install.** The Job is shipped as a ConfigMap
+  template (`aegis-forensic-job-template`); the controller may `get` only that
+  ConfigMap.
 - **Image registry** (`registry.bank.internal/...`) must be the bank's
   internal mirror with image signing (cosign) enabled. Production
   AdmissionController should reject unsigned images.
@@ -66,8 +75,8 @@ kubectl apply --dry-run=server -f /tmp/rendered.yaml
 
 | Failure | Containment |
 |---|---|
-| Healing controller is compromised | RBAC denies cluster-admin; can only label pods + create Jobs + patch Rollouts in the target namespace. "Create Jobs" alone would let it start any pod, so `forensic-admission-policy.yaml` (ValidatingAdmissionPolicy, Kubernetes ≥ 1.30; `forensics.admissionPolicy`) denies any Job it creates unless it uses the forensic image and the token-less `aegis-forensic-snapshot` ServiceAccount, with no hostPath, hostNetwork/hostIPC, privileged mode or extra capabilities. NetworkPolicy denies egress except to API server + DNS. |
-| Forensic Job is compromised | It runs as its own ServiceAccount with no API token mounted and no container-runtime socket (process state is read via hostPID + SYS_PTRACE), so it cannot call the API or take over the node's runtime. |
+| Healing controller is compromised | RBAC denies cluster-admin; can only label pods + create Jobs + patch Rollouts in the target namespace. "Create Jobs" alone would let it start any pod, so `forensic-admission-policy.yaml` (ValidatingAdmissionPolicy, Kubernetes ≥ 1.30; `forensics.admissionPolicy`) denies any Job it creates unless it is one container of the forensic image running the pinned `forensics.command`/`args`, as the token-less `aegis-forensic-snapshot` ServiceAccount, labelled `aegis.bank/role=forensic-snapshot`, with only emptyDir / WORM ephemeral volumes (no hostPath, Secret, projected, ConfigMap or existing PVC), no Secret/ConfigMap env, no nodeName/nodeSelector/tolerations/custom scheduler (placement only via the podAffinity to the labelled target pod), no hostNetwork/hostIPC, privileged mode or extra capabilities. `patch pods` is needed for the quarantine and forensic-target labels; a second policy (`aegis-healing-pod-patch`) rejects any pod update by the controller that changes the spec, annotations or any other label. NetworkPolicy denies egress except to API server + DNS. |
+| Forensic Job is compromised | It runs as its own ServiceAccount with no API token mounted and no container-runtime socket (process state is read via hostPID + SYS_PTRACE), so it cannot call the API or take over the node's runtime. `aegis-forensic-deny-all` gives forensic pods no ingress and no egress — the memory image cannot leave over the network. |
 | Forensic snapshot Job is compromised | Capabilities limited to SYS_PTRACE + SYS_ADMIN (needs them for memory dump); no privileged: true. Output goes to WORM PVC the Job cannot delete. |
 | Respawn pulls a tampered image | Cluster's image admission controller rejects unsigned/unverified images. The chart references `IfNotPresent` pull policy — production MUST set `Always` once registry signing is enforced. |
 | Rollout regresses | AnalysisTemplate failureLimit aborts on 2 consecutive metric failures; `setWeight` steps with pauses give time to detect. |

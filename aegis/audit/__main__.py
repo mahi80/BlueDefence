@@ -20,8 +20,18 @@ def main(argv: list[str] | None = None) -> int:
                                       "recording a retention checkpoint, so verify --all keeps working")
     r.add_argument("--audit", default=os.environ.get("AEGIS_AUDIT_PATH", "aegis/_audit_log.jsonl"))
     r.add_argument("--segments", type=int, required=True)
+    rs = sub.add_parser("resign", help="re-sign the retention checkpoint with AEGIS_AUDIT_KEY (key rotation: the old key "
+                                         "in AEGIS_AUDIT_KEY_PREVIOUS)")
+    rs.add_argument("--audit", default=os.environ.get("AEGIS_AUDIT_PATH", "aegis/_audit_log.jsonl"))
+    rs.add_argument("--trust-unverified", action="store_true",
+                    help="one-off migration: sign a checkpoint that cannot be verified (unsigned, or the old key is lost); "
+                         "recorded in the checkpoint as vouched_at")
     args = ap.parse_args(argv)
     path = Path(args.audit)
+    if args.cmd == "resign":
+        res = AuditLog(path, repair=False).resign_retention(trust_unverified=args.trust_unverified)
+        print(json.dumps(res))
+        return 0 if res.get("ok") else 1
     if args.cmd == "retire":
         res = AuditLog(path, repair=False).retire_segments(args.segments)
         print(json.dumps(res))
@@ -42,9 +52,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(rep))
     elif rep["ok"]:
         print(f"intact: {rep['entries']} entries across {len(rep['files'])} file(s) · tail {rep.get('tail', '')[:16]}")
+    elif rep.get("unverifiable"):
+        print(f"UNVERIFIABLE: {rep['broken_at'][1]}")
     else:
         print(f"BROKEN at {rep['broken_at']} after {rep['entries']} intact entries")
-    return 0 if rep["ok"] else 1
+    return 0 if rep["ok"] else (3 if rep.get("unverifiable") else 1)
 
 
 if __name__ == "__main__":

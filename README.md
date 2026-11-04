@@ -223,7 +223,12 @@ bank with no egress is fully supported. The BlueDefence side is the licence serv
 
 When things go wrong (`AEGIS_LICENSE_ENFORCE=1`): **grace** runs and warns; **over-limit** forces
 shadow, never a stop; **expired past grace** refuses to *start* (audit tools keep working);
-**missing / invalid** runs in evaluation mode (external, shadow, 100 devices). Nothing is ever
+**missing / invalid** runs in evaluation mode (external, shadow, 100 devices; a dashboard HITL
+transport falls back to the file queue and an `acp` source is dropped, rather than crash-looping;
+a valid licence that arrives later restores the configured edition). `install.sh` writes
+`AEGIS_LICENSE_ENFORCE=1` on every install, `--no-license` included. `AEGIS_LICENSE_PUBKEYS`
+(a bank running its own issuer) is supported but never silent: loud startup warning, `issuer` in
+the licence status, `issuer_overridden` in the heartbeat. Nothing is ever
 deleted, HITL always works, a licence can only cap an edition. An on-prem install can always be
 modified — these controls make that visible within days and self-penalising (the renewal decision
 lives on the server), which is as far as any vendor gets without a hardware root of trust.

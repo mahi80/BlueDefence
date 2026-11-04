@@ -34,7 +34,9 @@ Enforcement (``AEGIS_LICENSE_ENFORCE=1`` — off in dev/CI so tests and evals ru
 The licence can require an edition no higher than it names (a ``soc`` licence cannot run ``full``).
 Public keys: ``aegis/keys/*.pub.json`` ship in the image (``kid`` → key); ``AEGIS_LICENSE_PUBKEYS``
 (a directory or a file) overrides for a bank that rotates to its own issuer. Rotation = add the new
-public key, issue with the new ``kid``, retire the old file.
+public key, issue with the new ``kid``, retire the old file. The override is an operator option, not a
+secret one: it logs a loud warning at startup, and the licence status (``issuer``), ``verify`` and the
+heartbeat (``issuer_overridden``) record that licences are not checked against the BlueDefence keys.
 """
 
 from __future__ import annotations
@@ -217,6 +219,27 @@ def load_public_keys(where: str | Path | None = None) -> dict[str, tuple[int, in
     return out
 
 
+def issuer_override() -> str:
+    """Non-empty when ``AEGIS_LICENSE_PUBKEYS`` replaces the shipped issuer keys (review round 8 R8-12). That is a
+    supported operator option — a bank that runs its own issuer — but whoever controls it can mint any tier, so it is
+    never silent: the licence status, ``verify`` output and the heartbeat all carry it."""
+    v = os.environ.get("AEGIS_LICENSE_PUBKEYS", "").strip()
+    return f"operator keys: AEGIS_LICENSE_PUBKEYS={v}" if v else ""
+
+
+_ISSUER_WARNED: set[str] = set()
+
+
+def _warn_issuer(state: LicenseState) -> None:
+    if state.issuer in _ISSUER_WARNED:
+        return
+    _ISSUER_WARNED.add(state.issuer)
+    logger.warning("[license] !!! licences are verified against %s, NOT the BlueDefence issuer keys shipped in the image. "
+                   "Anyone who can write that location can issue themselves any edition/tier. This is recorded in the "
+                   "licence status and reported in the heartbeat. Unset AEGIS_LICENSE_PUBKEYS unless your bank runs its "
+                   "own issuer.", state.issuer)
+
+
 def write_keypair(out_dir: Path, kid: str, bits: int = 3072) -> tuple[Path, Path]:
     n, e, d = rsa_keygen(bits)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -354,6 +377,7 @@ class LicenseState:
     devices_limit: int = 100
     eps_limit: int = 5
     days_left: float | None = None
+    issuer: str = ""                    # "" = the BlueDefence keys shipped in the image; else the AEGIS_LICENSE_PUBKEYS override
 
     @property
     def runs(self) -> bool:
@@ -374,7 +398,8 @@ class LicenseState:
         lim = f"{lic.devices or '∞'} devices / {lic.eps or '∞'} eps"
         return (f"licence {self.status}: {lic.customer} · {lic.tier} · {lic.edition} · {lim} · {left} · "
                 f"features {','.join(sorted(self.effective_features)) or 'none'}"
-                + (" · data sharing ON" if "data_sharing" in self.effective_features else "") + ("" if self.enforce else " (not enforced)"))
+                + (" · data sharing ON" if "data_sharing" in self.effective_features else "") + ("" if self.enforce else " (not enforced)")
+                + (f" · NON-DEFAULT ISSUER ({self.issuer})" if self.issuer else ""))
 
     def to_dict(self) -> dict:
         lic = self.license
@@ -382,7 +407,8 @@ class LicenseState:
                 "customer": lic.customer if lic else None, "tier": lic.tier if lic else "evaluation", "edition": self.effective_edition,
                 "expires": int(lic.expires) if lic else None, "days_left": round(self.days_left, 1) if self.days_left is not None else None,
                 "features": sorted(self.effective_features), "limits": {"devices": self.devices_limit, "eps": self.eps_limit},
-                "license_id": lic.license_id if lic else None}
+                "license_id": lic.license_id if lic else None, "issuer": self.issuer or "bluedefence",
+                "issuer_overridden": bool(self.issuer)}
 
 
 def _read_token(env: MutableMapping[str, str]) -> tuple[str, str]:
@@ -417,6 +443,8 @@ def check(env: MutableMapping[str, str] | None = None, *, now: float | None = No
     ev = TIER_DEFAULTS["evaluation"]
     st = LicenseState(status="missing", installation_id=inst, enforce=enforce, effective_edition="external",
                       effective_features=set(ev["features"]), devices_limit=ev["devices"], eps_limit=ev["eps"])
+    if keys is None:
+        st.issuer = issuer_override()
     token, why = _read_token(env)
     if not token:
         st.reason = why
@@ -503,6 +531,20 @@ def _drop_forbidden(env: MutableMapping[str, str], edition: str) -> list[str]:
         return []
     ed = _BY_NAME.get(edition)
     dropped: list[str] = []
+    # the transport and source a smaller edition cannot serve (review round 8 R8-2): a soc/full env file names
+    # AEGIS_HITL_TRANSPORT=dashboard and full adds 'acp' to AEGIS_SOURCES — both crash-looped evaluation mode
+    if ed is not None and not ed.dashboard and str(env.get("AEGIS_HITL_TRANSPORT", "")).strip().lower() == "dashboard":
+        _force(env, "AEGIS_HITL_TRANSPORT", "file")
+        logger.warning("[license] edition %s has no dashboard: approvals go to the local file queue (AEGIS_HITL_TRANSPORT=file) "
+                       "for this run", edition)
+        dropped.append("AEGIS_HITL_TRANSPORT")
+    if ed is not None and not ed.bridge:
+        srcs = [x.strip() for x in str(env.get("AEGIS_SOURCES", "")).split(",") if x.strip()]
+        if any(x.lower() == "acp" for x in srcs):
+            _force(env, "AEGIS_SOURCES", ",".join(x for x in srcs if x.lower() != "acp"))
+            logger.warning("[license] edition %s has no Q ↔ AEGIS bridge: source 'acp' dropped from AEGIS_SOURCES for this run "
+                           "(now %r)", edition, env["AEGIS_SOURCES"])
+            dropped.append("AEGIS_SOURCES")
     for var in (ed.forbidden if ed else {}):
         val = str(env.get(var, "")).strip()
         if not val or (var == "ACP_GOVERN" and val.lower() not in ("1", "true", "yes", "on")):
@@ -526,8 +568,15 @@ def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> L
     if state.status == "expired":
         raise LicenseError(f"[license] {state.reason}. Renew the licence (installation {state.installation_id}); "
                            f"audit/verify/export tools keep working: python -m aegis.license verify")
-    explicit = env.get("AEGIS_EDITION", "").strip().lower()
+    if state.issuer:
+        _warn_issuer(state)
+    # judge the edition the OPERATOR configured, not one an earlier evaluation-mode pass forced: a valid licence that
+    # arrives at runtime must bring the configured edition back (review round 8 R8-11 — it stayed 'external')
+    saved = _saved_for(env)
+    configured = saved["AEGIS_EDITION"] if "AEGIS_EDITION" in saved else env.get("AEGIS_EDITION")
+    explicit = str(configured or "").strip().lower()
     wanted = explicit or "full"                                   # aegis.edition.current() defaults to full — mirror it
+    edition_forced = False
     if EDITION_RANK.get(wanted, 0) > EDITION_RANK[state.effective_edition]:
         if state.licensed and explicit:
             raise LicenseError(f"[license] AEGIS_EDITION={wanted} but the licence covers '{state.effective_edition}' — "
@@ -535,9 +584,11 @@ def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> L
         logger.warning("[license] %s: edition %s is not licensed — running as %s",
                        "evaluation mode" if not state.licensed else "licence", wanted, state.effective_edition)
         _force(env, "AEGIS_EDITION", state.effective_edition)
+        edition_forced = True
     elif not explicit:
         _force(env, "AEGIS_EDITION", state.effective_edition)
-    dropped = _drop_forbidden(env, env.get("AEGIS_EDITION", state.effective_edition))
+        edition_forced = True
+    dropped = _drop_forbidden(env, state.effective_edition if edition_forced else wanted)
     if dropped:
         logger.warning("[license] edition %s does not use %s — ignored for this run (the env file is unchanged)",
                        env.get("AEGIS_EDITION"), ", ".join(dropped))
@@ -554,7 +605,7 @@ def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> L
     for k, v in forced.items():
         if env.get(k, "") != v:
             _force(env, k, v)
-    keep = set(forced) | set(dropped) | {"AEGIS_EDITION"}
+    keep = set(forced) | set(dropped) | ({"AEGIS_EDITION"} if edition_forced else set())
     restored = _restore_unforced(env, keep)
     if restored:
         logger.info("[license] %s — restored the configured %s", state.describe(), ", ".join(sorted(restored)))
@@ -673,6 +724,7 @@ def heartbeat_payload(*, installation_id: str, audit_path: Path | None, counters
                                          "AEGIS_LICENSE_ENFORCE", "LLM_BACKEND", "AEGIS_SWARM")}
     return {"installation_id": installation_id, "ts": int(time.time()), "chains_total": chains, "audit_tail_hash": tail,
             "code_fingerprint": code_fingerprint(), "machine_hash": machine_hash(env), "pinned": bool(env.get("AEGIS_INSTALL_ID", "").strip()),
+            "issuer_overridden": bool(env.get("AEGIS_LICENSE_PUBKEYS", "").strip()),
             "flags": flags, "counters": dict(counters or {}), "contrib_cursor": contrib_cursor, "host": platform.node(),
             "python": platform.python_version()}
 
@@ -748,6 +800,32 @@ def install_token(token: str, dest: Path, *, env: MutableMapping[str, str] | Non
     return lic
 
 
+def seed_token(src: Path, dest: Path, *, env: MutableMapping[str, str] | None = None, keys: dict | None = None) -> str:
+    """Kubernetes: copy the licence from its (read-only) Secret mount onto the writable state volume, where the
+    service renews it in place (review round 8 R8-13). Copies when ``dest`` is missing or the Secret's token changed
+    since the last seeding (its digest is kept in ``<dest>.seed``) — never over a renewal the service wrote itself,
+    and only a token that verifies for this installation (``install_token``). Never raises: the pod starts either way."""
+    src, dest = Path(src), Path(dest)
+    try:
+        token = src.read_text().strip()
+    except OSError as e:
+        return f"no licence at {src} ({e.strerror or e}) — evaluation mode unless {dest} exists"
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    marker = dest.with_name(dest.name + ".seed")
+    try:
+        seeded = marker.read_text().strip()
+    except OSError:
+        seeded = ""
+    if dest.is_file() and seeded == digest:
+        return f"kept {dest} (the Secret is unchanged since it was seeded; renewals land there)"
+    try:
+        install_token(token, dest, env=env, keys=keys)
+    except LicenseError as e:
+        return f"not seeded: {e}"
+    marker.write_text(digest + "\n")
+    return f"seeded {dest} from {src}"
+
+
 def token_path(env: MutableMapping[str, str] | None = None) -> Path | None:
     """Where the licence file lives, if it is a file (so a renewed token can be written back)."""
     env = os.environ if env is None else env
@@ -819,6 +897,9 @@ def main(argv: list[str] | None = None) -> int:
     rn = sub.add_parser("renew", help="operator: roll the signed token at the licence service (the service runs this itself 7 days before expiry)")
     rn.add_argument("--server", default=os.environ.get("AEGIS_LICENSE_SERVER", ""))
     rn.add_argument("--license", default="", help="path of the token to renew (default: AEGIS_LICENSE)")
+    sd = sub.add_parser("seed", help="k8s init: copy the licence from a Secret mount onto the writable state volume")
+    sd.add_argument("--from", dest="src", required=True)
+    sd.add_argument("--to", dest="dest", default=os.environ.get("AEGIS_LICENSE", ""))
     sub.add_parser("fingerprint", help="print this install's code fingerprint (what the heartbeat attests)")
     r = sub.add_parser("report", help="operator: signed usage snapshot (counts only) for the true-up")
     r.add_argument("--push", default=os.environ.get("AEGIS_LICENSE_SERVER", ""), help="also POST the report to this licence service (optional)")
@@ -872,6 +953,11 @@ def main(argv: list[str] | None = None) -> int:
               + (" (re-issued: this installation had already redeemed the code)" if res.get("reissued") else ""))
         print(f"set AEGIS_LICENSE={Path(a.out).resolve()} and AEGIS_LICENSE_ENFORCE=1, then: python -m aegis.license verify")
         return 0
+    if a.cmd == "seed":
+        if not a.dest:
+            ap.error("--to (or AEGIS_LICENSE) is required")
+        print(seed_token(Path(a.src), Path(a.dest)))
+        return 0
     if a.cmd == "fingerprint":
         print(code_fingerprint())
         return 0
@@ -909,7 +995,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = ["License", "LicenseState", "LicenseMeter", "LicenseError", "check", "apply", "allows", "issue", "decode", "activate",
-           "renew", "heartbeat", "heartbeat_payload", "code_fingerprint", "token_path", "install_token", "machine_hash", "cached_state",
+           "renew", "heartbeat", "heartbeat_payload", "code_fingerprint", "token_path", "seed_token", "issuer_override", "install_token", "machine_hash", "cached_state",
            "installation_id", "load_public_keys", "write_keypair", "usage_report", "rsa_keygen", "rsa_sign", "rsa_verify",
            "ALL_FEATURES", "TIERS", "TIER_DEFAULTS"]
 
