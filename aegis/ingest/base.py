@@ -124,6 +124,21 @@ class AlertCheckpoint:
                 self._dirty += 1
             self._maybe_flush()
 
+    def aux(self, key: str) -> Any:
+        """Free-form per-source state persisted with the watermark (a kit connector's resume point)."""
+        return self._state.get("aux", {}).get(key)
+
+    def set_aux(self, key: str, value: Any) -> None:
+        with self._lock:
+            aux = self._state.setdefault("aux", {})
+            if value is None:
+                if aux.pop(key, None) is None:
+                    return
+            else:
+                aux[key] = value
+            self._dirty += 1
+            self._maybe_flush()
+
     def seen(self, key: str) -> bool:
         with self._lock:
             return key in self._lru(key)
@@ -325,6 +340,8 @@ class BaseConsumer:
     """Common loop: fetch raw records → normalize → dedupe → yield."""
 
     name = "base"
+    #: advance the watermark per yielded alert (a consumer that pages — kit — commits its own at the end of a pass)
+    advance_per_alert = True
 
     def __init__(self, checkpoint: Optional[AlertCheckpoint] = None):
         self.checkpoint = checkpoint or AlertCheckpoint()
@@ -404,7 +421,7 @@ class BaseConsumer:
                 if callable(done):
                     done()
                 ts = one.get("timestamp")
-                if ts:
+                if ts and self.advance_per_alert:
                     self.checkpoint.advance(self.name, str(ts))
 
     @property

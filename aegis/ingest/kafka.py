@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -99,6 +100,9 @@ class KafkaReader:
             raise ValueError("no Kafka topics configured (AEGIS_KAFKA_TOPICS)")
         self.config = dict(config)
         self.topics = dict(topics)
+        # librdkafka subscribes to a topic name starting with "^" as a regex; m.topic() is then the concrete name,
+        # so the source is found by matching (an exact dict lookup sent those records down the generic path)
+        self._topic_rx = [(re.compile(t), src) for t, src in self.topics.items() if t.startswith("^")]
         self.queue = queue if queue is not None else get_stream()
         self._factory = consumer_factory
         self.batch_size = batch_size
@@ -110,6 +114,14 @@ class KafkaReader:
         self.batches = 0
         self.messages = 0
         self.skipped = 0
+
+    def source_for(self, topic: str) -> str:
+        if topic in self.topics:
+            return self.topics[topic]
+        for rx, src in self._topic_rx:
+            if rx.match(topic):
+                return src
+        return "kafka"
 
     def _make_consumer(self) -> Any:
         if self._factory is not None:
@@ -144,9 +156,13 @@ class KafkaReader:
                 self.skipped += 1
                 logger.warning("[ingest:kafka] %s: message is not UTF-8; skipped", m.topic())
                 continue
-            source = self.topics.get(m.topic(), "kafka")
+            source = self.source_for(m.topic())
             if source == "ocsf" or source.startswith("ocsf-"):
-                lines = [body.strip()] if body.strip().startswith("[") else _split_body(body)
+                from .stream import ocsf_lines_from_body
+                lines, bad = ocsf_lines_from_body(body.encode("utf-8"))   # one event per item, arrays split, none cut
+                if bad:
+                    self.skipped += bad
+                    logger.warning("[ingest:kafka] %s: %d record(s) are not JSON objects; skipped", m.topic(), bad)
             else:
                 lines = _split_body(body)
             by_source.setdefault(source, []).extend(lines)

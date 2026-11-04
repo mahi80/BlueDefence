@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
@@ -124,8 +125,10 @@ def test_watermark_moves_the_next_query(tmp_path):
         calls.append(url)
         return 200, {}, json.dumps([{"uuid": "9", "published": "2026-11-04T05:00:00Z", "severity": "WARN"}])
     env = {"OKTA_API_TOKEN": "x", "OKTA_BASE_URL": "https://example.okta.com"}
-    list(kit.KitConsumer(spec, checkpoint=cp, transport=t, env=env).iter_alerts())
-    list(kit.KitConsumer(spec, checkpoint=cp, transport=t, env=env).iter_alerts())
+    # a fixed clock after the record: a record more than 5 minutes in the future never moves the watermark (I-6)
+    clock = lambda: datetime(2026, 11, 4, 6, 0, tzinfo=UTC).timestamp()
+    list(kit.KitConsumer(spec, checkpoint=cp, transport=t, env=env, clock=clock).iter_alerts())
+    list(kit.KitConsumer(spec, checkpoint=cp, transport=t, env=env, clock=clock).iter_alerts())
     assert "since=2026-11-04T04%3A55%3A00.000Z" in calls[-1]                  # watermark minus the 5-minute overlap
 
 

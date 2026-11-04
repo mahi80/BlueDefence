@@ -13,11 +13,13 @@ auth:
 request:
   method: GET
   url: "https://graph.microsoft.com/v1.0/security/alerts_v2"
-  params: {"$filter": "lastUpdateDateTime gt {watermark}", "$top": "{page_size}"}
+  # oldest first, and the watermark is the field the filter uses: a pass cut short (429, max_pages) then never skips
+  # the alerts on its unread pages (round 6 I-5)
+  params: {"$filter": "lastUpdateDateTime gt {watermark}", "$orderby": "lastUpdateDateTime asc", "$top": "{page_size}"}
 page_size: 200
 records: value
 paging: {type: next_url, path: "@odata.nextLink"}
-watermark: {format: iso, overlap_s: 300, initial_lookback_s: 3600}
+watermark: {field: lastUpdateDateTime, format: iso, overlap_s: 300, initial_lookback_s: 3600}
 format: map
 map:
   id: id

