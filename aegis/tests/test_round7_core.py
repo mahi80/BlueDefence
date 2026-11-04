@@ -56,6 +56,15 @@ def test_r4_evaluation_mode_runs_on_a_dashboard_integrated_host():
 
 
 # --------------------------------------------------------------- R-10 ---
+def test_r10_saved_originals_do_not_leak_across_a_reused_id(monkeypatch):
+    stale = {}
+    env = {"AEGIS_ENFORCEMENT_MODE": "live"}
+    monkeypatch.setitem(L._SAVED, id(env), (stale, {"AEGIS_ENFORCEMENT_MODE": None}))   # a dead dict's entry at this id
+    L.degrade(env)
+    L._restore_unforced(env, set())
+    assert env["AEGIS_ENFORCEMENT_MODE"] == "live"
+
+
 def test_r10_renewal_after_degrade_restores_live_settings():
     env = {"AEGIS_LICENSE_ENFORCE": "1", "AEGIS_EDITION": "soc", "AEGIS_ENFORCEMENT_MODE": "live",
            "AEGIS_SWARM": "1", "AEGIS_INSTALL_ID": "i"}

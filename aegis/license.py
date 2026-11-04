@@ -448,12 +448,21 @@ def check(env: MutableMapping[str, str] | None = None, *, now: float | None = No
 
 # what the operator configured before the licence forced a value — restored when the licence allows it again
 # (review round 7 R-10: a renewal used to leave the evaluation-mode values in place until restart). Keyed by the
-# env mapping's id so tests with their own dicts never share state with os.environ.
-_SAVED: dict[int, dict[str, str | None]] = {}
+# env mapping's id so tests with their own dicts never share state with os.environ. The mapping itself is kept
+# beside its saved values and checked by identity: a bare id() is reused once a mapping is freed, and a new dict
+# would then inherit a dead one's "originals".
+_SAVED: dict[int, tuple[MutableMapping[str, str], dict[str, str | None]]] = {}
+
+
+def _saved_for(env: MutableMapping[str, str]) -> dict[str, str | None]:
+    entry = _SAVED.get(id(env))
+    if entry is None or entry[0] is not env:
+        entry = _SAVED[id(env)] = (env, {})
+    return entry[1]
 
 
 def _force(env: MutableMapping[str, str], key: str, value: str) -> None:
-    saved = _SAVED.setdefault(id(env), {})
+    saved = _saved_for(env)
     if key not in saved:
         saved[key] = env.get(key)
     env[key] = value
@@ -461,7 +470,7 @@ def _force(env: MutableMapping[str, str], key: str, value: str) -> None:
 
 def _restore_unforced(env: MutableMapping[str, str], forced: set[str]) -> list[str]:
     """Put back the operator's own value of every key the licence forced earlier but no longer forces."""
-    saved = _SAVED.get(id(env), {})
+    saved = _saved_for(env)
     back: list[str] = []
     for key in [k for k in saved if k not in forced]:
         original = saved.pop(key)
@@ -501,8 +510,7 @@ def _drop_forbidden(env: MutableMapping[str, str], edition: str) -> list[str]:
         if var == "ACP_GOVERN":
             _force(env, var, "0")
         else:
-            saved = _SAVED.setdefault(id(env), {})
-            saved.setdefault(var, env.get(var))
+            _saved_for(env).setdefault(var, env.get(var))
             env.pop(var, None)
         dropped.append(var)
     return dropped
