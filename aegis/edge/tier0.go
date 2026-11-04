@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 )
 
@@ -67,6 +68,25 @@ func loadPolicy(path string) (*Policy, error) {
 	}
 	if len(p.Weights) != len(p.FeatureMap) {
 		return nil, fmt.Errorf("policy weights (%d) != feature_map (%d)", len(p.Weights), len(p.FeatureMap))
+	}
+	// every index must name a weight row: an out-of-range index used to panic on the first matching event
+	// and take the data plane down (review round 7 R-6)
+	for name, idx := range p.FeatureMap {
+		if idx < 0 || idx >= len(p.Weights) {
+			return nil, fmt.Errorf("feature_map[%q] = %d is outside the %d weight rows", name, idx, len(p.Weights))
+		}
+	}
+	for i, row := range p.Weights {
+		for _, w := range row {
+			if math.IsNaN(w) || math.IsInf(w, 0) {
+				return nil, fmt.Errorf("weight row %d is not finite", i)
+			}
+		}
+	}
+	for _, b := range p.Bias {
+		if math.IsNaN(b) || math.IsInf(b, 0) {
+			return nil, fmt.Errorf("bias is not finite")
+		}
 	}
 	return &p, nil
 }
@@ -108,6 +128,13 @@ func expFast(x float64) float64 {
 	return v
 }
 
+// failClosed: an event the policy cannot score goes to a human, never to "allow".
+func failClosed(id string) Decision {
+	return Decision{ID: id, Action: "escalate", Confidence: 0, HITLRequired: true}
+}
+
+func finite(x float64) bool { return !math.IsNaN(x) && !math.IsInf(x, 0) }
+
 func decide(p *Policy, ev Event) Decision {
 	logits := p.Bias
 	for name, idx := range p.FeatureMap {
@@ -115,11 +142,25 @@ func decide(p *Policy, ev Event) Decision {
 		if !ok {
 			continue
 		}
+		if !finite(val) || idx < 0 || idx >= len(p.Weights) {
+			return failClosed(ev.ID)
+		}
 		logits[0] += p.Weights[idx][0] * val
 		logits[1] += p.Weights[idx][1] * val
 		logits[2] += p.Weights[idx][2] * val
 	}
+	// an extreme feature (1e308 × weight) overflowed to ±Inf → NaN probabilities → argmax "allow" (review round 7 R-6)
+	for _, l := range logits {
+		if !finite(l) {
+			return failClosed(ev.ID)
+		}
+	}
 	probs := softmax(logits)
+	for _, v := range probs {
+		if !finite(v) {
+			return failClosed(ev.ID)
+		}
+	}
 	// argmax
 	best := 0
 	for i, v := range probs {
@@ -174,7 +215,11 @@ func main() {
 			continue
 		}
 		d := decide(p, ev)
-		out, _ := json.Marshal(d)
+		out, merr := json.Marshal(d)
+		if merr != nil {
+			// never an empty line: the consumer must see a decision for every event
+			out, _ = json.Marshal(failClosed(ev.ID))
+		}
 		wr.Write(out)
 		wr.WriteByte('\n')
 		if err == io.EOF {

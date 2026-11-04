@@ -1,8 +1,8 @@
 # AEGIS — Agent layer Helm chart
 
 Ships the agent layer (orchestrator + specialists + meta-agent + RL
-generator) as a Kubernetes Deployment with IRSA, NetworkPolicy egress
-allowlist, HPA, and Prometheus scrape annotations.
+generator) as a single-replica Kubernetes StatefulSet running `python -m aegis.service`,
+with IRSA, a NetworkPolicy egress allowlist and Prometheus scrape annotations.
 
 Pairs with the other two charts in this repo:
 
@@ -17,15 +17,14 @@ Pairs with the other two charts in this repo:
 ```
 aegis/k8s/
   Chart.yaml
-  values.yaml          replicas, resources, IRSA role ARN, LLM backend,
+  values.yaml          receiver port, state PVC, resources, IRSA role ARN, LLM backend,
                        voter backend (multi-provider diversity), egress
                        allowlist, securityContext
   templates/
     _helpers.tpl
     serviceaccount.yaml   IRSA-annotated ServiceAccount
-    deployment.yaml       Deployment + PVC for audit buffer + Service
-    networkpolicy.yaml    Egress allowlist + ingress restricted to OTel
-    hpa.yaml              HPA on CPU + custom alerts_queued metric
+    statefulset.yaml      StatefulSet (replicas 1) + state PVC template + Service
+    networkpolicy.yaml    Egress allowlist + ingress to the receiver (OTel + receiver.ingressFrom)
 ```
 
 ## Prerequisites
@@ -33,7 +32,7 @@ aegis/k8s/
 1. EKS cluster from `aegis/deploy/aws` (or equivalent) with the
    IAM role ARN for IRSA.
 2. Argo Rollouts CRDs installed (only required if you also apply the
-   `aegis/healing/k8s/` chart; this chart uses plain Deployment).
+   `aegis/healing/k8s/` chart; this chart uses a plain StatefulSet).
 3. external-secrets-operator installed (referenced for the runtime
    credentials secret; the actual `ExternalSecret` resource is
    tenant-specific and lives in the bank's own configuration repo,
@@ -55,27 +54,40 @@ helm install aegis-agent aegis/k8s \
 
 ## What the chart does
 
-- Deploys 3 replicas of the agent layer (HPA scales 3-20 based on CPU
-  + custom `aegis_alerts_queued` metric).
-- Mounts a PVC at `/var/aegis/audit` so the local hash-chain survives
-  pod restart while waiting for flush to the S3 Object Lock bucket.
+- Runs exactly **one** pod of `python -m aegis.service --audit /var/aegis/audit/audit.jsonl`.
+  There is deliberately no HPA and no replica knob: the service owns one append-only
+  audit hash chain, one alert checkpoint and one HITL queue, so a second pod would fork
+  the chain and poll every source twice (duplicate verdicts and actions). Scale with
+  `resources`. A StatefulSet (not a Deployment) guarantees the old pod is gone before the
+  new one attaches the volume.
+- One PVC (`volumeClaimTemplates`, `state.size`) at `/var/aegis` holds every writable
+  path — `AEGIS_AUDIT_PATH`, `AEGIS_CHECKPOINT`, `AEGIS_HITL_DIR`, `ACP_HOME`,
+  `AEGIS_TI_CACHE`, `HOME` — so the root filesystem stays read-only and the chain,
+  checkpoint and queue survive restarts. Ship the chain to the S3 Object Lock bucket;
+  the PVC is the working copy.
+- Starts the push receiver on `0.0.0.0:8787` (`AEGIS_INGEST_HTTP=1`): `/healthz` is the
+  readiness probe (503 when degraded takes the pod out of the Service without a restart
+  loop; liveness is a TCP check), `/metrics` is the scrape target (set
+  `AEGIS_METRICS_TOKEN`), `/ingest/*` takes pushed events. The receiver refuses to bind
+  a non-loopback address without `AEGIS_INGEST_TOKEN`, so that key must be in the
+  `aegis-runtime-credentials` secret.
 - IRSA binds the pod's ServiceAccount to an IAM role with
   bedrock:Invoke + secretsmanager:GetSecretValue + audit-bucket
   s3:PutObject. No long-lived static credentials in the pod.
 - NetworkPolicy denies all egress except: DNS, OTel collector, Bedrock
   VPC endpoint, Splunk REST, ServiceNow REST. Compromised agent pod
   cannot exfiltrate to attacker C2.
-- Prometheus scrape annotations + `/metrics` port enable the OTel
-  collector to pick up the per-agent counters automatically.
+- Prometheus scrape annotations point at `/metrics` on the receiver port (8787); the
+  scrape job needs the metrics bearer token.
 
 ## Production extensions left for the bank's platform team
 
 - ExternalSecret resource pointing to the Secrets Manager path
 - Image pull secrets / OCI registry creds (Cosign signature verify
   via admission controller)
-- PodDisruptionBudget tuning to bank's SLO posture
-- Affinity / topologySpreadConstraints across AZs
-- VolumeSnapshot policies for the audit buffer PVC
+- A PodDisruptionBudget (a single pod means node drains cause a short outage; pushes
+  should be retried by the sender)
+- VolumeSnapshot policies for the state PVC
 
 ## Validate locally
 

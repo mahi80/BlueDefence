@@ -9,7 +9,7 @@ home. One licence per installation; a second site is a second licence.
     python -m aegis.license issue   --key keys/license.key --customer "Bank X" --installation <id>
                                     --edition soc --tier standard --days 365 [--devices 2000 --eps 50]
                                     [--feature netops --feature kafka_bridge …] --out license.jwt
-    python -m aegis.license activate --server https://… --code BD-XXXX-XXXX-XXXX [--out /etc/aegis/license.jwt]
+    python -m aegis.license activate --server https://… --code BD-XXXX-XXXX-XXXX [--out /var/lib/aegis/license.jwt]
                                                                       operator: redeem an activation code from the licence
                                                                       service (sends only this installation's id)
     python -m aegis.license verify  [--license license.jwt]           operator: what the running service will conclude
@@ -388,12 +388,13 @@ class LicenseState:
 def _read_token(env: MutableMapping[str, str]) -> tuple[str, str]:
     raw = env.get("AEGIS_LICENSE", "").strip()
     if not raw:
-        for cand in ("/etc/aegis/license.jwt", "./license.jwt"):
+        # /var/lib/aegis first: the systemd unit makes /etc read-only, so renewals land there (review R-2)
+        for cand in ("/var/lib/aegis/license.jwt", "/etc/aegis/license.jwt", "./license.jwt"):
             if Path(cand).is_file():
                 raw = cand
                 break
     if not raw:
-        return "", "no licence (AEGIS_LICENSE unset, no /etc/aegis/license.jwt)"
+        return "", "no licence (AEGIS_LICENSE unset, no /var/lib/aegis/license.jwt or /etc/aegis/license.jwt)"
     try:
         is_file = Path(raw).is_file()
     except OSError:                                             # an inline token is far longer than a path may be
@@ -445,6 +446,76 @@ def check(env: MutableMapping[str, str] | None = None, *, now: float | None = No
     return st
 
 
+# what the operator configured before the licence forced a value — restored when the licence allows it again
+# (review round 7 R-10: a renewal used to leave the evaluation-mode values in place until restart). Keyed by the
+# env mapping's id so tests with their own dicts never share state with os.environ. The mapping itself is kept
+# beside its saved values and checked by identity: a bare id() is reused once a mapping is freed, and a new dict
+# would then inherit a dead one's "originals".
+_SAVED: dict[int, tuple[MutableMapping[str, str], dict[str, str | None]]] = {}
+
+
+def _saved_for(env: MutableMapping[str, str]) -> dict[str, str | None]:
+    entry = _SAVED.get(id(env))
+    if entry is None or entry[0] is not env:
+        entry = _SAVED[id(env)] = (env, {})
+    return entry[1]
+
+
+def _force(env: MutableMapping[str, str], key: str, value: str) -> None:
+    saved = _saved_for(env)
+    if key not in saved:
+        saved[key] = env.get(key)
+    env[key] = value
+
+
+def _restore_unforced(env: MutableMapping[str, str], forced: set[str]) -> list[str]:
+    """Put back the operator's own value of every key the licence forced earlier but no longer forces."""
+    saved = _saved_for(env)
+    back: list[str] = []
+    for key in [k for k in saved if k not in forced]:
+        original = saved.pop(key)
+        if original is None:
+            env.pop(key, None)
+        else:
+            env[key] = original
+        back.append(key)
+    return back
+
+
+def degrade(env: MutableMapping[str, str] | None = None) -> None:
+    """A RUNNING service past grace: shadow + every licensed feature off, remembering what was configured so a
+    renewal (``apply`` on the new state) restores it without a restart."""
+    env = os.environ if env is None else env
+    for k, v in SHADOW_ENV.items():
+        _force(env, k, v)
+    for offs in FEATURE_ENV_OFF.values():
+        for k, v in offs.items():
+            _force(env, k, v)
+
+
+def _drop_forbidden(env: MutableMapping[str, str], edition: str) -> list[str]:
+    """Evaluation / a smaller licensed edition must run, not crash-loop on configuration the smaller edition forbids
+    (review round 7 R-4: an unlicensed host with ACP_DASHBOARD_URL set refused to start). Neutralise those variables
+    for this process — the env file is untouched, so a valid licence brings them back at the next start."""
+    try:
+        from .edition import _BY_NAME
+    except Exception:  # noqa: BLE001
+        return []
+    ed = _BY_NAME.get(edition)
+    dropped: list[str] = []
+    for var in (ed.forbidden if ed else {}):
+        val = str(env.get(var, "")).strip()
+        if not val or (var == "ACP_GOVERN" and val.lower() not in ("1", "true", "yes", "on")):
+            continue
+        if var == "ACP_GOVERN":
+            _force(env, var, "0")
+        else:
+            _saved_for(env).setdefault(var, env.get(var))
+            env.pop(var, None)
+        dropped.append(var)
+    return dropped
+
+
 def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> LicenseState:
     """Make the environment honour the licence (enforce mode only). Called before ``apply_edition``
     so the edition check then sees the licensed edition. Raises ``LicenseError`` when the service
@@ -463,9 +534,13 @@ def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> L
                                f"set AEGIS_EDITION={state.effective_edition} or upgrade the licence")
         logger.warning("[license] %s: edition %s is not licensed — running as %s",
                        "evaluation mode" if not state.licensed else "licence", wanted, state.effective_edition)
-        env["AEGIS_EDITION"] = state.effective_edition
+        _force(env, "AEGIS_EDITION", state.effective_edition)
     elif not explicit:
-        env["AEGIS_EDITION"] = state.effective_edition
+        _force(env, "AEGIS_EDITION", state.effective_edition)
+    dropped = _drop_forbidden(env, env.get("AEGIS_EDITION", state.effective_edition))
+    if dropped:
+        logger.warning("[license] edition %s does not use %s — ignored for this run (the env file is unchanged)",
+                       env.get("AEGIS_EDITION"), ", ".join(dropped))
     forced: dict[str, str] = {}
     for feat, offs in FEATURE_ENV_OFF.items():
         if feat not in state.effective_features:
@@ -478,7 +553,11 @@ def apply(state: LicenseState, env: MutableMapping[str, str] | None = None) -> L
                 forced.update(ons)
     for k, v in forced.items():
         if env.get(k, "") != v:
-            env[k] = v
+            _force(env, k, v)
+    keep = set(forced) | set(dropped) | {"AEGIS_EDITION"}
+    restored = _restore_unforced(env, keep)
+    if restored:
+        logger.info("[license] %s — restored the configured %s", state.describe(), ", ".join(sorted(restored)))
     if forced:
         logger.warning("[license] %s — forced: %s", state.describe(), ", ".join(f"{k}={v}" for k, v in sorted(forced.items())))
     return state
@@ -672,7 +751,8 @@ def install_token(token: str, dest: Path, *, env: MutableMapping[str, str] | Non
 def token_path(env: MutableMapping[str, str] | None = None) -> Path | None:
     """Where the licence file lives, if it is a file (so a renewed token can be written back)."""
     env = os.environ if env is None else env
-    raw = env.get("AEGIS_LICENSE", "").strip() or ("/etc/aegis/license.jwt" if Path("/etc/aegis/license.jwt").is_file() else "")
+    raw = env.get("AEGIS_LICENSE", "").strip() or next(
+        (c for c in ("/var/lib/aegis/license.jwt", "/etc/aegis/license.jwt") if Path(c).is_file()), "")
     try:
         return Path(raw) if raw and Path(raw).is_file() else None
     except OSError:
@@ -729,7 +809,7 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument("--notes", default="")
     i.add_argument("--out", default="license.jwt")
     v = sub.add_parser("verify", help="operator: what the service will conclude from the licence")
-    v.add_argument("--license", help="path or token (default: AEGIS_LICENSE / /etc/aegis/license.jwt)")
+    v.add_argument("--license", help="path or token (default: AEGIS_LICENSE / /var/lib/aegis/license.jwt / /etc/aegis/license.jwt)")
     v.add_argument("--pubkeys", help="directory or file of *.pub.json (default: AEGIS_LICENSE_PUBKEYS / shipped keys)")
     v.add_argument("--json", action="store_true")
     ac = sub.add_parser("activate", help="operator: redeem an activation code from the licence service")

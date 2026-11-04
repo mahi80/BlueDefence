@@ -14,7 +14,8 @@ aegis/healing/k8s/
     _helpers.tpl
     rollout.yaml                  Argo Rollouts canary respawn + analysis
     networkpolicy.yaml            Egress allowlist + quarantine deny-all
-    forensic-snapshot-job.yaml    Pre-respawn LiME + criu Job + WORM PVC
+    forensic-snapshot-job.yaml    Pre-respawn LiME + criu Job + WORM PVC + its token-less ServiceAccount
+    forensic-admission-policy.yaml  ValidatingAdmissionPolicy bounding the Jobs the controller may create
     controller-rbac.yaml          Least-privilege ServiceAccount + Role
     controller-deployment.yaml    Healing controller (HA, leader-elected)
 ```
@@ -65,7 +66,8 @@ kubectl apply --dry-run=server -f /tmp/rendered.yaml
 
 | Failure | Containment |
 |---|---|
-| Healing controller is compromised | RBAC denies cluster-admin; can only label pods + create Jobs + patch Rollouts in the target namespace. NetworkPolicy denies egress except to API server + DNS. |
+| Healing controller is compromised | RBAC denies cluster-admin; can only label pods + create Jobs + patch Rollouts in the target namespace. "Create Jobs" alone would let it start any pod, so `forensic-admission-policy.yaml` (ValidatingAdmissionPolicy, Kubernetes ≥ 1.30; `forensics.admissionPolicy`) denies any Job it creates unless it uses the forensic image and the token-less `aegis-forensic-snapshot` ServiceAccount, with no hostPath, hostNetwork/hostIPC, privileged mode or extra capabilities. NetworkPolicy denies egress except to API server + DNS. |
+| Forensic Job is compromised | It runs as its own ServiceAccount with no API token mounted and no container-runtime socket (process state is read via hostPID + SYS_PTRACE), so it cannot call the API or take over the node's runtime. |
 | Forensic snapshot Job is compromised | Capabilities limited to SYS_PTRACE + SYS_ADMIN (needs them for memory dump); no privileged: true. Output goes to WORM PVC the Job cannot delete. |
 | Respawn pulls a tampered image | Cluster's image admission controller rejects unsigned/unverified images. The chart references `IfNotPresent` pull policy — production MUST set `Always` once registry signing is enforced. |
 | Rollout regresses | AnalysisTemplate failureLimit aborts on 2 consecutive metric failures; `setWeight` steps with pauses give time to detect. |

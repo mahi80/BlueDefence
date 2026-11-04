@@ -13,6 +13,14 @@ forensics:
   pvcSize: 50Gi
   storageClass: worm-immutable
   retentionDays: 2555  # ~7 years for regulatory retention
+  # The snapshot Job's own identity (no API token) and image. The admission
+  # policy only lets the controller create Jobs that use exactly these.
+  serviceAccount: aegis-forensic-snapshot
+  image: registry.bank.internal/aegis/forensic-tools:0.1.0
+  # ValidatingAdmissionPolicy (Kubernetes >= 1.30) that constrains the Jobs the
+  # controller may create. Leave on; turn off only on clusters < 1.30 and replace
+  # it with an equivalent Kyverno/Gatekeeper rule.
+  admissionPolicy: true
 
 # Argo Rollouts canary parameters for the respawn step.
 rollout:

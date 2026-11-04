@@ -185,6 +185,93 @@ class AuditLog:
                 return str(last["integrity_hash"])
         return GENESIS
 
+    # ----------------------------------------------------------- retention --
+    # Retention drops whole rotated segments. Without a record of what was dropped, ``verify --all`` started from
+    # GENESIS and every anchor in a dropped segment read as "the log was truncated" — the documented retention
+    # procedure broke verification for good (review round 7 R-12). ``retire_segments`` writes a checkpoint first:
+    # the hash the first kept row chains from, the anchors that went with the dropped rows, and (when a decision
+    # key is configured) an HMAC so the checkpoint cannot be edited to hide a cut.
+    def retention_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".retention")
+
+    @staticmethod
+    def _retention_sig(body: dict) -> str:
+        try:
+            from aegis.hitl.signing import _key
+            key = _key()
+        except Exception:  # noqa: BLE001
+            key = None
+        if key is None:
+            return ""
+        import hmac as _hmac
+        payload = json.dumps({k: body[k] for k in ("seed", "dropped", "anchors_retired", "entries_retired")},
+                             sort_keys=True, separators=(",", ":")).encode()
+        return _hmac.new(key, b"aegis-audit-retention-v1|" + payload, hashlib.sha256).hexdigest()
+
+    def retention(self) -> tuple[dict | None, str]:
+        """(checkpoint, problem). No checkpoint → (None, ""). A checkpoint that fails its signature → (None, why)."""
+        p = self.retention_path()
+        if not p.exists():
+            return None, ""
+        try:
+            cp = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            return None, f"retention checkpoint unreadable: {e}"
+        if not isinstance(cp, dict) or not isinstance(cp.get("seed"), str):
+            return None, "retention checkpoint malformed"
+        want = self._retention_sig(cp)
+        if want and not __import__("hmac").compare_digest(want, str(cp.get("sig") or "")):
+            return None, "retention checkpoint signature does not match (edited, or signed with another key)"
+        return cp, ""
+
+    def chain_seed(self) -> str:
+        """What the oldest retained row chains from: the retention checkpoint's seed, else GENESIS."""
+        cp, _ = self.retention()
+        return str(cp["seed"]) if cp else GENESIS
+
+    def retire_segments(self, count: int) -> dict:
+        """Drop the ``count`` oldest rotated segments, after verifying them and recording a retention checkpoint.
+        Never drops the live file. Refuses (nothing deleted) when the segments to drop do not verify."""
+        with _LOCK:
+            segments = self.rotated_files()
+            count = max(0, min(int(count), len(segments)))
+            if count == 0:
+                return {"ok": True, "dropped": [], "seed": self.chain_seed()}
+            cp, problem = self.retention()
+            if problem:
+                return {"ok": False, "error": problem}
+            prev = str(cp["seed"]) if cp else GENESIS
+            anchors = self._anchors()
+            retired_anchors = set(cp.get("anchors_retired", [])) if cp else set()
+            entries = int(cp.get("entries_retired", 0)) if cp else 0
+            for seg in segments[:count]:
+                with seg.open("r", encoding="utf-8", errors="replace") as fh:
+                    for n, line in enumerate(fh, 1):
+                        if not line.strip():
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except ValueError:
+                            return {"ok": False, "error": f"{seg.name}:{n} unparseable — not retiring"}
+                        claimed = entry.pop("integrity_hash", "")
+                        actual = hashlib.sha256((prev + json.dumps(entry, sort_keys=True, separators=(",", ":"))).encode()).hexdigest()
+                        if actual != claimed:
+                            return {"ok": False, "error": f"{seg.name}:{n} breaks the chain — not retiring"}
+                        if claimed in anchors:
+                            retired_anchors.add(claimed)
+                        prev = claimed
+                        entries += 1
+            body = {"seed": prev, "dropped": (list(cp.get("dropped", [])) if cp else []) + [s.name for s in segments[:count]],
+                    "anchors_retired": sorted(retired_anchors), "entries_retired": entries, "ts": time.time()}
+            body["sig"] = self._retention_sig(body)
+            tmp = self.retention_path().with_name(self.retention_path().name + ".tmp")
+            tmp.write_text(json.dumps(body, indent=1), encoding="utf-8")
+            os.replace(tmp, self.retention_path())
+            for seg in segments[:count]:
+                seg.unlink()
+            logger.info("[audit] retired %d segment(s); the chain now starts from %s", count, prev[:16])
+            return {"ok": True, "dropped": [s.name for s in segments[:count]], "seed": prev, "signed": bool(body["sig"])}
+
     def rotated_files(self) -> list[Path]:
         """Older segments, oldest first (``audit.jsonl.<utc-ts>``)."""
         return sorted(p for p in self.path.parent.glob(self.path.name + ".*") if p.name[len(self.path.name) + 1:].isdigit())
@@ -291,7 +378,7 @@ class AuditLog:
         as "chain BROKEN at (audit.jsonl, 1)" after the first rotation, and the compliance report failed."""
         rotated = self.rotated_files()
         if not rotated:
-            return GENESIS
+            return self.chain_seed()
         last = ""
         try:
             with rotated[-1].open("rb") as fh:
@@ -311,9 +398,12 @@ class AuditLog:
         """Walk the chain; ``{"ok", "entries", "files", "broken_at": (file, line) | None}``. With ``all_files``
         the rotated segments are verified in order as one chain (the first entry of each segment chains from the
         previous segment's tail)."""
-        prev = GENESIS if all_files else self._live_segment_seed()
+        cp, problem = self.retention()
+        if problem:
+            return {"ok": False, "entries": 0, "files": [], "broken_at": ("<retention>", problem)}
+        prev = (str(cp["seed"]) if cp else GENESIS) if all_files else self._live_segment_seed()
         entries, files = 0, set()
-        anchors = self._anchors() if all_files else set()
+        anchors = (self._anchors() - set(cp.get("anchors_retired", []) if cp else ())) if all_files else set()
         try:
             for f, n, entry in self._iter_entries(all_files):
                 files.add(f.name)

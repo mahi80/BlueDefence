@@ -1,0 +1,135 @@
+# AEGIS runs as ONE pod (review R-3). The service owns a single append-only hash chain
+# (audit.jsonl + its anchor/retention files), the alert checkpoint and the HITL queue; two
+# replicas would fork the chain and poll every source twice (duplicate verdicts, duplicate
+# actions). It is therefore a StatefulSet with replicas fixed at 1 and no HPA — scale the
+# receiver's throughput with resources, not pods. A restarted pod re-attaches the same PVC,
+# so the chain, checkpoint and queue survive.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aegis-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+{{ include "aegis-agent.labels" . | indent 4 }}
+spec:
+  replicas: 1
+  serviceName: aegis-agent
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+{{ include "aegis-agent.labels" . | indent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "aegis-agent.labels" . | indent 8 }}
+      annotations:
+{{ toYaml .Values.podAnnotations | indent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: true   # IRSA web-identity token for Bedrock / Secrets Manager
+      terminationGracePeriodSeconds: 60    # let the cycle finish and the audit file flush
+      securityContext:
+        fsGroup: {{ .Values.securityContext.runAsUser }}
+      containers:
+      - name: agent
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        # aegis.service is the long-running poller + push receiver (aegis.main is a one-shot demo)
+        command: ["python", "-m", "aegis.service", "--audit", "{{ .Values.state.mountPath }}/audit/audit.jsonl"]
+        securityContext:
+{{ toYaml .Values.securityContext | indent 10 }}
+        ports:
+        - name: receiver
+          containerPort: {{ .Values.receiver.port }}
+          protocol: TCP
+        env:
+        # receiver: /healthz (probes), /metrics (scrape, METRICS token), /ingest/* (INGEST token)
+        - name: AEGIS_INGEST_HTTP
+          value: "1"
+        - name: AEGIS_INGEST_BIND
+          value: "0.0.0.0:{{ .Values.receiver.port }}"
+        # every writable path lives on the PVC; the root filesystem stays read-only
+        - name: AEGIS_AUDIT_PATH
+          value: "{{ .Values.state.mountPath }}/audit/audit.jsonl"
+        - name: AEGIS_CHECKPOINT
+          value: "{{ .Values.state.mountPath }}/ingest-checkpoint.json"
+        - name: AEGIS_HITL_DIR
+          value: "{{ .Values.state.mountPath }}/hitl"
+        - name: ACP_HOME
+          value: "{{ .Values.state.mountPath }}/acp"
+        - name: AEGIS_TI_CACHE
+          value: "{{ .Values.state.mountPath }}/cache/threat-intel"
+        - name: HOME
+          value: "{{ .Values.state.mountPath }}/home"
+        - name: LLM_BACKEND
+          value: {{ .Values.llm.backend | quote }}
+        - name: AEGIS_VOTER_BACKEND
+          value: {{ .Values.llm.voter_backend | quote }}
+        - name: AEGIS_PII_TOKENIZATION
+          value: {{ .Values.pii_tokenization_enabled | quote }}
+        - name: AEGIS_TOKEN_BUDGET_INPUT
+          value: {{ .Values.token_budget.max_input | quote }}
+        - name: AEGIS_TOKEN_BUDGET_OUTPUT
+          value: {{ .Values.token_budget.max_output | quote }}
+        - name: AEGIS_TOKEN_BUDGET_COST_CENTS
+          value: {{ .Values.token_budget.max_cost_cents | quote }}
+        # Credentials (AEGIS_INGEST_TOKEN, AEGIS_METRICS_TOKEN, AEGIS_DECISION_KEY, vendor keys) come
+        # from Secrets Manager via external-secrets — never plain values in this chart.
+        envFrom:
+        - secretRef:
+            name: aegis-runtime-credentials
+        resources:
+{{ toYaml .Values.resources | indent 10 }}
+        # Liveness = the receiver socket answers. /healthz returns 503 when a source is degraded
+        # (stale index, broken chain, expired licence); that must take the pod out of the Service,
+        # not restart-loop it, so it is the readiness probe only.
+        livenessProbe:
+          tcpSocket: { port: receiver }
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 6
+        readinessProbe:
+          httpGet: { path: /healthz, port: receiver }
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: state
+          mountPath: {{ .Values.state.mountPath }}
+      volumes:
+      - name: tmp
+        emptyDir: {}
+  # One PVC per pod (= one, ever): audit chain, checkpoint, HITL queue, ACP_HOME, caches.
+  # Ship the chain off-box with the audit-storage module (S3 Object Lock) — the PVC is the
+  # working copy, not the archive.
+  volumeClaimTemplates:
+  - metadata:
+      name: state
+      labels:
+{{ include "aegis-agent.labels" . | indent 8 }}
+    spec:
+      accessModes: [ReadWriteOnce]
+{{- if .Values.state.storageClassName }}
+      storageClassName: {{ .Values.state.storageClassName | quote }}
+{{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.state.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aegis-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+{{ include "aegis-agent.labels" . | indent 4 }}
+spec:
+  selector:
+{{ include "aegis-agent.labels" . | indent 4 }}
+  ports:
+  - name: receiver
+    port: {{ .Values.receiver.port }}
+    targetPort: receiver
