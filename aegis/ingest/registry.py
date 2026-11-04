@@ -1,6 +1,6 @@
 """Build the configured alert sources from the environment.
 
-    AEGIS_SOURCES   comma list of: sample | splunk | sentinel | waf | apigw | ndr | netops | acp | stream | eventhub |
+    AEGIS_SOURCES   comma list of: sample | splunk | sentinel | waf | apigw | ndr | netops | acp | stream | eventhub | kafka |
                     kit:<name> (a declarative connector — ``python -m aegis.ingest.kit list``)   (default: sample)
     AEGIS_CHECKPOINT  path of the JSON checkpoint file (default: ./.aegis-ingest.json)
     WAF_EVENT_FILE  path of the WAF syslog/JSON export to read (for source "waf")
@@ -101,7 +101,7 @@ def sources_from_env() -> list[tuple[str, Iterator[dict]]]:
                 from .kit import consumer_for
                 c = consumer_for(name[4:], checkpoint=checkpoint)
                 out.append((c.name, c.iter_alerts()))
-            elif name in ("stream", "eventhub"):
+            elif name in ("stream", "eventhub", "kafka"):
                 pass                                         # drained once below, after the loop
             elif name == "acp":
                 from .acp import AcpGovernanceConsumer
@@ -117,7 +117,7 @@ def sources_from_env() -> list[tuple[str, Iterator[dict]]]:
     try:
         from .stream import StreamConsumer, get_stream
         q = get_stream()
-        if q.enabled or "stream" in wanted or "eventhub" in wanted:
+        if q.enabled or "stream" in wanted or "eventhub" in wanted or "kafka" in wanted:
             out.append(("stream", StreamConsumer(queue=q, checkpoint=checkpoint).iter_alerts()))
     except Exception as e:  # noqa: BLE001
         logger.error("[ingest] stream source failed to start: %s", str(e)[:200], exc_info=True)

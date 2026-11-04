@@ -20,6 +20,8 @@ dependencies = [
 index = ["sqlalchemy>=2.0,<2.1", "duckdb-engine>=0.17", "duckdb>=1.1"]
 postgres = ["sqlalchemy>=2.0,<2.1", "psycopg2-binary>=2.9"]
 mssql = ["sqlalchemy>=2.0,<2.1", "pyodbc>=5.0"]
+# Kafka ingest (AEGIS_SOURCES=kafka; aegis/ingest/kafka.py)
+kafka = ["confluent-kafka>=2.3"]
 # Posture scans in live mode (AEGIS_POSTURE_LIVE=1). Offline exports need nothing extra.
 posture-aws = ["boto3>=1.34"]
 # Governance runtime — the ACP SDK that governs SOC-AGENTQ-01. Optional: AEGIS runs
