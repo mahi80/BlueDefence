@@ -198,13 +198,48 @@ _KNOWN_BAD = {
 _KNOWN_GOOD = {"10.20.30.40", "192.168.1.5", "172.16.0.10"}
 
 
+def _canon_ip(v: object) -> str:
+    """One spelling per address: ``::ffff:185.220.101.45`` is the seed bad IP ``185.220.101.45`` (round 7 D-11)."""
+    import ipaddress
+    t = str(v or "").strip().strip("[]")
+    try:
+        a = ipaddress.ip_address(t.split("%", 1)[0])
+    except ValueError:
+        return t
+    if a.version == 6 and a.ipv4_mapped is not None:
+        a = a.ipv4_mapped
+    return str(a)
+
+
+def _min_abuse_score() -> int:
+    import os
+    try:
+        return max(0, min(100, int(os.environ.get("AEGIS_TI_MIN_ABUSE_SCORE", "50"))))
+    except ValueError:
+        return 50
+
+
 def ip_reputation(ip: str) -> ToolResult:
+    ip = _canon_ip(ip)
     if ip in _KNOWN_BAD:
         rep = _KNOWN_BAD[ip]
+        # a feed entry is only "known malicious" above the confidence floor: a 0.02-confidence listing (a benign
+        # scanner a feed half-heartedly lists) used to score high like a confirmed C2 (round 7 D-11)
+        try:
+            score = int(rep.get("abuse_score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        floor = _min_abuse_score()
+        if score >= floor:
+            verdict, weight = "known_malicious", "high"
+        elif score >= floor // 2:
+            verdict, weight = "listed_low_confidence", "medium"
+        else:
+            verdict, weight = "listed_low_confidence", "low"
         return ToolResult(
             name="ip_reputation",
-            data={"ip": ip, "verdict": "known_malicious", **rep},
-            weight="high",
+            data={"ip": ip, **rep, "verdict": verdict},
+            weight=weight,
         )
     if ip in _KNOWN_GOOD:
         return ToolResult(
@@ -329,16 +364,44 @@ def _host_is_internal(host: str) -> tuple[bool, str]:
         if ip.is_private or ip.is_reserved or ip.is_unspecified:
             return True, "private/reserved address"
     except ValueError:
-        pass  # not an IP literal; a bare hostname with a dot is treated as external
+        pass  # not an IP literal
+    # Wildcard-DNS services resolve a name to the address written inside it (``169.254.169.254.nip.io``,
+    # ``10-0-0-5.sslip.io``) or always to loopback (``localtest.me``): "a dotted name is external" let both reach
+    # the metadata service (round 7 D-9).
+    if h == "localhost" or h.endswith(".localhost"):
+        return True, "loopback name"
+    for suf in _LOOPBACK_WILDCARD_DNS:
+        if h == suf or h.endswith("." + suf):
+            return True, f"wildcard DNS ({suf}) always resolves to loopback"
+    for suf in _EMBEDDED_IP_DNS:
+        if h.endswith("." + suf):
+            prefix = h[: -len(suf) - 1]
+            m = _EMBEDDED_QUAD.search(prefix)
+            cand = m.group(1).replace("-", ".") if m else ""
+            if not cand:
+                hx = re.search(r"(?:^|[.-])([0-9a-f]{8})$", prefix)
+                cand = str(ipaddress.ip_address(int(hx.group(1), 16))) if hx else ""
+            if cand:
+                inner, why = _host_is_internal(cand)
+                if inner:
+                    return True, f"wildcard DNS ({suf}) to {cand}: {why}"
     return False, ""
+
+
+_LOOPBACK_WILDCARD_DNS = ("localtest.me", "lvh.me", "vcap.me", "lacolhost.com", "localho.st")
+_EMBEDDED_IP_DNS = ("nip.io", "sslip.io", "xip.io", "traefik.me")
+_EMBEDDED_QUAD = re.compile(r"(?:^|[.-])((?:\d{1,3}[.-]){3}\d{1,3})$")
 
 
 def ssrf_probe(raw: str) -> ToolResult:
     """Flag URL-valued input aimed at an internal / metadata / link-local destination.
 
-    Resolved-destination aware: matches RFC1918, loopback, link-local and metadata IPs,
-    internal DNS suffixes, and bare service names (``meta:8000``) — not a hand-written
-    blocklist of three literals (the exact gap that lets ``fetch.php`` reach ``meta:8000``).
+    Matches RFC1918, loopback, link-local and metadata IPs (in any form a resolver accepts),
+    internal DNS suffixes, bare service names (``meta:8000``), and the wildcard-DNS services
+    that resolve to an address written in the name (``169.254.169.254.nip.io``) or always to
+    loopback (``localtest.me``). It does not resolve DNS: any other public-looking name is
+    treated as external, so a domain the attacker controls that points at an internal address
+    (DNS rebinding) is not caught here — that needs the egress proxy's resolved-IP check.
     """
     layers = [raw]
     try:

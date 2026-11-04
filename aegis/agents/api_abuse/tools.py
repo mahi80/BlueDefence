@@ -158,11 +158,13 @@ def auth_boundary_check(role: str | None, endpoint: str | None) -> ToolResult:
 # from API abuse — these are AUTHENTICATED via DB creds, not the
 # application's auth layer.
 
+_MAX_QUERY_SCAN = 16_384
+
 _RISKY_QUERY_PATTERNS = [
     re.compile(r"\bselect\s+\*\s+from\s+(?:customers?|customer_kyc|loan_applications)\b", re.I),
     re.compile(r"\binto\s+outfile\b", re.I),
     re.compile(r"\bdumpfile\b", re.I),
-    re.compile(r"\bcopy\s+\(.*\)\s+to\b", re.I),         # postgres COPY
+    re.compile(r"\bcopy\s*\([\s\S]{0,2000}?\)\s*to\b", re.I),  # postgres COPY (bounded: round 7 D-8 ReDoS)
     re.compile(r"\bbcp\b", re.I),                          # MSSQL bulk copy
     re.compile(r"\bdrop\s+table\b", re.I),
     re.compile(r"\btruncate\s+table\b", re.I),
@@ -208,7 +210,9 @@ def db_direct_query_check(client_app: str | None,
         c in (client_app or "").lower()
         for c in ("psql", "mysql cli", "dbeaver", "ssms", "pgadmin", "mongo shell")
     ))
-    risky_pattern_hits = [str(rx.pattern) for rx in _RISKY_QUERY_PATTERNS if rx.search(query)]
+    # a logged statement is attacker-sized: the patterns only ever need the head of it (round 7 D-8)
+    scan = str(query)[:_MAX_QUERY_SCAN]
+    risky_pattern_hits = [str(rx.pattern) for rx in _RISKY_QUERY_PATTERNS if rx.search(scan)]
     bulk = bool(rows_returned and rows_returned >= 5000)
     if is_dba_client and (risky_pattern_hits or bulk):
         weight = "high"

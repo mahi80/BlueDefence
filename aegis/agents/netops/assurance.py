@@ -360,7 +360,7 @@ class NetworkAssurance:
             return self._link_event(ts, device, iface, state, ev)
         if mn in _ADJ_MNEMONICS:
             return self._adjacency(ts, device, iface, state, ev)
-        if mn in _RESTART_MNEMONICS or mn.split("-")[0] in ("SYS", "PLATFORM", "ENVM") and int(ev.get("severity") or 5) <= 2:
+        if mn in _RESTART_MNEMONICS or mn.split("-")[0] in ("SYS", "PLATFORM", "ENVM") and _sev(ev.get("severity")) <= 2:
             if self._covered(device, ts):
                 return []
             return [self._alert("hardware_fault" if mn.startswith(("PLATFORM", "ENVM")) else "device_restart", device, iface, ts,
@@ -688,3 +688,13 @@ class NetworkAssurance:
 
 
 __all__ = ["NetworkAssurance", "role_of"]
+
+
+def _sev(v: object) -> int:
+    """Syslog severity; 0 (emergency) is the most severe, not "missing" (round 7 D-7 — ``0 or 5`` was 5)."""
+    if v is None or v == "":
+        return 5
+    try:
+        return int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 5

@@ -59,31 +59,77 @@ def pull_mock_seed() -> Iterable[IOC]:
 _STIX_VALUE_RX = re.compile(r"\[(?P<type>[\w-]+):value\s*=\s*'(?P<value>[^']+)'")
 
 
-def parse_stix_bundle(payload: dict) -> list[IOC]:
-    """Convert a STIX 2.1 bundle dict into IOCs. Skips non-indicator objects."""
-    iocs: list[IOC] = []
-    now = time.time()
-    for obj in payload.get("objects", []):
-        if obj.get("type") != "indicator":
-            continue
-        m = _STIX_VALUE_RX.search(obj.get("pattern", ""))
-        if not m:
-            continue
+_STIX_HASH_RX = re.compile(r"\[file:hashes\.(?:'(?P<q>[^']+)'|(?P<u>[\w-]+))\s*=\s*'(?P<value>[0-9A-Fa-f]+)'")
+_STIX_HASH_KIND = {"md5": "hash_md5", "sha-1": "hash_sha1", "sha1": "hash_sha1", "sha-256": "hash_sha256",
+                   "sha256": "hash_sha256"}
+
+
+def _stix_time(v: object) -> float | None:
+    from datetime import datetime
+    if not isinstance(v, str) or not v.strip():
+        return None
+    try:
+        return datetime.fromisoformat(v.strip()).timestamp()
+    except ValueError:
+        return None
+
+
+def _stix_object(obj: dict, now: float) -> IOC | None:
+    if obj.get("type") != "indicator":
+        return None
+    # a feed retracts a false positive (a CDN IP, a shared host) by revoking it or ending its validity: those
+    # used to be ingested as live for 14 days (review round 7 D-10)
+    if obj.get("revoked") is True:
+        return None
+    until = _stix_time(obj.get("valid_until"))
+    if until is not None and until <= now:
+        return None
+    pattern = str(obj.get("pattern", ""))
+    m = _STIX_VALUE_RX.search(pattern)
+    kind: str | None
+    if m:
         kind_map = {
             "ipv4-addr": "ip", "ipv6-addr": "ip",
             "domain-name": "domain", "url": "url",
-            "file": "hash_sha256", "email-addr": "email",
+            "email-addr": "email",
         }
-        kind = kind_map.get(m.group("type"))
-        if not kind:
-            continue
-        labels = tuple(obj.get("labels", ()))
+        kind, value = kind_map.get(m.group("type")), m.group("value")
+    else:
+        h = _STIX_HASH_RX.search(pattern)               # [file:hashes.'SHA-256' = '…'] never matched :value
+        if not h:
+            return None
+        kind = _STIX_HASH_KIND.get(str(h.group("q") or h.group("u") or "").lower())
+        value = h.group("value")
+    if not kind:
+        return None
+    labels = tuple(str(x) for x in (obj.get("labels") or ()) if isinstance(x, (str, int, float)))
+    try:
         confidence = float(obj.get("confidence", 80)) / 100.0
-        iocs.append(IOC(
-            kind=kind, value=m.group("value"),
-            confidence=confidence, source=obj.get("created_by_ref", "stix_feed"),
-            tags=labels, last_seen=now,
-        ))
+    except (TypeError, ValueError):
+        confidence = 0.5                                 # "high" / "medium": a vocabulary, not a number
+    ttl = 86400 * 14
+    if until is not None:
+        ttl = max(60, int(until - now))
+    return IOC(kind=kind, value=value, confidence=confidence, source=str(obj.get("created_by_ref") or "stix_feed"),
+               tags=labels, last_seen=now, ttl_seconds=ttl)
+
+
+def parse_stix_bundle(payload: dict) -> list[IOC]:
+    """Convert a STIX 2.1 bundle dict into IOCs. Skips non-indicator, revoked and expired objects; one malformed
+    object is skipped, never the whole bundle (review round 7 D-10)."""
+    iocs: list[IOC] = []
+    now = time.time()
+    objects = payload.get("objects", []) if isinstance(payload, dict) else []
+    for obj in objects if isinstance(objects, list) else []:
+        if not isinstance(obj, dict):
+            continue
+        try:
+            ioc = _stix_object(obj, now)
+        except Exception as exc:  # noqa: BLE001 — a bad object is skipped, the rest of the feed still loads
+            _log.warning("[threat_intel] skipping malformed STIX object %s: %s", str(obj.get("id"))[:80], exc)
+            continue
+        if ioc is not None:
+            iocs.append(ioc)
     return iocs
 
 

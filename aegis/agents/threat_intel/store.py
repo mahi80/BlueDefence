@@ -32,7 +32,7 @@ _log = logging.getLogger("aegis.threat_intel")
 
 
 IocKind = Literal[
-    "ip", "domain", "url", "hash_md5", "hash_sha256",
+    "ip", "domain", "url", "hash_md5", "hash_sha1", "hash_sha256",
     "email", "asn", "cve", "config",
 ]
 
@@ -58,6 +58,10 @@ class IOCStoreStats:
 
 
 LLM_TAG = "llm-extracted"
+#: a domain IOC carrying this tag also names every host under it (``*.evil.example`` in a feed sets it); without
+#: it the NDR matcher takes the domain exactly (round 7 D-5 — a "malicious" sharepoint.com tenant apex used to
+#: flag every tenant)
+SUBDOMAIN_TAG = "match-subdomains"
 
 
 class IOCStore:
@@ -68,11 +72,20 @@ class IOCStore:
         # what this store pushed into the peer agents' matchers, so expired / removed entries can be taken back
         # out (the seed entries those modules ship with are never touched)
         self._pushed_perimeter: set[str] = set()
-        self._pushed_edr: dict[str, set[str]] = {"hash_md5": set(), "domain": set(), "ip": set()}
+        self._pushed_edr: dict[str, set[str]] = {"hash_md5": set(), "hash_sha1": set(), "hash_sha256": set(),
+                                                 "domain": set(), "ip": set()}
 
     def add(self, ioc: IOC) -> bool:
         """Validate, normalise and store. Returns False (and stores nothing) for a rejected indicator: an
         unknown kind, a malformed value, or the bank's own address space / domains — see ``validate.py``."""
+        if str(ioc.kind).startswith("hash_"):
+            # a feed's "hash" (RF) or a mislabelled MISP sha1: the hex length names the algorithm (round 7 D-12)
+            n = len(str(ioc.value or "").strip())
+            by_len = {32: "hash_md5", 40: "hash_sha1", 64: "hash_sha256"}.get(n)
+            if by_len and by_len != ioc.kind:
+                ioc = replace(ioc, kind=by_len)
+        if ioc.kind == "domain" and str(ioc.value or "").strip().startswith("*.") and SUBDOMAIN_TAG not in ioc.tags:
+            ioc = replace(ioc, tags=tuple(ioc.tags) + (SUBDOMAIN_TAG,))
         value, why = normalise(ioc.kind, ioc.value)
         conf = clamp_confidence(ioc.confidence)
         if value is None or conf is None:
@@ -114,7 +127,9 @@ class IOCStore:
                     confidence=max(ioc.confidence, existing.confidence),
                     source=ioc.source if ioc.confidence > existing.confidence else existing.source,
                     first_seen=existing.first_seen or now,
-                    last_seen=now,
+                    # the newer of the two observations, never "now": two regions syncing hourly used to refresh
+                    # each other forever, so a 3-day indicator nobody re-observed never expired (round 7 D-4)
+                    last_seen=max(existing.last_seen or 0.0, ioc.last_seen or 0.0) or now,
                     tags=tuple(set(existing.tags) | set(ioc.tags)),
                     ttl_seconds=max(ioc.ttl_seconds, existing.ttl_seconds),
                 )
@@ -235,11 +250,13 @@ class IOCStore:
         since expired. Returns count added."""
         from aegis.agents.edr import tools as e
 
-        want: dict[str, dict[str, IOC]] = {"hash_md5": {}, "domain": {}, "ip": {}}
+        # sha256 and sha1 too: only md5 used to reach the EDR, so a sha256 feed indicator never matched (round 7 D-12)
+        want: dict[str, dict[str, IOC]] = {"hash_md5": {}, "hash_sha1": {}, "hash_sha256": {}, "domain": {}, "ip": {}}
         for ioc in self._distributable():
             if ioc.kind in want:
                 want[ioc.kind][ioc.value] = ioc
-        targets = {"hash_md5": e._IOC_HASHES, "domain": e._IOC_DOMAINS, "ip": e._IOC_IPS}
+        targets = {"hash_md5": e._IOC_HASHES, "hash_sha1": e._IOC_SHA1, "hash_sha256": e._IOC_SHA256,
+                   "domain": e._IOC_DOMAINS, "ip": e._IOC_IPS}
         merged = 0
         for kind, target in targets.items():
             pushed = self._pushed_edr[kind]

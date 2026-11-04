@@ -14,6 +14,7 @@ Production swaps (per the project plan):
 """
 from __future__ import annotations
 
+import re
 import statistics
 from dataclasses import dataclass
 
@@ -141,8 +142,9 @@ def velocity_check(user_id: str | None,
         return ToolResult(name="velocity", data={
             "user_id": user_id, "baseline_known": False,
         }, weight="low")
-    count_ratio = recent_24h_count / max(baseline["txn_count_24h_p99"], 1)
-    amt_ratio = (recent_24h_total_inr or 0) / max(baseline["txn_total_24h_p99_inr"], 1)
+    # a count / total sent as text ("12", "9,50,000", "₹9,50,000") used to raise or read as 0 (round 7 D-14)
+    count_ratio = (_amount(recent_24h_count) or 0.0) / max(baseline["txn_count_24h_p99"], 1)
+    amt_ratio = (_amount(recent_24h_total_inr) or 0.0) / max(baseline["txn_total_24h_p99_inr"], 1)
     over_count = count_ratio > 1.0
     over_amount = amt_ratio > 1.0
     # 2x p99 is suspicious; 5x is high-confidence anomaly
@@ -184,10 +186,7 @@ def payment_rail_anomaly(user_id: str | None, rail: str | None,
     # `upi` and `UPI` are one rail (it was "novel" by case alone; review round 3 S3-23)
     rail = str(rail).strip().upper()
     novel_rail = rail not in {str(r).upper() for r in baseline["rails_used"]}
-    try:
-        amount = float(amount_inr or 0)               # a number sent as a string used to raise (S3-22)
-    except (TypeError, ValueError):
-        amount = 0.0
+    amount = _amount(amount_inr) or 0.0               # "₹1,50,000" is 150000, not 0 (S3-22, round 7 D-14)
     high_value = amount >= 100000  # 1L INR threshold for "large"
     weight = "high" if (novel_rail and high_value) else "medium" if novel_rail else "low"
     return ToolResult(name="payment_rail", data={
@@ -213,7 +212,12 @@ def _flag(v: object) -> bool:
 def _amount(v: object) -> float | None:
     import math
     try:
-        f = float(str(v).replace(",", "")) if isinstance(v, str) else float(v)  # type: ignore[arg-type]
+        if isinstance(v, str):
+            # "9,50,000", "₹950000", "INR 9,50,000.00", "Rs. 950000" are all one amount (round 7 D-14)
+            t = re.sub(r"(?i)^\s*(?:₹|inr|rs\.?)\s*|\s*(?:₹|inr|rs\.?)\s*$", "", v)
+            f = float(re.sub(r"[,\s_]", "", t))
+        else:
+            f = float(v)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
     return f if math.isfinite(f) else None

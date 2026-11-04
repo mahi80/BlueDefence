@@ -243,7 +243,8 @@ def test_known_bad_certificate_via_x509_join_and_ioc_store_domain():
     assert a["alert_type"] == "tls_known_bad" and a["severity"] == "high"
     assert a["egress"]["intel"]["confirming"] and a["egress"]["cert"]["sha1"] == sha1
     store = IOCStore()
-    store.add(IOC(kind="domain", value="evil-feed.example", confidence=0.9, source="feed", tags=("c2",)))
+    # round 7 D-5: parent-label matching is opt-in per IOC — a feed's "*.evil-feed.example" opts in
+    store.add(IOC(kind="domain", value="*.evil-feed.example", confidence=0.9, source="feed", tags=("c2",)))
     det = EgressDetector(ioc_store=store)
     (b,) = det.observe(tls("10.20.0.30", "x.evil-feed.example", T))
     assert b["egress"]["intel"]["kind"] == "domain" and b["egress"]["intel"]["source"] == "feed"
@@ -259,9 +260,13 @@ def test_shadow_ai_use_then_upload_and_registered_use_is_quiet(tmp_path):
     for i in range(1, 25):
         ups += det.observe(tls("10.20.0.33", "api.openai.com", T + 120 * i, dst="198.51.100.50", uid=f"A{i}"))
         ups += det.observe(conn("10.20.0.33", T + 120 * i, 500_000, 9_000, dst="198.51.100.50", uid=f"A{i}"))
+    # round 7 D-6: the SNI is still judged as AI use, but the destination IP's own fixed cadence is reported too —
+    # a C2 naming api.openai.com on its own IP used to hide behind "shadow AI, low"
+    beacons = [x for x in ups if x["alert_type"] == "tls_beacon"]
+    ups = [x for x in ups if x["alert_type"] != "tls_beacon"]
     assert [x["egress"]["level"] for x in ups] == [2] and ups[0]["severity"] == "medium"
     assert ups[0]["egress"]["shadow_ai"]["uploaded_last_hour"] >= 10_000_000
-    assert not any(x["alert_type"] == "tls_beacon" for x in ups)                # an AI API is judged as AI use, not C2
+    assert len(beacons) <= 1 and all(b["severity"] in ("low", "medium") for b in beacons)
     quiet = feed(det, [tls("10.30.0.5", "acmebank-prod.openai.azure.com", T + i, dst="198.51.100.40") for i in range(5)])
     quiet += feed(det, [tls("10.20.0.12", "acmebank-prod.openai.azure.com", T + 9, dst="198.51.100.40")])
     assert quiet == []
