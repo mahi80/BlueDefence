@@ -36,10 +36,12 @@ import os
 import re
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
@@ -248,11 +250,26 @@ def _tools(allow_reject: bool) -> list[dict]:
     return tools
 
 
-def _untrusted(label: str, payload: Any) -> str:
+def _untrusted(label: str, payload: Any, *, pii: Any = None) -> str:
+    """Evidence for the analyst's MCP client model, which is outside the bank: credentials redacted AND PII tokenized,
+    the same as every in-house model call. It used to get redaction only, so account numbers, Aadhaar, mobiles and
+    e-mails in evidence left in clear (review round 8 O8-11). ``pii`` is (tokenizer, token map) — the gateway keeps
+    one map so the same value gets the same token across calls and an id it tokenized can be passed back."""
     from aegis.agents.shared.injection_defense import wrap_untrusted
     from aegis.agents.shared.redact import redact_text
     # redact the whole text first, then cut: a cut through a secret used to leave its head unredacted (round 6 M-3)
     text = redact_text(json.dumps(payload, ensure_ascii=False, default=str, indent=1))
+    # tokenize before the cut too, for the same reason; a tokenizer failure withholds the data (fail closed)
+    try:
+        if pii is None:
+            from aegis.agents.shared.pii_tokenizer import PIITokenizer
+            text, _ = PIITokenizer().tokenize(text)
+        else:
+            tokenizer, tm = pii
+            text, _ = tokenizer.tokenize(text, into=tm)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[mcp] PII tokenization failed, result withheld: %s", str(e)[:120])
+        return "AEGIS could not mask personal data in this result, so it is withheld."
     if len(text) > MAX_RESULT_CHARS:
         text = text[:MAX_RESULT_CHARS] + "\n… [truncated]"
     w = wrap_untrusted(label, text)
@@ -271,6 +288,24 @@ class Gateway:
         self.allow_reject = bool(allow_reject and self.user)
         if allow_reject and not self.user:
             logger.warning("[mcp] AEGIS_MCP_ALLOW_REJECT=1 but AEGIS_MCP_USER is unset; reject stays off")
+        from aegis.agents.shared.pii_tokenizer import PIITokenizer, TokenMap
+        self._tokenizer = PIITokenizer()
+        self._tm = TokenMap(OrderedDict(), {})
+        self._lock = threading.Lock()
+
+    def _pii(self) -> tuple[Any, Any]:
+        with self._lock:
+            if len(self._tm.by_token) > 20_000:              # a long session: start a fresh map (and nonce)
+                from aegis.agents.shared.pii_tokenizer import TokenMap
+                self._tm = TokenMap(OrderedDict(), {})
+            return self._tokenizer, self._tm
+
+    def _untrusted(self, label: str, payload: Any) -> str:
+        return _untrusted(label, payload, pii=self._pii())
+
+    def _arg(self, args: dict, key: str) -> str:
+        """An id the client read from a tokenized result may carry a PII token: map it back to the real id."""
+        return self._tokenizer.detokenize(str(args.get(key) or ""), self._tm)
 
     def call(self, name: str, args: dict) -> tuple[str, bool]:
         """(text, is_error)."""
@@ -284,15 +319,15 @@ class Gateway:
                 rows = (self.backend.chains(limit if verdict is None else min(limit * 10, 1000)) or {}).get("chains") or []
                 if verdict:
                     rows = [r for r in rows if r.get("verdict") == verdict]
-                return _untrusted("aegis_verdicts", {"count": len(rows[:limit]), "chains": rows[:limit]}), False
+                return self._untrusted("aegis_verdicts", {"count": len(rows[:limit]), "chains": rows[:limit]}), False
             if name == "aegis_get_evidence_chain":
-                cid = str(args.get("id") or "")
+                cid = self._arg(args, "id")
                 if not _ID_RX.match(cid):
                     return "id must be a chain_id (integrity hash) or alert_id", True
                 c = self.backend.chain(cid)
                 if not c:
                     return f"no evidence chain {cid}", True
-                return _untrusted("aegis_evidence_chain", c), False
+                return self._untrusted("aegis_evidence_chain", c), False
             if name == "aegis_list_approvals":
                 status = str(args.get("status") or "pending")
                 if status not in _STATUSES:
@@ -301,11 +336,11 @@ class Gateway:
                 rows = (self.backend.approvals() or {}).get("approvals") or []
                 if status != "all":
                     rows = [r for r in rows if r.get("status") == status]
-                return _untrusted("aegis_approvals", {"count": len(rows[:limit]), "approvals": rows[:limit]}), False
+                return self._untrusted("aegis_approvals", {"count": len(rows[:limit]), "approvals": rows[:limit]}), False
             if name == "aegis_list_proposals":
-                return _untrusted("aegis_proposals", self.backend.proposals() or {}), False
+                return self._untrusted("aegis_proposals", self.backend.proposals() or {}), False
             if name == "aegis_reject_action" and self.allow_reject:
-                aid, reason = str(args.get("approval_id") or ""), str(args.get("reason") or "").strip()
+                aid, reason = self._arg(args, "approval_id"), str(args.get("reason") or "").strip()
                 if not _ID_RX.match(aid):
                     return "approval_id is not a valid id", True
                 if len(reason) < 10:

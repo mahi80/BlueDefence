@@ -53,6 +53,14 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 }
 _IP_FIELDS = ("source_ip", "src_ip", "client_ip", "ip", "remote_ip")
 _WAF_ACTIONS = frozenset({"block", "challenge", "throttle"})
+# Network-block actions act on an address / name at the perimeter. The alert's `host` / `hostname` / `device` is
+# the bank's own served virtual host on a WAF / proxy alert and the victim on an EDR alert, so "block -> hostname"
+# or "block_egress -> host" resolved to an action on the bank's own site — the O-7 `domain` outcome by another
+# name (review round 8 O8-9). Those symbols stay unresolved on these actions: the connector refuses the field
+# name and the action parks for a human.
+_NET_BLOCK_ACTIONS = frozenset({"block", "block_egress", "throttle", "challenge", "drop", "sinkhole", "block_ip",
+                                "block_domain", "block_export"})
+_OWN_HOST_FIELDS = frozenset({"host", "hostname", "device"})
 _EMPTY = frozenset({"", "?", "unknown", "anonymous", "none", "null", "n/a", "-"})
 
 
@@ -75,6 +83,10 @@ def resolve_action_targets(chain: Any, alert: dict) -> list[dict]:
         if key not in _ALIASES:
             continue
         src, value = "", ""
+        if key in _OWN_HOST_FIELDS and str(action.action_type) in _NET_BLOCK_ACTIONS:
+            changes.append({"action": action.action_type, "field": field, "unresolved": True,
+                            "note": f"`{field}` names the bank's own host on this alert — never a network-block target"})
+            continue
         if key in ("session", "session_id") and action.action_type in _WAF_ACTIONS:
             src, value = _value(alert, _IP_FIELDS)
             note = "session acted on at its client IP (WAFs act per IP)"

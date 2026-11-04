@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -15,6 +17,10 @@ SENSITIVITY = {
     "beneficiary_account": 0.5, "mule_account": 0.9, "bank_account": 0.6, "firewall_rule": 0.6, "group": 0.3, "unknown": 0.3,
 }
 CRITICAL = 0.85     # nodes at or above this sensitivity count as "critical assets reached"
+
+
+class _ChokeTimeout(Exception):
+    """choke_edges ran past its time box."""
 
 
 @dataclass(eq=False)
@@ -114,39 +120,120 @@ class BlastGraph:
         ts = [n.first_touch for n in self.reached() if n.first_touch]
         return min(ts) if ts else None
 
-    def choke_edges(self, top: int = 5) -> list[dict]:
+    def choke_edges(self, top: int = 5, max_seconds: float | None = None) -> list[dict]:
         """Edges whose removal disconnects the most critical nodes from the seeds — the 2.6
-        minimum-cut candidates. Brute-force single-edge removal over the reached subgraph; the
-        graphs are small (hundreds of edges) so this is cheap and exact for one-edge cuts."""
+        minimum-cut candidates, exact for one-edge cuts.
+
+        An edge is a one-edge cut for a critical node exactly when it dominates that node from the seeds. It used
+        to be found by removing each edge in turn and re-walking the graph — O(E²): a dense 400-node / 15,000-edge
+        telemetry answer took 8 s, with no time box, before the (time-boxed) planner even started (review round 8
+        O8-12). Now each edge is a node of its own in the graph (a → edge → b), the dominator tree from a virtual
+        root over the seeds is computed once (Cooper–Harvey–Kennedy), and each critical node's cut edges are the
+        edge-nodes on its dominator chain. Also time-boxed (``AEGIS_CHOKE_MAX_SECONDS``, default 2 s, the planner's
+        budget): past it the answer is ``[]`` and ``"choke_edges"`` is listed in ``truncated``."""
         key = (len(self.edges), len(self.nodes), top)
         if self._choke_cache is not None and self._choke_cache[0] == key:
             return self._choke_cache[1]
         crit = {n.id for n in self.critical_reached()}
         if not crit:
             return []
-        seeds = {n.id for n in self.nodes.values() if n.distance == 0}
-        base = self._reach(seeds, self.edges)
-        out = []
-        # only an edge on some seed → critical path can be a cut: skip the rest instead of re-walking the graph
-        # once per edge (review B8 — a 2,000-edge hub took 10 s, three times per investigation)
-        rev: dict[str, list[str]] = {}
-        for e in self.edges:
-            rev.setdefault(e.b, []).append(e.a)
-        to_crit = set(crit); stack = list(crit)                 # nodes from which some critical node is reachable
-        while stack:
-            for y in rev.get(stack.pop(), ()):
-                if y not in to_crit:
-                    to_crit.add(y); stack.append(y)
-        for i, e in enumerate(self.edges):
-            if e.a not in base or e.b not in to_crit:
-                continue
-            rest = self.edges[:i] + self.edges[i + 1:]
-            lost = (crit & base) - self._reach(seeds, rest)
-            if lost:
-                out.append({"edge": f"{e.a} -{e.relation}-> {e.b}", "protects": sorted(lost), "n": len(lost), "source": e.source})
+        if max_seconds is None:
+            try:
+                max_seconds = float(os.environ.get("AEGIS_CHOKE_MAX_SECONDS", "") or 2.0)
+            except ValueError:
+                max_seconds = 2.0
+        deadline = time.monotonic() + max(0.05, max_seconds)
+        try:
+            out = self._choke_by_dominators(crit, deadline)
+        except _ChokeTimeout:
+            if "choke_edges" not in self.truncated:
+                self.truncated.append("choke_edges")
+            out = []
         out.sort(key=lambda d: (-d["n"], d["edge"]))
         self._choke_cache = (key, out[:top])
         return out[:top]
+
+    def _choke_by_dominators(self, crit: set[str], deadline: float) -> list[dict]:
+        seeds = [n.id for n in self.nodes.values() if n.distance == 0]
+        idx: dict[str, int] = {}
+        succ: list[list[int]] = [[]]                         # 0 = virtual root
+        edge_of: dict[int, int] = {}                         # graph vertex -> index into self.edges
+        def vid(x: str) -> int:
+            v = idx.get(x)
+            if v is None:
+                v = idx[x] = len(succ); succ.append([])
+            return v
+        for sd in seeds:
+            succ[0].append(vid(sd))
+        for i, e in enumerate(self.edges):
+            ev = len(succ); succ.append([]); edge_of[ev] = i
+            succ[vid(e.a)].append(ev)
+            succ[ev].append(vid(e.b))
+        n = len(succ)
+        # iterative DFS post-order from the root (only what the seeds reach)
+        post = [-1] * n
+        order: list[int] = []
+        seen = [False] * n
+        seen[0] = True
+        stack: list[tuple[int, int]] = [(0, 0)]
+        while stack:
+            v, k = stack[-1]
+            if k < len(succ[v]):
+                stack[-1] = (v, k + 1)
+                w = succ[v][k]
+                if not seen[w]:
+                    seen[w] = True; stack.append((w, 0))
+            else:
+                stack.pop(); post[v] = len(order); order.append(v)
+        preds: list[list[int]] = [[] for _ in range(n)]
+        for v in order:
+            for w in succ[v]:
+                preds[w].append(v)
+        idom = [-1] * n
+        idom[0] = 0
+        rpo = order[::-1]
+        changed, rounds = True, 0
+        while changed:
+            changed, rounds = False, rounds + 1
+            if time.monotonic() > deadline:
+                raise _ChokeTimeout
+            for b in rpo:
+                if b == 0:
+                    continue
+                new = -1
+                for p in preds[b]:
+                    if idom[p] < 0:
+                        continue
+                    if new < 0:
+                        new = p
+                        continue
+                    f1, f2 = p, new
+                    while f1 != f2:
+                        while post[f1] < post[f2]:
+                            f1 = idom[f1]
+                        while post[f2] < post[f1]:
+                            f2 = idom[f2]
+                    new = f1
+                if new >= 0 and idom[b] != new:
+                    idom[b] = new; changed = True
+        protects: dict[int, list[str]] = {}
+        for c in crit:
+            v = idx.get(c)
+            if v is None or not seen[v]:
+                continue
+            steps = 0
+            while v != 0:
+                v = idom[v]
+                if v in edge_of:
+                    protects.setdefault(edge_of[v], []).append(c)
+                steps += 1
+                if steps % 4096 == 0 and time.monotonic() > deadline:
+                    raise _ChokeTimeout
+        out = []
+        for i, lost in protects.items():
+            e = self.edges[i]
+            out.append({"edge": f"{e.a} -{e.relation}-> {e.b}", "protects": sorted(lost), "n": len(lost), "source": e.source})
+        return out
 
     @staticmethod
     def _reach(seeds: set[str], edges: list[Edge]) -> set[str]:
