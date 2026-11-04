@@ -224,8 +224,22 @@ def _value_test(v: Any, mods: tuple[str, ...]) -> list[Callable[[Any], bool]]:
     if "windash" in mods:
         variants = list({s, s.replace("-", "/"), s.replace("/", "-"), s.replace("-", "–")})
     contains, start, end = "contains" in mods, "startswith" in mods, "endswith" in mods
+    if not any("*" in x or "?" in x or "\\\\" in x for x in variants):      # a lone backslash (Windows path) is literal
+        # no wildcard and no escape: plain case-insensitive string tests (most SigmaHQ values) — far cheaper than a regex
+        lows = tuple(x.lower() for x in variants)
+        if contains:
+            return [lambda x, lows=lows: any(v in _low(x) for v in lows)]
+        if start:
+            return [lambda x, lows=lows: _low(x).startswith(lows)]
+        if end:
+            return [lambda x, lows=lows: _low(x).endswith(lows)]
+        return [lambda x, lows=lows: _low(x) in lows]
     rxs = [_glob_rx(x, contains=contains, start=start, end=end) for x in variants]
     return [lambda x, rxs=rxs: any(r.match(str(x)) for r in rxs)]
+
+
+def _low(x: Any) -> str:
+    return str(x).lower()
 
 
 def _compile_field(key: str, value: Any) -> _Field:
@@ -265,7 +279,20 @@ def _walk(obj: Any, parts: list[str]) -> list[Any]:
     return out
 
 
+_LOCAL = threading.local()            # per-event lookup cache while SigmaEngine.match runs
+
+
 def field_values(ev: dict, sigma_field: str) -> list[Any]:
+    cache = getattr(_LOCAL, "cache", None)
+    if cache is not None and cache[0] is ev:
+        hit = cache[1].get(sigma_field)
+        if hit is None:
+            hit = cache[1][sigma_field] = _field_values(ev, sigma_field)
+        return hit
+    return _field_values(ev, sigma_field)
+
+
+def _field_values(ev: dict, sigma_field: str) -> list[Any]:
     paths = FIELD_MAP.get(sigma_field.lower(), ())
     for p in paths:
         vals = [v for v in _walk(ev, p.split(".")) if v is not None and v != ""]
@@ -301,7 +328,8 @@ def _field_match(f: _Field, ev: dict) -> bool:
         return not vals
     if not vals:
         return False
-    vals = [str(v)[:MAX_VALUE] if isinstance(v, str) else v for v in vals]
+    if any(isinstance(v, str) and len(v) > MAX_VALUE for v in vals):
+        vals = [v[:MAX_VALUE] if isinstance(v, str) else v for v in vals]
     if f.need_all:
         return all(any(t(v) for v in vals) for t in f.tests)
     return any(t(v) for t in f.tests for v in vals)
@@ -519,12 +547,16 @@ class SigmaEngine:
         except (TypeError, ValueError):
             return []
         out = []
-        for r in self._by_class.get(cls, ()):
-            try:
-                if r.match(ev):
-                    out.append(r)
-            except Exception as e:  # noqa: BLE001 — one rule's bad regex never stops the others
-                logger.debug("[sigma] rule %s failed on an event: %s", r.id, e)
+        _LOCAL.cache = (ev, {})            # each field is looked up once per event, not once per rule
+        try:
+            for r in self._by_class.get(cls, ()):
+                try:
+                    if r.match(ev):
+                        out.append(r)
+                except Exception as e:  # noqa: BLE001 — one rule's bad regex never stops the others
+                    logger.debug("[sigma] rule %s failed on an event: %s", r.id, e)
+        finally:
+            _LOCAL.cache = None
         return out
 
 

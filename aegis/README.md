@@ -832,8 +832,9 @@ before any model call.
     Script Activity (1009); Linux auditd; AV detections → Detection Finding (2004); Kubernetes, Bitbucket and GitHub
     audit → API Activity (6003); plus the process, file, network, DNS, web, cloud and identity categories.
   * **Against SigmaHQ (Nov 2026):** 3,109 rules load. 52 are skipped: 25 below the level floor, 15 with a logsource
-    that has no OCSF class, and 12 that use an unsupported modifier. On one core, a process event takes about 20 ms
-    against the 1,724 process rules; an event-log or script event takes about 1 ms.
+    that has no OCSF class, and 12 that use an unsupported modifier. On one core, a process event takes about 8 ms
+    against the 1,724 process rules; an event-log or script event takes about 1 ms. Each field is looked up once per
+    event, and values without wildcards use plain string tests instead of regexes.
   * `AEGIS_SIGMA_MIN_LEVEL` (default `low`) sets the lowest rule level loaded.
   * `python -m aegis.detect --rules <dir> events.ndjson` shows what loads and what fires.
 * **Kafka at scale:** `AEGIS_SOURCES=kafka` joins a consumer group (`aegis/ingest/kafka.py`, extra `aegis[kafka]`).
