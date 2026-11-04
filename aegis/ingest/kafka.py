@@ -32,7 +32,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from .eventhub import _split_body
+from .base import dead_letter_record, json_depth_ok, max_json_depth
+from .eventhub import split_body
 from .stream import StreamQueue, get_stream
 
 logger = logging.getLogger("aegis.ingest.kafka")
@@ -114,6 +115,18 @@ class KafkaReader:
         self.batches = 0
         self.messages = 0
         self.skipped = 0
+        self.poisoned = 0
+
+    def _poison(self, m: Any, body: Any, why: str) -> None:
+        """A message that can never be read: counted, set aside in the dead-letter file with its topic / partition /
+        offset, and committed past with the rest of the batch (round 8 G8-1)."""
+        self.poisoned += 1
+        self.skipped += 1
+        topic = m.topic()
+        part = m.partition() if callable(getattr(m, "partition", None)) else None
+        off = m.offset() if callable(getattr(m, "offset", None)) else None
+        logger.error("[ingest:kafka] %s[%s]@%s: poison message skipped (%s)", topic, part, off, why)
+        dead_letter_record(f"kafka:{topic}:{part}:{off}", body, why, topic=topic, partition=part, offset=off)
 
     def source_for(self, topic: str) -> str:
         if topic in self.topics:
@@ -157,14 +170,24 @@ class KafkaReader:
                 logger.warning("[ingest:kafka] %s: message is not UTF-8; skipped", m.topic())
                 continue
             source = self.source_for(m.topic())
-            if source == "ocsf" or source.startswith("ocsf-"):
-                from .stream import ocsf_lines_from_body
-                lines, bad = ocsf_lines_from_body(body.encode("utf-8"))   # one event per item, arrays split, none cut
-                if bad:
-                    self.skipped += bad
-                    logger.warning("[ingest:kafka] %s: %d record(s) are not JSON objects; skipped", m.topic(), bad)
-            else:
-                lines = _split_body(body)
+            try:
+                if source == "ocsf" or source.startswith("ocsf-"):
+                    from .stream import ocsf_lines_from_body
+                    lines, bad = ocsf_lines_from_body(body.encode("utf-8"))   # one event per item, arrays split, none cut
+                    if bad and not json_depth_ok(body):
+                        self._poison(m, body, f"OCSF record(s) nested past {max_json_depth()} levels")
+                        self.skipped += bad - 1
+                    elif bad:
+                        self.skipped += bad
+                        logger.warning("[ingest:kafka] %s: %d record(s) are not JSON objects; skipped", m.topic(), bad)
+                else:
+                    lines, bad = split_body(body)
+                    if bad:
+                        self._poison(m, body, f"{bad} record(s) nested past {max_json_depth()} levels")
+            except Exception as e:  # noqa: BLE001 — a message that cannot be parsed is skipped, never re-read forever
+                # (round 8 G8-1: a RecursionError here reconnected the consumer and re-read the same offset for good)
+                self._poison(m, body, f"{type(e).__name__}: {str(e)[:120]}")
+                continue
             by_source.setdefault(source, []).extend(lines)
         for source, lines in by_source.items():
             attempt = 0

@@ -76,7 +76,7 @@ class SplunkESConsumer:
     def iter_notable_events(
         self,
         *,
-        urgency: str = "high|medium",
+        urgency: str = "critical|high|medium",
         status: str = "unassigned",
         earliest_time: str = "-24h",
         max_count: int = 200,

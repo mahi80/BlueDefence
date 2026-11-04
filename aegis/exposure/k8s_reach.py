@@ -54,16 +54,29 @@ def _internal_ingress(ing: dict) -> bool:
 _MODSEC = "nginx.ingress.kubernetes.io/enable-modsecurity"
 
 
+def modsec_engine(snippet: str) -> str:
+    """The SecRuleEngine a ModSecurity snippet leaves in force: comments ignored, the LAST directive wins (it used to
+    be a substring match, so "# SecRuleEngine On" in a comment, or On followed by DetectionOnly, counted as
+    blocking — round 8 G8-10). ``""`` when the snippet never sets it (ingress-nginx's default is DetectionOnly)."""
+    engine = ""
+    for raw in str(snippet or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        tok = line.split(None, 2)
+        if tok[0].lower() == "secruleengine" and len(tok) > 1:
+            engine = tok[1].strip("\"'").lower()
+    return engine
+
+
 def _waf_ingress(ing: dict) -> bool:
     ann = {k.lower(): str(v).lower() for k, v in (_meta(ing).get("annotations") or {}).items()}
     for k in INGRESS_WAF_ANNOTATIONS:
         if ann.get(k) in (None, "", "false"):
             continue
-        if k == _MODSEC:
-            # ingress-nginx runs ModSecurity in DetectionOnly unless the snippet turns the engine on (G-1)
-            snippet = ann.get("nginx.ingress.kubernetes.io/modsecurity-snippet", "")
-            if "secruleengine on" not in " ".join(snippet.split()):
-                continue
+        # ingress-nginx runs ModSecurity in DetectionOnly unless the snippet turns the engine on (G-1)
+        if k == _MODSEC and modsec_engine(ann.get("nginx.ingress.kubernetes.io/modsecurity-snippet", "")) != "on":
+            continue
         return True
     return False
 

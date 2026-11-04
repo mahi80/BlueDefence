@@ -24,6 +24,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .base import (
+    JsonTooDeep,
+    dead_letter_record,
+    json_depth_ok,
+    loads_bounded,
+    max_json_depth,
+)
 from .stream import StreamQueue, get_stream
 
 logger = logging.getLogger("aegis.ingest.eventhub")
@@ -50,6 +57,7 @@ class EventHubReader:
         self._client: Any = None
         self.batches = 0
         self.events = 0
+        self.poisoned = 0
 
     # -- checkpoint
     def _load(self) -> dict[str, int]:
@@ -99,15 +107,18 @@ class EventHubReader:
         lines: list[str] = []
         last_seq: Optional[int] = None
         for ev in events:
-            try:
-                body = ev.body_as_str() if hasattr(ev, "body_as_str") else str(ev)
-            except Exception as e:  # noqa: BLE001 — one undecodable event
-                logger.warning("[ingest:eventhub] partition %s: event body unreadable: %s", pid, str(e)[:120])
-                continue
-            lines.extend(_split_body(body))
             seq = getattr(ev, "sequence_number", None)
             if isinstance(seq, int):
-                last_seq = seq
+                last_seq = seq                       # every event moves the checkpoint, a skipped one included
+            try:
+                body = ev.body_as_str() if hasattr(ev, "body_as_str") else str(ev)
+                got, bad = split_body(body)
+            except Exception as e:  # noqa: BLE001 — one unreadable event is skipped, never the batch (G8-1)
+                self._poison(pid, seq, None, f"{type(e).__name__}: {str(e)[:120]}")
+                continue
+            if bad:
+                self._poison(pid, seq, body, f"{bad} record(s) nested past {max_json_depth()} levels")
+            lines.extend(got)
         if not self.queue.put_many(self.source, lines):
             # queue full: do not advance the checkpoint; the SDK will not re-deliver, so retry the same batch until
             # it fits or we are stopped. Blocking here is the backpressure: the partition stops fetching. It used to
@@ -133,6 +144,14 @@ class EventHubReader:
                 partition_context.update_checkpoint(events[-1])
         except Exception:  # noqa: BLE001 — no checkpoint store configured is the normal case
             pass
+
+    def _poison(self, pid: str, seq: Any, body: str | None, why: str) -> None:
+        """A record that can never be read: counted, set aside in the dead-letter file with its position, and
+        checkpointed past — re-reading it forever stalled the partition (round 8 G8-1)."""
+        self.poisoned += 1
+        logger.error("[ingest:eventhub] partition %s seq %s: poison record skipped (%s)", pid, seq, why)
+        dead_letter_record(f"eventhub:{self.eventhub_name or 'hub'}:{pid}:{seq}", body, why,
+                           source=self.source, partition=pid, sequence_number=seq)
 
     # -- lifecycle
     def _make_client(self) -> Any:
@@ -190,20 +209,39 @@ class EventHubReader:
             self._thread.join(join_timeout)
 
 
-def _split_body(body: str) -> list[str]:
+def split_body(body: str) -> tuple[list[str], int]:
+    """An event / message body → (lines, poison): ``{"records": [...]}`` is split per record, NDJSON per line. A JSON
+    record nested past ``AEGIS_INGEST_MAX_JSON_DEPTH`` is a poison record: counted in ``poison``, not returned
+    (round 8 G8-1 — it raised RecursionError and stalled the partition)."""
     body = body.strip()
     if not body:
-        return []
+        return [], 0
     if body.startswith("{"):
         try:
-            obj = json.loads(body)
+            obj = loads_bounded(body)
+        except JsonTooDeep:
+            # the whole body is one over-deep document: nothing in it can be read safely
+            return [], 1
         except ValueError:
             obj = None
         if isinstance(obj, dict) and isinstance(obj.get("records"), list):
-            return [json.dumps(r) for r in obj["records"] if isinstance(r, dict)]
+            return [json.dumps(r) for r in obj["records"] if isinstance(r, dict)], 0
         if isinstance(obj, dict):
-            return [body]
-    return [ln for ln in body.split("\n") if ln.strip()]
+            return [body], 0
+    out: list[str] = []
+    bad = 0
+    for ln in body.split("\n"):
+        if not ln.strip():
+            continue
+        if ln.lstrip()[:1] in ("{", "[") and not json_depth_ok(ln):
+            bad += 1
+            continue
+        out.append(ln)
+    return out, bad
+
+
+def _split_body(body: str) -> list[str]:
+    return split_body(body)[0]
 
 
 def eventhub_from_env(queue: Optional[StreamQueue] = None) -> Optional[EventHubReader]:

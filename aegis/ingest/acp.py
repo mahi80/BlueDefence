@@ -117,6 +117,14 @@ class AcpGovernanceConsumer(BaseConsumer):
             for ev in events:
                 if isinstance(ev, dict):
                     yield ev
+                    # resumed: the base loop handled this event (yielded and marked its alert, or read it past as
+                    # below the floor). The watermark is the last event READ, not the last alert yielded: below-floor
+                    # events never moved it, so 20 pages of LOW rows were re-read from the same point every poll
+                    # and a CRITICAL behind them was never reached (round 8 G8-9). A caller stopping on an alert
+                    # never resumes here, so that alert's event is re-read next poll (at-least-once).
+                    ts = ev.get("ts")
+                    if ts:
+                        self.checkpoint.advance(self.name, str(ts))
             nxt = str(data.get("next_since") or "")
             if not events or not nxt or nxt == since:
                 return

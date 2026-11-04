@@ -52,6 +52,74 @@ def severity_to_score(raw: Any) -> float:
     return _SEVERITY_SCORE.get(normalize_severity(raw), 0.6)
 
 
+# ---- bounded JSON (round 8 G8-1) ------------------------------------------------------------------------------
+# A 400 KB record of 200,000 nested brackets raised RecursionError out of json.loads in the Kafka / Event Hubs
+# readers and the push receiver: the reader reconnected and re-read the same message forever (the partition
+# stalled) and the receiver answered 500 for the whole batch. Nesting is bounded at parse, without recursion; a
+# record past the bound is a poison record — rejected, counted and dead-lettered by the caller, never retried.
+MAX_JSON_DEPTH = 64
+_JSON_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"|[\[\]{}]')
+
+
+class JsonTooDeep(ValueError):
+    """A JSON record nests deeper than ``AEGIS_INGEST_MAX_JSON_DEPTH`` (a poison record)."""
+
+
+def max_json_depth() -> int:
+    try:
+        return max(1, int(os.environ.get("AEGIS_INGEST_MAX_JSON_DEPTH", "") or MAX_JSON_DEPTH))
+    except ValueError:
+        return MAX_JSON_DEPTH
+
+
+def json_depth_ok(text: str | bytes, limit: int | None = None) -> bool:
+    """True when ``text`` nests at most ``limit`` arrays / objects deep. Iterative and string-aware (a bracket inside
+    a string is data, so an attacker cannot get a normal record rejected by putting brackets in a URL)."""
+    if isinstance(text, (bytes, bytearray)):
+        text = bytes(text).decode("utf-8", errors="replace")
+    limit = max_json_depth() if limit is None else limit
+    if text.count("[") + text.count("{") <= limit:           # C-speed fast path: cannot be deeper than that
+        return True
+    depth = 0
+    for m in _JSON_TOKEN.finditer(text):
+        t = m.group()
+        if t in ("[", "{"):
+            depth += 1
+            if depth > limit:
+                return False
+        elif t in ("]", "}"):
+            depth -= 1
+    return True
+
+
+def loads_bounded(text: str | bytes, limit: int | None = None) -> Any:
+    """``json.loads`` that refuses over-deep nesting with ``JsonTooDeep`` (a ``ValueError``) instead of recursing
+    into a ``RecursionError``. Malformed JSON raises ``json.JSONDecodeError`` as usual."""
+    if not json_depth_ok(text, limit):
+        raise JsonTooDeep(f"JSON nested deeper than {max_json_depth() if limit is None else limit} levels")
+    try:
+        return json.loads(text)
+    except RecursionError as e:                               # belt and braces: a smaller interpreter stack
+        raise JsonTooDeep("JSON nesting exhausted the parser stack") from e
+
+
+def dead_letter_record(rid: str, body: Any, reason: str, **where: Any) -> bool:
+    """Set a raw poison record aside (``AEGIS_DEAD_LETTER``) with where it came from (topic / partition / offset),
+    so a person can look at it; the reader then moves past it. The body is kept up to 64 KB with its size and hash."""
+    import hashlib
+
+    from ..ops import dead_letter
+    raw = body if isinstance(body, (bytes, bytearray)) else (str(body).encode("utf-8", "replace") if body is not None else b"")
+    row = {"id": rid, "kind": "poison_record", **{k: v for k, v in where.items() if v is not None},
+           "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+           "raw_prefix": bytes(raw[:65536]).decode("utf-8", "replace")}
+    try:
+        return dead_letter.write(row, reason)
+    except Exception as e:  # noqa: BLE001 — setting it aside is best effort; the skip is already logged
+        logger.error("[ingest] poison record %s could not be dead-lettered: %s", rid, str(e)[:160])
+        return False
+
+
 def _feed_family(source: Any) -> str:
     """The feed a pushed record came through (``edr``, ``cloudflare``, ``waf``, ``alerts`` …), not the free-text
     ``?source=`` / ``?collector=`` suffix: two HA relays (``edr-relay-a`` / ``edr-relay-b``) carrying the same

@@ -234,8 +234,8 @@ def reconcile(store: Path, record: dict, *, hitl: Any = None, now: datetime | No
 
     # 1) new proposals for findings in the proposal tiers
     for fp, row in open_rows.items():
-        if row["extra"].get("tier") not in tiers or row.get("stale"):
-            continue
+        if row["extra"].get("tier") not in tiers or row.get("stale") or row["extra"].get("unverifiable"):
+            continue                    # an ambiguous scanner key is not a finding a change can be proposed for
         p = props.get(fp)
         if p and p.get("status") in OPEN_STATES:
             continue
@@ -301,6 +301,12 @@ def reconcile(store: Path, record: dict, *, hitl: Any = None, now: datetime | No
             continue
         if row is not None and row.get("stale"):
             p["verification"] = "not re-tested: the scan failed this run"
+            continue
+        if row is not None and row["extra"].get("unverifiable"):
+            # the scanner's key now names several assets (a private IP reused in another VPC): this run cannot say
+            # whether the fix landed, so it stays open — it used to be dropped and marked verified_closed (G8-6)
+            why = str(row["extra"]["unverifiable"]).removeprefix("ambiguous asset: ")
+            p["verification"] = f"unverifiable (ambiguous asset): {why} — kept open"
             continue
         if row is not None and row["extra"].get("tier") not in tiers and _path_still_open(row["extra"]):
             # it left the proposal tier only because the exploitation signal moved (EPSS fell, KEV / PoC flags

@@ -151,7 +151,8 @@ def test_alerts_passthrough_requires_ids(server):
     srv, q = server
     good = json.dumps({"id": "A-1", "source": "harness", "severity": "high", "source_ip": "203.0.113.5", "payload": "GET /x"})
     status, out = _post(f"{srv.url}/ingest/alerts", (good + "\nnot json\n" + json.dumps({"noid": 1})).encode())
-    assert status == 200 and out == {"ok": True, "accepted": 1, "rejected": 2}
+    assert status == 200 and {k: out[k] for k in ("ok", "accepted", "rejected")} == {"ok": True, "accepted": 1, "rejected": 2}
+    assert [e["line"] for e in out["rejected_lines"]] == [2, 3]            # each rejected record is named (round 8 G8-3)
     status, _ = _post(f"{srv.url}/ingest/alerts", b'{"noid": true}')
     assert status == 415
     (a,) = list(StreamConsumer(queue=q, checkpoint=AlertCheckpoint()).iter_alerts())

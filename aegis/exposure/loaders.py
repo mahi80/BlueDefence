@@ -286,6 +286,9 @@ def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> N
     groups; an NLB without security groups passes every listener. An AWS WAF web ACL on the ALB
     counts as a WAF in front of its targets."""
     by_key = {k: a for a in assets for k in a.keys | {a.id}}
+    # the ranges each instance opens to the internet ITSELF (a public address + its own security group), before any
+    # load balancer adds a path: a port reachable that way bypasses the ALB and its web ACL (round 8 G-1 variant b)
+    direct = {a.id: list(a.internet_ports) if a.public else [] for a in assets}
     for lb in bundle.get("load_balancers") or []:
         if lb.get("Scheme") != "internet-facing":
             continue
@@ -309,16 +312,20 @@ def _apply_aws_load_balancers(bundle: dict, sgs: dict, assets: list[Asset]) -> N
                 if a is None:
                     continue
                 r = (tp, tp)
+                bypass = any(lo <= tp <= hi for lo, hi in direct.get(a.id, ()))
                 if r not in a.internet_ports:
                     a.internet_ports.append(r)
-                a.internet_via.setdefault(r, f"load balancer {name} (listener {lp} → port {tp})")
+                if not bypass:   # the direct path is the one to report (and to cut): it stays "on the instance"
+                    a.internet_via.setdefault(r, f"load balancer {name} (listener {lp} → port {tp})")
                 if r not in a.opened_by:   # the listener's own SG rule is what lets the internet in
                     a.opened_by[r] = {g for (lo, hi), gs in lb_open_by.items() if lo <= lp <= hi for g in gs}
                     a.entry_port[r] = int(lp)
                 a.fronted_by |= {x for x in (name, lb.get("DNSName")) if x}
                 a.public = True
-                if lb.get("web_acl"):
-                    a.waf_ranges.add(r)          # this path only — not ports opened straight to the instance (G-1)
+                if lb.get("web_acl") and not bypass:
+                    # this path only — not ports opened straight to the instance (G-1); and not when the same port is
+                    # ALSO open straight to the instance: the attacker takes that path, around the web ACL (G-1 b)
+                    a.waf_ranges.add(r)
 
 
 def assets_from_inventory(path: str | Path) -> list[Asset]:
@@ -350,17 +357,55 @@ def assets_from_inventory(path: str | Path) -> list[Asset]:
     return out
 
 
+def _zone_scoped(key: str) -> bool:
+    """A key that only names one machine INSIDE its network: a private / link-local / ULA address, a VPC-internal
+    DNS name, a bare host name or Name tag. Two VPCs (or accounts) reuse them freely."""
+    k = str(key).strip().lower()
+    try:
+        ip = ipaddress.ip_address(k)
+    except ValueError:
+        return "." not in k or k.endswith((".internal", ".local", ".localdomain", ".lan"))
+    return not ip.is_global
+
+
+def _same_asset(m: Asset, a: Asset, holders: dict[str, int]) -> bool:
+    if a.id == m.id or a.id in m.keys or m.id in a.keys:
+        return True                                   # instance id / resource id / the inventory's asset id
+    shared = m.keys & a.keys
+    if any(not _zone_scoped(k) for k in shared):
+        return True                                   # a public address, an FQDN, a cloud instance id
+    for k in shared:
+        if m.zone and a.zone:
+            if m.zone == a.zone:
+                return True                           # same VPC / zone: the private address names one machine
+        elif holders.get(k, 0) == 1:
+            return True                               # a zone-less record (inventory) and only one asset holds it
+    return False
+
+
 def merge_assets(*groups: list[Asset]) -> list[Asset]:
-    """Later groups (the inventory) override earlier ones (cloud) for the same asset id or key —
-    the bank's own record of role / WAF / EDR wins over what the collector inferred."""
-    merged: dict[str, Asset] = {}
+    """Later groups (the inventory) override earlier ones (cloud) for the same asset — the bank's own record of
+    role / WAF / EDR wins over what the collector inferred.
+
+    Two assets are the same machine when they share an id or a globally unique key (public address, FQDN, instance
+    id). A private address is unique only inside its VPC / zone: it used to merge ANY two assets sharing it, so a
+    dev box reusing 10.0.0.5 in another VPC swallowed the internet-facing netbanking instance and its exposure — a
+    KEV RCE dropped from ACT NOW to SCHEDULE (round 8 G8-2). Exposure is never lost in a merge: public flags,
+    internet ranges and the paths behind them are combined (an inventory row that states internet ports still
+    replaces the cloud's view, as before)."""
+    merged: list[Asset] = []
+    holders: dict[str, int] = {}
     for g in groups:
         for a in g:
-            hit = next((k for k, m in merged.items() if k == a.id or (m.keys & a.keys)), None)
+            hit = next((m for m in merged if _same_asset(m, a, holders)), None)
             if hit is None:
-                merged[a.id] = a
+                merged.append(a)
+                for k in a.keys | {a.id}:
+                    holders[k] = holders.get(k, 0) + 1
                 continue
-            m = merged[hit]
+            m = hit
+            for k in a.keys - m.keys:
+                holders[k] = holders.get(k, 0) + 1
             m.keys |= a.keys
             if a.role != "server":
                 m.role = a.role
@@ -370,7 +415,20 @@ def merge_assets(*groups: list[Asset]) -> list[Asset]:
                 m.zone = a.zone
             if a.source == "inventory" and a.internet_ports:
                 m.internet_ports, m.public = a.internet_ports, a.public or m.public
-    return list(merged.values())
+            else:
+                m.public = m.public or a.public
+                for r in a.internet_ports:
+                    if r not in m.internet_ports:
+                        m.internet_ports.append(r)
+                for r, v in a.internet_via.items():
+                    m.internet_via.setdefault(r, v)
+                for r, gs in a.opened_by.items():
+                    m.opened_by.setdefault(r, set()).update(gs)
+                for r, p in a.entry_port.items():
+                    m.entry_port.setdefault(r, p)
+                m.fronted_by |= a.fronted_by
+                m.groups = m.groups | a.groups
+    return merged
 
 
 def load_settings(path: str | Path | None) -> Settings:

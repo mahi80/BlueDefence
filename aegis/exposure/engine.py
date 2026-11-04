@@ -110,6 +110,9 @@ class Exposure:
     reasons: list[str]
     vuln_source: str = ""
     path: dict = field(default_factory=dict)   # what opens / fronts the path — remediation builds its commands from it
+    # set when the scanner's key names several assets (a private IP reused across VPCs): the finding is scored on
+    # every candidate and cannot verify a fix on any of them (round 8 G8-6)
+    unverifiable: str = ""
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -181,9 +184,17 @@ def _reach(v: Vuln, a: Asset, internet_assets_by_zone: dict[str, list[Asset]]) -
                         f"({', '.join(x.name or x.id for x in neighbours[:3])}) are not allowed to reach it")
 
 
+def _entry(a: Asset, port: int | None) -> int | None:
+    """The port the internet hits for this finding when a load balancer listener stands in front of it."""
+    if port in (None, ANY_PORT):
+        return None
+    r = _internet_range(a, port)
+    return a.entry_port.get(r) if r else None
+
+
 def _defended(v: Vuln, a: Asset, s: Settings) -> tuple[str, str]:
     keys = a.keys | {a.id, a.name} | a.fronted_by
-    prots = [p for p in s.coverage if p.covers(keys, v.port)]
+    prots = [p for p in s.coverage if p.covers(keys, v.port, _entry(a, v.port))]
     blocking = [p for p in prots if p.mode == "block"]
     monitor = [p for p in prots if p.mode == "monitor"]
     note = ""
@@ -231,7 +242,7 @@ def _path(v: Vuln, a: Asset, s: Settings) -> dict:
             "entry_port": a.entry_port.get(r) if r else None,
             "fronted_by": sorted(a.fronted_by),
             "protections": [{"name": p.name, "vendor": p.vendor, "mode": p.mode}
-                            for p in s.coverage if p.covers(keys, v.port)]}
+                            for p in s.coverage if p.covers(keys, v.port, _entry(a, v.port))]}
 
 
 def _tier(exploitable: bool, reach: str, defended: str, crown: int | None, cvss: float | None) -> str:
@@ -252,15 +263,15 @@ def assess(vulns: list[Vuln], assets: list[Asset], settings: Settings | None = N
     """Score every vulnerability against the asset it sits on. Returns (exposures, notes)."""
     s = settings or Settings()
     by_key: dict[str, Asset] = {}
-    ambiguous: set[str] = set()
+    holders: dict[str, list[Asset]] = {}
     for a in assets:
         for k in {a.id, a.name, *a.keys} - {""}:
-            kl = k.lower()
-            if kl in by_key and by_key[kl] is not a:
-                ambiguous.add(kl)          # e.g. the same private IP in two VPCs: it identifies neither
-            by_key.setdefault(kl, a)
-    for kl in ambiguous:
-        by_key.pop(kl, None)
+            lst = holders.setdefault(k.lower(), [])
+            if not any(x is a for x in lst):
+                lst.append(a)
+    # e.g. the same private IP in two VPCs: it identifies neither
+    ambiguous = {kl: lst for kl, lst in holders.items() if len(lst) > 1}
+    by_key = {kl: lst[0] for kl, lst in holders.items() if len(lst) == 1}
     internet_by_zone: dict[str, list[Asset]] = {}
     crown_zones: set[str] = set()
     for a in assets:
@@ -271,27 +282,28 @@ def assess(vulns: list[Vuln], assets: list[Asset], settings: Settings | None = N
 
     out: list[Exposure] = []
     unmatched: Counter[str] = Counter()
+    unsure: Counter[str] = Counter()
     for v in vulns:
         a = next((by_key[k.lower()] for k in [v.asset, *v.asset_alt] if k and k.lower() in by_key), None)
-        if a is None:
+        if a is not None:
+            out.append(_score(v, a, s, internet_by_zone, crown_zones))
+            continue
+        amb = next((k for k in [v.asset, *v.asset_alt] if k and k.lower() in ambiguous), None)
+        if amb is None:
             unmatched[v.asset] += 1
             continue
-        exploitable, why_x = _exploitable(v, s)
-        reach, why_r = _reach(v, a, internet_by_zone)
-        defended, why_d = _defended(v, a, s)
-        crown = 0 if a.sensitivity >= CRITICAL else (1 if a.zone and a.zone in crown_zones else None)
-        why_c = ("the asset is a crown jewel" if crown == 0 else
-                 f"shares zone {_zl(a.zone)} with a crown-jewel asset" if crown == 1 else "no crown jewel in its zone")
-        tier = _tier(exploitable, reach, defended, crown, v.cvss)
-        if v.port == ANY_PORT and tier == "ACT_NOW":
-            # a package CVE is not proven to sit on the exposed path (e.g. a libc flaw in a web image)
-            tier = "ACT"
-            why_r += "; capped at ACT until the vulnerable component is confirmed on the exposed path"
-        out.append(Exposure(
-            tier=tier, cve=v.cve, title=v.title, asset=a.id, asset_name=a.name or a.id, port=v.port,
-            exploitable=exploitable, reach=reach, defended=defended, crown_distance=crown,
-            risk_score=compute_risk_score(cvss=v.cvss, epss=v.epss, kev=v.kev, poc_available=v.poc),
-            reasons=[why_x, why_r, why_d, why_c], vuln_source=v.source, path=_path(v, a, s)))
+        # The key names several assets. Dropping the finding (as before) let an approved remediation on the real
+        # asset be marked verified_closed (round 8 G8-6). It is scored on every candidate — fail-closed — and marked
+        # unverifiable, so remediation keeps the fix open instead of calling it verified.
+        cands = ambiguous[amb.lower()]
+        why = (f"ambiguous asset: scanner key {amb} names {len(cands)} assets "
+               f"({', '.join(c.name or c.id for c in cands[:4])}{', …' if len(cands) > 4 else ''})")
+        unsure[amb] += 1
+        for c in cands:
+            e = _score(v, c, s, internet_by_zone, crown_zones)
+            e.unverifiable = why
+            e.reasons.append(why + " — unverifiable until the scanner reports an instance id / FQDN")
+            out.append(e)
 
     rank = {t: i for i, t in enumerate(TIERS)}
     def crown_weight(e: Exposure) -> int:
@@ -303,7 +315,30 @@ def assess(vulns: list[Vuln], assets: list[Asset], settings: Settings | None = N
         top = ", ".join(f"{k} ({n})" for k, n in unmatched.most_common(5))
         notes.append(f"{sum(unmatched.values())} findings on {len(unmatched)} assets not in the asset model were "
                      f"left out (add them to the inventory): {top}")
+    if unsure:
+        top = ", ".join(f"{k} ({n})" for k, n in unsure.most_common(5))
+        notes.append(f"{sum(unsure.values())} findings use a key that names several assets (a private IP reused across "
+                     f"VPCs?): scored on every candidate and marked unverifiable — {top}")
     return out, notes
+
+
+def _score(v: Vuln, a: Asset, s: Settings, internet_by_zone: dict[str, list[Asset]], crown_zones: set[str]) -> Exposure:
+    exploitable, why_x = _exploitable(v, s)
+    reach, why_r = _reach(v, a, internet_by_zone)
+    defended, why_d = _defended(v, a, s)
+    crown = 0 if a.sensitivity >= CRITICAL else (1 if a.zone and a.zone in crown_zones else None)
+    why_c = ("the asset is a crown jewel" if crown == 0 else
+             f"shares zone {_zl(a.zone)} with a crown-jewel asset" if crown == 1 else "no crown jewel in its zone")
+    tier = _tier(exploitable, reach, defended, crown, v.cvss)
+    if v.port == ANY_PORT and tier == "ACT_NOW":
+        # a package CVE is not proven to sit on the exposed path (e.g. a libc flaw in a web image)
+        tier = "ACT"
+        why_r += "; capped at ACT until the vulnerable component is confirmed on the exposed path"
+    return Exposure(
+        tier=tier, cve=v.cve, title=v.title, asset=a.id, asset_name=a.name or a.id, port=v.port,
+        exploitable=exploitable, reach=reach, defended=defended, crown_distance=crown,
+        risk_score=compute_risk_score(cvss=v.cvss, epss=v.epss, kev=v.kev, poc_available=v.poc),
+        reasons=[why_x, why_r, why_d, why_c], vuln_source=v.source, path=_path(v, a, s))
 
 
 def funnel(exposures: list[Exposure], raw_total: int) -> dict[str, int]:
