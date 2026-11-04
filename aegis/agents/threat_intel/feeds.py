@@ -22,7 +22,7 @@ import urllib.error
 import urllib.request
 from typing import Iterable, Optional
 
-from .store import IOC
+from .store import IOC, RETRACTED_TAG
 
 
 _log = logging.getLogger("aegis.threat_intel.feeds")
@@ -74,16 +74,23 @@ def _stix_time(v: object) -> float | None:
         return None
 
 
+def _stix_bool(v: object) -> bool:
+    """STIX booleans as feeds really write them: ``true`` / ``"true"`` / ``"True"`` / ``1``."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v == 1
+    return isinstance(v, str) and v.strip().lower() in ("true", "1", "yes")
+
+
 def _stix_object(obj: dict, now: float) -> IOC | None:
     if obj.get("type") != "indicator":
         return None
     # a feed retracts a false positive (a CDN IP, a shared host) by revoking it or ending its validity: those
-    # used to be ingested as live for 14 days (review round 7 D-10)
-    if obj.get("revoked") is True:
-        return None
+    # used to be ingested as live for 14 days (review round 7 D-10); now they also take the stored copy back out
+    # (a retraction IOC, see store.RETRACTED_TAG — round 8 D8-11)
     until = _stix_time(obj.get("valid_until"))
-    if until is not None and until <= now:
-        return None
+    retracted = _stix_bool(obj.get("revoked")) or (until is not None and until <= now)
     pattern = str(obj.get("pattern", ""))
     m = _STIX_VALUE_RX.search(pattern)
     kind: str | None
@@ -108,15 +115,18 @@ def _stix_object(obj: dict, now: float) -> IOC | None:
     except (TypeError, ValueError):
         confidence = 0.5                                 # "high" / "medium": a vocabulary, not a number
     ttl = 86400 * 14
-    if until is not None:
+    if until is not None and not retracted:
         ttl = max(60, int(until - now))
+    if retracted:
+        labels = (*labels, RETRACTED_TAG)
     return IOC(kind=kind, value=value, confidence=confidence, source=str(obj.get("created_by_ref") or "stix_feed"),
                tags=labels, last_seen=now, ttl_seconds=ttl)
 
 
 def parse_stix_bundle(payload: dict) -> list[IOC]:
-    """Convert a STIX 2.1 bundle dict into IOCs. Skips non-indicator, revoked and expired objects; one malformed
-    object is skipped, never the whole bundle (review round 7 D-10)."""
+    """Convert a STIX 2.1 bundle dict into IOCs. Skips non-indicator objects; a revoked or expired indicator comes
+    back as a retraction (tagged ``retracted``) that IOCStore.add turns into a removal — it is never stored as
+    live. One malformed object is skipped, never the whole bundle (review round 7 D-10, round 8 D8-11)."""
     iocs: list[IOC] = []
     now = time.time()
     objects = payload.get("objects", []) if isinstance(payload, dict) else []

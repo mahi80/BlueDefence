@@ -94,7 +94,8 @@ def import_from_peer(store: IOCStore, bundle: dict, *,
             continue
 
     before_total = store.stats().total
-    n_added = store.add_many(incoming)
+    # a peer's last_seen is its observation time: 0 / missing stays unobserved, never "now" (round 8 D8-7)
+    n_added = store.add_many(incoming, keep_last_seen=True)
     after_total = store.stats().total
     return {
         "received": len(incoming),

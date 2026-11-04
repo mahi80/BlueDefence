@@ -18,30 +18,97 @@ class ToolResult:
 
 
 
+_AR_MAX = 16384          # one A-R header is a few hundred bytes; bound the scan
+
+
+def _ar_split(ar: str) -> list[str]:
+    """One Authentication-Results value → its ``;``-separated parts (RFC 8601 §2.2), with CFWS handled: a ``;``
+    inside a quoted-string (``smtp.mailfrom="x;dkim=pass"@evil``) or a comment (``(… ; …)``, nestable) does not
+    split, and comments are dropped. Quoted strings are kept (with their quotes) so a property value stays one
+    token."""
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0                         # comment nesting
+    quoted = False
+    i, n = 0, min(len(ar), _AR_MAX)
+    while i < n:
+        c = ar[i]
+        if c == "\\" and (quoted or depth) and i + 1 < n:
+            if quoted:
+                cur.append(c + ar[i + 1])
+            i += 2
+            continue
+        if quoted:
+            cur.append(c)
+            if c == '"':
+                quoted = False
+        elif depth:
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if not depth:
+                    cur.append(" ")
+        elif c == "(":
+            depth = 1
+        elif c == '"':
+            quoted = True
+            cur.append(c)
+        elif c == ";":
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    parts.append("".join(cur))
+    return [p.strip() for p in parts]
+
+
+_METHOD_RX = re.compile(r"([a-z][a-z0-9_-]*)\s*(?:/\s*\d+\s*)?=\s*([a-z]+)", re.IGNORECASE)
+
+
+def _ar_parse(ar: str) -> tuple[str | None, list[str]]:
+    """``(authserv-id, resinfos)`` of one A-R value. The authserv-id is the first token of the first part when that
+    token is not a ``method=result`` (Microsoft 365 / EOP write A-R without one: then every part is a resinfo)."""
+    parts = _ar_split(ar)
+    if not parts:
+        return None, []
+    first = parts[0]
+    tok = first.split(None, 1)[0] if first.split() else ""
+    if tok and "=" not in tok and not _METHOD_RX.match(first):
+        return tok.strip('"').lower(), [p for p in parts[1:] if p]
+    return None, [p for p in parts if p]
+
+
 def _trusted_auth_results(headers: dict) -> str:
     """The Authentication-Results our own gateway wrote. A message can carry any number of them and the sender
-    writes the rest, so with ``AEGIS_MAIL_AUTHSERV_ID`` set only an A-R whose authserv-id (the text before the
-    first ``;``) is one of ours counts; without it, the top-most one (the last hop's, which a receiving gateway
-    prepends) does (review round 4 X4-12)."""
-    import os
+    writes the rest, so with ``AEGIS_MAIL_AUTHSERV_ID`` set only an A-R whose authserv-id (parsed per RFC 8601) is
+    one of ours counts; without it, the top-most one (the last hop's, which a receiving gateway prepends) does
+    (review round 4 X4-12, round 8 D8-2)."""
     raw = headers.get("authentication-results")
     items = [str(x) for x in raw] if isinstance(raw, (list, tuple)) else ([str(raw)] if raw else [])
-    ours = {x.strip().lower() for x in os.environ.get("AEGIS_MAIL_AUTHSERV_ID", "").split(",") if x.strip()}
+    ours = _our_authserv_ids()
     if ours:
-        items = [x for x in items if x.split(";", 1)[0].strip().lower() in ours]
-    return items[0].lower() if items else ""
+        items = [x for x in items if _ar_parse(x)[0] in ours]
+    return items[0] if items else ""
+
+
+def _our_authserv_ids() -> set[str]:
+    import os
+    return {x.strip().lower() for x in os.environ.get("AEGIS_MAIL_AUTHSERV_ID", "").split(",") if x.strip()}
 
 
 def _ar_methods(ar: str) -> dict[str, str]:
-    """Method results from one Authentication-Results header, read per ``;``-separated resinfo: each resinfo's
-    FIRST ``method=result`` token is its verdict. Property values such as ``smtp.mailfrom=`` are text the sender
-    chose (an attacker's MAIL FROM local part could read ``dkim=pass.dmarc=pass@evil``) and are never scanned for
-    verdicts (review round 7 D-1). The first segment is the authserv-id."""
+    """Method results from one Authentication-Results header, read per resinfo: each resinfo's leading
+    ``method=result`` is its verdict, and the FIRST result per method wins. Property values such as
+    ``smtp.mailfrom=`` are text the sender chose (an attacker's MAIL FROM local part could read
+    ``dkim=pass.dmarc=pass@evil``, or a quoted ``"x;dkim=pass"``) and are never scanned for verdicts (review round 7
+    D-1, round 8 D8-2)."""
     out: dict[str, str] = {}
-    for resinfo in ar.split(";")[1:]:
-        m = re.match(r"\s*(spf|dkim|dmarc)\s*=\s*([a-z]+)", resinfo)
-        if m:
-            out.setdefault(m.group(1), m.group(2))
+    for resinfo in _ar_parse(ar)[1]:
+        m = _METHOD_RX.match(resinfo)
+        if m and m.group(1).lower() in ("spf", "dkim", "dmarc"):
+            out.setdefault(m.group(1).lower(), m.group(2).lower())
     return out
 
 
@@ -64,7 +131,9 @@ def header_auth_check(headers: dict | None) -> ToolResult:
     # When the gateway's A-R is present it is the only source: plain ``SPF:`` / ``DKIM:`` / ``DMARC:`` headers and
     # Received-SPF are written by the sender (or an untrusted hop) and used to override it (review round 7 D-1).
     # The shorthand keys are only read when no trusted A-R exists (pre-parsed feeds that carry verdicts that way).
-    if ar:
+    # With AEGIS_MAIL_AUTHSERV_ID set, the gateway is known to write an A-R: a message without one of ours has
+    # unknown verdicts, never the sender's own shorthand headers (review round 8 D8-3).
+    if ar or _our_authserv_ids():
         spf, dkim, dmarc = (_verdict(methods.get(m, "")) for m in ("spf", "dkim", "dmarc"))
     else:
         spf = _verdict(h.get("spf") or h.get("received-spf") or "")

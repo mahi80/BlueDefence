@@ -158,18 +158,60 @@ def auth_boundary_check(role: str | None, endpoint: str | None) -> ToolResult:
 # from API abuse — these are AUTHENTICATED via DB creds, not the
 # application's auth layer.
 
-_MAX_QUERY_SCAN = 16_384
+_MAX_QUERY_SCAN = 16_384            # per statement, after comments are stripped and whitespace collapsed
+_MAX_QUERY_INPUT = 1 << 18          # the whole logged text that is tokenised (linear)
+_MAX_STATEMENTS = 4096
 
 _RISKY_QUERY_PATTERNS = [
     re.compile(r"\bselect\s+\*\s+from\s+(?:customers?|customer_kyc|loan_applications)\b", re.I),
     re.compile(r"\binto\s+outfile\b", re.I),
     re.compile(r"\bdumpfile\b", re.I),
-    re.compile(r"\bcopy\s*\([\s\S]{0,2000}?\)\s*to\b", re.I),  # postgres COPY (bounded: round 7 D-8 ReDoS)
+    # postgres COPY … TO (query or table form, psql \copy too), judged per statement: one anchor, no nested
+    # quantifier (round 7 D-8 ReDoS; round 8 D8-9 wide select lists and `COPY customer_kyc TO`)
+    re.compile(r"^\\?copy\b.*\bto\b", re.IGNORECASE | re.DOTALL),
     re.compile(r"\bbcp\b", re.I),                          # MSSQL bulk copy
     re.compile(r"\bdrop\s+table\b", re.I),
     re.compile(r"\btruncate\s+table\b", re.I),
     re.compile(r"\bgrant\s+all\s+privileges\b", re.I),
 ]
+
+
+_SQL_TOK = re.compile(r"""'[^']*(?:''[^']*)*'?|"[^"]*(?:""[^"]*)*"?|`[^`]*`?"""     # quoted: kept verbatim
+                      r"|(?P<c>/\*.*?(?:\*/|\Z)|--[^\n]*)"                         # comment
+                      r"|(?P<s>;)"                                               # statement break
+                      r"|[^'\"`/;-]+|[/-]", re.DOTALL)
+
+
+def _sql_statements(query: str) -> list[str]:
+    """A logged SQL text → its statements, split on ``;`` outside quotes and whitespace collapsed, each bounded on
+    its own. Every statement is returned twice: with comments (``/* */``, ``--``) removed — a 16 KB comment or a
+    run of ``SELECT 1;`` can no longer push the real statement past the scan bound — and as written, since
+    dialects disagree on what a comment is (MySQL's ``1--1`` is arithmetic). Linear in the (capped) input;
+    identical statements collapse (round 8 D8-9)."""
+    q = str(query)[:_MAX_QUERY_INPUT]
+    out: list[str] = []
+    seen: set[str] = set()
+    cur: list[str] = []
+    raw: list[str] = []
+
+    def flush() -> None:
+        for buf in (cur, raw):
+            st = " ".join("".join(buf).split())[:_MAX_QUERY_SCAN]
+            buf.clear()
+            if st and st not in seen and len(out) < _MAX_STATEMENTS:
+                seen.add(st)
+                out.append(st)
+    for m in _SQL_TOK.finditer(q):
+        if m.group("s"):
+            flush()
+        elif m.group("c") is not None:
+            cur.append(" ")
+            raw.append(m.group(0))
+        else:
+            cur.append(m.group(0))
+            raw.append(m.group(0))
+    flush()
+    return out
 
 
 def _is_app_host(ip: str | None) -> bool:
@@ -210,9 +252,10 @@ def db_direct_query_check(client_app: str | None,
         c in (client_app or "").lower()
         for c in ("psql", "mysql cli", "dbeaver", "ssms", "pgadmin", "mongo shell")
     ))
-    # a logged statement is attacker-sized: the patterns only ever need the head of it (round 7 D-8)
-    scan = str(query)[:_MAX_QUERY_SCAN]
-    risky_pattern_hits = [str(rx.pattern) for rx in _RISKY_QUERY_PATTERNS if rx.search(scan)]
+    # a logged statement is attacker-sized: each statement (comments stripped) is bounded on its own, not the
+    # head of the whole text (round 7 D-8, round 8 D8-9)
+    stmts = _sql_statements(str(query))
+    risky_pattern_hits = [str(rx.pattern) for rx in _RISKY_QUERY_PATTERNS if any(rx.search(st) for st in stmts)]
     bulk = bool(rows_returned and rows_returned >= 5000)
     if is_dba_client and (risky_pattern_hits or bulk):
         weight = "high"

@@ -32,10 +32,12 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote_plus
 
 logger = logging.getLogger("aegis.detect.sigma")
 
@@ -306,6 +308,22 @@ def _windash(text: str) -> str:
     return _WINDASH_RX.sub("-", text)
 
 
+def _ip(x: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """An event address as written by any sensor → one canonical address: whitespace and ``[…]`` stripped, an
+    IPv6 zone id dropped, an IPv4-mapped IPv6 address (``::ffff:a.b.c.d`` / ``::FFFF:A9FE:A9FE``) unwrapped."""
+    s = str(x).strip()[:64]
+    if s.startswith("[") and "]" in s:
+        s = s[1:s.index("]")]
+    s = s.split("%", 1)[0].strip()
+    try:
+        ip = ipaddress.ip_address(s)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
 def _num(v: Any) -> float | None:
     try:
         return float(v)
@@ -330,13 +348,11 @@ def _value_test(v: Any, mods: tuple[str, ...]) -> list[Callable[[Any], bool]]:
         # a rule author's own regex (trusted like the bank's SIEM trusts it); input bounded by MAX_VALUE
         return [lambda x, rx=rx: rx.search(str(x)[:MAX_VALUE]) is not None]
     if "cidr" in mods:
-        net = ipaddress.ip_network(str(v), strict=False)
+        net = ipaddress.ip_network(str(v).strip(), strict=False)
 
         def in_net(x: Any, net=net) -> bool:
-            try:
-                return ipaddress.ip_address(str(x)) in net
-            except ValueError:
-                return False
+            ip = _ip(x)
+            return ip is not None and ip.version == net.version and ip in net
         return [in_net]
     for op in ("lt", "lte", "gt", "gte"):
         if op in mods:
@@ -415,14 +431,29 @@ def _walk(obj: Any, parts: list[str]) -> list[Any]:
     if isinstance(obj, dict):
         nxt = obj.get(parts[0])
         if nxt is None:
-            low = {str(k).lower(): v for k, v in obj.items()}
-            nxt = low.get(parts[0].lower())
+            nxt = _lowered(obj).get(parts[0].lower())
         if nxt is not None:
             return _walk(nxt, parts[1:])
     return out
 
 
 _LOCAL = threading.local()            # per-event lookup cache while SigmaEngine.match runs
+
+
+def _lowered(obj: dict) -> dict:
+    """A dict with lower-cased keys, built once per dict per event while SigmaEngine.match runs (a wide event must
+    not be re-copied for every Sigma field that misses on it)."""
+    cache = getattr(_LOCAL, "lowdicts", None)
+    if cache is not None:
+        hit = cache.get(id(obj))
+        if hit is not None and hit[0] is obj:
+            return hit[1]
+    low = {}
+    for k, v in obj.items():
+        low.setdefault(str(k).lower(), v)
+    if cache is not None:
+        cache[id(obj)] = (obj, low)
+    return low
 
 
 def field_values(ev: dict, sigma_field: str) -> list[Any]:
@@ -460,8 +491,36 @@ def _present(vals: list[Any]) -> list[Any]:
     return [v for v in vals if v is not None]
 
 
+#: Sigma web fields whose values are matched both as received and URL-decoded + NFKC-folded: a probe written
+#: ``id=1%27%20or%201%3D1`` or with fullwidth letters is the same probe
+_URL_FIELDS = frozenset({"cs-uri-query", "c-uri-query", "cs-uri", "c-uri", "cs-uri-stem", "c-uri-stem"})
+_URL_DECODE_ROUNDS = 3
+_SQL_COMMENT_RX = re.compile(r"/\*.{0,256}?\*/", re.DOTALL)
+
+
+def _url_norm(v: Any) -> str:
+    """URL-decode (``+`` is a space; at most a few rounds, so double encoding is seen), NFKC-fold, and turn inline
+    SQL comments into a space. Bounded by MAX_VALUE."""
+    s = str(v)[:MAX_VALUE]
+    for _ in range(_URL_DECODE_ROUNDS):
+        d = unquote_plus(s)
+        if d == s:
+            break
+        s = d
+    s = unicodedata.normalize("NFKC", s)[:MAX_VALUE]
+    return _SQL_COMMENT_RX.sub(" ", s)
+
+
 def _field_values(ev: dict, sigma_field: str) -> list[Any]:
     """Values of a Sigma field in an OCSF event: [] when the field is absent; "" when it is present but empty."""
+    vals = _field_values_raw(ev, sigma_field)
+    if vals and sigma_field.lower() in _URL_FIELDS:
+        extra = [n for v in vals if isinstance(v, str) and (n := _url_norm(v)) != v]
+        return vals + extra if extra else vals
+    return vals
+
+
+def _field_values_raw(ev: dict, sigma_field: str) -> list[Any]:
     low = sigma_field.lower()
     if low == "c-uri-extension":
         out = []
@@ -485,17 +544,26 @@ def _field_values(ev: dict, sigma_field: str) -> list[Any]:
     return []
 
 
-def _str_values(obj: Any, out: list[str], depth: int = 0) -> None:
-    if depth > 8 or len(out) > 2000:
+#: total characters of one event that keyword rules search (every value is still capped at MAX_VALUE): a padded
+#: event costs at most this much per keyword, not 2,000 × 32 K
+KEYWORD_BUDGET = 1 << 20
+
+
+def _str_values(obj: Any, out: list[str], depth: int = 0, budget: list[int] | None = None) -> None:
+    if budget is None:
+        budget = [KEYWORD_BUDGET]
+    if depth > 8 or len(out) > 2000 or budget[0] <= 0:
         return
     if isinstance(obj, dict):
         for v in obj.values():
-            _str_values(v, out, depth + 1)
+            _str_values(v, out, depth + 1, budget)
     elif isinstance(obj, list):
         for v in obj[:500]:
-            _str_values(v, out, depth + 1)
+            _str_values(v, out, depth + 1, budget)
     elif isinstance(obj, (str, int, float)) and not isinstance(obj, bool):
-        out.append(str(obj)[:MAX_VALUE])
+        s = str(obj)[:min(MAX_VALUE, budget[0])]
+        budget[0] -= len(s)
+        out.append(s)
 
 
 def _field_match(f: _Field, ev: dict) -> bool:
@@ -513,12 +581,23 @@ def _field_match(f: _Field, ev: dict) -> bool:
     return any(t(v) for t in f.tests for v in vals)
 
 
+def _haystack(ev: dict) -> list[str]:
+    """Every string value of the event (bounded), collected once per event however many keyword rules run."""
+    cache = getattr(_LOCAL, "hay", None)
+    if cache is not None and cache[0] is ev:
+        return cache[1]
+    strs: list[str] = []
+    _str_values(ev, strs)
+    if getattr(_LOCAL, "cache", None) is not None:
+        _LOCAL.hay = (ev, strs)
+    return strs
+
+
 def _keywords(words: list[Any], *, need_all: bool = False) -> Callable[[dict], bool]:
     globs = [_Glob(str(w), contains=True) for w in words]
 
     def keywords(ev: dict) -> bool:
-        strs: list[str] = []
-        _str_values(ev, strs)
+        strs = _haystack(ev)
         found = (any(g(x) for x in strs) for g in globs)
         return all(found) if need_all else any(found)
     return keywords
@@ -549,12 +628,22 @@ def _compile_item(item: Any) -> Callable[[dict], bool]:
 
 # ----------------------------------------------------------------------------------------------- condition --
 
-def _and(a: Callable[[dict], bool], b: Callable[[dict], bool]) -> Callable[[dict], bool]:
-    return lambda ev: a(ev) and b(ev)
+#: a condition nested deeper than this (parentheses / ``not``), or longer than _MAX_TOKENS tokens, is skipped as
+#: Unsupported — SigmaHQ conditions are a handful of levels deep; a 1,000-deep one is a broken or hostile file
+_MAX_DEPTH = 32
+_MAX_TOKENS = 512
 
 
-def _or(a: Callable[[dict], bool], b: Callable[[dict], bool]) -> Callable[[dict], bool]:
-    return lambda ev: a(ev) or b(ev)
+def _all_of(preds: list[Callable[[dict], bool]]) -> Callable[[dict], bool]:
+    if len(preds) == 1:
+        return preds[0]
+    return lambda ev, preds=tuple(preds): all(p(ev) for p in preds)
+
+
+def _any_of(preds: list[Callable[[dict], bool]]) -> Callable[[dict], bool]:
+    if len(preds) == 1:
+        return preds[0]
+    return lambda ev, preds=tuple(preds): any(p(ev) for p in preds)
 
 
 _TOK = re.compile(r"\s*(\(|\)|\b(?:1|any|all)\s+of\s+[\w*]+|\band\b|\bor\b|\bnot\b|[\w*.-]+)", re.IGNORECASE)
@@ -565,11 +654,17 @@ def _compile_condition(cond: str, blocks: dict[str, Callable[[dict], bool]]) -> 
         raise Unsupported("aggregation / near condition")
     toks: list[str] = []
     pos = 0
+    depth = 0
     while pos < len(cond.strip()):
         m = _TOK.match(cond, pos)
         if not m:
-            raise Unsupported(f"condition {cond!r}")
-        toks.append(m.group(1))
+            raise Unsupported(f"condition {cond[:80]!r}")
+        tok = m.group(1)
+        depth += tok == "("
+        if depth > _MAX_DEPTH or len(toks) >= _MAX_TOKENS:
+            raise Unsupported("condition too deep / too long")
+        depth -= tok == ")"
+        toks.append(tok)
         pos = m.end()
         if not cond[pos:].strip():
             break
@@ -591,44 +686,44 @@ def _compile_condition(cond: str, blocks: dict[str, Callable[[dict], bool]]) -> 
             raise Unsupported(f"no detection block matches {pattern!r}")
         return [blocks[n] for n in names]
 
-    def atom() -> Callable[[dict], bool]:
+    def atom(level: int) -> Callable[[dict], bool]:
+        if level > _MAX_DEPTH:
+            raise Unsupported("condition too deep / too long")
         t = take()
         lo = t.lower()
         if lo == "(":
-            e = expr()
+            e = expr(level + 1)
             if take() != ")":
                 raise Unsupported("unbalanced parentheses")
             return e
         if lo == "not":
-            inner = atom()
+            inner = atom(level + 1)
             return lambda ev: not inner(ev)
         m = re.fullmatch(r"(1|any|all)\s+of\s+([\w*]+)", t, re.IGNORECASE)
         if m:
             preds = group(m.group(2))
             if m.group(1).lower() == "all":
-                return lambda ev: all(p(ev) for p in preds)
-            return lambda ev: any(p(ev) for p in preds)
+                return _all_of(preds)
+            return _any_of(preds)
         if t not in blocks:
-            raise Unsupported(f"unknown detection block {t!r}")
+            raise Unsupported(f"unknown detection block {t[:80]!r}")
         return blocks[t]
 
-    def conj() -> Callable[[dict], bool]:
-        left = atom()
+    def conj(level: int) -> Callable[[dict], bool]:
+        terms = [atom(level)]               # flat, not a left-deep lambda chain: `a and b and …` cannot overflow
         while peek() == "and":
             take()
-            right = atom()
-            left = _and(left, right)
-        return left
+            terms.append(atom(level))
+        return _all_of(terms)
 
-    def expr() -> Callable[[dict], bool]:
-        left = conj()
+    def expr(level: int) -> Callable[[dict], bool]:
+        terms = [conj(level)]
         while peek() == "or":
             take()
-            right = conj()
-            left = _or(left, right)
-        return left
+            terms.append(conj(level))
+        return _any_of(terms)
 
-    fn = expr()
+    fn = expr(0)
     if i != len(toks):
         raise Unsupported(f"trailing tokens in condition {cond!r}")
     return fn
@@ -670,23 +765,44 @@ def _classes(logsource: dict) -> tuple[int, ...] | None:
     raise Unsupported(f"logsource {cat or '-'} / {svc or '-'} / {prod or '-'} has no OCSF class mapping")
 
 
+class Malformed(Unsupported):
+    """A rule whose YAML does not have Sigma's shape (logsource not a mapping, tags not a list, a non-string block
+    name, a condition that is not a string)."""
+
+
 def compile_rule(doc: dict, path: str = "") -> CompiledRule:
+    if not isinstance(doc, dict):
+        raise Malformed("malformed rule: not a mapping")
     det = doc.get("detection")
     if not isinstance(det, dict) or "condition" not in det:
         raise Unsupported("no detection / condition")
     if doc.get("correlation"):
         raise Unsupported("correlation rule")
+    logsource = doc.get("logsource")
+    if logsource is None:
+        logsource = {}
+    if not isinstance(logsource, dict):
+        raise Malformed("malformed rule: logsource is not a mapping")
+    tags = doc.get("tags")
+    if tags is None:
+        tags = []
+    if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+        raise Malformed("malformed rule: tags is not a list of strings")
+    if not all(isinstance(k, str) for k in det):
+        raise Malformed("malformed rule: detection block name is not a string")
     cond = det["condition"]
     if isinstance(cond, list):
         if len(cond) != 1:
             raise Unsupported("multiple conditions")
         cond = cond[0]
+    if not isinstance(cond, str):
+        raise Malformed("malformed rule: condition is not a string")
     blocks = {k: _compile_item(v) for k, v in det.items() if k not in ("condition", "timeframe")}
-    match = _compile_condition(str(cond), blocks)
+    match = _compile_condition(cond, blocks)
     return CompiledRule(id=str(doc.get("id") or path), title=str(doc.get("title") or path),
-                        level=str(doc.get("level") or "medium").lower(), tags=[str(t) for t in doc.get("tags") or []],
-                        classes=_classes(doc.get("logsource") or {}), match=match, path=path,
-                        activities=_CATEGORY_ACTIVITIES.get(str((doc.get("logsource") or {}).get("category") or "").lower()))
+                        level=str(doc.get("level") or "medium").lower(), tags=list(tags),
+                        classes=_classes(logsource), match=match, path=path,
+                        activities=_CATEGORY_ACTIVITIES.get(str(logsource.get("category") or "").lower()))
 
 
 @dataclass
@@ -718,19 +834,26 @@ class SigmaEngine:
                 eng.skipped["unreadable"] = eng.skipped.get("unreadable", 0) + 1
                 continue
             for d in docs:
-                if d.get("status") in ("deprecated", "unsupported"):
-                    eng.skipped["deprecated"] = eng.skipped.get("deprecated", 0) + 1
-                    continue
-                if _LEVELS.get(str(d.get("level") or "medium").lower(), 2) < floor:
-                    eng.skipped["below level"] = eng.skipped.get("below level", 0) + 1
-                    continue
+                rel = str(p.relative_to(root))
                 try:
-                    eng.rules.append(compile_rule(d, str(p.relative_to(root))))
+                    if d.get("status") in ("deprecated", "unsupported"):
+                        eng.skipped["deprecated"] = eng.skipped.get("deprecated", 0) + 1
+                        continue
+                    if _LEVELS.get(str(d.get("level") or "medium").lower(), 2) < floor:
+                        eng.skipped["below level"] = eng.skipped.get("below level", 0) + 1
+                        continue
+                    eng.rules.append(compile_rule(d, rel))
+                except Malformed as e:
+                    eng.skipped["malformed"] = eng.skipped.get("malformed", 0) + 1
+                    logger.warning("[sigma] skipped %s: %s", rel, e)
                 except (Unsupported, re.error, ValueError) as e:
                     reason = str(e).split(" ", 1)[0] if isinstance(e, Unsupported) else "bad regex/value"
                     reason = {"modifier": "unsupported modifier", "aggregation": "aggregation / near",
-                              "logsource": "logsource not mapped"}.get(reason, reason)
+                              "logsource": "logsource not mapped", "condition": "bad condition"}.get(reason, reason)
                     eng.skipped[reason] = eng.skipped.get(reason, 0) + 1
+                except Exception as e:  # noqa: BLE001 — one broken rule is skipped (once, at load), never fatal
+                    eng.skipped["malformed"] = eng.skipped.get("malformed", 0) + 1
+                    logger.warning("[sigma] skipped %s: %s: %s", rel, type(e).__name__, str(e)[:200])
         eng.reindex()
         return eng
 
@@ -746,6 +869,8 @@ class SigmaEngine:
             act = None                     # no activity_id: rules are not gated on it
         _LOCAL.cache = (ev, {})            # each field is looked up once per event, not once per rule
         _LOCAL.lowers = {}                 # and each value lowercased once
+        _LOCAL.lowdicts = {}               # each dict key-lowercased once
+        _LOCAL.hay = None                  # and the keyword haystack collected once
         try:
             for r in self._by_class.get(cls, ()):
                 if act is not None and r.activities is not None and act not in r.activities:
@@ -758,23 +883,39 @@ class SigmaEngine:
         finally:
             _LOCAL.cache = None
             _LOCAL.lowers = None
+            _LOCAL.lowdicts = None
+            _LOCAL.hay = None
         return out
 
 
 _ENGINE: SigmaEngine | None = None
 _ENGINE_LOCK = threading.Lock()
-_ENGINE_KEY: tuple[str, str] = ("", "")
+_ENGINE_KEY: tuple = ("", "")
 _WARNED: set[str] = set()
+
+
+def _dir_mtime(root: str) -> float | None:
+    """mtime of the rules directory (and of its ``rules/`` sub-directory): a rule added or removed there reloads
+    the engine; otherwise the loaded (or failed) result is reused for every event."""
+    out = None
+    for d in (Path(root), Path(root) / "rules"):
+        try:
+            m = d.stat().st_mtime
+        except OSError:
+            continue
+        out = m if out is None else max(out, m)
+    return out
 
 
 def engine_from_env() -> SigmaEngine | None:
     """``AEGIS_SIGMA_RULES`` (a SigmaHQ checkout or a rules directory; unset = off), ``AEGIS_SIGMA_MIN_LEVEL``
-    (``low``). Loaded once per (path, level); the per-event path takes no lock."""
+    (``low``). Loaded once per (path, level, directory mtime) — including a load that failed — so the per-event path
+    is one ``stat`` and takes no lock."""
     global _ENGINE, _ENGINE_KEY
     root = os.environ.get("AEGIS_SIGMA_RULES", "").strip()
     if not root:
         return None
-    key = (root, os.environ.get("AEGIS_SIGMA_MIN_LEVEL", "low").strip().lower() or "low")
+    key = (root, os.environ.get("AEGIS_SIGMA_MIN_LEVEL", "low").strip().lower() or "low", _dir_mtime(root))
     eng, cur = _ENGINE, _ENGINE_KEY
     if eng is not None and cur == key:
         return eng
@@ -783,7 +924,12 @@ def engine_from_env() -> SigmaEngine | None:
             if not Path(root).is_dir() and root not in _WARNED:
                 _WARNED.add(root)
                 logger.error("[sigma] AEGIS_SIGMA_RULES=%s is not a directory — no Sigma rule will run", root)
-            eng = SigmaEngine.from_dir(root, min_level=key[1])
+            try:
+                eng = SigmaEngine.from_dir(root, min_level=key[1])
+            except Exception as e:  # noqa: BLE001 — a failed load is cached too: never re-walk the tree per event
+                logger.error("[sigma] loading %s failed (%s: %s) — no Sigma rule will run until it changes",
+                             root, type(e).__name__, str(e)[:200])
+                eng = SigmaEngine(skipped={"load failed": 1})
             logger.info("[sigma] %d rule(s) loaded from %s; skipped %s", len(eng.rules), root,
                         ", ".join(f"{k}: {v}" for k, v in sorted(eng.skipped.items())) or "none")
             _ENGINE, _ENGINE_KEY = eng, key

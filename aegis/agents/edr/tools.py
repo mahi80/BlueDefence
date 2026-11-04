@@ -165,6 +165,10 @@ _IOC_HASHES = {
 _IOC_SHA256: dict[str, str] = {}
 _IOC_SHA1: dict[str, str] = {}
 _IOC_DOMAINS = {"evil.example.com", "c2.attacker.test"}
+#: domain IOCs that also name every host under them: the seeds (attacker-owned names) and feed indicators tagged
+#: ``match-subdomains`` (``*.evil.example`` in a feed) — merge_into_edr keeps this in step. Any other domain IOC
+#: matches exactly, like the NDR path (review round 8 D8-6).
+_IOC_DOMAIN_SUBTREE = {"evil.example.com", "c2.attacker.test"}
 _IOC_IPS = {"203.0.113.66", "198.51.100.99",
             # HF/ModelScope model-loader cryptominer campaign (AEGIS-TI-2026-HF-LOADER):
             # reverse shell, exfil, and wave-1 C2 — catches post-exploitation of a slipped model load.
@@ -190,6 +194,12 @@ def _canon_ip(v: str) -> str:
     return str(ip)
 
 
+def _shared_base(domain: str) -> bool:
+    from ..shared.public_suffix import is_public_suffix
+    from ..threat_intel.validate import _shared
+    return is_public_suffix(domain) or _shared(domain)
+
+
 def _hash_hit(fh: str) -> tuple[str, str] | None:
     """md5 / sha1 / sha256 — every length the feeds distribute (only md5 used to reach the EDR, round 7 D-12)."""
     for table in (_IOC_HASHES, _IOC_SHA256, _IOC_SHA1):
@@ -211,13 +221,19 @@ def ioc_match(file_hash: str | None, dest_domain: str | None, dest_ip: str | Non
             matches.append(f"hash:{hit[0]}={hit[1]}")
     dom = str(dest_domain or "").strip().lower().rstrip(".")
     if dom:
-        # suffix match on whole labels: `x7f3a.c2.attacker.test` is the IOC `c2.attacker.test` (D-12)
-        labels = dom.split(".")
-        for i in range(len(labels) - 1):
-            parent = ".".join(labels[i:])
-            if parent in _IOC_DOMAINS:
-                matches.append(f"domain:{dom}" + (f" (under {parent})" if parent != dom else ""))
-                break
+        # exact, or on whole labels under an IOC tagged for its subtree: `x7f3a.c2.attacker.test` is the IOC
+        # `c2.attacker.test` (D-12). An untagged IOC never names its subdomains, and a public suffix / shared-hosting
+        # base (`gitlab.io`, `web.core.windows.net`) never does even when tagged — every tenant under it would
+        # match (review round 8 D8-6).
+        if dom in _IOC_DOMAINS:
+            matches.append(f"domain:{dom}")
+        else:
+            labels = dom.split(".")
+            for i in range(1, len(labels) - 1):
+                parent = ".".join(labels[i:])
+                if parent in _IOC_DOMAINS and parent in _IOC_DOMAIN_SUBTREE and not _shared_base(parent):
+                    matches.append(f"domain:{dom} (under {parent})")
+                    break
     ip = _canon_ip(dest_ip) if dest_ip else ""
     if ip and ip in {_canon_ip(x) for x in _IOC_IPS}:
         matches.append(f"ip:{ip}")
@@ -267,25 +283,11 @@ def _entropy(s: str) -> float:
     return -sum((c / n) * log2(c / n) for c in counts.values() if c > 0)
 
 
-#: two-label public suffixes (a small, sector-relevant slice of the PSL — production: the full list)
-_TWO_LABEL_SUFFIXES = frozenset({
-    "co.in", "net.in", "org.in", "gov.in", "nic.in", "ac.in", "edu.in", "res.in", "firm.in", "gen.in", "ind.in",
-    "mil.in", "bank.in", "fin.in", "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "com.sg",
-    "co.jp", "ne.jp", "com.br", "com.cn", "com.hk", "co.za", "co.nz", "com.my", "co.id", "com.ae",
-    "s3.amazonaws.com", "cloudfront.net", "azurewebsites.net", "blob.core.windows.net", "appspot.com",
-    "herokuapp.com", "github.io", "workers.dev", "pages.dev", "vercel.app", "netlify.app", "ngrok.io",
-    "duckdns.org", "no-ip.com", "trycloudflare.com",
-})
-
-
 def _registrable(labels: list[str]) -> str:
-    labels = [x for x in labels if x]
-    for n in (3, 2):
-        if len(labels) > n and ".".join(labels[-n:]) in _TWO_LABEL_SUFFIXES:
-            return ".".join(labels[-(n + 1):])
-    if len(labels) >= 2 and ".".join(labels[-2:]) in _TWO_LABEL_SUFFIXES:
-        return ".".join(labels[-2:])
-    return ".".join(labels[-2:]) if len(labels) >= 2 else ""
+    """Registrable name over a multi-label public-suffix list: ``acct.blob.core.windows.net`` is its own name, not
+    ``windows.net`` (the old two/three-label loop never reached four-label suffixes — review round 8 D8-16)."""
+    from ..shared.public_suffix import registrable
+    return registrable(labels)
 
 
 def dns_exfil_check(dns_queries: list[str] | None,
@@ -474,6 +476,7 @@ def tcc_grant(service: str | None, client: str | None, allowed: object = None,
     c = str(client or "").strip()
     trusted = False
     namespace_only = False
+    unverified = False
     for entry in al:
         e = str(entry)
         if e.startswith("/"):
@@ -488,15 +491,22 @@ def tcc_grant(service: str | None, client: str | None, allowed: object = None,
             if c.startswith(e):
                 if authority and str(authority).strip().lower() in _NAMESPACE_SIGNERS.get(e, ()):
                     trusted = True
+                elif authority:
+                    namespace_only = True            # signed, but not by the namespace's owner: a spoof
                 else:
-                    namespace_only = True
+                    # no signing data at all (the stock osquery pack does not join `signature`): a namespace
+                    # match stays low, flagged unverified — escalating every genuine Apple grant to medium was
+                    # noise, not detection (review round 8 D8-12)
+                    trusted = True
+                    unverified = True
         elif c == e:
             trusted = True                               # an exact bundle id
     weight = "low" if trusted else ("medium" if namespace_only else "high")
     return ToolResult(
         name="tcc_grant",
         data={"service": service, "client": client, "trusted": trusted,
-              "unverified_namespace": namespace_only and not trusted},
+              "unverified_namespace": (namespace_only and not trusted) or unverified,
+              "signing_authority_mismatch": namespace_only and not trusted},
         weight=weight,
     )
 

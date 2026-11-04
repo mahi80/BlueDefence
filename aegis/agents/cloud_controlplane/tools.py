@@ -153,6 +153,8 @@ def iam_change_check(event: dict | None) -> ToolResult:
 
     # full IAM admin (iam:* / * over a wildcard resource) is self-escalation on its own: it counts twice
     risk = sum([has_wildcard, has_dangerous_role, creates_access_key]) + (1 if admin_grant else 0)
+    if admin_grant:                       # an escalation grant without a literal wildcard action (round 8 D8-5)
+        risk = max(risk, 2)
     if risk >= 2:
         weight = "high"
     elif risk >= 1:
@@ -222,14 +224,40 @@ def _wild(v: Any, rx: re.Pattern) -> bool:
     return any(isinstance(x, str) and rx.match(x) for x in vals)
 
 
+#: calls that let a principal raise its own privileges (write / attach a policy, pass or assume a role, mint a
+#: credential); granted over a wildcarded IAM resource (``role/*``, ``user/*``, ``*``) they are admin by another
+#: name (round 8 D8-5)
+_ESCALATION_ACTIONS = (
+    "iam:putuserpolicy", "iam:putrolepolicy", "iam:putgrouppolicy", "iam:attachuserpolicy", "iam:attachrolepolicy",
+    "iam:attachgrouppolicy", "iam:createpolicyversion", "iam:setdefaultpolicyversion", "iam:passrole",
+    "iam:updateassumerolepolicy", "iam:createaccesskey", "iam:createloginprofile", "iam:updateloginprofile",
+    "iam:addusertogroup", "sts:assumerole",
+)
+
+
+def _escalation_grant(st: dict) -> bool:
+    import fnmatch
+    acts = _ci(st, "Action", "actions")
+    acts = acts if isinstance(acts, (list, tuple)) else [acts]
+    res = _ci(st, "Resource")
+    res = res if isinstance(res, (list, tuple)) else [res if res is not None else "*"]
+    wild_res = any(isinstance(r, str) and "*" in r for r in res)
+    return wild_res and any(isinstance(a, str) and any(fnmatch.fnmatchcase(e, a.strip().lower())
+                                                        for e in _ESCALATION_ACTIONS) for a in acts)
+
+
 def _admin_grant(st: dict) -> bool:
-    """Allow on every action of IAM (or everything) over a wildcard resource: full admin / self-escalation."""
+    """Allow on every action of IAM (or everything) over a wildcard resource: full admin / self-escalation. Also an
+    ``Allow`` + ``NotAction`` over ``*`` (everything except a few calls), and a privilege-escalation call
+    (``iam:Put*``, ``iam:Attach*``, ``sts:AssumeRole`` …) over a wildcarded IAM resource (round 8 D8-5)."""
     if str(_ci(st, "Effect") or "allow").lower() != "allow":
         return False
+    if _ci(st, "NotAction") is not None and _wild(_ci(st, "Resource") or "*", _RESOURCE_WILD_RX):
+        return True
     acts = _ci(st, "Action", "actions")
     acts = acts if isinstance(acts, (list, tuple)) else [acts]
     admin = any(isinstance(a, str) and a.strip().lower() in ("*", "*:*", "iam:*") for a in acts)
-    return admin and _wild(_ci(st, "Resource") or "*", _RESOURCE_WILD_RX)
+    return (admin and _wild(_ci(st, "Resource") or "*", _RESOURCE_WILD_RX)) or _escalation_grant(st)
 
 
 def _public_principal(p: Any) -> bool:
@@ -295,20 +323,22 @@ def resource_policy_check(event: dict | None) -> ToolResult:
             "action": action, "encryption_removed": removed,
         }, weight="high" if removed else "low")
 
-    if action in ("PutBucketPublicAccessBlock",):
+    if action in ("PutBucketPublicAccessBlock", "PutAccountPublicAccessBlock", "PutPublicAccessBlock"):
+        # CloudTrail records the account-level (s3control) call as PutAccountPublicAccessBlock (round 8 D8-5)
         block = _ci(params, "publicAccessBlockConfiguration", "PublicAccessBlockConfiguration") or {}
         weakened = not all(_truthy(_ci(block, k)) if _ci(block, k) is not None else True for k in [
             "blockPublicAcls", "ignorePublicAcls", "blockPublicPolicy", "restrictPublicBuckets",
         ])
         return ToolResult(name="resource_policy", data={
             "action": action, "public_access_block_weakened": weakened,
+            "scope": "bucket" if action == "PutBucketPublicAccessBlock" else "account",
         }, weight="high" if weakened else "low")
 
-    if action in ("DeleteBucketPublicAccessBlock", "DeletePublicAccessBlock"):
+    if action in ("DeleteBucketPublicAccessBlock", "DeletePublicAccessBlock", "DeleteAccountPublicAccessBlock"):
         # removing the block entirely (bucket or whole account, s3control) is the commonest S3 exposure step
         return ToolResult(name="resource_policy", data={
             "action": action, "public_access_block_removed": True,
-            "scope": "account" if action == "DeletePublicAccessBlock" else "bucket",
+            "scope": "bucket" if action == "DeleteBucketPublicAccessBlock" else "account",
         }, weight="high")
 
     if action in ("PutBucketAcl", "PutObjectAcl"):
@@ -330,9 +360,11 @@ def _acl_grants_public(params: dict) -> bool:
     """A PutBucketAcl / PutObjectAcl that grants AllUsers or AuthenticatedUsers: a canned ACL (``x-amz-acl``),
     a grant header (``x-amz-grant-*: uri=…AllUsers``) or an AccessControlPolicy grant (review round 7 D-3)."""
     import json
-    canned = str(_ci(params, "x-amz-acl", "acl") or "").strip().lower()
-    if canned in _PUBLIC_CANNED:
-        return True
+    canned = _ci(params, "x-amz-acl", "acl")
+    # CloudTrail records request headers as lists (``"x-amz-acl": ["public-read"]``) (round 8 D8-5)
+    for c in (canned if isinstance(canned, (list, tuple)) else [canned]):
+        if str(c or "").strip().lower() in _PUBLIC_CANNED:
+            return True
     text = json.dumps(params, default=str).lower()
     return any(g in text for g in _PUBLIC_GROUPS)
 
@@ -759,7 +791,8 @@ def hsm_audit_check(event: dict | None) -> ToolResult:
 _EXTRA_NAMES = (
     "PutBucketPolicy", "s3:PutBucketPolicy", "Microsoft.Storage/storageAccounts/write", "PutBucketEncryption",
     "DeleteBucketEncryption", "PutBucketPublicAccessBlock", "DeleteBucketPublicAccessBlock", "DeletePublicAccessBlock",
-    "PutPublicAccessBlock", "PutBucketAcl", "PutObjectAcl", "AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules",
+    "PutPublicAccessBlock", "PutAccountPublicAccessBlock", "DeleteAccountPublicAccessBlock", "PutBucketAcl",
+    "PutObjectAcl", "AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules",
     "Microsoft.Network/networkSecurityGroups/securityRules/write", "Microsoft.Network/networkSecurityGroups/write",
     "CreateVpcPeeringConnection", "AcceptVpcPeeringConnection", "CreateVpnConnection", "CreateClientVpnEndpoint",
     "Microsoft.Network/virtualNetworkGateways/write", "network.security_group_rule.create.end",
