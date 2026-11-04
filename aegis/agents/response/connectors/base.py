@@ -655,6 +655,7 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
     - ``AEGIS_SOAR_VENDOR`` = xsoar | sentinel | mock → playbook connector for the actions in ``AEGIS_SOAR_PLAYBOOKS``
     - ``AEGIS_EDR_VENDOR``  = crowdstrike | mock → Falcon host contain (isolate) + RTR kill_process (both HITL)
     - ``AEGIS_SWG_VENDOR``  = zscaler | mock → ZIA egress block (block_egress on a destination URL/IP)
+    - ``AEGIS_AGENT_SANDBOX`` = openshell | mock → NVIDIA OpenShell network quarantine of an AI agent (isolate agent:<sandbox>)
     - ``AEGIS_ENFORCEMENT_MODE`` = shadow (default) | live — shadow makes every vendor connector dry-run
 
     Registration order (WAF, SOAR, EDR, SWG) gives the SOAR playbook connector priority for
@@ -663,6 +664,14 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
     Anything not routed falls to the logging connector. ``mock`` vendors are the in-process
     fakes (``mock_vendor.py``) behind the real connector classes."""
     connectors: list[Connector] = []
+    try:
+        # first: it claims only agent:/sandbox: targets, so a rogue AI agent's isolate never falls to the host EDR
+        from .openshell import openshell_from_env
+        osh = openshell_from_env()
+        if osh is not None:
+            connectors.append(osh)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[connectors] OpenShell connector not built: %s", str(e)[:160])
     try:
         from .waf import waf_from_env
         waf = waf_from_env()
