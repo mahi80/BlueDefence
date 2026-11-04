@@ -103,7 +103,8 @@ def test_records_envelope_ndjson_and_multiline_ocsf_array():
     items = q.drain()
     assert [i.source for i in items].count("cloudflare") == 4
     arr = [i for i in items if i.source == "ocsf"]
-    assert len(arr) == 1 and len(json.loads(arr[0].line)) == 2
+    # round 6 I-4: an OCSF array (pretty-printed or not) becomes one queue item per event, never one truncated line
+    assert len(arr) == 2 and all(json.loads(i.line)["class_uid"] == 3002 for i in arr)
 
 
 def test_bad_messages_are_skipped_and_errors_do_not_commit_alone():

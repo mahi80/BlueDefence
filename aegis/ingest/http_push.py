@@ -300,6 +300,17 @@ class PushServer:
             return 503, {"error": "queue full, retry"}
         return 200, {"ok": True, "accepted": len(lines)}
 
+    def ingest_ocsf(self, body: bytes, source: str) -> tuple[int, dict]:
+        """OCSF: one event per queue item, whatever the framing (NDJSON, one array, a pretty-printed document).
+        Records that are not JSON objects are counted back to the sender, never dropped behind a 200."""
+        from .stream import ocsf_lines_from_body
+        lines, bad = ocsf_lines_from_body(body)
+        if not lines:
+            return (400, {"error": "no JSON object in the body", "rejected": bad}) if bad else (200, {"ok": True, "accepted": 0})
+        if not self.queue.put_many(source or "ocsf", lines):
+            return 503, {"error": "queue full, retry"}
+        return 200, {"ok": True, "accepted": len(lines), "rejected": bad}
+
     def ingest_alerts(self, body: bytes) -> tuple[int, dict]:
         lines = lines_from_body(body)
         bad = 0
@@ -339,9 +350,12 @@ class PushServer:
             except Exception as e:  # noqa: BLE001 — a broken registry must not take the receiver down
                 logger.warning("[ingest:http] blocklist source failed: %s", str(e)[:120])
                 receipts = []
+            now = time.time()
             for r in receipts:
                 if getattr(r, "dry_run", False) or getattr(r, "action_type", "") not in ("block", "challenge", "throttle"):
                     continue
+                if _expired(r, now):
+                    continue                   # lapsed but not swept yet: an edge must not keep enforcing it
                 row = {"action": r.action_type, "expires_at": r.expires_at, "receipt": r.receipt_id}
                 t = str(r.target)
                 if is_fingerprint_target(t):
@@ -381,8 +395,9 @@ class PushServer:
         except Exception as e:  # noqa: BLE001
             logger.warning("[ingest:http] blocklist source failed: %s", str(e)[:120])
             receipts = []
+        now = time.time()
         for r in receipts:
-            if getattr(r, "dry_run", False) or getattr(r, "action_type", "") != want:
+            if getattr(r, "dry_run", False) or getattr(r, "action_type", "") != want or _expired(r, now):
                 continue
             t = str(r.target).strip()
             for p in ("ip:", "src:", "dst:", "outbound:"):
@@ -703,6 +718,10 @@ class _Handler(BaseHTTPRequestHandler):
             q = parse_qs(urlsplit(self.path).query)
             fmt = (q.get("format") or ["json"])[0].lower()
             if fmt == "txt":
+                if os.environ.get("AEGIS_BLOCK_FEED", "0").strip() != "1":
+                    # the firewall feed exists only when the operator turned it on (and the feed connector with it)
+                    self._reply(404, {"error": "the block feed is off (AEGIS_BLOCK_FEED=1 turns it on)"})
+                    return
                 if not self.server_ref.feed_authorized(self.headers):
                     self._reply(401, {"error": "unauthorized"})
                     return
@@ -817,7 +836,7 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/ingest/ocsf":
                 # any OCSF producer (Security Lake subscribers, CrowdStrike, Okta, Cribl, Vector …): NDJSON or arrays
                 product = (parse_qs(parts.query).get("product") or [""])[0].strip().lower()[:24]
-                status, out = srv.ingest_waf(body, f"ocsf-{product}" if product else "ocsf")
+                status, out = srv.ingest_ocsf(body, f"ocsf-{product}" if product else "ocsf")
             elif path == "/ingest/alerts":
                 status, out = srv.ingest_alerts(body)
             else:
@@ -826,6 +845,14 @@ class _Handler(BaseHTTPRequestHandler):
             logger.error("[ingest:http] %s failed: %s", path, str(e)[:200], exc_info=True)
             status, out = 500, {"error": "internal"}
         self._reply(status, out)
+
+
+def _expired(r: Any, now: float) -> bool:
+    exp = getattr(r, "expires_at", None)
+    try:
+        return exp is not None and float(exp) <= now
+    except (TypeError, ValueError):
+        return False
 
 
 def push_server_from_env(blocklist: Optional[Callable[[], list[Any]]] = None, *,

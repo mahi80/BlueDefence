@@ -70,7 +70,9 @@ def load_spec(name_or_path: str | Path) -> dict:
     return spec
 
 
-_SECRETISH = re.compile(r"(?i)(token|secret|password|api[_-]?key|authorization)")
+_SECRETISH = re.compile(r"(?i)(token|secret|password|passwd|api[_-]?key|apikey|authorization|credential)")
+# a credential written into a URL / query string: ...?api_key=abc, token=abc (not {env:...})
+_SECRET_IN_TEXT = re.compile(r"(?i)(?:token|secret|password|api[_-]?key|apikey|sig|signature)=(?!\{env:)[^&\s{]+")
 
 
 def validate_spec(spec: Any, *, where: str = "spec") -> None:
@@ -101,8 +103,12 @@ def validate_spec(spec: Any, *, where: str = "spec") -> None:
         elif isinstance(o, list):
             for i, v in enumerate(o):
                 walk(v, f"{path}[{i}]")
+        elif isinstance(o, str) and _SECRET_IN_TEXT.search(o):
+            raise SpecError(f"{where}: {path} carries a literal credential in a URL / query — use {{env:NAME}}")
+    # every part of the spec that reaches the wire or the context, not only auth + headers (round 6 I-10)
     walk(spec.get("auth") or {}, "auth")
-    walk(req.get("headers") or {}, "request.headers")
+    walk(req, "request")
+    walk(spec.get("config") or {}, "config")
     # every credential-carrying auth field must come from the environment, whatever it is called
     for k, v in (spec.get("auth") or {}).items():
         if k not in ("type", "name", "token_url", "scope", "audience", "resource") and isinstance(v, str) \
@@ -260,8 +266,29 @@ def _parse_time(v: Any) -> datetime | None:
     return None
 
 
+FUTURE_SKEW_S = 300.0
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    u = urllib.parse.urlsplit(url)
+    try:
+        port = u.port or (443 if u.scheme == "https" else 80 if u.scheme == "http" else None)
+    except ValueError:
+        port = -1
+    return u.scheme.lower(), (u.hostname or "").lower(), port
+
+
 class KitConsumer(BaseConsumer):
-    """Runs one declarative spec as a source."""
+    """Runs one declarative spec as a source.
+
+    The watermark is committed once per completed pass, from the records the pass read (not per alert): a pass cut
+    short by an error re-reads from the old watermark (round 6 I-5). A pass that hits its cap — a page with no
+    paging, ``max_pages`` or ``MAX_RECORDS`` — leaves a resume point at its newest record, and the next pass starts
+    there instead of re-reading the overlap: with more records in the overlap window than one pass returns, every
+    pass used to re-read the same duplicates and the feed went blind (I-1). Timestamps beyond now + 5 min never
+    move the watermark (I-6)."""
+
+    advance_per_alert = False
 
     def __init__(self, spec: dict | str, *, checkpoint: AlertCheckpoint | None = None,
                  transport: Transport | None = None, env: dict | None = None, clock: Callable[[], float] = time.time):
@@ -273,6 +300,7 @@ class KitConsumer(BaseConsumer):
         self._env = os.environ if env is None else env
         self._clock = clock
         self._token: tuple[str, float] | None = None
+        self._future_warned = False
 
     # -- auth
     def _auth_headers(self) -> dict:
@@ -307,16 +335,66 @@ class KitConsumer(BaseConsumer):
         wm_cfg = self.spec.get("watermark") or {}
         how = wm_cfg.get("format", "iso")
         wm = _parse_time(self.checkpoint.watermark(self.name)) if self.checkpoint is not None else None
+        now = datetime.fromtimestamp(self._clock(), UTC)
+        if wm is not None and wm > now + timedelta(seconds=FUTURE_SKEW_S):
+            wm = now                                     # a watermark persisted before the cap existed
         overlap = float(wm_cfg.get("overlap_s", 300))
-        start = (wm - timedelta(seconds=overlap)) if wm else \
-            datetime.fromtimestamp(self._clock(), UTC) - timedelta(seconds=float(wm_cfg.get("initial_lookback_s", 3600)))
+        resume = self.checkpoint.aux(f"{self.name}:resume") if self.checkpoint is not None else None
+        rt = _parse_time(resume.get("ts")) if isinstance(resume, dict) else None
+        if rt is not None:
+            # the last pass was capped: carry on from its newest record (1 ms before it, so ties are re-read and
+            # deduped; strictly at it once a pass made no progress, so a cap's worth of same-millisecond records
+            # can never pin the feed)
+            start = rt if resume.get("strict") else rt - timedelta(milliseconds=1)
+        else:
+            start = (wm - timedelta(seconds=overlap)) if wm else \
+                now - timedelta(seconds=float(wm_cfg.get("initial_lookback_s", 3600)))
         ctx = {"watermark": _fmt_time(start, how), "now": _fmt_time(datetime.fromtimestamp(self._clock(), UTC), how),
                "page_size": int(self.spec.get("page_size", 200))}
         for k, v in (self.spec.get("config") or {}).items():
             ctx[k] = render(v, {}, self._env)
         return ctx
 
-    def fetch(self, **_kw: Any) -> Iterator[Any]:
+    def _record_time(self, r: Any) -> datetime | None:
+        if not isinstance(r, dict):
+            return None
+        path = (self.spec.get("watermark") or {}).get("field") or (
+            "time" if self.spec.get("format") == "ocsf" else (self.spec.get("map") or {}).get("timestamp"))
+        t = _parse_time(get_path(r, path)) if path else None
+        if t is None:
+            return None
+        if t > datetime.fromtimestamp(self._clock(), UTC) + timedelta(seconds=FUTURE_SKEW_S):
+            if not self._future_warned:
+                self._future_warned = True
+                logger.warning("[ingest:%s] record stamped %s is in the future; it does not move the watermark",
+                               self.name, t.isoformat())
+            return None
+        return t
+
+    def fetch(self, **kw: Any) -> Iterator[Any]:
+        newest: list[datetime] = []
+        capped = [False]
+        for r in self._fetch_pages(capped):
+            t = self._record_time(r)
+            if t is not None and (not newest or t > newest[0]):
+                newest[:] = [t]
+            yield r
+        # the whole pass was read and handled (a generator resumes only after the caller took the last record)
+        if self.checkpoint is None or not newest:
+            return
+        key = f"{self.name}:resume"
+        if capped[0]:
+            prev = self.checkpoint.aux(key)
+            prev_t = _parse_time(prev.get("ts")) if isinstance(prev, dict) else None
+            strict = prev_t is not None and newest[0] <= prev_t
+            logger.warning("[ingest:%s] pass hit its cap — resuming from %s next cycle%s", self.name,
+                           newest[0].isoformat(), " (strictly after: the last pass made no progress)" if strict else "")
+            self.checkpoint.set_aux(key, {"ts": newest[0].isoformat(), "strict": strict})
+        else:
+            self.checkpoint.set_aux(key, None)
+        self.checkpoint.advance(self.name, newest[0].isoformat())
+
+    def _fetch_pages(self, capped: list[bool]) -> Iterator[Any]:
         req = self.spec["request"]
         paging = self.spec.get("paging") or {"type": "none"}
         ctx = self._context()
@@ -326,7 +404,8 @@ class KitConsumer(BaseConsumer):
         n = 0
         cursor: Any = None
         offset = 0
-        for _page in range(int(self.spec.get("max_pages", MAX_PAGES))):
+        max_pages = int(self.spec.get("max_pages", MAX_PAGES))
+        for _page in range(max_pages):
             pctx = {**ctx, "cursor": cursor if cursor is not None else "", "offset": offset}
             q = dict(params)
             if paging.get("type") in ("cursor", "offset") and _page > 0:
@@ -354,20 +433,23 @@ class KitConsumer(BaseConsumer):
                 yield r
                 n += 1
                 if n >= MAX_RECORDS:
+                    capped[0] = True
                     return
             kind = paging.get("type", "none")
+            if _page == max_pages - 1 and records:
+                capped[0] = True                          # a next page may exist that this pass will not read
             if kind == "link_header":
                 m = re.search(r'<([^>]+)>;\s*rel="next"', rh.get("link", ""))
                 if not m or not records:
                     return
                 url, params = m.group(1), {}
-                if urllib.parse.urlsplit(url).hostname != urllib.parse.urlsplit(full).hostname:
-                    return                                     # never follow a next link to another host
+                if _origin(url) != _origin(full):
+                    return                     # never follow a next link to another host, port or scheme (I-11)
             elif kind == "next_url":
                 nxt = get_path(data, paging["path"])
                 if not nxt or not records:
                     return
-                if urllib.parse.urlsplit(str(nxt)).hostname != urllib.parse.urlsplit(full).hostname:
+                if _origin(str(nxt)) != _origin(full):
                     return
                 url, params = str(nxt), {}
             elif kind == "cursor":
@@ -379,6 +461,8 @@ class KitConsumer(BaseConsumer):
                     return
                 offset += len(records)
             else:
+                if len(records) >= int(ctx["page_size"]):
+                    capped[0] = True                      # no paging and a full page: there may be more
                 return
 
     # -- map

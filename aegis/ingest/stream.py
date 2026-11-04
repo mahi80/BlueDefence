@@ -505,8 +505,19 @@ class StreamConsumer(BaseConsumer):
         out = []
         hint = item.source[5:] if item.source.startswith("ocsf-") else ""
         from aegis.detect.sigma import enrich
-        for ev in events[:1000]:
-            a = to_alert(ev, source_hint=hint) if isinstance(ev, dict) else None
+        if len(events) > MAX_OCSF_PER_LINE:
+            # the receivers split arrays into one event per line; a line this big came from elsewhere — say so
+            logger.warning("[stream] OCSF line with %d events: the first %d are read, %d dropped",
+                           len(events), MAX_OCSF_PER_LINE, len(events) - MAX_OCSF_PER_LINE)
+            self.skipped_invalid += len(events) - MAX_OCSF_PER_LINE
+        for ev in events[:MAX_OCSF_PER_LINE]:
+            try:
+                # per event: one malformed sibling (a junk severity_id) used to drop every event in its array
+                a = to_alert(ev, source_hint=hint) if isinstance(ev, dict) else None
+            except Exception as e:  # noqa: BLE001
+                self.skipped_invalid += 1
+                self._drop_log(f"OCSF event: {str(e)[:120]}")
+                continue
             if a is None:
                 continue
             try:
@@ -711,6 +722,43 @@ def gunzip_bounded(body: bytes, limit: Optional[int] = None) -> bytes:
     return bytes(out)
 
 
+MAX_OCSF_PER_LINE = 10_000
+
+
+def ocsf_lines_from_body(body: bytes) -> tuple[list[str], int]:
+    """OCSF body → one event per line, plus the number of records that are not JSON objects. A whole-body JSON array
+    or object (pretty-printed or not) is taken whole — splitting it on newlines turned a pretty array into fragments
+    that all failed to parse while the sender got 200; otherwise it is NDJSON, where a line may itself be an array."""
+    if body[:2] == b"\x1f\x8b":
+        body = gunzip_bounded(body)
+    text = body.decode("utf-8", errors="replace").strip()
+    if not text:
+        return [], 0
+    try:
+        whole = json.loads(text)
+    except ValueError:
+        whole = None
+        chunks = []
+        bad = 0
+        for ln in text.split("\n"):
+            if not ln.strip():
+                continue
+            try:
+                chunks.append(json.loads(ln))
+            except ValueError:
+                bad += 1
+    else:
+        chunks, bad = [whole], 0
+    out: list[str] = []
+    for c in chunks:
+        for ev in (c if isinstance(c, list) else [c]):
+            if isinstance(ev, dict):
+                out.append(json.dumps(ev, separators=(",", ":")))
+            else:
+                bad += 1
+    return out, bad
+
+
 def lines_from_body(body: bytes) -> list[str]:
     """Split a (possibly gzip-compressed) NDJSON / syslog body into lines (inflation bounded)."""
     if body[:2] == b"\x1f\x8b":
@@ -719,4 +767,4 @@ def lines_from_body(body: bytes) -> list[str]:
     return [ln.rstrip("\r") for ln in text.split("\n") if ln.strip()]
 
 
-__all__ = ["StreamQueue", "StreamItem", "StreamStats", "StreamConsumer", "get_stream", "reset_stream", "lines_from_body", "gunzip_bounded", "InflateTooLarge"]
+__all__ = ["StreamQueue", "StreamItem", "StreamStats", "StreamConsumer", "get_stream", "reset_stream", "lines_from_body", "ocsf_lines_from_body", "gunzip_bounded", "InflateTooLarge"]

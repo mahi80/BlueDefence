@@ -74,29 +74,65 @@ def _iso(t: Any) -> str | None:
     return None
 
 
+def _int(v: Any) -> int | None:
+    """An OCSF enum id (``severity_id``, ``status_id``) that a producer may send as int, numeric string or junk."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, str):
+        t = v.strip()
+        if 0 < len(t) <= 6 and t.isascii() and (t.isdigit() or (t[0] == "-" and t[1:].isdigit())):
+            return int(t)
+    return None
+
+
+#: AEGIS's own verdicts (``to_detection_finding``) carry this marker; one fed back in is never a new alert
+AEGIS_ORIGIN = "aegis_origin"
+_OWN_PRODUCT = "bluedefence"
+
+
+def is_own(ev: dict) -> bool:
+    """An AEGIS verdict coming back (a SIEM / Security Lake that forwards ``/ingest/verdicts?format=ocsf`` to
+    ``/ingest/ocsf``): re-ingesting it would loop — every finding a new alert, a new chain, a new finding."""
+    un = ev.get("unmapped")
+    if isinstance(un, dict) and un.get(AEGIS_ORIGIN):
+        return True
+    prod = _g(ev, "metadata", "product")
+    if isinstance(prod, dict):
+        for k in ("name", "vendor_name"):
+            if str(prod.get(k) or "").strip().lower() == _OWN_PRODUCT:
+                return True
+    return False
+
+
 def _base(p: Any) -> str:
     return str(p or "").replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def is_ocsf(ev: Any) -> bool:
-    return isinstance(ev, dict) and isinstance(ev.get("class_uid"), int) and "time" in ev
+    return (isinstance(ev, dict) and isinstance(ev.get("class_uid"), int) and not isinstance(ev.get("class_uid"), bool)
+            and "time" in ev)
 
 
 def to_alert(ev: dict, *, source_hint: str = "") -> dict | None:
     """One OCSF event → one AEGIS alert, or None when it is not OCSF (no ``class_uid`` / ``time``)."""
-    if not is_ocsf(ev):
+    if not is_ocsf(ev) or is_own(ev):
         return None
     cls = int(ev["class_uid"])
     alert_type, cls_name = CLASSES.get(cls, (f"ocsf_{cls}", str(ev.get("class_name") or f"class {cls}")))
     product = _first(_g(ev, "metadata", "product", "name"), _g(ev, "metadata", "product", "vendor_name"),
                      source_hint, "OCSF")
     vendor = _g(ev, "metadata", "product", "vendor_name")
-    sev = _SEVERITY.get(int(ev.get("severity_id") or 0) if str(ev.get("severity_id", "")).lstrip("-").isdigit() else 0,
-                        "medium")
+    sid = _int(ev.get("severity_id"))
+    sev = _SEVERITY.get(sid if sid is not None else 0, "medium")
     finding = ev.get("finding_info") if isinstance(ev.get("finding_info"), dict) else {}
     uid = _first(_g(ev, "metadata", "uid"), finding.get("uid"))
     if not uid:
-        uid = hashlib.sha256(json.dumps(ev, sort_keys=True, default=str)[:8000].encode()).hexdigest()[:24]
+        # the whole event: a prefix cut made two events that differ only after 8,000 characters one id (dedupe ate one)
+        uid = hashlib.sha256(json.dumps(ev, sort_keys=True, default=str).encode()).hexdigest()[:32]
     alert: dict[str, Any] = {
         "id": f"ocsf:{str(uid)[:120]}",
         "source": f"{product}" + (f" ({vendor})" if vendor and vendor != product else ""),
@@ -118,7 +154,8 @@ def to_alert(ev: dict, *, source_hint: str = "") -> dict | None:
         alert["techniques"] = sorted({str(_g(a, "technique", "uid")) for a in attacks if _g(a, "technique", "uid")})
 
     # who / where
-    src_ip = _first(_g(ev, "src_endpoint", "ip"), _g(ev, "device", "ip") if cls in (3002, 6003) else None)
+    # never device.ip: that is the host that LOGGED the event (a domain controller for a 4625), not the source
+    src_ip = _g(ev, "src_endpoint", "ip")
     if src_ip:
         alert["source_ip"] = str(src_ip)
     dst_ip = _g(ev, "dst_endpoint", "ip")
@@ -130,8 +167,13 @@ def to_alert(ev: dict, *, source_hint: str = "") -> dict | None:
     port = _g(ev, "dst_endpoint", "port")
     if isinstance(port, int):
         alert["dst_port"] = port
-    user = _first(_g(ev, "actor", "user", "name"), _g(ev, "actor", "user", "email_addr"), _g(ev, "user", "name"),
-                  _g(ev, "user", "email_addr"), _g(ev, "actor", "user", "uid"), _g(ev, "user", "uid"))
+    if cls in (3001, 3002, 3003, 3005):
+        # IAM classes: `user` is the account being authenticated / changed; `actor` is who (or which host) acted
+        user = _first(_g(ev, "user", "name"), _g(ev, "user", "email_addr"), _g(ev, "user", "uid"),
+                      _g(ev, "actor", "user", "name"), _g(ev, "actor", "user", "email_addr"), _g(ev, "actor", "user", "uid"))
+    else:
+        user = _first(_g(ev, "actor", "user", "name"), _g(ev, "actor", "user", "email_addr"), _g(ev, "user", "name"),
+                      _g(ev, "user", "email_addr"), _g(ev, "actor", "user", "uid"), _g(ev, "user", "uid"))
     if user:
         alert["user_id"] = str(user)
     host = _first(_g(ev, "device", "hostname"), _g(ev, "device", "name"))
@@ -184,8 +226,9 @@ def to_alert(ev: dict, *, source_hint: str = "") -> dict | None:
         if svc:
             alert["eventSource"] = str(svc)
     if cls == 3002:
-        alert["auth_result"] = "failure" if int(ev.get("status_id") or 0) == 2 else (
-            "success" if int(ev.get("status_id") or 0) == 1 else str(ev.get("status") or "unknown").lower())
+        st = _int(ev.get("status_id"))
+        alert["auth_result"] = "failure" if st == 2 else (
+            "success" if st == 1 else str(ev.get("status") or "unknown").lower()[:32])
         mfa = ev.get("is_mfa")
         if isinstance(mfa, bool):
             alert["mfa"] = mfa
@@ -215,11 +258,18 @@ def to_detection_finding(chain: dict, *, product_version: str = "") -> dict:
     Security Lake / data lake reads AEGIS verdicts like any other finding."""
     c = chain.get("chain", chain) if isinstance(chain, dict) else {}
     verdict = str(c.get("verdict") or "uncertain")
-    ts = c.get("created_at") or c.get("timestamp")
-    try:
-        t_ms = int(datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp() * 1000) if ts else None
-    except ValueError:
-        t_ms = None
+    # an EvidenceChain carries started_at / completed_at; the finding's time is when the verdict was reached (it used
+    # to read created_at / timestamp, which a chain does not have, so every finding was stamped "now")
+    ts = c.get("completed_at") or c.get("started_at") or c.get("created_at") or c.get("timestamp")
+    t_ms = None
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        t_ms = int(ts * 1000 if ts < 1e11 else ts)
+    elif ts:
+        try:
+            d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            t_ms = int((d if d.tzinfo else d.replace(tzinfo=UTC)).timestamp() * 1000)
+        except ValueError:
+            t_ms = None
     actions = c.get("recommended_actions") or []
     return {
         "class_uid": 2004, "class_name": "Detection Finding", "category_uid": 2, "category_name": "Findings",
@@ -235,8 +285,8 @@ def to_detection_finding(chain: dict, *, product_version: str = "") -> dict:
         "evidences": [{"data": {"source": e.get("source"), "weight": e.get("weight"), "signal": str(e.get("signal") or "")[:500]}}
                       for e in (c.get("evidence") or [])[:20] if isinstance(e, dict)],
         "remediation": {"desc": "; ".join(f"{a.get('action_type')} -> {a.get('target')}" for a in actions[:10] if isinstance(a, dict))},
-        "unmapped": {"verdict": verdict, "integrity_hash": c.get("integrity_hash")},
+        "unmapped": {"verdict": verdict, "integrity_hash": c.get("integrity_hash"), AEGIS_ORIGIN: True},
     }
 
 
-__all__ = ["CLASSES", "is_ocsf", "to_alert", "to_detection_finding"]
+__all__ = ["AEGIS_ORIGIN", "CLASSES", "is_ocsf", "is_own", "to_alert", "to_detection_finding"]
