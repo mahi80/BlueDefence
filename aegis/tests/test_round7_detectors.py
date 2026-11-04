@@ -158,10 +158,14 @@ def test_d9_wildcard_dns_ssrf(url, want):
 
 def test_d10_stix_revoked_expired_and_bad_confidence():
     from aegis.agents.threat_intel import feeds
-    assert feeds.parse_stix_bundle({"objects": [{"type": "indicator", "pattern": "[ipv4-addr:value = '52.66.1.10']",
-                                                 "revoked": True, "confidence": 90}]}) == []
-    assert feeds.parse_stix_bundle({"objects": [{"type": "indicator", "pattern": "[ipv4-addr:value = '52.66.1.11']",
-                                                 "valid_until": "2020-01-01T00:00:00Z", "confidence": 90}]}) == []
+    from aegis.agents.threat_intel.store import RETRACTED_TAG
+
+    def live(out):                     # round 8 D8-11: revoked / expired come back as retractions, never live
+        return [i for i in out if RETRACTED_TAG not in i.tags]
+    assert live(feeds.parse_stix_bundle({"objects": [{"type": "indicator", "pattern": "[ipv4-addr:value = '52.66.1.10']",
+                                                      "revoked": True, "confidence": 90}]})) == []
+    assert live(feeds.parse_stix_bundle({"objects": [{"type": "indicator", "pattern": "[ipv4-addr:value = '52.66.1.11']",
+                                                      "valid_until": "2020-01-01T00:00:00Z", "confidence": 90}]})) == []
     out = feeds.parse_stix_bundle({"objects": [
         {"type": "indicator", "pattern": "[ipv4-addr:value = '5.5.5.5']", "confidence": "high"},
         {"type": "indicator", "pattern": "[ipv4-addr:value = '6.6.6.6']"}]})
@@ -190,7 +194,8 @@ def test_d12_edr_ioc_and_tcc():
     from aegis.agents.threat_intel.store import IOC, IOCStore
     assert e.ioc_match(None, "x7f3a.c2.attacker.test", None).weight == "high"
     assert e.ioc_match(None, None, "::ffff:203.0.113.66").weight == "high"
-    assert e.tcc_grant("kTCCServiceScreenCapture", "com.apple.evil-updater", True).weight != "low"
+    assert e.tcc_grant("kTCCServiceScreenCapture", "com.apple.evil-updater", True,
+                       authority="Developer ID Application: Evil (X1)").weight != "low"   # round 8 D8-12
     assert e.tcc_grant("kTCCServiceMicrophone", "/Applications/zoom.us.app.evil/Contents/MacOS/x", True).weight == "high"
     s = IOCStore()
     sha1 = "a" * 40

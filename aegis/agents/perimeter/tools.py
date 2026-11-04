@@ -337,9 +337,55 @@ def _inet_aton(h: str) -> ipaddress.IPv4Address | None:
     return ipaddress.IPv4Address(v)
 
 
+#: full stops a browser / resolver folds to "." (UTS #46): ideographic, fullwidth, halfwidth, vertical-form
+_DOTS = str.maketrans({"\u3002": ".", "\uff0e": ".", "\uff61": ".", "\ufe12": "."})
+_SSRF_DECODE_ROUNDS = 4
+
+
+def _fold(text: str) -> str:
+    """NFKC + every full-stop variant → ``.``: ``①⑥⑨.②⑤④…``, ``１６９．２５４…``, ``169.254.169.254。nip.io``
+    are the addresses a resolver reaches (round 8 D8-10)."""
+    return unicodedata.normalize("NFKC", text).translate(_DOTS)
+
+
+def _norm_host(host: str) -> str:
+    h = _fold(str(host or "")).strip().strip("[]").lower().rstrip(".")
+    if h and not h.isascii():
+        try:
+            h = h.encode("idna").decode("ascii")       # IDNA (punycode) the way a resolver would look it up
+        except UnicodeError:
+            pass
+    return h
+
+
+def _url_hosts(url: str) -> list[str]:
+    """Every host a URL parser might pick: the standard one (after the last ``@``) and each ``@``-separated piece
+    of the authority — ``http://user@169.254.169.254.nip.io@evil.com/`` reaches the first with some clients
+    (round 8 D8-10)."""
+    out: list[str] = []
+    try:
+        sp = urllib.parse.urlsplit(url)
+        if sp.hostname:
+            out.append(sp.hostname)
+        netloc = sp.netloc
+    except Exception:  # noqa: BLE001 — malformed authority: fall back to the raw text
+        netloc = url.split("://", 1)[-1].split("/", 1)[0]
+    if "@" in netloc:
+        for piece in netloc.split("@")[1:]:
+            if piece.startswith("[") and "]" in piece:
+                host = piece[1:piece.index("]")]          # [v6]:port
+            elif piece.count(":") == 1:
+                host = piece.rsplit(":", 1)[0]            # name:port
+            else:
+                host = piece
+            if host and host not in out:
+                out.append(host)
+    return out
+
+
 def _host_is_internal(host: str) -> tuple[bool, str]:
     """Classify a URL host as an SSRF target by what it *resolves to*, not a literal match."""
-    h = (host or "").strip().strip("[]").lower().rstrip(".")
+    h = _norm_host(host)
     if not h:
         return False, ""
     if h in _METADATA_HOSTS or h in _INTERNAL_NAMES:
@@ -404,12 +450,19 @@ def ssrf_probe(raw: str) -> ToolResult:
     (DNS rebinding) is not caught here — that needs the egress proxy's resolved-IP check.
     """
     layers = [raw]
-    try:
-        u = urllib.parse.unquote_plus(raw)
-        if u != raw:
-            layers.append(u)
-    except Exception:  # noqa: BLE001, S110 — decode probing; failure is common, not an error
-        pass
+    # bounded repeated decoding (``%252e`` → ``%2e`` → ``.``), each layer NFKC- and full-stop-folded (round 8 D8-10)
+    cur = raw
+    for _ in range(_SSRF_DECODE_ROUNDS):
+        try:
+            nxt = urllib.parse.unquote_plus(cur)
+        except Exception:  # noqa: BLE001 — decode probing; failure is common, not an error
+            break
+        if nxt == cur:
+            break
+        layers.append(nxt)
+        cur = nxt
+    folded = [_fold(x) for x in layers]
+    layers += [f for f, x in zip(folded, layers, strict=True) if f != x]
     text = " ".join(layers)
     low = text.lower()
     hits: list[dict] = []
@@ -420,14 +473,11 @@ def ssrf_probe(raw: str) -> ToolResult:
     # `1http://…` and a 100-letter prefix before `http://` are still caught.
     for m in _URL_RX.findall(text):
         m = _SCHEME_LEAD.sub("", m)
-        try:
-            host = urllib.parse.urlsplit(m).hostname or ""
-        except Exception:  # noqa: BLE001, S112 — malformed URL; skip it
-            continue
-        internal, why = _host_is_internal(host)
-        if internal and host.lower() not in seen:
-            seen.add(host.lower())
-            hits.append({"url": m[:200], "host": host, "reason": why})
+        for host in _url_hosts(m):
+            internal, why = _host_is_internal(host)
+            if internal and host.lower() not in seen:
+                seen.add(host.lower())
+                hits.append({"url": m[:200], "host": host, "reason": why})
     # scheme-less service refs like meta:8000 — only when the host is known-internal
     for name, port in re.findall(r"\b([a-z0-9][a-z0-9.\-]{1,62}):(\d{2,5})\b", low):
         # `10:30`, `16:00`, an ISO timestamp's `T10:30` are times, not host:port: a bare 1–3 digit "host" read

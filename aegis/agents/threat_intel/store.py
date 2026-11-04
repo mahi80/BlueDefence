@@ -62,6 +62,9 @@ LLM_TAG = "llm-extracted"
 #: it the NDR matcher takes the domain exactly (round 7 D-5 — a "malicious" sharepoint.com tenant apex used to
 #: flag every tenant)
 SUBDOMAIN_TAG = "match-subdomains"
+#: an IOC carrying this tag is a retraction, not an indicator: the feed revoked it or its validity ended. Adding
+#: one removes the stored entry (and stores nothing) — review round 8 D8-11
+RETRACTED_TAG = "retracted"
 
 
 class IOCStore:
@@ -73,11 +76,18 @@ class IOCStore:
         # out (the seed entries those modules ship with are never touched)
         self._pushed_perimeter: set[str] = set()
         self._pushed_edr: dict[str, set[str]] = {"hash_md5": set(), "hash_sha1": set(), "hash_sha256": set(),
-                                                 "domain": set(), "ip": set()}
+                                                 "domain": set(), "ip": set(), "domain_subtree": set()}
 
-    def add(self, ioc: IOC) -> bool:
+    def add(self, ioc: IOC, *, keep_last_seen: bool = False) -> bool:
         """Validate, normalise and store. Returns False (and stores nothing) for a rejected indicator: an
-        unknown kind, a malformed value, or the bank's own address space / domains — see ``validate.py``."""
+        unknown kind, a malformed value, or the bank's own address space / domains — see ``validate.py``.
+
+        ``keep_last_seen``: the IOC's ``last_seen`` is an observation time to keep as given — a peer entry with no
+        ``last_seen`` (0) stays unobserved (already expired) instead of becoming "seen now" (round 8 D8-7).
+        An IOC tagged ``retracted`` removes the stored entry instead (round 8 D8-11)."""
+        if RETRACTED_TAG in ioc.tags:
+            self.retract(ioc.kind, ioc.value, source=ioc.source)
+            return False
         if str(ioc.kind).startswith("hash_"):
             # a feed's "hash" (RF) or a mislabelled MISP sha1: the hex length names the algorithm (round 7 D-12)
             n = len(str(ioc.value or "").strip())
@@ -121,7 +131,10 @@ class IOCStore:
             if existing is not None and old_llm and not new_llm:
                 existing = None                    # a feed now vouches for it: the feed entry replaces the LLM one
             if existing is not None:
-                # Merge: keep the higher confidence + extend last_seen
+                # Merge: keep the higher confidence + extend last_seen. The same source re-publishing its own
+                # indicator restates its validity: a shorter one shrinks the entry (round 8 D8-11); another
+                # source vouching for it keeps the longer of the two.
+                same_source = ioc.source == existing.source
                 merged = IOC(
                     kind=ioc.kind, value=ioc.value,
                     confidence=max(ioc.confidence, existing.confidence),
@@ -129,9 +142,9 @@ class IOCStore:
                     first_seen=existing.first_seen or now,
                     # the newer of the two observations, never "now": two regions syncing hourly used to refresh
                     # each other forever, so a 3-day indicator nobody re-observed never expired (round 7 D-4)
-                    last_seen=max(existing.last_seen or 0.0, ioc.last_seen or 0.0) or now,
+                    last_seen=max(existing.last_seen or 0.0, ioc.last_seen or 0.0) or (0.0 if keep_last_seen else now),
                     tags=tuple(set(existing.tags) | set(ioc.tags)),
-                    ttl_seconds=max(ioc.ttl_seconds, existing.ttl_seconds),
+                    ttl_seconds=ioc.ttl_seconds if same_source else max(ioc.ttl_seconds, existing.ttl_seconds),
                 )
                 self._iocs[key] = merged
             else:
@@ -139,14 +152,27 @@ class IOCStore:
                     kind=ioc.kind, value=ioc.value,
                     confidence=ioc.confidence, source=ioc.source,
                     first_seen=ioc.first_seen or now,
-                    last_seen=ioc.last_seen or now,
+                    last_seen=ioc.last_seen if keep_last_seen else (ioc.last_seen or now),
                     tags=ioc.tags, ttl_seconds=ioc.ttl_seconds,
                 )
         return True
 
-    def add_many(self, iocs: Iterable[IOC]) -> int:
-        """Returns how many were accepted."""
-        return sum(1 for ioc in iocs if self.add(ioc))
+    def add_many(self, iocs: Iterable[IOC], *, keep_last_seen: bool = False) -> int:
+        """Returns how many were accepted (retractions are applied, not counted)."""
+        return sum(1 for ioc in iocs if self.add(ioc, keep_last_seen=keep_last_seen))
+
+    def retract(self, kind: str, value: str, *, source: str | None = None) -> bool:
+        """Remove an indicator a feed revoked or let expire. Returns True when an entry was removed; the matchers
+        drop it on their next merge_into_* (they only keep what the store still distributes)."""
+        if str(kind).startswith("hash_"):
+            kind = {32: "hash_md5", 40: "hash_sha1", 64: "hash_sha256"}.get(len(str(value or "").strip()), kind)
+        norm, _why = normalise(kind, value)
+        key = (kind, norm if norm is not None else str(value))
+        with self._lock:
+            gone = self._iocs.pop(key, None)
+        if gone is not None:
+            _log.info("[threat_intel] retracted IOC %s %r (revoked / expired by %s)", kind, key[1][:80], source)
+        return gone is not None
 
     def lookup(self, value: str, kind: IocKind | None = None, *, include_llm: bool | None = None) -> IOC | None:
         """Return the IOC if present and not expired. Honors TTL.
@@ -276,4 +302,14 @@ class IOCStore:
                 else:
                     target.add(v)
                 pushed.add(v)
+        # the subdomain opt-in travels with the indicator: only a domain tagged match-subdomains names the hosts
+        # under it in the EDR matcher, as in NDR (review round 8 D8-6)
+        sub_want = {v for v, ioc in want["domain"].items() if SUBDOMAIN_TAG in ioc.tags and v in self._pushed_edr["domain"]}
+        sub_pushed = self._pushed_edr["domain_subtree"]
+        for v in list(sub_pushed - sub_want):
+            e._IOC_DOMAIN_SUBTREE.discard(v)
+            sub_pushed.discard(v)
+        for v in sub_want:
+            e._IOC_DOMAIN_SUBTREE.add(v)
+            sub_pushed.add(v)
         return merged

@@ -11,6 +11,7 @@ matched against incoming alerts.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from ..shared.client_actions import client_actions
@@ -61,28 +62,51 @@ def registry_with_stacks(stacks: list[str] | None = None, base: list[Honeytoken]
     return out
 
 
-# where a decoy can show up: the WAF ingest renames username -> user_id, Imperva maps qstr / postbody to
-# query_string / post_body, and a decoy key is most often presented in a request header (review round 7 D-2)
+# where a decoy can show up: the WAF ingest renames username -> user_id, Imperva maps qstr / postbody / ref to
+# query_string / post_body / referrer, AWS WAF puts the matched request part in matched_data, and a decoy key is
+# most often presented in a request header (review round 7 D-2, round 8 D8-4)
 _FIELDS = ("payload", "url", "uri", "path", "request_uri", "username", "user_id", "user", "principal", "account",
-           "query", "query_string", "post_body", "body", "request_body", "raw", "db_name", "database", "cmdline")
+           "query", "query_string", "post_body", "body", "request_body", "raw", "db_name", "database", "cmdline",
+           "user_agent", "referrer", "referer", "matched_data", "host", "cookie")
 _HEADER_FIELDS = ("headers", "request_headers", "http_headers")
+#: each field (and each header) is bounded on its own: an attacker's 200 KB payload or query string cannot push
+#: another field's decoy out of a shared haystack
+_FIELD_CAP = 65536
+_MAX_HEADERS = 512
 
 
-def _haystack(alert: dict) -> str:
-    parts = [str(alert.get(f, "")) for f in _FIELDS if alert.get(f) not in (None, "")]
+def _values(alert: dict):
+    """Every place a decoy can show up, one bounded string per field / header."""
+    for f in _FIELDS:
+        v = alert.get(f)
+        if v not in (None, ""):
+            yield str(v)[:_FIELD_CAP]
     for hf in _HEADER_FIELDS:
         hv = alert.get(hf)
         if isinstance(hv, dict):
-            parts.extend(f"{k}: {v}" for k, v in list(hv.items())[:100])
+            for k, v in list(hv.items())[:_MAX_HEADERS]:
+                yield f"{k}: {v}"[:_FIELD_CAP]
         elif isinstance(hv, (list, tuple)):
-            parts.extend(str(x) for x in hv[:100])
+            for x in hv[:_MAX_HEADERS]:
+                if isinstance(x, dict) and "name" in x:            # AWS WAF / API-gateway [{name, value}] form
+                    yield f"{x.get('name')}: {x.get('value')}"[:_FIELD_CAP]
+                else:
+                    yield str(x)[:_FIELD_CAP]
         elif hv:
-            parts.append(str(hv))
-    return " ".join(parts)[:200_000]
+            yield str(hv)[:_FIELD_CAP]
+
+
+def _haystack(alert: dict) -> str:
+    """Kept for callers that want one string; matching is per field (see _values)."""
+    return " ".join(_values(alert))
+
+
+_DOT_SEG = re.compile(r"/\.(?=/|$)")
+_DOTDOT_SEG = re.compile(r"/[^/]+/\.\.(?=/|$)")
 
 
 def _normalise(s: str) -> str:
-    import re
+    import unicodedata
     from urllib.parse import unquote
     out = s
     for _ in range(3):                                   # double-encoding: %252e → %2e → .
@@ -90,7 +114,14 @@ def _normalise(s: str) -> str:
         if nxt == out:
             break
         out = nxt
+    out = unicodedata.normalize("NFKC", out)             # fullwidth ／ ． → / .
     out = re.sub(r"/{2,}", "/", out.replace("\\", "/"))
+    # RFC 3986 dot-segments: /.git/./config and /.git/x/../config are /.git/config (bounded passes)
+    for _ in range(16):
+        nxt = _DOTDOT_SEG.sub("", _DOT_SEG.sub("", out), count=64)
+        if nxt == out:
+            break
+        out = nxt
     return out.lower()
 
 
@@ -104,15 +135,15 @@ class HoneytokenMonitor:
         return self._match(alert) is not None
 
     def _match(self, alert: dict) -> Honeytoken | None:
-        raw = _haystack(alert)
-        norm = _normalise(raw)
+        vals = list(_values(alert))
+        norms = [_normalise(v) for v in vals]
         for token in self._registry:
-            if token.value in raw:
-                return token
-            # URL paths and account names compare case-insensitively after percent-decoding and collapsing
-            # repeated slashes: `/Admin-Internal-Debug`, `/%2egit/config`, `/.git//config`, `SVC_BANKING_LEGACY`
-            # all touch the decoy (review round 7 D-2). Keys / DB names keep an exact, case-sensitive match too.
-            if _normalise(token.value) in norm:
+            tnorm = _normalise(token.value)
+            # URL paths and account names compare case-insensitively after percent-decoding, NFKC, collapsing
+            # repeated slashes and resolving dot-segments: `/Admin-Internal-Debug`, `/%2egit/config`,
+            # `/.git//config`, `/.git/x/../config`, `/．git/config`, `SVC_BANKING_LEGACY` all touch the decoy
+            # (review round 7 D-2, round 8 D8-4). Keys / DB names keep an exact, case-sensitive match too.
+            if any(token.value in v for v in vals) or any(tnorm in n for n in norms):
                 return token
         return None
 

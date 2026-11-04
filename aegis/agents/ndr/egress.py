@@ -93,6 +93,36 @@ def internal_networks() -> list[Any]:
     return out
 
 
+_AI_RANGES_CACHE: tuple[str, list[Any]] = ("", [])
+
+
+def ai_provider_networks() -> list[Any]:
+    """``AEGIS_NDR_AI_PROVIDER_CIDRS``: the AI providers' published egress ranges (comma-separated). Only a
+    destination inside one of them lets an approved / registered AI SNI skip the beacon check (round 8 D8-8)."""
+    global _AI_RANGES_CACHE
+    raw = os.environ.get("AEGIS_NDR_AI_PROVIDER_CIDRS", "").strip()
+    if raw == _AI_RANGES_CACHE[0]:
+        return _AI_RANGES_CACHE[1]
+    out = []
+    for n in (x.strip() for x in raw.split(",") if x.strip()):
+        try:
+            out.append(ipaddress.ip_network(n, strict=False))
+        except ValueError:
+            logger.warning("[ndr] AEGIS_NDR_AI_PROVIDER_CIDRS entry %r is not a network; ignored", n)
+    _AI_RANGES_CACHE = (raw, out)
+    return out
+
+
+def _in_networks(ip: str, nets: list[Any]) -> bool:
+    try:
+        a = ipaddress.ip_address(str(ip).strip().strip("[]"))
+    except ValueError:
+        return False
+    if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None:
+        a = a.ipv4_mapped
+    return any(a.version == n.version and a in n for n in nets)
+
+
 def _suffix_list(name: str) -> tuple[str, ...]:
     return tuple(s.strip().lower().strip(".") for s in os.environ.get(name, "").split(",") if s.strip())
 
@@ -366,11 +396,13 @@ class EgressDetector:
             if status in ("unregistered", "unapproved"):
                 out.append(self._emit("shadow_ai", p, ts, 1, indicator=svc.endpoint,
                                       shadow_ai={**u.to_dict(), "level": "use"}))
-                # an AI SNI is client-chosen too: a C2 that names api.openai.com while talking to its own IP on a
-                # fixed period was only ever "shadow AI, low" (round 7 D-6). The destination IP's own cadence is
-                # still judged; a registered / approved AI system keeps the old quiet path.
-                if ip_pair is not None and not ip_pair.beacon:
-                    out.append(self._check_beacon(ip_pair, ts))
+            # an AI SNI is client-chosen too: a C2 that names api.openai.com while talking to its own IP on a fixed
+            # period was only ever "shadow AI, low" (round 7 D-6) — and approving api.openai.com bank-wide silenced
+            # it completely (round 8 D8-8). The destination IP's own cadence is judged whatever the AI status,
+            # unless the operator listed the provider's ranges and the IP is inside them.
+            vetted = status not in ("unregistered", "unapproved") and _in_networks(dst, ai_provider_networks())
+            if ip_pair is not None and not ip_pair.beacon and not vetted:
+                out.append(self._check_beacon(ip_pair, ts))
             return out                       # the SNI itself is judged as AI usage, not as a beacon
         hit_b = self._check_beacon(p, ts)
         if hit_b is None and ip_pair is not None and not p.beacon:

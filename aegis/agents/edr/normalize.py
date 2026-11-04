@@ -118,8 +118,13 @@ def from_osquery(query: str, row: dict) -> dict:
     if query == "webshell_webroot_scripts":
         return {**base, "file_path": row.get("path"), "file_hash_current": row.get("sha256")}
     if query == "macos_tcc_grants":
-        return {**base, "tcc_service": row.get("service"), "tcc_client": row.get("client"),
-                "tcc_allowed": _int(row.get("allowed"))}
+        out = {**base, "tcc_service": row.get("service"), "tcc_client": row.get("client"),
+               "tcc_allowed": _int(row.get("allowed"))}
+        # the code-signing authority, when the pack joins osquery's `signature` table (review round 8 D8-12)
+        auth = row.get("authority") or row.get("signing_authority")
+        if auth:
+            out["tcc_authority"] = auth
+        return out
     if query == "net_etc_hosts":
         return {**base, "file_path": "/etc/hosts"}
     if query == "net_dns_resolvers":

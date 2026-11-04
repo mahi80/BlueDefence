@@ -1,6 +1,7 @@
 """Tools for the Wireless specialist."""
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
 
@@ -36,11 +37,54 @@ _CONFUSABLES = str.maketrans({
 })
 
 
+def _ssid_fold(ssid: str) -> str:
+    t = unicodedata.normalize("NFKC", str(ssid or "")[:64])
+    t = "".join(c for c in t if not c.isspace() and unicodedata.category(c) not in ("Cf", "Cc", "Mn", "Zs"))
+    return t.casefold()
+
+
 def _ssid_key(ssid: str) -> str:
     """NFKC, drop invisible / whitespace characters, fold case and look-alikes (round 7 D-13)."""
-    t = unicodedata.normalize("NFKC", str(ssid or ""))
-    t = "".join(c for c in t if not c.isspace() and unicodedata.category(c) not in ("Cf", "Cc", "Mn", "Zs"))
-    return t.casefold().translate(_CONFUSABLES)
+    return _ssid_fold(ssid).translate(_CONFUSABLES)
+
+
+#: one trailing decoration an AP name gets (or an attacker adds to look like a second radio / extender):
+#: ``-2``, ``5G``, ``_5GHz``, ``2.4G``, ``-guest``, ``-ext`` (round 8 D8-17)
+_SSID_SUFFIX = re.compile(r"[-_.]?(?:\d(?:\.\d)?ghz|\d(?:\.\d)?g|guest|ext|extender|repeater|\d{1,2})$")
+
+
+def _ssid_variants(ssid: str) -> list[str]:
+    """The SSID's key, then the key with one, two, three trailing decorations removed."""
+    t = _ssid_fold(ssid)
+    out = [t.translate(_CONFUSABLES)]
+    for _ in range(3):
+        nxt = _SSID_SUFFIX.sub("", t)
+        if nxt == t or not nxt:
+            break
+        t = nxt
+        out.append(t.translate(_CONFUSABLES))
+    return out
+
+
+def _edit_le(a: str, b: str, k: int) -> bool:
+    """Optimal-string-alignment distance (adjacent swaps count once) of at most ``k``; banded, so linear in the
+    (short) SSID."""
+    if abs(len(a) - len(b)) > k:
+        return False
+    prev2: list[int] | None = None
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [k + 1] * len(b)
+        for j in range(max(1, i - k), min(len(b), i + k) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            v = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if prev2 is not None and i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                v = min(v, prev2[j - 2] + 1)
+            cur[j] = v
+        if min(cur) > k:
+            return False
+        prev2, prev = prev, cur
+    return prev[len(b)] <= k
 
 
 def _edit1(a: str, b: str) -> bool:
@@ -67,14 +111,19 @@ def _ssid_match(ssid: str) -> tuple[str | None, str]:
         return ssid, "exact"
     if _AUTH_KEYS is None:
         _AUTH_KEYS = {_ssid_key(k): k for k in _AUTHORIZED_SSIDS}
-    k = _ssid_key(ssid)
-    if not k:
+    variants = [v for v in _ssid_variants(ssid) if v]
+    if not variants:
         return None, ""
-    if k in _AUTH_KEYS:
-        return _AUTH_KEYS[k], "normalised"
-    for ak, name in _AUTH_KEYS.items():
-        if len(ak) >= 6 and _edit1(k, ak):
-            return name, "lookalike"
+    if variants[0] in _AUTH_KEYS:
+        return _AUTH_KEYS[variants[0]], "normalised"
+    # a decorated name (`BankWiFi-PoS-2`, `BankWiFi-PoS 5G`, `BankWiFi-PoS_5GHz`) and up to two edits on a long
+    # name are look-alikes too (round 8 D8-17)
+    for k in variants:
+        if k in _AUTH_KEYS:
+            return _AUTH_KEYS[k], "lookalike"
+        for ak, name in _AUTH_KEYS.items():
+            if len(ak) >= 6 and _edit_le(k, ak, 2 if len(ak) >= 10 else 1):
+                return name, "lookalike"
     return None, ""
 
 

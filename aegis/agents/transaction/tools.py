@@ -143,21 +143,25 @@ def velocity_check(user_id: str | None,
             "user_id": user_id, "baseline_known": False,
         }, weight="low")
     # a count / total sent as text ("12", "9,50,000", "₹9,50,000") used to raise or read as 0 (round 7 D-14)
-    count_ratio = (_amount(recent_24h_count) or 0.0) / max(baseline["txn_count_24h_p99"], 1)
-    amt_ratio = (_amount(recent_24h_total_inr) or 0.0) / max(baseline["txn_total_24h_p99_inr"], 1)
+    # an amount that was sent but cannot be read is unknown, not 0: it never lowers the risk (round 8 D8-13)
+    cnt, tot = _amount(recent_24h_count), _amount(recent_24h_total_inr)
+    unknown = (cnt is None) or (tot is None and recent_24h_total_inr not in (None, ""))
+    count_ratio = (cnt or 0.0) / max(baseline["txn_count_24h_p99"], 1)
+    amt_ratio = (tot or 0.0) / max(baseline["txn_total_24h_p99_inr"], 1)
     over_count = count_ratio > 1.0
     over_amount = amt_ratio > 1.0
     # 2x p99 is suspicious; 5x is high-confidence anomaly
     weight = "low"
     if count_ratio >= 5.0 or amt_ratio >= 5.0:
         weight = "high"
-    elif over_count or over_amount:
+    elif over_count or over_amount or unknown:
         weight = "medium"
     return ToolResult(name="velocity", data={
         "user_id": user_id,
         "count_ratio_p99": round(count_ratio, 2),
         "amount_ratio_p99": round(amt_ratio, 2),
         "over_p99": over_count or over_amount,
+        "amount_unknown": unknown,
     }, weight=weight)
 
 
@@ -186,14 +190,17 @@ def payment_rail_anomaly(user_id: str | None, rail: str | None,
     # `upi` and `UPI` are one rail (it was "novel" by case alone; review round 3 S3-23)
     rail = str(rail).strip().upper()
     novel_rail = rail not in {str(r).upper() for r in baseline["rails_used"]}
-    amount = _amount(amount_inr) or 0.0               # "₹1,50,000" is 150000, not 0 (S3-22, round 7 D-14)
-    high_value = amount >= 100000  # 1L INR threshold for "large"
+    amount = _amount(amount_inr)                      # "₹1,50,000" is 150000, not 0 (S3-22, round 7 D-14)
+    # an amount that cannot be read is unknown: it is judged as if large, never as 0 (round 8 D8-13)
+    amount_unknown = amount is None and amount_inr not in (None, "")
+    high_value = amount_unknown or (amount or 0.0) >= 100000  # 1L INR threshold for "large"
     weight = "high" if (novel_rail and high_value) else "medium" if novel_rail else "low"
     return ToolResult(name="payment_rail", data={
         "user_id": user_id, "rail": rail,
         "primary_rail": baseline["primary_rail"],
         "novel_rail": novel_rail,
         "high_value": high_value,
+        "amount_unknown": amount_unknown,
     }, weight=weight)
 
 
@@ -209,16 +216,45 @@ def _flag(v: object) -> bool:
     return bool(v)
 
 
+_CURRENCY_RX = re.compile(r"^(?:₹|₨|inr|rs\.?|rupees?)\s*|\s*(?:₹|₨|inr|rs\.?|rupees?)$")
+_MULTIPLIER = {"lakh": 1e5, "lakhs": 1e5, "lac": 1e5, "lacs": 1e5, "l": 1e5,
+               "crore": 1e7, "crores": 1e7, "cr": 1e7, "k": 1e3, "thousand": 1e3}
+_AMOUNT_RX = re.compile(r"^([+-]?(?:[0-9][0-9,_ ]*(?:\.[0-9]*)?|\.[0-9]+)(?:e[+-]?[0-9]+)?)\s*([a-z]+)?$")
+
+
 def _amount(v: object) -> float | None:
+    """An INR amount as banks and statements write it, or ``None`` when it cannot be read. ``9,50,000``,
+    ``₹9,50,000/-``, ``Rs.9,50,000.00 CR``, ``INR 9,50,000.00 Dr``, ``₨9,50,000``, ``9.5 lakh``, ``9.5L``,
+    ``1 Cr`` (round 7 D-14, round 8 D8-13). ``Dr`` / ``Cr`` after a statement-formatted figure (paise or digit
+    grouping) is the debit / credit marker, otherwise ``Cr`` is crore."""
     import math
+    if isinstance(v, bool):
+        return None
     try:
         if isinstance(v, str):
-            # "9,50,000", "₹950000", "INR 9,50,000.00", "Rs. 950000" are all one amount (round 7 D-14)
-            t = re.sub(r"(?i)^\s*(?:₹|inr|rs\.?)\s*|\s*(?:₹|inr|rs\.?)\s*$", "", v)
-            f = float(re.sub(r"[,\s_]", "", t))
+            t = " ".join(v.strip().lower().split())[:64]
+            if t.endswith("/-"):
+                t = t[:-2].rstrip()
+            for _ in range(2):                                      # currency before and / or after the figure
+                t = _CURRENCY_RX.sub("", t).strip()
+            if t.endswith("/-"):
+                t = t[:-2].rstrip()
+            m = _AMOUNT_RX.match(t)
+            if not m:
+                return None
+            num, word = m.group(1), m.group(2) or ""
+            statement_fmt = "," in num or re.search(r"\.\d{2}$", num.strip()) is not None
+            mult = 1.0
+            if word in ("dr", "cr") and (statement_fmt or word == "dr"):
+                mult = 1.0                                          # debit / credit marker
+            elif word in _MULTIPLIER:
+                mult = _MULTIPLIER[word]
+            elif word:
+                return None
+            f = float(re.sub(r"[,\s_]", "", num)) * mult
         else:
             f = float(v)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return f if math.isfinite(f) else None
 
@@ -229,7 +265,9 @@ def aml_structuring_check(recent_amounts_inr: list[float] | None,
         return ToolResult(name="aml_structuring", data={
             "verdict": "insufficient_data",
         }, weight="low")
-    amounts = [a for a in (_amount(x) for x in recent_amounts_inr) if a is not None]   # "950000" counts (S4-15)
+    parsed = [_amount(x) for x in recent_amounts_inr]
+    amounts = [a for a in parsed if a is not None]   # "950000" counts (S4-15)
+    n_unknown = len(parsed) - len(amounts)
     just_under_threshold = [
         a for a in amounts
         if 0.85 * threshold_inr <= a < threshold_inr
@@ -238,12 +276,16 @@ def aml_structuring_check(recent_amounts_inr: list[float] | None,
         len(just_under_threshold) >= 3
         and statistics.stdev(just_under_threshold) / statistics.mean(just_under_threshold) < 0.10
     )
+    # amounts that could not be read could complete the pattern: unknown, never "clean" (round 8 D8-13)
+    weight = "high" if structuring_pattern else (
+        "medium" if n_unknown and len(just_under_threshold) + n_unknown >= 3 else "low")
     return ToolResult(name="aml_structuring", data={
         "n_recent": len(amounts),
         "n_just_under": len(just_under_threshold),
+        "n_unparseable": n_unknown,
         "threshold_inr": threshold_inr,
         "structuring_pattern": structuring_pattern,
-    }, weight="high" if structuring_pattern else "low")
+    }, weight=weight)
 
 
 # ---- SWIFT-specific check (LAU verification, RMA changes) ----------
