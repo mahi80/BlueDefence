@@ -659,6 +659,7 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
     - ``AEGIS_FW_VENDOR``   = panos | fortigate | mock-panos | mock-fortigate → firewall block / block_egress of one IP
     - ``AEGIS_IDP_VENDOR``  = entra | ad | mock → revoke_sessions / force_logout / lock_account on a user principal
     - ``AEGIS_PAM_VENDOR``  = cyberark | mock → rotate_credential of one vaulted account
+    - ``AEGIS_PAYHOLD_VENDOR`` = api | mock → hold an account's outbound payments / one transfer (AEGIS Payment Hold API)
     - ``AEGIS_BLOCK_FEED``  = 1 → block / block_egress listed on the pull feed firewalls fetch (registered last)
     - ``AEGIS_AGENT_SANDBOX`` = openshell | mock → NVIDIA OpenShell network quarantine of an AI agent (isolate agent:<sandbox>)
     - ``AEGIS_ENFORCEMENT_MODE`` = shadow (default) | live — shadow makes every vendor connector dry-run
@@ -684,6 +685,14 @@ def registry_from_env(on_receipt: Iterable[Callable[[str, Receipt], Any]] = ()) 
             connectors.append(waf)
     except Exception as e:  # noqa: BLE001 — a bad env block must not take the response agent down
         logger.warning("[connectors] WAF connector not built: %s", str(e)[:160])
+    try:
+        # before SOAR: a bank with the Payment Hold API never routes a hold to a playbook
+        from .payhold import payhold_from_env
+        ph = payhold_from_env()
+        if ph is not None:
+            connectors.append(ph)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[connectors] payment-hold connector not built: %s", str(e)[:160])
     try:
         from .soar import soar_from_env
         soar = soar_from_env()
