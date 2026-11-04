@@ -23,7 +23,9 @@ from .base import (
 from .soar import SentinelPlaybookConnector, XsoarConnector, parse_playbook_map, soar_from_env
 from .cloud_waf import AwsWafConnector, AzureWafConnector, CloudflareWafConnector
 from .waf import F5WafConnector, ImpervaWafConnector, waf_from_env
-from .edr import CrowdStrikeConnector, crowdstrike_from_env
+from .edr import CrowdStrikeConnector, DefenderConnector, SentinelOneConnector, crowdstrike_from_env
+from .firewall import FortiGateConnector, PanosConnector, firewall_from_env
+from .identity import CyberArkConnector, EntraConnector, idp_from_env, pam_from_env
 from .swg import ZscalerConnector, zscaler_from_env
 
 __all__ = [
@@ -33,4 +35,6 @@ __all__ = [
     "CloudflareWafConnector", "AwsWafConnector", "AzureWafConnector",
     "XsoarConnector", "SentinelPlaybookConnector", "parse_playbook_map", "soar_from_env",
     "CrowdStrikeConnector", "crowdstrike_from_env", "ZscalerConnector", "zscaler_from_env",
+    "DefenderConnector", "SentinelOneConnector", "PanosConnector", "FortiGateConnector", "firewall_from_env",
+    "EntraConnector", "CyberArkConnector", "idp_from_env", "pam_from_env",
 ]

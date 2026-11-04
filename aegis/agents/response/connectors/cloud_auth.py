@@ -117,8 +117,9 @@ class AzureToken:
 
     def __init__(self, *, token: str = "", tenant_id: str = "", client_id: str = "", client_secret: str = "",
                  transport: Optional[Transport] = None, login_url: str = AZURE_LOGIN,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, scope: str = AZURE_MGMT_SCOPE):
         self._static = token
+        self.scope = scope                       # ARM by default; Graph / Defender pass their own
         self.tenant_id, self.client_id, self._secret = tenant_id, client_id, client_secret
         self._transport = transport or httpx_transport
         self.login_url = login_url.rstrip("/")
@@ -142,7 +143,7 @@ class AzureToken:
     def _fetch(self) -> tuple[str, float]:
         if self.tenant_id and self.client_id and self._secret:
             form = RawBody(urlencode({"grant_type": "client_credentials", "client_id": self.client_id,
-                                      "client_secret": self._secret, "scope": AZURE_MGMT_SCOPE}).encode())
+                                      "client_secret": self._secret, "scope": self.scope}).encode())
             res = call(self._transport, "POST", f"{self.login_url}/{self.tenant_id}/oauth2/v2.0/token",
                        json_body=form, headers={"Content-Type": "application/x-www-form-urlencoded"})
             tok = str(res.json().get("access_token") or "")
@@ -155,7 +156,7 @@ class AzureToken:
             raise ConnectorError("no Azure credentials: set AEGIS_AZURE_TENANT_ID/CLIENT_ID/CLIENT_SECRET, "
                                  "AEGIS_AZURE_TOKEN, or install azure-identity for managed identity") from None
         try:
-            at = DefaultAzureCredential().get_token(AZURE_MGMT_SCOPE)
+            at = DefaultAzureCredential().get_token(self.scope)
         except Exception as e:  # noqa: BLE001
             raise ConnectorError(f"Azure DefaultAzureCredential failed: {str(e)[:160]}") from None
         return at.token, float(at.expires_on)

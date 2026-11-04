@@ -145,6 +145,160 @@ class CrowdStrikeConnector(Connector):
         return f"[crowdstrike] RTR kill {receipt.vendor_ref} already executed; nothing to renew"
 
 
+class _HostEdr(Connector):
+    """Shared shape of the host-containment EDRs: isolate (reversible) only, on a host name or device id."""
+
+    reapply_on_human_approval = True
+    actions = frozenset({"isolate"})
+
+    def __init__(self, *, base_url: str, transport: Transport | None = None, **kw: Any):
+        super().__init__(**kw)
+        self.base_url = base_url.rstrip("/")
+        self._transport = transport or httpx_transport
+
+    def supports_target(self, target: str) -> bool:
+        t = str(target).strip()
+        if t.lower().startswith(("agent:", "sandbox:")):
+            return False
+        host = t[5:] if t.lower().startswith("host:") else t
+        return bool(_HOSTNAME.match(host)) and not is_fingerprint_target(t) and not _looks_like_ip(host)
+
+    @staticmethod
+    def _host(target: str) -> str:
+        t = str(target).strip()
+        t = t[5:] if t.lower().startswith("host:") else t
+        if not _HOSTNAME.match(t):
+            raise ConnectorError(f"not a host name: {target!r}")
+        return t
+
+    def _do_renew(self, receipt: Receipt, ttl_sec: int) -> str:
+        return f"[{self.name}] isolation of {receipt.target} still active"
+
+
+_HOSTNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
+_MDE_ID = re.compile(r"^[0-9a-f]{40}$")
+
+
+class DefenderConnector(_HostEdr):
+    """Microsoft Defender for Endpoint: full network isolation of a device, released on undo.
+
+    API (api.securitycenter.microsoft.com, application permission ``Machine.Isolate`` + ``Machine.Read.All``)::
+
+        resolve  GET  /api/machines?$filter=computerDnsName eq '<host>'        → value[0].id
+        isolate  POST /api/machines/{id}/isolate    {"Comment", "IsolationType": "Full"}
+        release  POST /api/machines/{id}/unisolate  {"Comment"}
+        verify   GET  /api/machineactions?$filter=machineId eq '{id}'  → newest Isolate / Unisolate action
+    """
+
+    name = "defender"
+
+    def __init__(self, *, token_provider: Callable[[], str], **kw: Any):
+        super().__init__(**kw)
+        self._token = token_provider
+
+    def _h(self) -> dict:
+        return {"Authorization": f"Bearer {self._token()}", "Content-Type": "application/json"}
+
+    def _machine(self, target: str) -> str:
+        host = self._host(target)
+        if _MDE_ID.match(host):
+            return host
+        from urllib.parse import quote
+        flt = quote(f"computerDnsName eq '{host.lower()}'", safe="")
+        res = call(self._transport, "GET", f"{self.base_url}/api/machines?$filter={flt}", headers=self._h())
+        rows = res.json().get("value") or []
+        if not rows:
+            # a short name: match the first DNS label (Defender stores the FQDN)
+            flt = quote(f"startswith(computerDnsName,'{host.lower()}.')", safe="")
+            res = call(self._transport, "GET", f"{self.base_url}/api/machines?$filter={flt}", headers=self._h())
+            rows = res.json().get("value") or []
+        if len(rows) != 1:
+            raise ConnectorError(f"{len(rows)} Defender devices match {host!r}; give the device id or FQDN")
+        return str(rows[0]["id"])
+
+    def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
+        mid = self._machine(action.target)
+        res = call(self._transport, "POST", f"{self.base_url}/api/machines/{mid}/isolate",
+                   json_body={"Comment": f"AEGIS {key[:16]}: {str(getattr(action, 'reasoning', ''))[:200]}",
+                              "IsolationType": "Full"}, headers=self._h(), expect=(200, 201, 400))
+        if res.status == 400 and "already" not in str(res.body).lower():
+            raise ConnectorError(f"Defender refused isolation: {str(res.body)[:200]}")
+        return mid, f"[defender] isolated device {action.target} ({mid}); only Defender cloud traffic is allowed", mid
+
+    def _do_rollback(self, receipt: Receipt) -> str:
+        mid = receipt.vendor_ref or self._machine(receipt.target)
+        call(self._transport, "POST", f"{self.base_url}/api/machines/{mid}/unisolate",
+             json_body={"Comment": f"AEGIS release of {receipt.receipt_id}"}, headers=self._h(), expect=(200, 201))
+        return f"[defender] released isolation of {receipt.target}"
+
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        from urllib.parse import quote
+        flt = quote(f"machineId eq '{receipt.vendor_ref}'", safe="")
+        res = call(self._transport, "GET", f"{self.base_url}/api/machineactions?$filter={flt}", headers=self._h())
+        acts = [a for a in (res.json().get("value") or []) if isinstance(a, dict)
+                and a.get("type") in ("Isolate", "Unisolate") and a.get("status") not in ("Failed", "Cancelled", "TimeOut")]
+        if not acts:
+            return None
+        newest = max(acts, key=lambda a: str(a.get("creationDateTimeUtc") or ""))
+        return newest.get("type") == "Isolate"
+
+
+class SentinelOneConnector(_HostEdr):
+    """SentinelOne: disconnect an agent from the network, reconnect on undo.
+
+    API (``{console}/web/api/v2.1``, ``Authorization: ApiToken <token>``)::
+
+        resolve     GET  /agents?computerName=<host>                         → data[].id
+        disconnect  POST /agents/actions/disconnect  {"filter": {"ids": [id]}}  → data.affected
+        connect     POST /agents/actions/connect     {"filter": {"ids": [id]}}
+        verify      GET  /agents?ids=<id>  → networkStatus disconnected / disconnecting
+    """
+
+    name = "sentinelone"
+
+    def __init__(self, *, api_token: str, **kw: Any):
+        super().__init__(**kw)
+        self._tok = api_token
+
+    def _h(self) -> dict:
+        return {"Authorization": f"ApiToken {self._tok}", "Content-Type": "application/json"}
+
+    def _agent(self, target: str) -> str:
+        from urllib.parse import urlencode
+        host = self._host(target)
+        if host.isdigit():
+            return host
+        res = call(self._transport, "GET", f"{self.base_url}/web/api/v2.1/agents?{urlencode({'computerName': host})}",
+                   headers=self._h())
+        rows = res.json().get("data") or []
+        if len(rows) != 1:
+            raise ConnectorError(f"{len(rows)} SentinelOne agents named {host!r}; give the agent id")
+        return str(rows[0]["id"])
+
+    def _act(self, aid: str, what: str) -> int:
+        res = call(self._transport, "POST", f"{self.base_url}/web/api/v2.1/agents/actions/{what}",
+                   json_body={"filter": {"ids": [aid]}}, headers=self._h())
+        return int((res.json().get("data") or {}).get("affected") or 0)
+
+    def _do_apply(self, action: Any, key: str, ttl_sec: int | None) -> tuple[str, str, str]:
+        aid = self._agent(action.target)
+        if self._act(aid, "disconnect") < 1:
+            raise ConnectorError(f"SentinelOne disconnected no agent for {action.target}")
+        return aid, f"[sentinelone] disconnected {action.target} (agent {aid}) from the network", aid
+
+    def _do_rollback(self, receipt: Receipt) -> str:
+        self._act(receipt.vendor_ref or self._agent(receipt.target), "connect")
+        return f"[sentinelone] reconnected {receipt.target}"
+
+    def _do_verify(self, receipt: Receipt) -> bool | None:
+        res = call(self._transport, "GET", f"{self.base_url}/web/api/v2.1/agents?ids={receipt.vendor_ref}",
+                   headers=self._h())
+        rows = res.json().get("data") or []
+        if not rows:
+            return None
+        return str(rows[0].get("networkStatus") or "").lower() in ("disconnected", "disconnecting")
+
+
 class _FalconToken:
     """OAuth2 client-credentials token with in-process caching (refetch near expiry)."""
 
@@ -174,11 +328,34 @@ class _FalconToken:
 
 
 def crowdstrike_from_env(transport: Optional[Transport] = None) -> Optional[Connector]:
-    """``AEGIS_EDR_VENDOR=crowdstrike|mock`` (default off). Live needs ``AEGIS_EDR_CLIENT_ID`` +
-    ``AEGIS_EDR_CLIENT_SECRET`` (``AEGIS_EDR_URL`` defaults to the US-1 cloud)."""
+    """``AEGIS_EDR_VENDOR = crowdstrike | defender | sentinelone | mock | mock-defender | mock-sentinelone`` (default
+    off). CrowdStrike: ``AEGIS_EDR_CLIENT_ID`` + ``AEGIS_EDR_CLIENT_SECRET`` (``AEGIS_EDR_URL`` defaults to US-1).
+    Defender: ``AEGIS_EDR_TENANT_ID`` + ``AEGIS_EDR_CLIENT_ID`` + ``AEGIS_EDR_CLIENT_SECRET`` (or a managed identity).
+    SentinelOne: ``AEGIS_EDR_URL`` (console) + ``AEGIS_EDR_TOKEN``."""
     vendor = os.environ.get("AEGIS_EDR_VENDOR", "off").strip().lower()
     if vendor in ("", "off", "0", "none"):
         return None
+    if vendor == "mock-defender":
+        from .mock_bank import MockDefender
+        return DefenderConnector(base_url="https://mde.mock", token_provider=lambda: "mock-mde-token",
+                                 transport=transport or MockDefender())
+    if vendor == "mock-sentinelone":
+        from .mock_bank import MockSentinelOne
+        return SentinelOneConnector(base_url="https://s1.mock", api_token="mock-s1-token",
+                                    transport=transport or MockSentinelOne())
+    if vendor in ("defender", "mde"):
+        from .cloud_auth import AzureToken
+        tok = AzureToken(tenant_id=os.environ.get("AEGIS_EDR_TENANT_ID", ""), client_id=os.environ.get("AEGIS_EDR_CLIENT_ID", ""),
+                         client_secret=os.environ.get("AEGIS_EDR_CLIENT_SECRET", ""), transport=transport,
+                         scope="https://api.securitycenter.microsoft.com/.default")
+        return DefenderConnector(base_url=os.environ.get("AEGIS_EDR_URL", "https://api.securitycenter.microsoft.com"),
+                                 token_provider=tok, transport=transport)
+    if vendor in ("sentinelone", "s1"):
+        base, tok = os.environ.get("AEGIS_EDR_URL", "").strip(), os.environ.get("AEGIS_EDR_TOKEN", "")
+        if not (base.startswith("https://") and tok):
+            logger.warning("[edr] sentinelone needs AEGIS_EDR_URL (https console) and AEGIS_EDR_TOKEN")
+            return None
+        return SentinelOneConnector(base_url=base, api_token=tok, transport=transport)
     if vendor == "mock":
         from .mock_vendor import MockCrowdStrike
         return CrowdStrikeConnector(base_url="https://api.crowdstrike.mock",
