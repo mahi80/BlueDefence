@@ -51,9 +51,21 @@ def _internal_ingress(ing: dict) -> bool:
     return ann.get("alb.ingress.kubernetes.io/scheme") == "internal" or "internal" in cls or "private" in cls
 
 
+_MODSEC = "nginx.ingress.kubernetes.io/enable-modsecurity"
+
+
 def _waf_ingress(ing: dict) -> bool:
     ann = {k.lower(): str(v).lower() for k, v in (_meta(ing).get("annotations") or {}).items()}
-    return any(ann.get(k) not in (None, "", "false") for k in INGRESS_WAF_ANNOTATIONS)
+    for k in INGRESS_WAF_ANNOTATIONS:
+        if ann.get(k) in (None, "", "false"):
+            continue
+        if k == _MODSEC:
+            # ingress-nginx runs ModSecurity in DetectionOnly unless the snippet turns the engine on (G-1)
+            snippet = ann.get("nginx.ingress.kubernetes.io/modsecurity-snippet", "")
+            if "secruleengine on" not in " ".join(snippet.split()):
+                continue
+        return True
+    return False
 
 
 def _template(o: dict) -> tuple[dict, dict]:
@@ -106,7 +118,8 @@ def assets_from_k8s(export: dict | list, *, cluster: str = "k8s", public_nodes: 
                 a.internet_ports.append(r)
             a.internet_via.setdefault(r, via)
             a.public = True
-            a.waf = a.waf or waf
+            if waf:
+                a.waf_ranges.add(r)              # only the ingress path is behind the WAF (G-1)
 
         selected: dict[str, dict] = {}
         for svc in services:

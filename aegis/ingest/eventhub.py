@@ -169,6 +169,11 @@ class EventHubReader:
 
     def start(self) -> "EventHubReader":
         self.queue.enabled = True
+        if getattr(self.queue, "journal", None) is None:
+            # Round-7 G-10: the checkpoint is written once a record is queued, so without a journal a crash between
+            # queueing and investigation loses it — same at-least-once caveat as the Kafka reader.
+            logger.warning("[ingest:eventhub] AEGIS_STREAM_JOURNAL is not set: records queued and checkpointed but "
+                           "not yet investigated are lost on a crash — set it for at-least-once")
         self._thread = threading.Thread(target=self._run, name="AegisEventHubReader", daemon=True)
         self._thread.start()
         return self

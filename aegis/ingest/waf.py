@@ -354,7 +354,13 @@ class WafConsumer(BaseConsumer):
         if cloud is not None:
             alert, vendor_id = cloud
             alert["severity"] = normalize_severity(alert.get("severity") or _severity_hint(alert))
-            alert["id"] = self._make_id(alert, vendor_id)
+            # Azure (anomaly scoring) and Cloudflare log one row per matched rule plus the final action, all under one
+            # request id: the id names the rule and action too, or the SQLi and Blocked rows were dropped as
+            # duplicates of the first rule's row (round 7 G-2). The request id stays as correlation_id.
+            per_rule = str(alert.get("source", "")).startswith(("Azure", "Cloudflare"))
+            alert["id"] = self._make_id(alert, vendor_id, per_rule=per_rule)
+            if vendor_id:
+                alert["correlation_id"] = str(vendor_id)[:200]
             alert["raw"] = obj
             return self._finish(alert)
         src = str(obj.get("vendor") or obj.get("product") or obj.get("source") or "").lower()
@@ -377,9 +383,13 @@ class WafConsumer(BaseConsumer):
         return alert
 
     @staticmethod
-    def _make_id(alert: dict, vendor_id: Any) -> str:
+    def _make_id(alert: dict, vendor_id: Any, *, per_rule: bool = False) -> str:
         if vendor_id:
             vid = str(vendor_id)
+            if per_rule and (alert.get("signature") or alert.get("action")):
+                import hashlib
+                rule = hashlib.sha256(f"{alert.get('signature', '')}|{alert.get('action', '')}".encode()).hexdigest()[:10]
+                vid = f"{vid}-{rule}"
             if len(vid) <= 48:
                 return f"WAF-{vid}"
             # cutting at 48 merged two ids that share a long prefix (round 3 G4-4); keep a prefix and a hash of all

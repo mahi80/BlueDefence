@@ -75,7 +75,10 @@ class Asset:
     # host in the zone — a private CIDR rule, or the inventory's lateral_ports)
     lateral: list[tuple[int, int, frozenset[str]]] = field(default_factory=lambda: [(0, 65535, frozenset({"*"}))])
     groups: frozenset[str] = frozenset()                       # security groups this asset is in
-    waf: bool = False
+    waf: bool = False                                # operator / tag statement: a WAF fronts every web port
+    # internet ranges reached THROUGH a WAF (an ALB with a web ACL, a WAF ingress). A path-level WAF only defends
+    # the ranges it fronts: a port opened straight to the instance beside it is not behind it (round 7 G-1).
+    waf_ranges: set[tuple[int, int]] = field(default_factory=set)
     edr: bool = False
     source: str = ""
 
@@ -197,12 +200,25 @@ def _defended(v: Vuln, a: Asset, s: Settings) -> tuple[str, str]:
     # but does not block the exploit itself, so it is reported, never used to lower the tier.
     edr = "; EDR on the host will see post-exploitation activity (detection, not prevention)" if a.edr else ""
     web = v.port in WEB_PORTS or (v.port == ANY_PORT and any(lo <= p <= hi for lo, hi in a.internet_ports for p in WEB_PORTS))
-    if web and (a.waf or blocking):
+    if web and (a.waf or blocking or _waf_fronts(v, a)):
         who = f"{blocking[0].vendor} {blocking[0].name} in blocking mode" if blocking else "WAF in front of the web port"
         return "partial", f"{who} (generic rules, no CVE-specific virtual patch)" + note + edr
     if v.port is None:
         return "none", "no network control applies to a local vulnerability; patching is the fix" + note + edr
     return "none", "no blocking control in front: no WAF or virtual patch for this port" + note + edr
+
+
+def _waf_fronts(v: Vuln, a: Asset) -> bool:
+    """Is the path the internet uses to reach this finding fronted by a WAF (path-level coverage only)?"""
+    if not a.waf_ranges:
+        return False
+    if v.port == ANY_PORT:
+        # a package finding is behind a WAF only if every internet path to the workload is
+        return bool(a.internet_ports) and all(r in a.waf_ranges for r in a.internet_ports)
+    if v.port is None:
+        return False
+    r = _internet_range(a, v.port)
+    return r is not None and r in a.waf_ranges
 
 
 def _path(v: Vuln, a: Asset, s: Settings) -> dict:

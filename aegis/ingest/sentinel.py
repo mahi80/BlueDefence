@@ -119,9 +119,12 @@ class SentinelConsumer(BaseConsumer):
         """Run the KQL and yield one dict per row (column name → value)."""
         query = kql or self.cfg.kql
         watermarked = kql is None and self.cfg.kql == DEFAULT_KQL
+        span = timespan or self.cfg.timespan
         if watermarked:
             query = self._since_watermark()
-        payload = json.dumps({"query": query, "timespan": timespan or self.cfg.timespan}).encode()
+            if timespan is None:
+                span = self._watermark_timespan() or span
+        payload = json.dumps({"query": query, "timespan": span}).encode()
         url = f"{self.cfg.api_base}/workspaces/{self.cfg.workspace_id}/query"
         status, body = self._request_with_retry("POST", url, payload)
         if status != 200:
@@ -145,6 +148,31 @@ class SentinelConsumer(BaseConsumer):
     @property
     def _ingest_key(self) -> str:
         return f"{self.name}:ingested"
+
+    def _watermark_timespan(self) -> str | None:
+        """The request ``timespan`` for a watermarked poll. Log Analytics applies ``timespan`` to TimeGenerated, so the
+        fixed PT1H silently cut everything between the watermark and now − 1 h after an outage, and every alert
+        generated > 1 h before it was ingested (round 7 G-3). It now reaches back to the watermark minus the overlap,
+        plus ``AEGIS_SENTINEL_MAX_LAG_S`` (24 h) of generation-to-ingestion lag, capped at
+        ``AEGIS_SENTINEL_MAX_TIMESPAN_DAYS`` (30, the workspace's usual retention). None = no watermark yet."""
+        from .base import _when
+        cp = self.checkpoint
+        wm = cp.watermark(self._ingest_key) if cp is not None else None
+        t = _when(wm) if wm else None
+        if t is None:
+            return None
+        def _env(name: str, default: float) -> float:
+            try:
+                return max(0.0, float(os.environ.get(name, str(default))))
+            except ValueError:
+                return default
+        overlap = max(60.0, _env("AEGIS_SENTINEL_OVERLAP_S", 600.0))
+        lag = _env("AEGIS_SENTINEL_MAX_LAG_S", 86400.0)
+        cap = _env("AEGIS_SENTINEL_MAX_TIMESPAN_DAYS", 30.0) * 86400.0
+        now = time.time()
+        secs = (now - min(t, now)) + overlap + lag
+        secs = max(3600.0, min(secs, cap)) if cap > 0 else max(3600.0, secs)
+        return f"PT{int(secs)}S"
 
     def _since_watermark(self) -> str:
         """The default query from the last ingestion time handled, oldest first, with an overlap

@@ -13,6 +13,7 @@ this module only reshapes fields, it never executes anything from them.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from typing import Iterable, Optional
 
@@ -214,5 +215,11 @@ def to_alert(raw: dict) -> dict | None:
         quiet = False
     if quiet and os.environ.get("AEGIS_EDR_PREFILTER", "1").strip().lower() not in ("0", "off", "false", "no"):
         return None
-    digest = hashlib.sha256(repr(sorted(raw.items(), key=lambda kv: str(kv[0])))[:4000].encode()).hexdigest()[:16]
+    # the whole canonical event is hashed: cutting the repr at 4000 chars left the host and time out of the id once a
+    # command line was long (an encoded stager), so a second host's compromise deduped away (round 7 G-4)
+    try:
+        canon = json.dumps(raw, sort_keys=True, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        canon = repr(sorted(raw.items(), key=lambda kv: str(kv[0])))
+    digest = hashlib.sha256(canon.encode("utf-8", "surrogatepass")).hexdigest()[:16]
     return {"id": f"edr-{digest}", "alert_type": "host_endpoint", **alert}

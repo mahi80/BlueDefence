@@ -60,6 +60,7 @@ import logging
 import os
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -841,6 +842,21 @@ class _Handler(BaseHTTPRequestHandler):
                 status, out = srv.ingest_alerts(body)
             else:
                 status, out = 404, {"error": "not found"}
+        except InflateTooLarge as e:
+            # a gzip bomb is the sender's fault and must not be retried forever: 413, not a 500 with a traceback
+            # (round 7 G-9). Only /ingest/firehose mapped it before.
+            logger.warning("[ingest:http] %s refused: %s", path, str(e)[:160])
+            status, out = 413, {"error": "decompressed body too large", "detail": str(e)[:160]}
+        except (zlib.error, EOFError) as e:
+            logger.warning("[ingest:http] %s refused: malformed gzip (%s)", path, str(e)[:160])
+            status, out = 400, {"error": "malformed gzip body"}
+        except ValueError as e:
+            if "gzip" not in str(e).lower():
+                logger.exception("[ingest:http] %s failed: %s", path, str(e)[:200])
+                status, out = 500, {"error": "internal"}
+            else:
+                logger.warning("[ingest:http] %s refused: %s", path, str(e)[:160])
+                status, out = 400, {"error": "malformed gzip body"}
         except Exception as e:  # noqa: BLE001 — one bad batch must not kill the receiver thread
             logger.error("[ingest:http] %s failed: %s", path, str(e)[:200], exc_info=True)
             status, out = 500, {"error": "internal"}

@@ -37,7 +37,7 @@ from typing import Any, Iterable, Iterator, Optional
 
 from ..agents.api_abuse.object_walk import ObjectWalkDetector
 from ..agents.api_abuse.ownership import ownership_from_env
-from .base import AlertCheckpoint, BaseConsumer
+from .base import CONSUMED, AlertCheckpoint, BaseConsumer
 
 logger = logging.getLogger("aegis.ingest.apigw")
 
@@ -201,24 +201,10 @@ class ApiGatewayConsumer(BaseConsumer):
         if ev is None:
             return None
         self.events += 1
-        return self.detector.observe(ev)
-
-    def _iter_alerts(self, **kwargs) -> Iterator[dict]:
-        # an event that does not cross a threshold is the normal case, not an invalid record
-        for record in self.fetch(**kwargs):
-            try:
-                alert = self.normalize(record)
-            except Exception as e:  # noqa: BLE001 — one bad record must not stop the stream
-                self.skipped_invalid += 1
-                logger.warning("[ingest:apigw] record dropped: %s", str(e)[:160])
-                continue
-            if not alert:
-                continue
-            if not self.checkpoint.mark(f"{self.name}:{alert['id']}"):
-                self.skipped_duplicates += 1
-                continue
-            self.yielded += 1
-            yield alert
+        # an event under every threshold is the normal case, not an invalid record: CONSUMED, and the base consumer
+        # marks an alert seen only after it was handled (at-least-once). The override marked before yielding, so a
+        # crash between take and handle lost the object-walk alert for good (round 7 G-6).
+        return self.detector.observe(ev) or CONSUMED
 
 
 _shared: Optional[ObjectWalkDetector] = None

@@ -302,6 +302,20 @@ def reconcile(store: Path, record: dict, *, hitl: Any = None, now: datetime | No
         if row is not None and row.get("stale"):
             p["verification"] = "not re-tested: the scan failed this run"
             continue
+        if row is not None and row["extra"].get("tier") not in tiers and _path_still_open(row["extra"]):
+            # it left the proposal tier only because the exploitation signal moved (EPSS fell, KEV / PoC flags
+            # changed): the port is still reachable from the internet and nothing blocks it, so nothing was
+            # closed (round 7 G-5). An approved fix stays owed; an undecided proposal is deprioritised, and is
+            # proposed again if the finding climbs back.
+            x = row["extra"]
+            why = (f"Deprioritised to {x['tier'].replace('_', ' ').title()} by the exploitation signal only "
+                   f"({x.get('reasons', ['', '', ''])[0]}); the path is still open: " + x["reasons"][1])
+            p["verification"] = why
+            if st in ("approved", "approved_still_open"):
+                _event(p, now, "approved_still_open", why)
+            else:
+                _event(p, now, "deprioritised", why)
+            continue
         if row is None or row["extra"].get("tier") not in tiers:
             if fp in resolved or row is None:
                 why = "The scanner no longer reports it on this asset (patched or removed)"
@@ -329,6 +343,12 @@ def reconcile(store: Path, record: dict, *, hitl: Any = None, now: datetime | No
     for p in rows:
         counts[p["status"]] = counts.get(p["status"], 0) + 1
     return {"proposals": rows, "counts": counts, "notes": notes, "channel": getattr(hitl, "name", None)}
+
+
+def _path_still_open(extra: dict) -> bool:
+    """The finding is still reachable the way it was proposed and nothing blocks it (closure must come from the path,
+    the defence or the scanner — never from the exploitation score alone)."""
+    return extra.get("reach") == "internet" and str(extra.get("defended") or "none") == "none"
 
 
 def save(store: Path, section: dict) -> None:
