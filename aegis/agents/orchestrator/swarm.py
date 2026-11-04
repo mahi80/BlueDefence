@@ -34,10 +34,10 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
-from collections import deque
 import re
 import threading
 import time
+from collections import OrderedDict, deque
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -417,6 +417,9 @@ class SwarmOrchestrator:
         self._abandoned: set = set()          # futures of replaced pools still running (capped)
         self._cap_logged = False
         self._lock = threading.Lock()
+        # storm mode's fast-path check attaches campaign context; handle() of the same alert object reuses it
+        self._pre: OrderedDict[int, tuple[dict, dict]] = OrderedDict()
+        self._pre_ids: OrderedDict[str, None] = OrderedDict()
         # recent fan-outs for the status page / tests — the last 1,000, not one per alert forever
         self.runs: deque[dict] = deque(maxlen=1000)
 
@@ -424,17 +427,59 @@ class SwarmOrchestrator:
     def __getattr__(self, item: str) -> Any:
         return getattr(self._orch, item)
 
+    def is_fast_path(self, alert: dict) -> bool:
+        """Storm mode's question, asked of the alert ``handle()`` will see. The adaptive-attacker, low-and-slow and
+        spoofed-client fast paths read ``campaign_context`` / ``tls_client``, which only the attach step writes; asked
+        of the raw alert they never fired, so during a storm every such alert was deferred as model-bound (review
+        round 8 O8-10). The attach runs here once; ``handle()`` of the same object reuses it (the event is not
+        recorded twice), and a deferred copy re-fed later is re-attached without recording it again."""
+        if self._events is None or not isinstance(alert, dict):
+            return self._orch.is_fast_path(alert)
+        try:
+            attached = self._attach(alert, record=True)
+        except Exception as e:  # noqa: BLE001 — context is a bonus, never a blocker
+            logger.debug("[swarm] campaign context skipped: %s", str(e)[:120])
+            return self._orch.is_fast_path(alert)
+        with self._lock:
+            self._pre[id(alert)] = (alert, attached)
+            while len(self._pre) > 256:
+                self._pre.popitem(last=False)
+            aid = alert.get("id")
+            if aid not in (None, ""):
+                self._pre_ids[str(aid)] = None
+                while len(self._pre_ids) > 4096:
+                    self._pre_ids.popitem(last=False)
+        from .walkers.campaign import TRUSTED_CONTEXT
+        tok = TRUSTED_CONTEXT.set(attached)
+        try:
+            return self._orch.is_fast_path(attached)
+        finally:
+            TRUSTED_CONTEXT.reset(tok)
+
+    def _attach(self, alert: dict, *, record: bool) -> dict:
+        from .walkers.campaign import attach_campaign_context
+        return attach_campaign_context(alert, self._events, record=record, min_events=self._campaign_min)
+
     def handle(self, alert: dict) -> EvidenceChain:
         attached = False
         if self._events is not None:
             # the last N minutes of the same source / session / user, in the campaign-summary shape
             # the fine-tuned first-pass is trained on; the original dict is left untouched
-            try:
-                from .walkers.campaign import attach_campaign_context
-                alert = attach_campaign_context(alert, self._events, min_events=self._campaign_min)
-                attached = True
-            except Exception as e:  # noqa: BLE001 — context is a bonus, never a blocker
-                logger.debug("[swarm] campaign context skipped: %s", str(e)[:120])
+            with self._lock:
+                pre = self._pre.pop(id(alert), None)
+                if pre is not None and pre[0] is not alert:
+                    pre = None
+                aid = alert.get("id") if isinstance(alert, dict) else None
+                seen = aid not in (None, "") and self._pre_ids.pop(str(aid), 0) is None
+            if pre is not None:
+                alert, attached = pre[1], True               # storm mode attached (and recorded) it a moment ago
+            else:
+                try:
+                    # an alert storm mode already checked (a deferred copy re-fed later) was recorded then
+                    alert = self._attach(alert, record=not seen)
+                    attached = True
+                except Exception as e:  # noqa: BLE001 — context is a bonus, never a blocker
+                    logger.debug("[swarm] campaign context skipped: %s", str(e)[:120])
         from .walkers.campaign import TRUSTED_CONTEXT
         # Only an alert that went through the attach step (which strips what the sender wrote first) carries
         # trusted derived keys. With no event store, or a failed attach, the keys on it are the sender's

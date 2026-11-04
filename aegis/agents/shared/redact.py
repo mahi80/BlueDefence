@@ -39,33 +39,48 @@ SECRET_KEYS: frozenset[str] = frozenset({
 # A credential-field value is kept only when it is an injection that needs to break out of its field: a quote
 # or comment before SQL, a script/handler, JNDI, traversal or shell chaining. A bare "select … from" or a
 # back-ticked word is a plausible passphrase, so it no longer counts (it kept such passwords in clear).
+# Every open-ended part is bounded or possessive: `<img[^>]*` and `\$\([^)]+\)` re-scanned the rest of the value
+# from every "<img" / "$(" — a 100 KB password field took 86 s per alert (review round 8 O8-2).
 _ATTACK_RX = re.compile(
-    r"(?:'|\"|%27|%22|\)|--|#|/\*)\s*(?:or|and|union|select|insert|update|delete|drop|sleep|benchmark|waitfor)\b"
-    r"|\bunion\b[\s/*]+(?:all\s+)?select\b|;\s*(?:drop|shutdown|exec)\b"
-    r"|<\s*script|<\s*img[^>]*\bon\w+\s*=|javascript:|\bon(?:error|load|focus|mouseover)\s*="
-    r"|\$\{\s*jndi:|\$\{[^}]*\$\{|(?:\.\./|\.\.\\|%2e%2e%2f){2,}|/etc/passwd|\bwin\.ini\b"
-    r"|(?:;|\|\||&&|\|)\s*(?:cat|curl|wget|bash|sh|nc|id|whoami|powershell|cmd)\b|\$\([^)]+\)",
+    r"(?:'|\"|%27|%22|\)|--|#|/\*)\s*+(?:or|and|union|select|insert|update|delete|drop|sleep|benchmark|waitfor)\b"
+    r"|\bunion\b[\s/*]{1,64}(?:all\s{1,16})?select\b|;\s*+(?:drop|shutdown|exec)\b"
+    r"|<\s{0,16}script|<\s{0,16}img\b[^<>]{0,256}?\bon\w{1,32}\s{0,16}=|javascript:|\bon(?:error|load|focus|mouseover)\s{0,16}="
+    r"|\$\{\s{0,16}jndi:|\$\{[^{}]{0,256}?\$\{|(?:\.\./|\.\.\\|%2e%2e%2f){2,}|/etc/passwd|\bwin\.ini\b"
+    r"|(?:;|\|\||&&|\|)\s*+(?:cat|curl|wget|bash|sh|nc|id|whoami|powershell|cmd)\b|\$\([^()]{1,256}\)",
     re.IGNORECASE)
 
 #: any key ending in one of these is a credential too (db_password, githubToken, stripeSecretKey, …)
 SECRET_SUFFIXES: tuple[str, ...] = ("password", "passwd", "passphrase", "secret", "secret_key", "token",
                                     "api_key", "apikey", "private_key", "access_key", "pwd", "_pin", "mpin", "tpin",
                                     "_otp")
+#: a key with one of these as a whole word anywhere is a card / one-time / PIN credential (card_cvv, cvvCode,
+#: otp_value, txn_otp, X-Customer-Pin, mpin_value) — the suffix rule missed every one with a trailing word
+#: (review round 8 O8-6)
+SECRET_WORDS: frozenset[str] = frozenset({"cvv", "cvv2", "cvc", "cvc2", "cid", "otp", "totp", "mpin", "tpin", "pin",
+                                          "upipin", "atmpin", "ipin"})
+#: ... except the Indian postal PIN code, which is an address, not a secret
+_NOT_SECRET: frozenset[str] = frozenset({"pin_code", "pincode", "postal_pin", "pin_zip", "zip_pin", "zip"})
 _PAIR_KEYS = "|".join(sorted((re.escape(k).replace("_", "[_-]?") for k in SECRET_KEYS), key=len, reverse=True))
-_PAIR_KEYS = rf"(?:[A-Za-z0-9]*[_-]?)?(?:password|passwd|passphrase|secret(?:[_-]?key)?|token|api[_-]?key|access[_-]?key|private[_-]?key|pwd|[Pp]wd|mpin|MPin|[mt][Pp]in)|{_PAIR_KEYS}"
+# card / OTP / PIN words with any prefix segments and an optional trailing word (code, value, no …)
+_CRED_WORD = r"(?:cvv2?|cvc2?|otp|totp|mpin|tpin|upi[_-]?pin|atm[_-]?pin|pin(?![_-]?code))(?-i:(?![a-z]))(?:[_-]?(?:code|value|val|no|num|number|digits?))?"
+_PAIR_KEYS = (rf"(?:[A-Za-z0-9]*[_-])*+(?:[A-Za-z0-9]*?(?:password|passwd|passphrase|secret(?:[_-]?key)?|token|api[_-]?key|"
+              rf"access[_-]?key|private[_-]?key|pwd|[Pp]wd|mpin|MPin|[mt][Pp]in)|(?-i:[a-z0-9]*?(?:Cvv|CVV|Otp|OTP|Pin|PIN|Mpin))"
+              rf"(?:[_-]?(?i:code|value|val|no|num|number))?(?-i:(?![a-z]))|{_CRED_WORD})|{_PAIR_KEYS}")
 # key=value in query strings / form bodies / log lines. The value runs to the next "&" or end of line: a
 # password may contain spaces, quotes or ";" — over-redacting the rest of a log line is the safe direction,
 # and an attack-shaped value (the whole of it) is kept by redact_value.
 # The value stops at the next " key=" on the same log line, so one credential followed by an attack string
 # (kept whole) is not stored in clear with it.
-# The terminator is bounded ([ \t]{1,64}, key ≤ 64 chars): an unbounded \s+ re-scanned the whole whitespace run at
-# every position of the lazy value — 40 KB of spaces after "password=" took 15 s per call (review round 7 O-1).
-_KV_RX = re.compile(rf"(?i)(?<![A-Za-z0-9_-])((?:{_PAIR_KEYS})[ \t]{{0,64}}=[ \t]{{0,64}})([^&\r\n]+?)"
+# The terminator lookahead is bounded ([ \t]{1,64}, key ≤ 64 chars): an unbounded \s+ re-scanned the whole whitespace
+# run at every position of the lazy value — 40 KB of spaces after "password=" took 15 s per call (review round 7 O-1).
+# The whitespace around "=" is unbounded again but possessive (any amount of padding, NBSP, \f — none of it ever
+# re-scanned): the round-7 bound let "password" + 65 spaces + "=hunter2" through in clear (review round 8 O8-7).
+_KV_RX = re.compile(rf"(?i)(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_-]{{2,96}}+[^\S\r\n]*+=)((?:{_PAIR_KEYS})[^\S\r\n]*+=[^\S\r\n]*+)([^&\r\n]+?)"
                     rf"(?=[ \t]{{1,64}}[A-Za-z_][\w.-]{{0,64}}=|&|\r|\n|$)")
 # "key": "value" inside JSON text, and 'key': 'value' in a Python repr of a dict
-_JSON_RX = re.compile(rf"(?i)(([\"'])(?:{_PAIR_KEYS})\2\s*:\s*([\"']))((?:(?!\3)[^\\]|\\.)*)(\3)")
-# header lines: "X-Api-Key: …", "Authorization: ApiKey …", "X-Auth-Token: …"
-_HEADER_RX = re.compile(rf"(?im)^((?:proxy-)?authorization|x[-_]api[-_]key|api[-_]key|x[-_]auth[-_]token|(?:{_PAIR_KEYS}))(\s*:\s*)(.+)$")
+_JSON_RX = re.compile(rf"(?i)(([\"'])(?=[A-Za-z0-9_-]{{2,96}}+[\"'])(?:{_PAIR_KEYS})\2\s*+:\s*+([\"']))((?:(?!\3)[^\\]|\\.)*+)(\3)")
+# header lines: "X-Api-Key: …", "Authorization: ApiKey …", "X-Auth-Token: …", "X-Customer-Pin: …"
+_HEADER_RX = re.compile(rf"(?im)^((?:proxy-)?authorization|x[-_]api[-_]key|api[-_]key|x[-_]auth[-_]token|(?:{_PAIR_KEYS}))(\s*+:\s*+)(.+)$")
 _BEARER_RX = re.compile(r"(?i)\b(bearer|basic|digest|negotiate|token)\s+([A-Za-z0-9._~+/=-]{8,})")
 _JWT_RX = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,}")
 _AWS_KEY_RX = re.compile(r"\b(?:AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}\b")
@@ -80,7 +95,11 @@ def _norm(key: Any) -> str:
 
 def is_secret_key(key: Any) -> bool:
     k = _norm(key)
-    return k in SECRET_KEYS or k.endswith(SECRET_SUFFIXES)
+    if k in SECRET_KEYS or k.endswith(SECRET_SUFFIXES):
+        return True
+    if k in _NOT_SECRET or k.endswith(("pin_code", "pincode")):
+        return False
+    return any(w in SECRET_WORDS for w in k.split("_"))
 
 
 def looks_like_attack(value: str) -> bool:

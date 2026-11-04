@@ -431,7 +431,7 @@ def _low_and_slow_signal(alert: dict, store: EventStore, now: float | None = Non
     }
 
 
-def attach_campaign_context(alert: dict, store: EventStore, **kw) -> dict:
+def attach_campaign_context(alert: dict, store: EventStore, *, record: bool = True, **kw) -> dict:
     """Judge the client's TLS handshake against the browser it claims (``tls_client``, before the
     request teaches the model anything), record the alert, then return a copy carrying
     ``campaign_context`` when history warrants it. The original dict is never mutated (it is what
@@ -449,7 +449,8 @@ def attach_campaign_context(alert: dict, store: EventStore, **kw) -> dict:
             check = None
         if check is not None:
             alert = {**alert, "tls_client": check.to_dict()}
-    store.add(alert)
+    if record:              # False: the event was already recorded (storm mode's fast-path check of a deferred alert)
+        store.add(alert)
     summary = campaign_summary(alert, store, **kw)
     low_slow = _low_and_slow_signal(alert, store, now=kw.get("now"))
     if summary is None and low_slow is None:

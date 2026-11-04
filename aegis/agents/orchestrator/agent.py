@@ -160,6 +160,42 @@ def _carry_injection(chain: Any, alert: dict, triage: dict) -> None:
         md["injection_detected"] = True
         md.setdefault("_triage_metadata", {}).update({"injection_detected": True})
 
+def _injection_floor(chain: EvidenceChain, alert: Any) -> None:
+    """An alert that carried prompt-injection text never closes "benign" / "allow" with nobody looking.
+
+    Triage's auto-close / respond shortcuts were refused on injection (``guard_triage``), but the specialist path
+    had no equivalent: a specialist (and a voter reading the same text) talked into ``benign`` + ``allow`` closed
+    the alert and the allow executed unattended (review round 8 O8-8). Applied where every chain is sealed, so the
+    swarm's re-seal and every route get it: the verdict floor is ``uncertain``, every action other than
+    ``monitor`` waits for a human, and an ``escalate`` puts the alert in front of an analyst."""
+    try:
+        from ..response.grounding import injection_flagged
+        flagged = injection_flagged(chain)
+    except Exception:  # noqa: BLE001 — a check that cannot run is not a clean check
+        flagged = True
+    if not flagged:
+        return
+    md = chain.metadata
+    md["injection_detected"] = True
+    for a in chain.recommended_actions:
+        if a.action_type != "monitor":
+            a.requires_hitl = True
+    if chain.verdict in ("benign", "uncertain"):
+        if chain.verdict == "benign":
+            md["injection_floor"] = {"verdict_was": "benign"}
+            chain.verdict = "uncertain"
+            chain.reasoning.append(ReasoningStep(
+                step=len(chain.reasoning) + 1, action="Prompt-injection floor",
+                observation="The alert carried prompt-injection text and the verdict was benign.",
+                conclusion="Verdict floored to uncertain; an analyst decides (nothing closes unattended)."))
+        if not any(a.action_type == "escalate" for a in chain.recommended_actions):
+            chain.recommended_actions.append(RecommendedAction(
+                action_type="escalate", target=str((alert or {}).get("id", chain.alert_id) if isinstance(alert, dict)
+                                                   else chain.alert_id),
+                requires_hitl=True, confidence=chain.confidence,
+                reasoning="Prompt-injection text in the alert: a benign / uncertain verdict needs an analyst"))
+
+
 def _auto_close_context(alert: Any, triage: dict) -> str:
     """What the reviewer needs to judge an auto-close: there is no specialist evidence, so it sees the alert
     (redacted, inside the untrusted wrapper) and triage's own reason (review round 4 O4-4)."""
@@ -232,7 +268,11 @@ class SOCOrchestrator:
 
     def is_fast_path(self, alert: dict) -> bool:
         """True when ``handle()`` would reach a verdict deterministically (no model call). The service uses this
-        in storm mode: fast paths keep flowing at full speed, model-bound alerts are deferred, not dropped."""
+        in storm mode: fast paths keep flowing at full speed, model-bound alerts are deferred, not dropped.
+        Derived keys the sender wrote are ignored here exactly as ``handle()`` ignores them."""
+        from .walkers.campaign import ORCH_DERIVED_KEYS, TRUSTED_CONTEXT
+        if isinstance(alert, dict) and any(k in alert for k in ORCH_DERIVED_KEYS) and TRUSTED_CONTEXT.get() is not alert:
+            alert = {k: v for k, v in alert.items() if k not in ORCH_DERIVED_KEYS}
         try:
             return bool(self._honeytoken.alert_touches_decoy(alert) or is_control_plane_fact(alert) or is_network_fault(alert)
                         or is_privileged_event(alert) or is_treasury_outflow(alert) or is_adaptive_attacker(alert)
@@ -392,6 +432,7 @@ class SOCOrchestrator:
             resolve_action_targets(chain, alert)
         except Exception as e:  # noqa: BLE001 — an unresolved target parks for a human; never drop the chain
             logger.warning("[orchestrator] target resolution failed for %s: %s", chain.alert_id, str(e)[:120])
+        _injection_floor(chain, alert)
         dataset_capture.attach(chain, alert)
         return self._audit.append(chain)
 
