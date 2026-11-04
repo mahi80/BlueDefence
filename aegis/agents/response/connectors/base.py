@@ -584,12 +584,19 @@ class ConnectorRegistry:
         n = 0
         for (cname, ikey), e in last.items():
             c = by_name.get(cname)
-            if c is None or e.get("status") not in ACTIVE_STATUSES or e.get("action_type") in c.one_shot_actions:
+            status = e.get("status")
+            # a failed undo means the rule is STILL at the vendor: re-adopt it so the sweep retries the rollback after
+            # a restart — it used to be forgotten and stay at the vendor for good (review round 7 A-3)
+            if c is None or (status not in ACTIVE_STATUSES and status != STATUS_ROLLBACK_FAILED) \
+                    or e.get("action_type") in c.one_shot_actions:
                 continue
             try:
                 r = Receipt(**{k: v for k, v in e.items() if k in names})
             except TypeError:
                 continue
+            if status == STATUS_ROLLBACK_FAILED and r.retry_rollback_at is None \
+                    and int(r.rollback_attempts or 0) < MAX_ROLLBACK_ATTEMPTS:
+                r.retry_rollback_at = c._clock()                 # retry on the next sweep (abandoned ones stay listed)
             with c._lock:
                 if ikey not in c._active:
                     c._active[ikey] = r

@@ -113,6 +113,12 @@ class FileHITL(BaseHITL):
         rows = self._read_new_decisions().get(p.approval_id)
         if not rows:
             return None
+        # A rejection anywhere in the buffered rows wins over approvals read alongside it. decisions.jsonl is re-read
+        # from the start after a restart, so an approval that already ran into a vendor error (and was rejected
+        # afterwards) used to be popped first and executed (review round 7 A-4).
+        rej = next((i for i, r in enumerate(rows) if str(r.get("status", "")).lower() == "rejected"), None)
+        if rej is not None:
+            del rows[:rej]
         d = rows.pop(0)                                  # one decision per poll, in the order they were made
         from .base import action_text
         from .signing import enabled
@@ -123,11 +129,11 @@ class FileHITL(BaseHITL):
             # "contested" holds the card from the timeout instead of reading as "nobody decided" (R4-2).
             logger.error("[hitl:file] decision for %s ignored: it approves %r, the card is %r", p.approval_id,
                          str(d.get("action"))[:300], want[:300])
-            return "contested", str(d.get("decided_by") or "file"), "decision names a different action"
+            return "contested", str(d.get("decided_by") or ""), "decision names a different action"
         status = str(d.get("status", "")).lower()
         if status not in ("approved", "rejected"):
             logger.warning("[hitl:file] decision for %s has unknown status %r; ignored", p.approval_id, status); return None
-        return status, str(d.get("decided_by") or "file"), str(d.get("reason") or "")[:500]
+        return status, str(d.get("decided_by") or ""), str(d.get("reason") or "")[:500]   # "" = unattributed (A-8)
 
     def _record_settled(self, p: PendingApproval, status: str, decided_by: str, reason: str) -> None:
         self._append(self.cards, {"kind": "settled", "ts": time.time(), "approval_id": p.approval_id, "alert_id": p.alert_id,

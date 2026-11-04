@@ -49,6 +49,18 @@ def _looks_like_ip(target: str) -> bool:
         return False
 
 
+_FALCON_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
+
+
+def _falcon_host(target: str) -> str:
+    """The host part of an isolate (`host:<name>` / `<aid>`) or kill_process (`<host>:<pid>`) target."""
+    t = target.strip()
+    if t.lower().startswith("host:"):
+        t = t[5:].strip()
+    m = re.fullmatch(r"(.+):(\d+)", t)
+    return m.group(1) if m else t
+
+
 class CrowdStrikeConnector(Connector):
     """CrowdStrike Falcon: contain/lift a host, RTR-kill a process."""
 
@@ -69,7 +81,13 @@ class CrowdStrikeConnector(Connector):
         t = str(target).strip()
         if t.lower().startswith(("agent:", "sandbox:")):
             return False                # an AI agent's sandbox, not a Falcon host (OpenShell quarantines it)
-        return bool(t) and not is_fingerprint_target(t) and not _looks_like_ip(t.split(":", 1)[0])
+        if not t or is_fingerprint_target(t):
+            return False
+        host = _falcon_host(t)
+        # a plain host name or aid only: an FQL wildcard / quote / OR in a "host name" used to be pasted into the
+        # device query, so `*db-core*` contained db-core while the protected-target checks saw a literal name that
+        # matched nothing (review round 7 A-5)
+        return bool(host) and not _looks_like_ip(host) and bool(_AID.match(host) or _FALCON_HOST.match(host))
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self._token_provider()}",
@@ -78,15 +96,20 @@ class CrowdStrikeConnector(Connector):
     def _device_id(self, target: str) -> str:
         t = str(target).strip()
         if t.lower().startswith("host:"):
-            t = t[5:]
+            t = t[5:].strip()
         if _AID.match(t):
             return t                    # already a Falcon device id (aid)
-        res = call(self._transport, "GET",
-                   f"{self.base_url}/devices/queries/devices/v1?filter=hostname:'{t}'",
+        if not _FALCON_HOST.match(t):
+            raise ConnectorError(f"not a plain host name: {target!r}")
+        from urllib.parse import quote
+        fql = quote("hostname:'" + t + "'", safe="")
+        res = call(self._transport, "GET", f"{self.base_url}/devices/queries/devices/v1?filter={fql}",
                    headers=self._headers(), expect=(200,))
         ids = res.json().get("resources") or []
         if not ids:
             raise ConnectorError(f"no CrowdStrike device for hostname {t!r}")
+        if len(ids) > 1:
+            raise ConnectorError(f"{len(ids)} CrowdStrike devices named {t!r}; give the device id (aid)")
         return str(ids[0])
 
     def _device_action(self, device_id: str, action_name: str) -> Any:
@@ -95,8 +118,8 @@ class CrowdStrikeConnector(Connector):
                     headers=self._headers(), expect=(200, 202))
 
     def _kill(self, action: Any) -> tuple[str, str, str]:
-        host, _, pid = str(action.target).partition(":")
-        if not pid.isdigit():
+        host, _, pid = str(action.target).rpartition(":")      # `host:<name>:<pid>` keeps its prefix in `host`
+        if not pid.isdigit() or not host:
             raise ConnectorError("kill_process target must be '<host-or-device-id>:<pid>'")
         did = self._device_id(host)
         init = call(self._transport, "POST", f"{self.base_url}/real-time-response/combined/batch-init-session/v1",

@@ -126,9 +126,9 @@ class DashboardHITL(BaseHITL):
                                f"{str((data or {}).get('error') if isinstance(data, dict) else data)[:160]}")
         st = str(data.get("status", "")).lower()
         if st == "approved":
-            return "approved", str(data.get("decided_by") or "dashboard"), ""
+            return "approved", str(data.get("decided_by") or ""), ""          # "" = unattributed (round 7 A-8)
         if st == "rejected":
-            return "rejected", str(data.get("decided_by") or "dashboard"), str(data.get("reject_reason") or "")
+            return "rejected", str(data.get("decided_by") or ""), str(data.get("reject_reason") or "")
         if st == "expired":
             # closed to humans at the dashboard: settle it, never poll it forever or time it out (review round 4 R4-12)
             return "expired", str(data.get("decided_by") or ""), "expired at the dashboard"
