@@ -444,11 +444,9 @@ class SwarmOrchestrator:
             chain = self._orch.handle(alert)
         finally:
             TRUSTED_CONTEXT.reset(tok)
-        if isinstance(alert.get("tls_client"), dict) and "tls_client" not in chain.metadata:
-            chain.metadata["tls_client"] = alert["tls_client"]
-        if "campaign_context" in alert:
-            cc = alert["campaign_context"]
-            chain.metadata["campaign_context"] = {k: cc[k] for k in ("events_in_window", "window_minutes", "enumeration", "waf", "timeline", "identity", "adaptation") if k in cc}
+        # tls_client / campaign_context are attached by the orchestrator before it seals the chain, and only from an
+        # alert that went through the attach step — copying them here, after the seal, made the chain handed on
+        # differ from the audited row, and a failed attach copied the sender's own keys (review round 7 O-9)
         if chain.verdict not in self.trigger_verdicts:
             return chain
         return self.fan_out(alert, chain)

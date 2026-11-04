@@ -136,7 +136,10 @@ def run_walkers(alert: dict, source: TelemetrySource, *, walkers: dict[str, Walk
     wall clock and each is a governed tool call (``walker.<name>``) when a guard is given."""
     walkers = walkers or DEFAULT_WALKERS
     g = BlastGraph(); t0 = time.time()
-    for nid, ntype in seeds_from(alert):
+    # Seeds are the alert's TOP-LEVEL entities only. The mitigation plan cuts edges of this graph, so a graph grown
+    # from nested client-written fields put revoke / force-logout / block-export on whoever the attacker named in a
+    # request body (review round 7 O-5, B7 through the plan).
+    for nid, ntype in seeds_from(alert, top_level_only=True):
         g.seed(nid, ntype)
     report: dict[str, dict] = {name: {"edges": 0, "elapsed_ms": 0, "truncated": False} for name in walkers}
     active: dict[str, Walker] = {}
@@ -169,6 +172,8 @@ def run_walkers(alert: dict, source: TelemetrySource, *, walkers: dict[str, Walk
                 expanded.add((name, n.id))
                 try:
                     report[name]["edges"] += g.add(w.step(source, n.id, n.type, window_min))
+                    if len(g.nodes) >= max_nodes:          # one telemetry answer can carry many nodes (round 7 O-6)
+                        report[name]["truncated"] = True; break
                 except Exception as e:  # noqa: BLE001 — one bad query is a note, not a failed walk
                     if "error" not in report[name]:        # first failure per walker is logged; the rest are counted
                         logger.warning("[walker.%s] query failed on %s %s: %s: %s", name, n.type, n.id[:40], type(e).__name__, str(e)[:120])

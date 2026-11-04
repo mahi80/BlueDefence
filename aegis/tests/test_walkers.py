@@ -176,7 +176,9 @@ def test_swarm_attaches_campaign_context_before_triage():
     for i in range(3):
         chain = sw.handle({"id": f"E-{i}", "source_ip": "203.0.113.9", "url": f"/x/{i}"})
     assert "campaign_context" in seen["alert"] and seen["alert"]["campaign_context"]["events_in_window"] == 2
-    assert chain.metadata["campaign_context"]["events_in_window"] == 2
+    # the swarm no longer copies it onto the chain after the seal (round 7 O-9): the orchestrator attaches it before
+    # sealing — this stub does not, so the chain carries none
+    assert "campaign_context" not in chain.metadata
 
 
 def test_containment_loop_confirms_shrink_and_replans_on_movement():
