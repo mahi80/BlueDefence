@@ -390,6 +390,11 @@ class KitConsumer(BaseConsumer):
             a = to_alert(record, source_hint=self.spec["title"])
             if a is not None:
                 a["connector"] = self.spec["name"]
+                try:
+                    from aegis.detect.sigma import enrich
+                    enrich(a, record)              # Sigma rules (AEGIS_SIGMA_RULES; off when unset)
+                except Exception as e:  # noqa: BLE001 — a detector failure never drops the alert
+                    logger.warning("[kit] sigma enrichment failed: %s", str(e)[:160])
             return a
         m = self.spec["map"]
         alert: dict[str, Any] = dict(self.spec.get("constants") or {})

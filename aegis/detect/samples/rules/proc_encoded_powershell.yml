@@ -1,0 +1,11 @@
+title: Encoded PowerShell command line
+id: 7c1f2e10-0b1d-4c55-9a51-0d6f5e0c0002
+status: experimental
+logsource: {category: process_creation, product: windows}
+detection:
+  selection:
+    Image|endswith: '\powershell.exe'
+    CommandLine|re: '(?i)\s-e(nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{20,}'
+  condition: selection
+level: medium
+tags: [attack.execution, attack.t1059.001]

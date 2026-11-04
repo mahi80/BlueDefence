@@ -504,10 +504,15 @@ class StreamConsumer(BaseConsumer):
         events = obj if isinstance(obj, list) else [obj]
         out = []
         hint = item.source[5:] if item.source.startswith("ocsf-") else ""
+        from aegis.detect.sigma import enrich
         for ev in events[:1000]:
             a = to_alert(ev, source_hint=hint) if isinstance(ev, dict) else None
             if a is None:
                 continue
+            try:
+                enrich(a, ev)                      # Sigma rules over the OCSF event (AEGIS_SIGMA_RULES; off when unset)
+            except Exception as e:  # noqa: BLE001 — a detector failure never drops the alert
+                logger.warning("[stream] sigma enrichment failed: %s", str(e)[:160])
             a["received_at"] = item.received_at
             a["ingest_source"] = item.source
             ts = _vendor_ts(a)

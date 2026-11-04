@@ -1,0 +1,12 @@
+title: Connection to the cloud instance metadata service
+id: 7c1f2e10-0b1d-4c55-9a51-0d6f5e0c0006
+status: experimental
+logsource: {category: network_connection}
+detection:
+  selection:
+    DestinationIp|cidr: 169.254.169.254/32
+  filter_agents:
+    Image|endswith: ['/amazon-ssm-agent', '\amazon-ssm-agent.exe']
+  condition: selection and not filter_agents
+level: high
+tags: [attack.credential_access, attack.t1552.005]

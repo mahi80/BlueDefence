@@ -1,0 +1,9 @@
+title: Base64-offset match (skipped by the engine)
+id: 7c1f2e10-0b1d-4c55-9a51-0d6f5e0c0008
+status: experimental
+logsource: {category: process_creation, product: windows}
+detection:
+  selection:
+    CommandLine|base64offset|contains: 'IEX'
+  condition: selection
+level: high
