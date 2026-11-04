@@ -1,0 +1,29 @@
+name: qradar
+title: IBM QRadar offenses
+category: siem
+docs: https://www.ibm.com/docs/en/qradar-common?topic=endpoints-siem
+verified: recorded-sample (shape per the QRadar REST API /siem/offenses docs; not yet run against a live console)
+read_only: true
+auth: {type: header, name: SEC, value: "{env:QRADAR_SEC_TOKEN}"}
+config: {base_url: "{env:QRADAR_BASE_URL}"}        # https://<console>
+request:
+  method: GET
+  url: "{base_url}/api/siem/offenses"
+  params: {filter: "start_time > {watermark}", sort: "+start_time",
+           fields: "id,description,start_time,severity,magnitude,offense_type,offense_source,categories,status"}
+  headers: {Version: "20.0"}
+page_size: 50
+paging: {type: range}
+watermark: {format: epoch_ms, overlap_s: 300, initial_lookback_s: 3600}
+format: map
+map:
+  id: id
+  timestamp: start_time
+  title: description
+  severity: severity
+  offense_source: offense_source
+  source_ip: offense_source
+  categories: categories
+  status: status
+severity_map: {"0": low, "1": low, "2": low, "3": low, "4": medium, "5": medium, "6": medium, "7": high, "8": high, "9": critical, "10": critical}
+constants: {source: IBM QRadar}

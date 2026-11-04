@@ -25,6 +25,7 @@
     GET  /ingest/blocklist    the active enforcement set (IPs, CIDRs, client fingerprints)
     GET  /ingest/license      the installation's licence state (status, edition, tier, features, limits) — the
                               Kafka bridge checks the ``kafka_bridge`` feature here before it starts
+    POST /ingest/ocsf         OCSF events (any class; NDJSON or JSON arrays; ?product=<name>)
     GET  /ingest/verdicts     cursor feed of finalised evidence chains for a message bus (the Kafka
                               bridge): ``?after=<seq>&limit=<n>`` returns chains with seq > after, in
                               order, with ``next`` to pass back; seq is the chain's 1-based position in
@@ -673,7 +674,13 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._reply(400, {"error": "after and limit must be integers"})
                 return
-            self._reply(200, self.server_ref.verdicts_payload(max(0, after), limit))
+            payload = self.server_ref.verdicts_payload(max(0, after), limit)
+            if (q.get("format") or [""])[0].lower() == "ocsf":
+                from .ocsf import to_detection_finding
+                for v in payload["verdicts"]:
+                    v["ocsf"] = to_detection_finding(v["chain"])
+                    v.pop("chain", None)
+            self._reply(200, payload)
             return
         if path.startswith("/api/"):
             if not self.server_ref.read_authorized(self.headers):
@@ -748,6 +755,10 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 feed = (parse_qs(parts.query).get("feed") or [""])[0].strip().lower()[:24]   # syslog | snmp | netflow | telemetry | config | lldp
                 status, out = srv.ingest_waf(body, f"netops-{feed}" if feed else "netops")
+            elif path == "/ingest/ocsf":
+                # any OCSF producer (Security Lake subscribers, CrowdStrike, Okta, Cribl, Vector …): NDJSON or arrays
+                product = (parse_qs(parts.query).get("product") or [""])[0].strip().lower()[:24]
+                status, out = srv.ingest_waf(body, f"ocsf-{product}" if product else "ocsf")
             elif path == "/ingest/alerts":
                 status, out = srv.ingest_alerts(body)
             else:

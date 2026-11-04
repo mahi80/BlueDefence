@@ -1,0 +1,30 @@
+name: sentinelone
+title: SentinelOne threats
+category: edr
+docs: https://usea1-partners.sentinelone.net/api-doc/api-details?category=threats&api=get-threats
+verified: recorded-sample (shape per the Management API v2.1 docs; not yet run against a live console)
+read_only: true
+auth: {type: header, name: Authorization, value: "ApiToken {env:S1_API_TOKEN}"}
+config: {base_url: "{env:S1_BASE_URL}"}            # https://<tenant>.sentinelone.net
+request:
+  method: GET
+  url: "{base_url}/web/api/v2.1/threats"
+  params: {createdAt__gte: "{watermark}", limit: "{page_size}", sortBy: createdAt, sortOrder: asc}
+page_size: 100
+records: data
+paging: {type: cursor, path: pagination.nextCursor, param: cursor}
+watermark: {format: iso, overlap_s: 300, initial_lookback_s: 3600}
+format: map
+map:
+  id: id
+  timestamp: threatInfo.createdAt
+  title: threatInfo.threatName
+  severity: threatInfo.confidenceLevel
+  alert_type: threatInfo.classification
+  file_path: threatInfo.filePath
+  file_hash: threatInfo.sha256
+  host: agentRealtimeInfo.agentComputerName
+  user_id: threatInfo.processUser
+  vendor_disposition: threatInfo.mitigationStatus
+severity_map: {malicious: high, suspicious: medium, n/a: low}
+constants: {source: SentinelOne}

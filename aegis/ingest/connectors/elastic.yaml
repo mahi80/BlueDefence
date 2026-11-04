@@ -1,0 +1,36 @@
+name: elastic
+title: Elastic Security detection alerts
+category: siem
+docs: https://www.elastic.co/guide/en/security/current/signals-api-overview.html
+verified: recorded-sample (shape per the detection-engine signals search API; not yet run against a live cluster)
+read_only: true
+auth: {type: header, name: Authorization, value: "ApiKey {env:ELASTIC_API_KEY}"}
+config: {base_url: "{env:ELASTIC_KIBANA_URL}"}    # https://<kibana>
+request:
+  method: POST
+  search_endpoint: true
+  url: "{base_url}/api/detection_engine/signals/search"
+  headers: {kbn-xsrf: "aegis"}
+  body:
+    size: "{page_size}"
+    sort: [{"@timestamp": {order: asc}}]
+    query: {bool: {filter: [{range: {"@timestamp": {gt: "{watermark}"}}}]}}
+page_size: 500
+records: hits.hits
+watermark: {format: iso, overlap_s: 300, initial_lookback_s: 3600}
+format: map
+map:
+  id: _id
+  timestamp: "_source.@timestamp"
+  title: _source.kibana.alert.rule.name
+  severity: "_source.kibana.alert.severity"
+  source_ip: _source.source.ip
+  dest_ip: _source.destination.ip
+  user_id: _source.user.name
+  host: _source.host.name
+  cmdline: _source.process.command_line
+  parent_process: _source.process.parent.name
+  child_process: _source.process.name
+  url: _source.url.original
+severity_map: {low: low, medium: medium, high: high, critical: critical}
+constants: {source: Elastic Security}
