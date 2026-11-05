@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -302,6 +303,96 @@ class GemmaClient(LLMClient):
         )
 
 
+class LLMCircuitOpen(RuntimeError):
+    """The provider has failed repeatedly; calls fail fast instead of queueing.
+
+    Raising is deliberate: the orchestrator turns it into an ``uncertain`` chain
+    with HITL, so a dead provider costs one log line per alert, not a 10-minute
+    timeout per alert.
+    """
+
+
+class LLMDeadlineExceeded(RuntimeError):
+    """The retry loop ran out of wall-clock budget before the next attempt."""
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = float(os.environ.get(name, "") or default)
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+class CircuitBreaker:
+    """Consecutive-failure breaker, one per backend.
+
+    Closed → (N consecutive failures) → open for ``reset_s`` → half-open: one
+    probe is let through; success closes it, failure re-opens it for another
+    window. No background thread, no state shared between backends.
+    """
+
+    def __init__(self, *, failures: int = 5, reset_s: float = 30.0, clock=time.monotonic):
+        self.failures = max(1, int(failures))
+        self.reset_s = float(reset_s)
+        self._clock = clock
+        self._consecutive = 0
+        self._opened_at = 0.0
+        self._probe = False
+        self._lock = threading.Lock()
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            if not self._opened_at:
+                return False
+            return (self._clock() - self._opened_at) < self.reset_s
+
+    def allow(self) -> bool:
+        """True if a call may proceed. After the window, exactly one probe passes."""
+        with self._lock:
+            if not self._opened_at:
+                return True
+            if (self._clock() - self._opened_at) >= self.reset_s:
+                if self._probe:
+                    return False          # another thread is already probing
+                self._probe = True
+                return True
+            return False
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive = 0
+            self._opened_at = 0.0
+            self._probe = False
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._probe = False
+            self._consecutive += 1
+            if self._consecutive >= self.failures or self._opened_at:
+                if not self._opened_at:
+                    _log.error("LLM circuit open after %d consecutive failures; failing fast for %ds",
+                               self._consecutive, int(self.reset_s))
+                self._opened_at = self._clock()
+
+
+_BREAKERS: dict[str, CircuitBreaker] = {}
+_BREAKERS_LOCK = threading.Lock()
+
+
+def breaker_for(name: str) -> CircuitBreaker:
+    with _BREAKERS_LOCK:
+        b = _BREAKERS.get(name)
+        if b is None:
+            b = CircuitBreaker(
+                failures=int(_env_float("AEGIS_LLM_BREAKER_FAILURES", 5)),
+                reset_s=_env_float("AEGIS_LLM_BREAKER_RESET_S", 30.0),
+            )
+            _BREAKERS[name] = b
+        return b
+
+
 class AnthropicClient(LLMClient):
     """Production-shape Anthropic client.
 
@@ -327,10 +418,20 @@ class AnthropicClient(LLMClient):
         budget: Optional[TokenBudget] = None,
         cache_system_prompt: bool = True,
         stream: bool = False,
+        timeout_s: Optional[float] = None,
+        deadline_s: Optional[float] = None,
+        breaker: Optional[CircuitBreaker] = None,
     ):
         from anthropic import Anthropic  # imported lazily
         self._anthropic_mod = __import__("anthropic")
-        self._client = Anthropic()
+        # The SDK default is 600 s per request and two built-in retries on top of
+        # the loop below: a hung call stalled the serial pipeline for ten minutes
+        # and a 429 was billed three times. One timeout, one retry policy.
+        self.timeout_s = float(timeout_s if timeout_s is not None
+                               else _env_float("AEGIS_LLM_TIMEOUT_S", 60.0))
+        self.deadline_s = float(deadline_s if deadline_s is not None
+                                else _env_float("AEGIS_LLM_DEADLINE_S", 90.0))
+        self._client = Anthropic(timeout=self.timeout_s, max_retries=0)
         self.model = model
         self._max_retries = max_retries
         self._initial_backoff = initial_backoff_s
@@ -338,6 +439,7 @@ class AnthropicClient(LLMClient):
         self._budget = budget or TokenBudget()
         self._cache_system = cache_system_prompt
         self._stream = stream
+        self._breaker = breaker or breaker_for(f"anthropic:{model}")
 
     @property
     def budget(self) -> TokenBudget:
@@ -366,24 +468,53 @@ class AnthropicClient(LLMClient):
 
         return self._call_with_retry(system_param, messages, max_tokens)
 
-    def _call_with_retry(self, system_param, messages, max_tokens: int) -> LLMResponse:
+    def _retry(self, call, *, label: str):
+        """One retry policy for every Anthropic call.
+
+        Bounded by both attempt count and wall clock (``deadline_s``), and
+        guarded by the breaker: once the provider has failed ``failures`` times
+        in a row, calls raise ``LLMCircuitOpen`` immediately so a dead backend
+        costs one log line per alert instead of ten minutes of timeouts.
+        """
+        started = time.monotonic()
         backoff = self._initial_backoff
+        # Admission is decided once per logical call: an alert that got in may
+        # use its own retry budget, and the breaker governs the next alert.
+        if not self._breaker.allow():
+            raise LLMCircuitOpen(
+                f"{self.model}: circuit open after {self._breaker.failures} consecutive failures"
+            )
         for attempt in range(self._max_retries + 1):
             try:
-                return self._call_once(system_param, messages, max_tokens, retries=attempt)
+                resp = call(attempt)
             except Exception as exc:  # noqa: BLE001
-                if not self._is_retriable(exc) or attempt == self._max_retries:
+                retriable = self._is_retriable(exc)
+                if not retriable or attempt == self._max_retries:
+                    if retriable:
+                        self._breaker.record_failure()
                     raise
-                # Exponential backoff with full jitter
                 sleep_s = min(backoff, self._max_backoff) * (0.5 + random.random())
+                if (time.monotonic() - started) + sleep_s > self.deadline_s:
+                    self._breaker.record_failure()
+                    raise LLMDeadlineExceeded(
+                        f"{label} exceeded its {self.deadline_s:.0f}s deadline after {attempt + 1} attempt(s)"
+                    ) from exc
                 _log.warning(
-                    "Anthropic call attempt %d/%d hit %s; sleeping %.1fs",
-                    attempt + 1, self._max_retries + 1, type(exc).__name__, sleep_s,
+                    "%s attempt %d/%d hit %s; sleeping %.1fs",
+                    label, attempt + 1, self._max_retries + 1, type(exc).__name__, sleep_s,
                 )
                 time.sleep(sleep_s)
                 backoff = min(backoff * 2, self._max_backoff)
-        # Unreachable
+                continue
+            self._breaker.record_success()
+            return resp
         raise RuntimeError("retry loop fell through")
+
+    def _call_with_retry(self, system_param, messages, max_tokens: int) -> LLMResponse:
+        return self._retry(
+            lambda attempt: self._call_once(system_param, messages, max_tokens, retries=attempt),
+            label="Anthropic call",
+        )
 
     # ---- Tool-use API ------------------------------------------------
 
@@ -419,21 +550,10 @@ class AnthropicClient(LLMClient):
         return self._call_tools_with_retry(system_param, messages, tools_param, max_tokens)
 
     def _call_tools_with_retry(self, system_param, messages, tools_param, max_tokens: int) -> LLMResponse:
-        backoff = self._initial_backoff
-        for attempt in range(self._max_retries + 1):
-            try:
-                return self._call_tools_once(system_param, messages, tools_param, max_tokens, retries=attempt)
-            except Exception as exc:  # noqa: BLE001
-                if not self._is_retriable(exc) or attempt == self._max_retries:
-                    raise
-                sleep_s = min(backoff, self._max_backoff) * (0.5 + random.random())
-                _log.warning(
-                    "Anthropic tool-use attempt %d/%d hit %s; sleeping %.1fs",
-                    attempt + 1, self._max_retries + 1, type(exc).__name__, sleep_s,
-                )
-                time.sleep(sleep_s)
-                backoff = min(backoff * 2, self._max_backoff)
-        raise RuntimeError("retry loop fell through")
+        return self._retry(
+            lambda attempt: self._call_tools_once(system_param, messages, tools_param, max_tokens, retries=attempt),
+            label="Anthropic tool-use call",
+        )
 
     def _call_tools_once(self, system_param, messages, tools_param, max_tokens: int, retries: int) -> LLMResponse:
         msg = self._client.messages.create(
