@@ -64,18 +64,20 @@ _MOCK_REFUSAL = "Refusing to grade the deterministic keyword table"
 
 
 def _eval_status(rc: int, out: str, pass_n: int, total: int) -> str:
-    if rc != 0 and _MOCK_REFUSAL in out:
+    # exit 2 is aegis.eval.run's "this run is not credible" (mock backend or transcript miss);
+    # the red-team runner instead exits 1 with the require_live_llm refusal on stderr.
+    if rc == 2 or (rc != 0 and _MOCK_REFUSAL in out):
         return "SKIP"
     return "PASS" if rc == 0 and pass_n == total and total > 0 else "FAIL"
 
 
 def _skip_note() -> str:
-    return ("no live LLM credentials (set ANTHROPIC_API_KEY, or AEGIS_EVAL_ALLOW_MOCK=1 "
-            "for a deliberate offline run)")
+    return ("not credible offline: no live model and no recorded transcript "
+            "(set ANTHROPIC_API_KEY or AEGIS_EVAL_TRANSCRIPT)")
 
 
 def _run_historical_eval() -> SuiteResult:
-    rc, out = _run([sys.executable, "-m", "aegis.eval.run"])
+    rc, out = _run([sys.executable, "-m", "aegis.eval.run", "--gate"])
     # Parse the curated text output
     pass_n, total = 0, 0
     rows: list[dict] = []
@@ -100,7 +102,7 @@ def _run_historical_eval() -> SuiteResult:
 
 def _run_injection_eval() -> SuiteResult:
     # The same eval/run.py covers both historical + injection
-    rc, out = _run([sys.executable, "-m", "aegis.eval.run"])
+    rc, out = _run([sys.executable, "-m", "aegis.eval.run", "--gate"])
     pass_n, total = 0, 0
     for line in out.splitlines():
         line = line.strip()

@@ -50,9 +50,21 @@ jobs:
       - name: Manifest verify (drift check)
         run: python -m aegis.agents.shared.agent_identity --verify
 
-      - name: Historical + injection eval
-        if: env.ANTHROPIC_API_KEY != ''
-        run: python -m aegis.eval.run
+      - name: Historical + injection eval (real model or recorded transcript — never the mock)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TRANSCRIPT: aegis/eval/transcripts/historical.jsonl
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            python -m aegis.eval.run --gate --json eval-historical.json
+          elif [ -f "$TRANSCRIPT" ]; then
+            AEGIS_EVAL_TRANSCRIPT="$TRANSCRIPT" python -m aegis.eval.run --gate --json eval-historical.json
+          else
+            echo "::warning title=Eval gate skipped::No ANTHROPIC_API_KEY and no recorded transcript at $TRANSCRIPT; the historical, injection and red-team gates did NOT grade a model."
+            echo "Record one real run once, then commit the transcript:"
+            echo "  AEGIS_EVAL_RECORD=$TRANSCRIPT python -m aegis.eval.run"
+            echo "See aegis/eval/transcripts/README.md."
+          fi
 
       - name: Adversarial AI red-team eval
         if: env.ANTHROPIC_API_KEY != ''

@@ -90,6 +90,7 @@ def test_dashboard_skips_gates_without_a_live_model_and_fails_real_disagreements
     refusal = ("historical/injection eval: the resolved LLM backend is MockClient (no model credentials). "
                "Refusing to grade the deterministic keyword table as if it were a model.")
     assert _eval_status(1, refusal, 0, 0) == "SKIP"
+    assert _eval_status(2, "GATE: FAIL — run is not credible (mock backend or transcript miss)", 0, 0) == "SKIP"
     assert _eval_status(1, "DISAGREE: alert-7", 8, 9) == "FAIL"
     assert _eval_status(0, "", 9, 9) == "PASS"
 

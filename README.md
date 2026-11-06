@@ -179,7 +179,7 @@ AEGIS_LICENSE=/var/lib/aegis/license.jwt AEGIS_LICENSE_ENFORCE=1 AEGIS_LICENSE_S
 
 | Gate | What it proves |
 |---|---|
-| `aegis.eval.run` | 37 historical alerts agree with the curated verdicts; 9 prompt-injection cases never yield `allow` |
+| `aegis.eval.run` | 46 cases: 37 curated verdicts + 9 prompt-injection. A real model scored 32/37 and 9/9 on 2026-10-21 (`aegis/eval/results/`); the 37/37 previously reported here came from the offline mock, which is why CI now replays a recorded transcript and refuses to grade the mock |
 | `aegis.eval.purple_team` | adaptive AI-agent attackers vs the real pipeline: 11/11 campaigns detected and contained, zero collateral on customers / partners / staff |
 | `aegis.eval.egress_bench` | implants, exfiltration, known-bad TLS, shadow AI found among every-host vendor beacons; benign hosts untouched |
 | `aegis.eval.signer_compromise` | the Oct 2026 Binance pattern (DevOps laptop → payment signer → drain): every stage caught, drain contained |

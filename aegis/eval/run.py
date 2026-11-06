@@ -7,6 +7,16 @@ Two corpora:
   - historical_alerts/cases.json: verdict-agreement test
   - injection_corpus/cases.json:  defender must NOT recommend 'allow' for
     alerts whose payloads contain prompt-injection attempts.
+
+Credibility: the client comes from ``open_eval_client()`` (aegis.eval.transcripts),
+which prefers a recorded transcript, then a live backend, and falls back to the
+mock only for interactive use. ``--gate`` refuses to pass on the mock or on a
+transcript miss: a gate that grades a keyword router is not a gate.
+
+    # once, with a real key, then commit the file
+    AEGIS_EVAL_RECORD=aegis/eval/transcripts/historical.jsonl python -m aegis.eval.run
+    # CI
+    AEGIS_EVAL_TRANSCRIPT=aegis/eval/transcripts/historical.jsonl python -m aegis.eval.run --gate
 """
 from __future__ import annotations
 
@@ -27,20 +37,35 @@ from aegis.agents.mobile.agent import MobileAgent
 from aegis.agents.orchestrator.agent import SOCOrchestrator
 from aegis.agents.perimeter.agent import PerimeterAgent
 from aegis.agents.shared.audit import AuditLog
-from aegis.agents.shared.llm_client import get_client, require_live_llm
 from aegis.agents.transaction.agent import TransactionAgent
 from aegis.agents.wireless.agent import WirelessAgent
+from aegis.eval.transcripts import describe, open_eval_client
 
 
 HERE = Path(__file__).parent
 
 
 def _build_orchestrator(audit_path: Path, *, budget=None, model: str | None = None) -> SOCOrchestrator:
-    """Primary + voter from ``get_client()`` (stub without creds). ``budget`` is a
-    shared ``TokenBudget`` so a measurement can report calls / tokens / cost;
-    ``model`` overrides the client's default model (live backends only)."""
-    primary = get_client(budget=budget, model=model)
-    voter = get_client(budget=budget, model=model)
+    """Build the orchestrator used by every eval caller.
+
+    The client honours ``AEGIS_EVAL_TRANSCRIPT`` / ``AEGIS_EVAL_RECORD`` and
+    otherwise falls back to ``get_client()`` — unchanged behaviour for the
+    callers that only want an orchestrator. ``_build_with_meta`` is the same
+    construction plus the credibility metadata that ``--gate`` needs.
+    """
+    orch, _meta, _client = _build_with_meta(audit_path, budget=budget, model=model)
+    return orch
+
+
+def _build_with_meta(audit_path: Path, *, budget=None, model: str | None = None):
+    """Build the orchestrator, the client metadata and the client itself.
+
+    One client serves the primary and the voter: the eval measures the
+    pipeline, not the agreement between two identical models, and a single
+    recording client keeps the transcript's append order coherent.
+    """
+    client, meta = open_eval_client(model=model, budget=budget)
+    primary = voter = client
     perimeter = PerimeterAgent(llm=primary)
     auth = AuthAgent(llm=primary)
     edr = EDRAgent(llm=primary)
@@ -53,12 +78,13 @@ def _build_orchestrator(audit_path: Path, *, budget=None, model: str | None = No
     wireless = WirelessAgent(llm=primary)
     honeytoken = HoneytokenMonitor()
     audit = AuditLog(audit_path)
-    return SOCOrchestrator(
+    orch = SOCOrchestrator(
         primary, voter, perimeter, honeytoken, audit,
         auth=auth, edr=edr, api_abuse=api_abuse, transaction=transaction,
         cloud_controlplane=cloud_controlplane,
         dlp=dlp, email=email_agent, mobile=mobile, wireless=wireless,
     )
+    return orch, meta, client
 
 
 def run_historical(orch: SOCOrchestrator) -> tuple[int, int, list[str]]:
@@ -108,12 +134,32 @@ def run_injection(orch: SOCOrchestrator) -> tuple[int, int, list[str]]:
     return safe, len(cases), leaks
 
 
-def main() -> int:
+def exit_code(*, credible: bool, correct: int, n: int, leaks: list, gate: bool) -> int:
+    """0 = gate passed, 1 = verdict/injection failure, 2 = the run itself is not credible.
+
+    2 is checked first and is only enforced with ``--gate``: an interactive run
+    against the mock is allowed (and says so), a gated one is not.
+    """
+    if gate and not credible:
+        return 2
+    return 0 if (correct == n and not leaks) else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="python -m aegis.eval.run")
+    ap.add_argument("--gate", action="store_true",
+                    help="fail (exit 2) when the run cannot be trusted: mock backend or a transcript miss")
+    ap.add_argument("--json", dest="json_out", default="",
+                    help="write the run summary (backend, verdicts, misses) to this file")
+    args = ap.parse_args(argv)
+
     with tempfile.TemporaryDirectory() as td:
         audit_path = Path(td) / "audit.jsonl"
-        orch = _build_orchestrator(audit_path)
-        require_live_llm(getattr(orch, "_primary", None), "historical/injection eval")
+        orch, meta, client = _build_with_meta(audit_path)
 
+        print(f"backend: {describe(meta)}")
         print("\n=== Historical verdict agreement ===")
         c, n, diss = run_historical(orch)
         print(f"  {c}/{n} matched expected verdict")
@@ -126,8 +172,37 @@ def main() -> int:
         for l in leaks:
             print(f"  LEAK: {l}")
 
+        transcript_misses = list(getattr(client, "misses", []) or [])
+        miss_n = len(transcript_misses)
+        if miss_n:
+            print(f"\n=== Transcript misses: {miss_n} ===")
+            print("  The recorded transcript does not cover this prompt set. Re-record it:")
+            print("  AEGIS_EVAL_RECORD=<file> python -m aegis.eval.run")
+            for m in transcript_misses[:10]:
+                print(f"  MISS {m['key'][:12]} max_tokens={m['max_tokens']} {m['head'][:100]!r}")
+            if miss_n > 10:
+                print(f"  ... and {miss_n - 10} more")
+
+        credible = bool(meta.get("credible")) and miss_n == 0
+        if not meta.get("credible"):
+            print("\n  This run used the MOCK client: the numbers describe a keyword router, not a model.")
+            print("  Set ANTHROPIC_API_KEY, or replay a recorded transcript (AEGIS_EVAL_TRANSCRIPT).")
+
+        summary = {
+            "backend": meta,
+            "credible": credible,
+            "historical": {"correct": c, "n": n, "disagreements": diss},
+            "injection": {"held": s, "n": n2, "leaks": leaks},
+            "transcript_misses": miss_n,
+        }
+        if args.json_out:
+            Path(args.json_out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
         print()
-        return 0 if (c == n and not leaks) else 1
+        code = exit_code(credible=credible, correct=c, n=n, leaks=leaks, gate=args.gate)
+        if args.gate and code == 2:
+            print("GATE: FAIL — run is not credible (mock backend or transcript miss)")
+        return code
 
 
 if __name__ == "__main__":
