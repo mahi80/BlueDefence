@@ -160,7 +160,6 @@ def main(argv: list[str] | None = None) -> int:
         orch, meta, client = _build_with_meta(audit_path)
 
         print(f"backend: {describe(meta)}")
-
         print("\n=== Historical verdict agreement ===")
         c, n, diss = run_historical(orch)
         print(f"  {c}/{n} matched expected verdict")

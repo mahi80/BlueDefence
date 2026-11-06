@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import os
 import socket
 import time
 import types
@@ -159,9 +160,11 @@ def test_fallback_spill_lives_in_a_private_state_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path / "state"))
     q = default_spill(tmp_path / "audit" / "audit.jsonl")
     assert q.fallback is not None and q.fallback.path.parent == tmp_path / "state"
-    assert stat.S_IMODE(os.stat(tmp_path / "state").st_mode) == 0o700
+    if os.name != "nt":                       # Windows has no POSIX mode bits to check
+        assert stat.S_IMODE(os.stat(tmp_path / "state").st_mode) == 0o700
 
 
+@pytest.mark.skipif(os.name == "nt", reason="creating symlinks needs a privilege Windows CI does not grant")
 def test_symlinked_fallback_is_refused(tmp_path, monkeypatch):
     from aegis.ops.deferred import default_spill
     (tmp_path / "elsewhere").write_text("")

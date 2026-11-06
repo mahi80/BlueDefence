@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -128,10 +129,12 @@ def test_spill_is_private(tmp_path):
     from aegis.ops.deferred import DeferredQueue
     q = DeferredQueue(tmp_path / "d.jsonl")
     q.push({"id": "leak-1", "body": "AWS_SECRET_ACCESS_KEY=abcd1234abcd1234abcd1234abcd1234abcd1234"})
-    assert stat.S_IMODE(os.stat(tmp_path / "d.jsonl").st_mode) == 0o600
+    if os.name != "nt":                       # Windows has no POSIX mode bits to check
+        assert stat.S_IMODE(os.stat(tmp_path / "d.jsonl").st_mode) == 0o600
     assert "abcd1234" in q.pop(1)[0]["body"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="creating symlinks needs a privilege Windows CI does not grant")
 def test_spill_refuses_a_symlink(tmp_path):
     from aegis.ops.deferred import DeferredQueue
     (tmp_path / "elsewhere").write_text("")

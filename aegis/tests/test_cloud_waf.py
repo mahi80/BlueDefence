@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import gzip
+import os
 import tempfile
 from pathlib import Path
 
@@ -341,6 +342,6 @@ def test_waf_alert_end_to_end_blocks_the_attacker_ip(monkeypatch, tmp_path):
     chain = orch.handle(alert)
     block = next(a for a in chain.recommended_actions if a.action_type == "block")
     assert block.target == "203.0.113.10"
-    agent = ResponseAgent(connectors=ConnectorRegistry([c]), hitl_stream=open("/dev/null", "w"))
+    agent = ResponseAgent(connectors=ConnectorRegistry([c]), hitl_stream=open(os.devnull, "w"))
     done = agent.approve(block, "analyst", source_alert_id=chain.alert_id)
     assert done.status == "executed" and srv.blocked() == {"203.0.113.10"}

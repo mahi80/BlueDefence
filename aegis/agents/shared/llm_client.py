@@ -1532,6 +1532,34 @@ def _promoted_model(var: str = "AEGIS_MODEL_POINTER", *, path: str | None = None
     return None
 
 
+def is_mock_client(client: Any) -> bool:
+    """True when ``client`` is the deterministic mock, including when wrapped by the PII middleware."""
+    for _ in range(5):
+        if isinstance(client, MockClient):
+            return True
+        client = getattr(client, "_inner", None)
+    return False
+
+
+def require_live_llm(client: Any, where: str) -> None:
+    """Eval gates must grade a model, not the keyword table.
+
+    Exits non-zero unless the resolved client is a real backend, so a CI job with no credentials
+    cannot report a green "eval gate". ``AEGIS_EVAL_ALLOW_MOCK=1`` is the explicit, logged opt-out
+    for offline/deterministic runs.
+    """
+    if not is_mock_client(client):
+        return
+    if os.environ.get("AEGIS_EVAL_ALLOW_MOCK", "").strip().lower() in ("1", "true", "yes", "on"):
+        _log.warning("[eval] %s: grading the MOCK client on purpose (AEGIS_EVAL_ALLOW_MOCK=1)", where)
+        return
+    raise SystemExit(
+        f"{where}: the resolved LLM backend is MockClient (no model credentials, or LLM_BACKEND=mock). "
+        "Refusing to grade the deterministic keyword table as if it were a model. Configure a live "
+        "backend, or set AEGIS_EVAL_ALLOW_MOCK=1 for a deliberate offline run."
+    )
+
+
 def get_client(
     prefer: Optional[str] = None,
     *,
@@ -1601,11 +1629,16 @@ def get_client(
     # blocker (DPDP Act 2023 + PCI-DSS scope-out). Local dev can set
     # AEGIS_PII_TOKENIZATION=0 to bypass for debugging.
     if os.environ.get("AEGIS_PII_TOKENIZATION", "1") != "0":
+        # Fail closed: an import error must not silently downgrade to the raw client, because that sends
+        # cards / accounts / phones to the model (the compliance blocker this wrapper exists to prevent).
         try:
             from .pii_tokenizing_client import TokenizingLLMClient
-            return TokenizingLLMClient(inner)
         except Exception as exc:  # noqa: BLE001
-            _log.warning("PII tokenizer unavailable (%s) — using raw client", exc)
+            raise RuntimeError(
+                "PII tokenization is enabled but TokenizingLLMClient could not be loaded "
+                f"({type(exc).__name__}: {exc}); set AEGIS_PII_TOKENIZATION=0 only for local debugging"
+            ) from exc
+        return TokenizingLLMClient(inner)
     return inner
 
 
@@ -1663,10 +1696,12 @@ def get_voter_client(
     if os.environ.get("AEGIS_PII_TOKENIZATION", "1") != "0":
         try:
             from .pii_tokenizing_client import TokenizingLLMClient
-            return TokenizingLLMClient(inner)
         except Exception as exc:  # noqa: BLE001
-            _log.error("PII tokenization wrapper unavailable (%s: %s) — voter runs WITHOUT PII tokenization", type(exc).__name__, str(exc)[:160])
-            return inner
+            raise RuntimeError(
+                "PII tokenization is enabled but TokenizingLLMClient could not be loaded "
+                f"({type(exc).__name__}: {exc}); set AEGIS_PII_TOKENIZATION=0 only for local debugging"
+            ) from exc
+        return TokenizingLLMClient(inner)
     return inner
 
 

@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .deferred import _restrict_to_owner
+
 logger = logging.getLogger("aegis.ops.dead_letter")
 _lock = threading.Lock()
 written = 0
@@ -47,8 +49,7 @@ def write(alert: Any, reason: str) -> bool:
         with _lock:
             fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
             try:
-                with contextlib.suppress(OSError):
-                    os.fchmod(fd, 0o600)
+                _restrict_to_owner(fd, p)
                 start = os.lseek(fd, 0, os.SEEK_END)
                 try:
                     view = memoryview(data)

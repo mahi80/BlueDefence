@@ -49,7 +49,8 @@ def test_isolate_empties_network_keeps_filesystem_and_undo_restores():
     assert "2 rule(s)" in r.detail and "core_banking" in r.detail
     assert c.verify(r) is True
     saved = r.rollback_token
-    assert stat.S_IMODE(os.stat(saved).st_mode) == 0o600
+    if os.name != "nt":                       # Windows has no POSIX mode bits to check
+        assert stat.S_IMODE(os.stat(saved).st_mode) == 0o600
     rb = c.rollback(r)
     assert rb.status == STATUS_ROLLED_BACK
     assert mock.policies["loan-agent"] == before

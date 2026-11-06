@@ -48,7 +48,7 @@ def test_protocols_filesystem_and_shape():
     assert pol["version"] == 1 and pol["landlock"] == {"compatibility": "best_effort"}
     # round 6 P-2: the threat-intel cache is writable too, and every path is absolute
     assert {"/data", "/var/lib/aegis/hitl", "/var/lib/aegis"} <= set(pol["filesystem_policy"]["read_write"])
-    assert all(p.startswith("/") for p in pol["filesystem_policy"]["read_write"])
+    assert all(p.startswith("/") or Path(p).is_absolute() for p in pol["filesystem_policy"]["read_write"])
     kafka = pol["network_policies"]["kafka"]["endpoints"]
     assert all("protocol" not in e for e in kafka)                               # L4 for Kafka
     assert pol["network_policies"]["fw"]["endpoints"][0]["protocol"] == "rest"
@@ -82,6 +82,6 @@ def test_round6_microsoft_login_kafka_forms_other_urls_and_userinfo_trick(tmp_pa
     assert collect({"AEGIS_Y_URL": "https://intranet"}) == {}               # dotless never, unless --extra
     pol = build_policy({"AEGIS_AUDIT_PATH": "audit.jsonl"}, extra=["siem:6514"])
     assert ("siem", 6514) in _hosts(pol)
-    assert all(p.startswith("/") for p in pol["filesystem_policy"]["read_write"])   # P-2: relative made absolute
+    assert all(p.startswith("/") or Path(p).is_absolute() for p in pol["filesystem_policy"]["read_write"])   # P-2: relative made absolute
     assert build_policy({})["network_policies"] == {} and build_policy({})["filesystem_policy"]["read_write"]
     assert all(b["path"] == "/usr/bin/python3" for p in build_policy(ENV)["network_policies"].values() for b in p["binaries"])

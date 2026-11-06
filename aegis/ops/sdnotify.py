@@ -21,7 +21,7 @@ def enabled() -> bool:
 def _send(msg: str) -> bool:
     global _sock
     addr = os.environ.get("NOTIFY_SOCKET")
-    if not addr:
+    if not addr or not hasattr(socket, "AF_UNIX"):
         return False
     try:
         if _sock is None:
