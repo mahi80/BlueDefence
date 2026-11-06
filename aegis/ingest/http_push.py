@@ -577,9 +577,16 @@ class _Handler(BaseHTTPRequestHandler):
         connection a client could send one quick request and then trickle the next one's headers for as long as
         each read beat the 30 s timeout, holding a slot (review round 5 Y5-6)."""
         fired = threading.Event()
+        self._headers_done = False
 
         def expire() -> None:
             fired.set()
+            # counted here, not in parse_request: on Windows the shutdown surfaces as an OSError while the
+            # handler is blocked in recv, so parse_request never runs to observe the deadline.
+            if not self._headers_done:
+                srv = self.server
+                if hasattr(srv, "header_timeouts"):
+                    srv.header_timeouts += 1
             _close_if_no_headers(self.connection)
         timer = threading.Timer(float(getattr(self.server, "header_s", 10.0)), expire)
         timer.daemon = True
@@ -592,6 +599,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def parse_request(self) -> bool:
         ok = super().parse_request()                   # reads the header lines: the deadline covers them
+        self._headers_done = True
         t = getattr(self, "_header_timer", None)
         if t is not None:
             t.cancel()                                  # headers are in: the per-read timeout governs the body
@@ -599,9 +607,6 @@ class _Handler(BaseHTTPRequestHandler):
         if fired is not None and fired.is_set():
             # the deadline passed while the headers were arriving: whatever was read is not a request
             self.close_connection = True
-            srv = self.server
-            if hasattr(srv, "header_timeouts"):
-                srv.header_timeouts += 1
             return False
         return ok
 

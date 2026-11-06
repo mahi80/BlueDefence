@@ -38,7 +38,7 @@ def test_run_once_tracks_exposures(ws):
     log4 = next(o for o in r["open"] if o["id"] == "CVE-2021-44228")
     assert log4["severity"] == "critical" and log4["extra"]["reach"] == "internet" and len(log4["extra"]["reasons"]) == 4
     assert log4["affected_component"] == "legacy-reports:8080" and "Patch CVE-2021-44228" in log4["recommended_remediation"]
-    md = (Path(cfg.store) / "runs" / f"{r['run_id']}.md").read_text()
+    md = (Path(cfg.store) / "runs" / f"{r['run_id']}.md").read_text(encoding="utf-8")
     assert "Exposure funnel — exposure-sample-bank: 14 findings → 10 exploitable" in md and "monitor mode do not count" in md
 
 

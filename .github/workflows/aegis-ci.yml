@@ -22,6 +22,10 @@ jobs:
     name: Evals + manifest verify + PII roundtrip
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    env:
+      # The two LLM-in-the-loop evals refuse to grade MockClient. Map the key so they can run;
+      # when it is absent those steps are skipped (and say so) instead of reporting a false green.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -47,10 +51,16 @@ jobs:
         run: python -m aegis.agents.shared.agent_identity --verify
 
       - name: Historical + injection eval
+        if: env.ANTHROPIC_API_KEY != ''
         run: python -m aegis.eval.run
 
       - name: Adversarial AI red-team eval
+        if: env.ANTHROPIC_API_KEY != ''
         run: python -m aegis.eval.ai_red_team.run
+
+      - name: LLM evals skipped
+        if: env.ANTHROPIC_API_KEY == ''
+        run: echo "::warning title=LLM evals skipped::ANTHROPIC_API_KEY is not set; the historical, injection and adversarial red-team gates did NOT grade a model."
 
       - name: Investigation quality gate (walkers / planner / loop / twin)
         run: python -m aegis.eval.investigation_quality

@@ -16,6 +16,7 @@ Durability (what an on-prem box does to a log file):
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import hashlib
@@ -26,13 +27,22 @@ import time
 from pathlib import Path
 from typing import Iterator, Optional
 
+try:                                    # POSIX (the supported server platform)
+    import fcntl
+except ImportError:                     # pragma: no cover - Windows dev boxes
+    fcntl = None                            # type: ignore[assignment]
+try:
+    import msvcrt
+except ImportError:                     # pragma: no cover - Linux
+    msvcrt = None                           # type: ignore[assignment]
+
 from .evidence_chain import EvidenceChain
 from .redact import redact_chain
 
 logger = logging.getLogger("aegis.audit")
 
 
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()          # reentrant: the cross-process wrapper and the append body both hold it
 GENESIS = "0" * 64
 
 
@@ -66,9 +76,97 @@ class AuditLog:
         self.write_failures = 0
         self.last_error: str = ""
         if repair:
-            self._repair_torn_tail()
+            with self._file_lock():
+                self._repair_torn_tail()
         self._tail_hash = self._compute_tail_hash()
         self._appended = 0
+        self._seen_sig: tuple[int, int, int] | None = None    # forces one tail sync on the first append
+
+    # --------------------------------------------------------- writer lock --
+    @contextlib.contextmanager
+    def _file_lock(self):
+        """Serialise appends across processes, not just threads.
+
+        A compliance report / ``python -m aegis.audit`` / ``--once`` run used to build its own AuditLog,
+        chain from its own ``_tail_hash`` and fork the log. The lock file lives beside the log and is
+        created 0600; when the platform has no advisory lock it degrades to the in-process lock only.
+        """
+        if fcntl is None and msvcrt is None:        # pragma: no cover - exotic platform
+            yield
+            return
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            else:                                    # pragma: no cover - Windows dev boxes
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                else:                                # pragma: no cover
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.close(fd)
+
+    def _last_hash_in(self, f: Path) -> Optional[str]:
+        """The last complete row's hash in ``f`` (bounded read; ``None`` when the window has no row)."""
+        try:
+            size = f.stat().st_size
+        except OSError:
+            return None
+        if not size:
+            return None
+        with f.open("rb") as fh:
+            fh.seek(max(0, size - 4 * 1024 * 1024))
+            data = fh.read()
+        for raw in reversed(data.split(b"\n")):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("integrity_hash"):
+                return str(row["integrity_hash"])
+        return None
+
+    def _disk_tail(self) -> str:
+        if self.path.exists() and self.path.stat().st_size:
+            h = self._last_hash_in(self.path)
+            return h if h is not None else self._compute_tail_hash()
+        # the live file is empty: the chain continues from the newest rotated segment
+        return self._live_segment_seed()
+
+    def _stat_sig(self) -> tuple[int, int, int]:
+        """(size, mtime_ns, inode): cheap evidence that this writer last saw the current file."""
+        try:
+            st = self.path.stat()
+            return (st.st_size, st.st_mtime_ns, st.st_ino)
+        except OSError:
+            return (0, 0, 0)
+
+    def _sync_tail(self) -> None:
+        """Adopt a tail another process appended (or rotated) while this instance was idle."""
+        sig = self._stat_sig()
+        if sig == self._seen_sig:
+            return
+        size = sig[0]
+        if size:
+            with self.path.open("rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    self._repair_torn_tail()         # a crashed writer left a partial row; we hold the lock
+                    size = self._stat_sig()[0]
+        disk = self._disk_tail()
+        if disk != self._tail_hash:
+            logger.info("[audit] another writer advanced %s; chaining from %s", self.path, disk[:12])
+            self._tail_hash = disk
+        self._seen_sig = self._stat_sig()
 
     # ------------------------------------------------------------- anchor --
     @staticmethod
@@ -365,6 +463,15 @@ class AuditLog:
 
     # -------------------------------------------------------------- append --
     def append(self, chain: EvidenceChain) -> EvidenceChain:
+        """Append under the in-process lock AND an OS file lock, after adopting any tail another writer added."""
+        with _LOCK, self._file_lock():
+            self._sync_tail()
+            try:
+                return self._append_locked(chain)
+            finally:
+                self._seen_sig = self._stat_sig()
+
+    def _append_locked(self, chain: EvidenceChain) -> EvidenceChain:
         with _LOCK:
             chain.finalize()
             # credentials never enter the sealed record (audit file, index, dashboard row all come from here)

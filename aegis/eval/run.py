@@ -27,7 +27,7 @@ from aegis.agents.mobile.agent import MobileAgent
 from aegis.agents.orchestrator.agent import SOCOrchestrator
 from aegis.agents.perimeter.agent import PerimeterAgent
 from aegis.agents.shared.audit import AuditLog
-from aegis.agents.shared.llm_client import get_client
+from aegis.agents.shared.llm_client import get_client, require_live_llm
 from aegis.agents.transaction.agent import TransactionAgent
 from aegis.agents.wireless.agent import WirelessAgent
 
@@ -112,6 +112,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         audit_path = Path(td) / "audit.jsonl"
         orch = _build_orchestrator(audit_path)
+        require_live_llm(getattr(orch, "_primary", None), "historical/injection eval")
 
         print("\n=== Historical verdict agreement ===")
         c, n, diss = run_historical(orch)

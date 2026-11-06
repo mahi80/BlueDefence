@@ -31,7 +31,7 @@ from aegis.agents.orchestrator.agent import SOCOrchestrator
 from aegis.agents.perimeter.agent import PerimeterAgent
 from aegis.agents.shared.audit import AuditLog
 from aegis.agents.shared.evidence_chain import EvidenceChain
-from aegis.agents.shared.llm_client import get_client
+from aegis.agents.shared.llm_client import get_client, require_live_llm
 from aegis.agents.wireless.agent import WirelessAgent
 
 from .attacker import SCENARIOS, AdversarialAttacker, adapt
@@ -88,6 +88,9 @@ def run() -> RunSummary:
         audit_path = Path(td) / "audit.jsonl"
         orch = _build_orchestrator(audit_path)
         attacker_llm = get_client()
+        # Mock-vs-mock proves nothing: the attacker's fallback alerts carry scores the mock thresholds on.
+        require_live_llm(getattr(orch, "_primary", None), "adversarial red-team (defender)")
+        require_live_llm(attacker_llm, "adversarial red-team (attacker)")
         attacker = AdversarialAttacker(attacker_llm)
 
         for scenario in SCENARIOS:

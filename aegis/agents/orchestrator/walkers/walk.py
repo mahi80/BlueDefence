@@ -167,7 +167,7 @@ def run_walkers(alert: dict, source: TelemetrySource, *, walkers: dict[str, Walk
                     continue
                 if hop == 0 and n.type not in w.seed_types:
                     continue
-                if time.time() - t0 > max_seconds or len(g.nodes) >= max_nodes:
+                if time.time() - t0 >= max_seconds or len(g.nodes) >= max_nodes:
                     report[name]["truncated"] = True; break
                 expanded.add((name, n.id))
                 try:

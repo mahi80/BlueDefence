@@ -1,0 +1,4 @@
+include README.md LICENSE NOTICE pyproject.toml
+recursive-include aegis *.md *.json *.yaml *.yml *.txt *.proto *.tpl *.xml *.sh
+recursive-exclude aegis/tests *
+global-exclude __pycache__ *.py[cod]

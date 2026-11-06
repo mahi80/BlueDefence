@@ -20,6 +20,17 @@ from pathlib import Path
 logger = logging.getLogger("aegis.ops.deferred")
 
 
+def _restrict_to_owner(fd: int, path: Path) -> None:
+    """Best-effort 0600 on an already-open spill file. Windows has no ``os.fchmod``; there the file was
+    created 0600 by ``os.open`` and ``os.chmod`` only toggles the read-only bit, so fall back to the path."""
+    chmod = getattr(os, "fchmod", None)
+    with contextlib.suppress(OSError):
+        if chmod is not None:
+            chmod(fd, 0o600)
+        else:
+            os.chmod(path, 0o600)
+
+
 class DeferredQueue:
     def __init__(self, path: Path | str, *, max_bytes: int = 512 * 1024 * 1024):
         self.path = Path(path)
@@ -102,8 +113,7 @@ class DeferredQueue:
             fd = os.open(self.path, flags, 0o600)
             try:
                 # a file left by an older build may be 0644, and it now receives unredacted rows (round 4 X4-9)
-                with contextlib.suppress(OSError):
-                    os.fchmod(fd, 0o600)
+                _restrict_to_owner(fd, self.path)
                 start = os.lseek(fd, 0, os.SEEK_END)
                 try:
                     view = memoryview(data)
@@ -255,7 +265,8 @@ def _private_state_dir() -> Path:
     ``$XDG_STATE_HOME/aegis``, else ``~/.local/state/aegis``. The fallback used to sit at a predictable name in the
     shared temp dir — another local user could pre-create it as a symlink or inject rows into it, and
     ``PrivateTmp`` wiped it on every restart (review round 3 G4-9)."""
-    base = (os.environ.get("STATE_DIRECTORY", "").split(":")[0].strip()
+    # os.pathsep: a Windows drive letter ("C:\…") is not a list separator, as ":" would make it
+    base = (os.environ.get("STATE_DIRECTORY", "").split(os.pathsep)[0].strip()
             or os.path.join(os.environ.get("XDG_STATE_HOME", "") or os.path.join(os.path.expanduser("~"), ".local", "state"), "aegis"))
     d = Path(base)
     d.mkdir(parents=True, exist_ok=True, mode=0o700)

@@ -380,10 +380,11 @@ cat > /usr/local/bin/aegis-restore <<'EOS'
 # aegis-restore BACKUP.tar.gz — stop the service, restore /etc/aegis + /var/lib/aegis, fix ownership, start, verify the chain.
 set -euo pipefail
 B=${1:?usage: aegis-restore BACKUP.tar.gz}; [[ -f "$B" ]] || { echo "no such file: $B"; exit 2; }
-[[ -f "$B.sha256" ]] && (cd "$(dirname "$B")" && sha256sum -c "$(basename "$B").sha256")
+[[ -f "$B.sha256" ]] || { echo "refusing to restore: $B.sha256 is required (aegis-backup always writes one)"; exit 2; }
+(cd "$(dirname "$B")" && sha256sum -c "$(basename "$B").sha256")
 systemctl stop aegis-soc 2>/dev/null || true
 NOW=$(date -u +%Y%m%dT%H%M%SZ); for d in /etc/aegis /var/lib/aegis; do [[ -d $d ]] && mv "$d" "$d.pre-restore-$NOW"; done
-tar -xzf "$B" -C /
+tar --no-same-owner --no-same-permissions -xzf "$B" -C /
 chown root:aegis /etc/aegis; chmod 750 /etc/aegis; chmod 640 /etc/aegis/* 2>/dev/null || true
 chown -R aegis:aegis /var/lib/aegis
 systemctl start aegis-soc 2>/dev/null || true
