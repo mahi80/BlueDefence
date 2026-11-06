@@ -80,3 +80,19 @@ def test_two_writers_append_one_chain(tmp_path):
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert [r["alert_id"] for r in rows] == ["a0", "b0", "a1", "b1", "a2", "b2"]
     assert AuditLog(path).verify() is True
+
+
+def test_dashboard_skips_gates_without_a_live_model_and_fails_real_disagreements():
+    """CI has no model key: the dashboard must say SKIP rather than claim a green eval gate, but a genuine
+    disagreement (non-zero exit without the refusal marker) still fails the run."""
+    from aegis.eval.dashboard import SuiteResult, _eval_status, overall_status
+
+    refusal = ("historical/injection eval: the resolved LLM backend is MockClient (no model credentials). "
+               "Refusing to grade the deterministic keyword table as if it were a model.")
+    assert _eval_status(1, refusal, 0, 0) == "SKIP"
+    assert _eval_status(1, "DISAGREE: alert-7", 8, 9) == "FAIL"
+    assert _eval_status(0, "", 9, 9) == "PASS"
+
+    mixed = [SuiteResult("manifest", status="PASS"), SuiteResult("historical", status="SKIP")]
+    assert overall_status(mixed) == "SKIP"
+    assert overall_status(mixed + [SuiteResult("red team", status="FAIL")]) == "FAIL"

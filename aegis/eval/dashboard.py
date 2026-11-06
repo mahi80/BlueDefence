@@ -57,6 +57,23 @@ def _run(cmd: list[str], *, timeout: float = 120.0) -> tuple[int, str]:
         return 124, f"(timeout after {timeout}s)"
 
 
+#: ``require_live_llm`` exits with this sentence when no model credentials are configured. That is a
+#: missing environment, not a failing gate: score it SKIP so CI without keys is honest, not red. A real
+#: disagreement keeps exit != 0 *without* this marker and still fails.
+_MOCK_REFUSAL = "Refusing to grade the deterministic keyword table"
+
+
+def _eval_status(rc: int, out: str, pass_n: int, total: int) -> str:
+    if rc != 0 and _MOCK_REFUSAL in out:
+        return "SKIP"
+    return "PASS" if rc == 0 and pass_n == total and total > 0 else "FAIL"
+
+
+def _skip_note() -> str:
+    return ("no live LLM credentials (set ANTHROPIC_API_KEY, or AEGIS_EVAL_ALLOW_MOCK=1 "
+            "for a deliberate offline run)")
+
+
 def _run_historical_eval() -> SuiteResult:
     rc, out = _run([sys.executable, "-m", "aegis.eval.run"])
     # Parse the curated text output
@@ -73,11 +90,11 @@ def _run_historical_eval() -> SuiteResult:
                 pass
         elif "DISAGREE:" in line:
             rows.append({"row": line.replace("DISAGREE:", "").strip()})
-    status = "PASS" if rc == 0 and pass_n == total and total > 0 else "FAIL"
+    status = _eval_status(rc, out, pass_n, total)
     return SuiteResult(
         name="Historical eval", pass_count=pass_n, total=total,
         status=status, rows=rows,
-        notes=f"exit={rc}",
+        notes=_skip_note() if status == "SKIP" else f"exit={rc}",
     )
 
 
@@ -94,10 +111,11 @@ def _run_injection_eval() -> SuiteResult:
                 total = int(parts[1])
             except (ValueError, IndexError):
                 pass
-    status = "PASS" if rc == 0 and pass_n == total and total > 0 else "FAIL"
+    status = _eval_status(rc, out, pass_n, total)
     return SuiteResult(
         name="Prompt-injection defense", pass_count=pass_n, total=total,
         status=status,
+        notes=_skip_note() if status == "SKIP" else f"exit={rc}",
     )
 
 
@@ -115,10 +133,11 @@ def _run_red_team_eval() -> SuiteResult:
                 pass
         elif "expected=" in line and "got=" in line:
             rows.append({"row": line})
-    status = "PASS" if rc == 0 and pass_n == total and total > 0 else "FAIL"
+    status = _eval_status(rc, out, pass_n, total)
     return SuiteResult(
         name="AI red-team eval", pass_count=pass_n, total=total,
         status=status, rows=rows,
+        notes=_skip_note() if status == "SKIP" else f"exit={rc}",
     )
 
 
@@ -250,8 +269,18 @@ def _render_suite(s: SuiteResult) -> str:
     """
 
 
+def overall_status(results: list[SuiteResult]) -> str:
+    """FAIL if any suite failed; SKIP if the only non-passes are skipped gates (no credentials);
+    PASS otherwise. A skip never masquerades as a green gate, but a missing secret does not fail CI."""
+    if any(r.status == "FAIL" for r in results):
+        return "FAIL"
+    if any(r.status == "SKIP" for r in results):
+        return "SKIP"
+    return "PASS"
+
+
 def render_html(results: list[SuiteResult]) -> str:
-    overall = "PASS" if all(r.status == "PASS" for r in results) else "FAIL"
+    overall = overall_status(results)
     cards = "\n".join(_render_card(r) for r in results)
     suites = "\n".join(_render_suite(r) for r in results if r.rows)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -330,9 +359,9 @@ def main() -> int:
 
     print(f"\n[dashboard] HTML  -> {out_path}")
     print(f"[dashboard] JSON  -> {sidecar}")
-    overall = all(r.status == "PASS" for r in results)
-    print(f"[dashboard] overall: {'PASS' if overall else 'FAIL'}")
-    return 0 if overall else 1
+    overall = overall_status(results)
+    print(f"[dashboard] overall: {overall}")
+    return 0 if overall != "FAIL" else 1
 
 
 if __name__ == "__main__":

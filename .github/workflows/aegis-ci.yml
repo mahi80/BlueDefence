@@ -263,7 +263,11 @@ jobs:
           pip install -r aegis/requirements.txt pytest
 
       - name: Install acp-sdk (governance runtime — pinned to mahi80/rbi@b2e9d97, acp-sdk 0.8.3)
+        id: acp_install
         if: ${{ env.GH_READ_TOKEN != '' }}
+        # Optional runtime: an expired or under-scoped token must not red the unit-test job, but the
+        # governed eval below is gated on this step's outcome so it cannot pretend acp is installed.
+        continue-on-error: true
         run: |
           pip install "acp-sdk @ git+https://x-access-token:${GH_READ_TOKEN}@github.com/mahi80/rbi.git@b2e9d97#subdirectory=acp-sdk"
           python -c "import acp; print('acp-sdk', acp.__version__)"
@@ -271,6 +275,10 @@ jobs:
       - name: Note — governance runtime skipped (no GH_READ_TOKEN)
         if: ${{ env.GH_READ_TOKEN == '' }}
         run: echo "GH_READ_TOKEN not set — acp-sdk install and the governed eval are skipped. aegis runs without it (governance is optional); governance-only tests self-skip. Add the secret to run the full governed gate."
+
+      - name: Note — governance runtime install failed
+        if: ${{ steps.acp_install.outcome == 'failure' }}
+        run: echo "::warning title=Governance runtime unavailable::GH_READ_TOKEN could not clone mahi80/rbi (expired or under-scoped); acp-sdk and the governed eval were skipped."
 
       - name: Unit tests (governance tests self-skip without acp-sdk)
         run: |
@@ -288,7 +296,7 @@ jobs:
           exit $rc
 
       - name: Historical + injection eval under governance (must match the ungoverned gate)
-        if: ${{ env.GH_READ_TOKEN != '' }}
+        if: ${{ steps.acp_install.outcome == 'success' }}
         env:
           ACP_GOVERN: "1"
         run: |
