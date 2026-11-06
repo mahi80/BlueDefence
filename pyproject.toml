@@ -13,6 +13,8 @@ dependencies = [
     "anthropic>=0.40.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    # imported directly by connectors, dashboards and dataset sources
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -42,4 +44,29 @@ testpaths = ["aegis/tests"]
 addopts = "-q"
 
 [tool.setuptools.package-data]
+# Runtime assets. Without these a wheel/sdist install imports but cannot build an orchestrator
+# (system_prompt.md) or verify a licence (keys/*.pub.json); install.sh hid this by using -e.
+"aegis" = [
+    "_manifest.json",
+    "keys/*.pub.json",
+    "requirements*.txt",
+    "prompts/*.md",
+    "agents/*/system_prompt.md",
+    "agents/*/prompts/*.md",
+    "agents/edr/host_baselines.json",
+    "agents/edr/collectors/*",
+    "dataset/seed/*.json",
+    "eval/*/cases.json",
+    "ingest/connectors/*.yaml",
+    "ingest/connectors/*.json",
+    "ingest/fixtures/*.json",
+    "ingest/fixtures/*/*.json",
+    "healing/k8s/templates/*",
+    "healing/k8s/*.yaml",
+    "observability/k8s/templates/*",
+    "observability/k8s/*.yaml",
+    "k8s/templates/*",
+    "k8s/*.yaml",
+]
+"aegis.agents.threat_intel" = ["sync.proto"]
 "aegis.ingest" = ["connectors/*.yaml", "connectors/*.json"]

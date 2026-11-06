@@ -270,6 +270,8 @@ def test_r8_6_reindex_cli_fails_on_a_broken_chain(_nokeys, tmp_path, capsys):
 
 # ---------------------------------------------------------------- R8-8 ---
 def test_r8_8_backup_is_private(tmp_path):
+    if os.name == "nt":
+        pytest.skip("the backup script depends on POSIX tools and mode bits")
     if not (shutil.which("bash") and shutil.which("tar") and shutil.which("sha256sum")):
         pytest.skip("needs bash, tar, sha256sum")
     sh = (ROOT / "install.sh").read_text()

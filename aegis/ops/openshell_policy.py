@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 _DEFAULT_PORTS = {"https": 443, "http": 80, "ldaps": 636, "postgresql": 5432, "postgres": 5432, "mssql": 1433,
@@ -154,6 +154,17 @@ def collect(env: dict[str, str] | None = None) -> dict[str, list[tuple[str, int]
     return out
 
 
+def _policy_path(p: str | Path) -> str:
+    """An absolute path for the sandbox policy. An explicit POSIX path is kept as written: resolving it on a
+    Windows host would turn ``/var/lib/aegis`` into ``C:\\var\\lib\\aegis``, which is not what the Linux
+    sandbox should be granted. Only relative / native paths are resolved against this host."""
+    s = str(p).strip()
+    posix = s.replace("\\", "/")           # WindowsPath renders "/var/lib/aegis" with backslashes
+    if posix.startswith("/"):
+        return str(PurePosixPath(posix))
+    return Path(s).expanduser().resolve().as_posix()
+
+
 def _state_dirs(e: dict[str, str]) -> set[str]:
     """Directories the service writes, as absolute paths (round 6 P-2): the audit log and what lives beside it
     (receipts, deferred actions — their defaults are the audit file's directory), the HITL queue, ACP_HOME, the
@@ -169,7 +180,7 @@ def _state_dirs(e: dict[str, str]) -> set[str]:
         if (e.get(var) or "").strip():
             dirs.add(Path(e[var]))
     dirs.add(Path((e.get("AEGIS_TI_CACHE") or "").strip() or Path(e.get("HOME") or Path.home()) / ".cache" / "aegis-threat-intel"))
-    return {str(d.expanduser().resolve()) for d in dirs}
+    return {_policy_path(d) for d in dirs}
 
 
 def build_policy(env: dict[str, str] | None = None, *, extra: list[str] = (), workdir: str = "/app",
@@ -181,7 +192,7 @@ def build_policy(env: dict[str, str] | None = None, *, extra: list[str] = (), wo
         host = host.strip("[]").lower()
         if host and port.isdigit():
             groups.setdefault("extra", []).append((host, int(port)))
-    rw = sorted(_state_dirs(e) | {str(Path(d).expanduser().resolve()) for d in state_dirs})
+    rw = sorted(_state_dirs(e) | {_policy_path(d) for d in state_dirs})
     binary = python
     policies = {}
     for name, hosts in sorted(groups.items()):

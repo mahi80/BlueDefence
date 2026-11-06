@@ -722,11 +722,15 @@ def heartbeat_payload(*, installation_id: str, audit_path: Path | None, counters
             pass
     flags = {k: env.get(k, "") for k in ("AEGIS_EDITION", "AEGIS_ENFORCEMENT_MODE", "AEGIS_DATASET_CAPTURE", "AEGIS_CONTRIB",
                                          "AEGIS_LICENSE_ENFORCE", "LLM_BACKEND", "AEGIS_SWARM")}
-    return {"installation_id": installation_id, "ts": int(time.time()), "chains_total": chains, "audit_tail_hash": tail,
-            "code_fingerprint": code_fingerprint(), "machine_hash": machine_hash(env), "pinned": bool(env.get("AEGIS_INSTALL_ID", "").strip()),
-            "issuer_overridden": bool(env.get("AEGIS_LICENSE_PUBKEYS", "").strip()),
-            "flags": flags, "counters": dict(counters or {}), "contrib_cursor": contrib_cursor, "host": platform.node(),
-            "python": platform.python_version()}
+    payload = {"installation_id": installation_id, "ts": int(time.time()), "chains_total": chains, "audit_tail_hash": tail,
+               "code_fingerprint": code_fingerprint(), "machine_hash": machine_hash(env), "pinned": bool(env.get("AEGIS_INSTALL_ID", "").strip()),
+               "issuer_overridden": bool(env.get("AEGIS_LICENSE_PUBKEYS", "").strip()),
+               "flags": flags, "counters": dict(counters or {}), "contrib_cursor": contrib_cursor,
+               "python": platform.python_version()}
+    # A bank hostname is infrastructure identity: only send it when the operator asks for it.
+    if env.get("AEGIS_HEARTBEAT_INCLUDE_HOST", "").strip().lower() in ("1", "true", "yes", "on"):
+        payload["host"] = platform.node()
+    return payload
 
 
 def _require_https(server: str) -> None:

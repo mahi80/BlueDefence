@@ -167,7 +167,8 @@ def cmd_synth(args: argparse.Namespace) -> int:
     problems = _validate_sft_rows(rows)
     out = Path(args.out); (out / "sft").mkdir(parents=True, exist_ok=True)
     h = hashlib.sha256()
-    with (out / "sft" / "triage.jsonl").open("w", encoding="utf-8") as fh:
+    # newline="\n": Windows text-mode translation to CRLF would not match the digest computed over LF
+    with (out / "sft" / "triage.jsonl").open("w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
             line = json.dumps(row, ensure_ascii=False, sort_keys=True)
             h.update(line.encode()); fh.write(line + "\n")
@@ -236,7 +237,7 @@ def cmd_build_judge(args: argparse.Namespace) -> int:
         return 1
     out = Path(args.out); (out / "sft").mkdir(parents=True, exist_ok=True)
     h = hashlib.sha256()
-    with (out / "sft" / "triage.jsonl").open("w", encoding="utf-8") as fh:       # the file name train.py loads
+    with (out / "sft" / "triage.jsonl").open("w", encoding="utf-8", newline="\n") as fh:  # the file name train.py loads
         for r in out_rows:
             line = json.dumps(r, ensure_ascii=False, sort_keys=True)
             h.update(line.encode()); fh.write(line + "\n")
@@ -280,7 +281,7 @@ def cmd_build_public(args: argparse.Namespace) -> int:
     problems = _validate_sft_rows(rows)
     out = Path(args.out); (out / "sft").mkdir(parents=True, exist_ok=True)
     h = hashlib.sha256()
-    with (out / "sft" / "triage.jsonl").open("w", encoding="utf-8") as fh:
+    with (out / "sft" / "triage.jsonl").open("w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
             line = json.dumps(row, ensure_ascii=False, sort_keys=True)
             h.update(line.encode()); fh.write(line + "\n")

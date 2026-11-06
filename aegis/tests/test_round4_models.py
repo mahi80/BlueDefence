@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import types
 
 import pytest
@@ -117,6 +118,7 @@ def _adapter(tmp_path):
     return ad
 
 
+@pytest.mark.skipif(os.name == "nt", reason="creating symlinks needs a privilege Windows CI does not grant")
 def test_nested_symlink_out_of_the_adapter_is_refused(tmp_path):
     from aegis.finetune import publish
     ad = _adapter(tmp_path)

@@ -207,6 +207,8 @@ def test_sdnotify_is_a_noop_without_systemd_and_speaks_the_protocol_with_it(tmp_
     from aegis.ops import sdnotify
     monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
     assert not sdnotify.enabled() and sdnotify.ready() is False and sdnotify.watchdog() is False
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("sd_notify speaks over a Unix datagram socket; systemd does not run on Windows")
     sock_path = str(tmp_path / "notify.sock")
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); srv.bind(sock_path); srv.settimeout(2)
     monkeypatch.setenv("NOTIFY_SOCKET", sock_path); monkeypatch.setenv("WATCHDOG_USEC", "180000000")

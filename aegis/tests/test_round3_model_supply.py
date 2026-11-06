@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import types
 from pathlib import Path
 
@@ -130,6 +131,7 @@ def test_rolled_back_version_is_denied(tmp_path):
 
 # ---- publish never ships files from outside the adapter -------------------------------------------------------
 
+@pytest.mark.skipif(os.name == "nt", reason="creating symlinks needs a privilege Windows CI does not grant")
 def test_publish_refuses_links_outside_the_adapter(tmp_path):
     from aegis.finetune.publish import _tar_adapter
     ad = tmp_path / "ad"; ad.mkdir()

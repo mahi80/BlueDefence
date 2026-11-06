@@ -149,15 +149,15 @@ def test_stream_lru_is_per_pushed_source():
 def test_file_source_reads_only_new_lines(tmp_path):
     from aegis.ingest.base import AlertCheckpoint
     f = tmp_path / "waf.log"
-    f.write_text("a\nb\n")
+    f.write_bytes(b"a\nb\n")                                          # bytes: no CRLF translation on Windows
     cp = AlertCheckpoint(tmp_path / "cp.json")
     assert list(cp.tail_lines(f)) == ["a\n", "b\n"]
-    with f.open("a") as fh:
-        fh.write("c\npartial")
+    with f.open("ab") as fh:
+        fh.write(b"c\npartial")
     assert list(cp.tail_lines(f)) == ["c\n"]
     cp.flush()
     assert list(AlertCheckpoint(tmp_path / "cp.json").tail_lines(f)) == []
-    f.write_text("rotated\n")                                          # truncated / rotated: start over
+    f.write_bytes(b"rotated\n")                                        # truncated / rotated: start over
     assert list(cp.tail_lines(f)) == ["rotated\n"]
 
 

@@ -450,7 +450,9 @@ def verify_dataset(out_dir: Path | str) -> tuple[bool, list[str]]:
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> str:
     h = hashlib.sha256()
-    with path.open("w", encoding="utf-8") as fh:
+    # newline="\n": text mode would translate to CRLF on Windows, while the digest below is over LF —
+    # verify hashes the file's raw bytes, so the export failed its own integrity check there.
+    with path.open("w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
             line = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n"
             fh.write(line)

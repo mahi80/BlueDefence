@@ -8,6 +8,7 @@ exercised together. IPs are RFC 5737 documentation ranges; payload strings are a
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 
@@ -194,7 +195,7 @@ def _aws():
 def test_live_auto_block_stops_the_whole_pool_on_cloudflare(orch):
     srv, cf = _cloudflare()
     agent = ResponseAgent(connectors=ConnectorRegistry([cf]), autonomy=AutonomyPolicy(mode="live"),
-                          hitl_stream=open("/dev/null", "w"))
+                          hitl_stream=open(os.devnull, "w"))
     for alert, chain in _run(rotating_agent(), orch):
         agent.execute(chain, alert)
     (rule,) = srv.custom_rules()
@@ -213,7 +214,7 @@ def test_live_auto_block_stops_the_whole_pool_on_cloudflare(orch):
 def test_live_auto_block_on_aws_uses_the_rule_group(orch):
     srv, aws = _aws()
     agent = ResponseAgent(connectors=ConnectorRegistry([aws]), autonomy=AutonomyPolicy(mode="live"),
-                          hitl_stream=open("/dev/null", "w"))
+                          hitl_stream=open(os.devnull, "w"))
     for alert, chain in _run(rotating_agent(), orch):
         agent.execute(chain, alert)
     (rule,) = srv.fingerprint_rules()
@@ -227,7 +228,7 @@ def test_ip_only_waf_refuses_fingerprints_and_parks_them_for_a_human(orch):
     srv = MockImperva()
     imp = ImpervaWafConnector(site_id="1", api_id="mock", api_key="mock", base_url="https://i", transport=srv, dry_run=False)
     agent = ResponseAgent(connectors=ConnectorRegistry([imp]), autonomy=AutonomyPolicy(mode="live"),
-                          hitl_stream=open("/dev/null", "w"))
+                          hitl_stream=open(os.devnull, "w"))
     alert, chain = [(a, c) for a, c in _run(rotating_agent(), orch) if c.investigated_by == "adaptive_attacker"][-1]
     summary = agent.execute(chain, alert)
     fp = [x for x in summary.hitl_queue if x.action.target.startswith("fp:")]
@@ -239,7 +240,7 @@ def test_default_mode_is_shadow_records_and_still_asks_a_human(orch):
     srv, cf = _cloudflare()
     seen = []
     reg = ConnectorRegistry([cf], on_receipt=[lambda ev, r: seen.append((ev, r))])
-    agent = ResponseAgent(connectors=reg, hitl_stream=open("/dev/null", "w"))          # AutonomyPolicy.from_env()
+    agent = ResponseAgent(connectors=reg, hitl_stream=open(os.devnull, "w"))          # AutonomyPolicy.from_env()
     alert, chain = [(a, c) for a, c in _run(rotating_agent(), orch) if c.investigated_by == "adaptive_attacker"][-1]
     summary = agent.execute(chain, alert)
     assert not srv.custom_rules() and not srv.blocked()                               # nothing enforced
@@ -258,7 +259,7 @@ def test_mixed_traffic_only_the_agent_is_acted_on(orch):
     human were counted as that client 'retrying from new IPs' and got blocked / challenged."""
     srv, cf = _cloudflare()
     agent = ResponseAgent(connectors=ConnectorRegistry([cf]), autonomy=AutonomyPolicy(mode="live"),
-                          hitl_stream=open("/dev/null", "w"))
+                          hitl_stream=open(os.devnull, "w"))
     lines = (FIX / "agentic_rotation.jsonl").read_text().splitlines()
     for alert, chain in _run(lines, orch):
         agent.execute(chain, alert)
